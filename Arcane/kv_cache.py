@@ -1,19 +1,35 @@
-from typing import List, Optional
-
 class KVCache:
-    def __init__(self, n_layers: int):
-        self.n_layers = n_layers
-        self.caches: List[Optional[dict]] = [None] * n_layers
+    """
+    Per-layer key/value cache for autoregressive decoding.
 
-    def get(self, layer_idx: int) -> Optional[dict]:
+    Stores concatenated K/V tensors for each transformer layer to
+    avoid recomputation during incremental generation.
+    """
+
+    def __init__(self, n_layers):
+        self.n_layers = n_layers
+        self.caches = [None for _ in range(n_layers)]
+
+    def get(self, layer_idx):
         return self.caches[layer_idx]
 
-    def update(self, layer_idx: int, cache: dict):
-        self.caches[layer_idx] = cache
+    def update(self, layer_idx, kv):
+        self.caches[layer_idx] = kv
 
     def reset(self):
-        """Clear all cached keys/values (e.g. for new conversation)"""
-        self.caches = [None] * self.n_layers
+        for i in range(self.n_layers):
+            self.caches[i] = None
 
-    def is_empty(self) -> bool:
-        return all(c is None for c in self.caches)
+    def is_empty(self):
+        return all(cache is None for cache in self.caches)
+
+    def to(self, device):
+        """
+        Move all cached tensors to the specified device.
+        Useful when the model is moved after prefill.
+        """
+        for i, cache in enumerate(self.caches):
+            if cache is not None:
+                k, v = cache
+                self.caches[i] = (k.to(device), v.to(device))
+        return self

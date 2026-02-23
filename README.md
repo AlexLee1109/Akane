@@ -55,17 +55,6 @@ Install dependencies:
 pip install torch tiktoken
 ```
 
-## Model Training Performance
-The training and validation loss curves for the models over training steps are shown below. The model was trained on 10B tokens, equating to 19,073 steps for the 124M and 355M models and 9,536 steps for the 1.3B model due to increased batch size.
-
-![Loss Graph](/Images/Train_Val_graph.png)
-
-| Model                 | Training Loss   | Validation Loss |
-|-----------------------|-----------------|-----------------|
-| Akane 124M           | 3.07            | 3.00            |
-| Akane 355M           | 2.89            | 2.88            |
-| Akane 1.3B           | 2.88            | 2.87            |
-
 ## Future Implementations
 Planned enhancements for Arcane include:
 - **Reinforcement Learning with Human Feedback (RLHF)**

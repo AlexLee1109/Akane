@@ -1,6 +1,6 @@
-# Arcane: A GPT-2 Inspired Model
+# Akane: A GPT-2 Inspired Model
 
-Arcane is a streamlined, educational GPT-style transformer model built in PyTorch, inspired by GPT-2. It offers a clear and efficient implementation to demonstrate modern transformer techniques, with a focus on performance and modularity. Key features include rotary positional embeddings (RoPE), RMS normalization, key-value (KV) caching for efficient inference, and a custom MLP design.
+Akane is a streamlined, educational GPT-style transformer model built in PyTorch, inspired by GPT-2. It offers a clear and efficient implementation to demonstrate modern transformer techniques, with a focus on performance and modularity. Key features include rotary positional embeddings (RoPE), RMS normalization, key-value (KV) caching for efficient inference, and a custom MLP design.
 
 ## Features
 - **Compact Transformer Architecture**: A modular GPT-2-inspired model with a focus on clarity and extensibility.

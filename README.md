@@ -1,6 +1,6 @@
-# Arcane: A GPT-2 Inspired Model
+# Akane: A GPT-2 Inspired Model
 
-Arcane is a streamlined, educational GPT-style transformer model built in PyTorch, inspired by GPT-2. It offers a clear and efficient implementation to demonstrate modern transformer techniques, with a focus on performance and modularity. Key features include rotary positional embeddings (RoPE), RMS normalization, key-value (KV) caching for efficient inference, and a custom MLP design.
+Akane is a streamlined, educational GPT-style transformer model built in PyTorch, inspired by GPT-2. It offers a clear and efficient implementation to demonstrate modern transformer techniques, with a focus on performance and modularity. Key features include rotary positional embeddings (RoPE), RMS normalization, key-value (KV) caching for efficient inference, and a custom MLP design.
 
 ## Features
 - **Compact Transformer Architecture**: A modular GPT-2-inspired model with a focus on clarity and extensibility.
@@ -19,7 +19,7 @@ Arcane is a streamlined, educational GPT-style transformer model built in PyTorc
 - [Model Comparison](#model-comparison)
 
 ## Overview
-Arcane is designed to help users understand transformer models through a clean, efficient implementation. It incorporates modern techniques like RoPE and KV caching, making it suitable for both educational exploration and practical experimentation.
+Akane is designed to help users understand transformer models through a clean, efficient implementation. It incorporates modern techniques like RoPE and KV caching, making it suitable for both educational exploration and practical experimentation.
 
 ### Key Concepts
 - **Transformer Blocks**: Stacked layers with causal self-attention and MLP components.
@@ -62,9 +62,9 @@ The training and validation loss curves for the models over training steps are s
 
 | Model                 | Training Loss   | Validation Loss |
 |-----------------------|-----------------|-----------------|
-| Arcane 124M           | 3.07            | 3.00            |
-| Arcane 355M           | 2.89            | 2.88            |
-| Arcane 1.3B           | 2.88            | 2.87            |
+| Akane 124M           | 3.07            | 3.00            |
+| Akane 355M           | 2.89            | 2.88            |
+| Akane 1.3B           | 2.88            | 2.87            |
 
 ## Future Implementations
 Planned enhancements for Arcane include:

@@ -1,130 +1,150 @@
+import os
+import gc
 import time
+
 import torch
 import tiktoken
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
 
-from Arcane.gpt import GPT, GPTConfig
+from Akane.gpt import GPT, GPTConfig
 
-CONFIG = GPTConfig(n_layer=24, n_head=16, n_kv_head=4, n_embd=1344)
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+    torch.set_float32_matmul_precision('high')
 
-CHECKPOINT_PATH = "models/arcane2.pt"
+CHECKPOINT_PATH = "Models/arcanev2.pt"
+EXIT_COMMANDS = {"quit", "exit", "q"}
+
+MODEL_CONFIG = GPTConfig(
+    n_layer=36,
+    n_head=16,
+    n_kv_head=4,
+    n_embd=1536
+)
 
 MAX_TOKENS = 100
-TEMPERATURE = 0.9
+TEMPERATURE = 0.85
 TOP_K = 40
-TYPING_DELAY = 0.015
+REPETITION_PENALTY = 1.08
 
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+SYSTEM = "You are Akane, a cheerful and expressive AI Vtuber companion.\n"
 
+# ── Helpers ─────────────────────────────────────────────────────────────────
+def _free_memory():
+    gc.collect()
+    if DEVICE.type == "mps":
+        torch.mps.empty_cache()
 
-def load_model(device: torch.device) -> GPT:
-    model = GPT(CONFIG).to(device).eval()
+# ── Model loading for M3 MPS ────────────────────────────────────────────────
+def _load_model():
+    model = GPT(MODEL_CONFIG)
 
-    try:
-        print(f"Loading checkpoint: {CHECKPOINT_PATH}")
-        checkpoint = torch.load(
-            CHECKPOINT_PATH,
-            map_location=device,
-            weights_only=True,
-        )
-        model.load_state_dict(checkpoint["model"])
-        print("Checkpoint loaded.")
-    except Exception as e:
-        print(f"Checkpoint load failed: {e}")
-        print("Using randomly initialized weights.")
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=True, mmap=True)
+    model.load_state_dict(checkpoint["model"])
+    del checkpoint
+    gc.collect()
 
-    if device.type in {"cuda", "mps"}:
-        print("Compiling model...")
-        model = torch.compile(model, dynamic=False)
+    model = model.to(DEVICE, dtype=torch.bfloat16).eval()
+    model = torch.compile(model, mode="reduce-overhead", fullgraph=False, dynamic=False)
 
+    _free_memory()
     return model
 
-class SinonChat:
-    def __init__(self, model, tokenizer, device):
+
+class ChatBot:
+    _PANEL_STYLE = dict(
+        title="[bold green]Akane[/bold green]",
+        border_style="green",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+    def __init__(self, model, console):
         self.model = model
-        self.tokenizer = tokenizer
-        self.device = device
+        self.console = console
+        self.tokenizer = tiktoken.get_encoding("gpt2")
+
+    def _show_system_info(self):
+        param_m = sum(p.numel() for p in self.model.parameters()) / 1e6
+        table = Table(title="[bold]System Info[/bold]", box=box.ROUNDED)
+        table.add_column("Item", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("Device", "MPS")
+        table.add_row("Model Size", f"{param_m:.1f}M params")
+        self.console.print(table)
 
     @torch.inference_mode()
-    def stream_generate(self, prompt):
-        """
-        Generate text and yield characters incrementally
-        (token-level generation, character-level display).
-        """
-        enc = self.tokenizer
+    def _stream_tokens(self, prompt):
+        tokens = self.tokenizer.encode(SYSTEM + prompt, allowed_special={"<|endoftext|>"})
+        tokens = tokens[-MODEL_CONFIG.block_size:]
 
-        tokens = enc.encode(prompt, allowed_special={"<|endoftext|>"})
-        tokens = tokens[-CONFIG.block_size:]
-
-        eos_token = enc.encode(".")[0]
-
-        token_ids = self.model.generate(
+        byte_buf = b""
+        for token_id in self.model.generate(
             tokens=tokens,
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
             top_k=TOP_K,
-            eos_tokens=eos_token,
-            min_tokens=int(MAX_TOKENS * 0.8),
-            kv_cache=None,
-        )
+            repetition_penalty=REPETITION_PENALTY,
+        ):
+            byte_buf += self.tokenizer.decode_single_token_bytes(token_id)
+            try:
+                text = byte_buf.decode("utf-8")
+                byte_buf = b""
+                yield text
+            except UnicodeDecodeError:
+                continue
 
-        for token_id in token_ids:
-            text = enc.decode([token_id])
-            text = text.replace("�", "'")
+    def _respond(self, prompt):
+        t0 = time.perf_counter()
+        n_tokens = 0
+        chunks = []
+        first = True
 
-            for ch in text:
-                yield ch
+        with Live(Panel("", **self._PANEL_STYLE), console=self.console, refresh_per_second=30) as live:
+            for chunk in self._stream_tokens(prompt):
+                n_tokens += 1
+                if first:
+                    chunk = chunk.lstrip()
+                    if not chunk:
+                        continue
+                    first = False
+                chunks.append(chunk)
+                live.update(Panel("".join(chunks), **self._PANEL_STYLE))
 
-    def run(self) -> None:
-        print("=== Sinon Chatbot ===")
-        print("Type 'quit' to exit.\n")
+        elapsed = time.perf_counter() - t0
+        tok_s = n_tokens / elapsed if elapsed > 0 else 0.0
+        self.console.print(f"[dim]{n_tokens} tokens • {tok_s:.1f} tok/s • {elapsed:.1f}s[/dim]\n")
+
+        _free_memory()
+
+    def run(self):
+        self._show_system_info()
+        self.console.print("Type [bold]quit, exit or q[/bold] to exit\n", style="dim")
 
         while True:
-            try:
-                prompt = input("You: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nGoodbye!")
-                return
+            self.console.print("[bold cyan]You[/bold cyan] ", end="")
+            user_input = input().strip()
 
-            if not prompt:
+            if user_input.lower() in EXIT_COMMANDS:
+                self.console.print("\n[bold cyan]Akane has left the chat.[/bold cyan]\n")
+                break
+            if not user_input:
                 continue
-            if prompt.lower() in {"quit", "exit", "q"}:
-                print("Goodbye!")
-                return
 
-            print("Sinon:", end=" ", flush=True)
+            self._respond(user_input)
 
-            start = time.time()
-            chars = 0
-            first_char = True
 
-            for ch in self.stream_generate(prompt):
-                if first_char and ch.isspace():
-                    continue
-                first_char = False
+def main():
+    console = Console()
 
-                print(ch, end="", flush=True)
-                chars += 1
-                time.sleep(max(0.001, TYPING_DELAY))
+    with console.status("[bold green]Loading model...", spinner="dots"):
+        model = _load_model()
 
-            elapsed = time.time() - start
-            speed = chars / elapsed if elapsed > 0 else 0.0
-
-            print()
-            print(f"({speed:.1f} chars/sec • {elapsed:.2f}s)\n")
-
-def main() -> None:
-    device = get_device()
-    print(f"Using device: {device}")
-
-    model = load_model(device)
-    tokenizer = tiktoken.get_encoding("gpt2")
-
-    SinonChat(model, tokenizer, device).run()
+    ChatBot(model, console).run()
 
 
 if __name__ == "__main__":

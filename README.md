@@ -25,7 +25,6 @@ Akane is an AI VTuber companion chatbot powered by a custom GPT-style transforme
 Akane is an AI VTuber chatbot built on a custom transformer trained from scratch on FineWeb and fine-tuned on Hololive VTuber transcript data. It incorporates modern techniques like GQA, RoPE, SwiGLU, and pre-allocated KV caching for responsive, on-device conversation.
 
 ### Key Concepts
-- **VTuber-Style Conversation**: The model is fine-tuned on transcript data from 60+ Hololive VTubers, giving it a distinctive, character-driven conversational style.
 - **Grouped Query Attention (GQA)**: Uses fewer KV heads than query heads (e.g., 12 query heads, 6 KV heads) for memory-efficient attention via PyTorch's `scaled_dot_product_attention` with `enable_gqa=True`.
 - **Pre-Allocated KV Cache**: Eliminates per-step memory allocation during generation by writing into a fixed, pre-allocated tensor.
 

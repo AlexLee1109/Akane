@@ -1,8 +1,8 @@
 import torch
 import os
 import time
-from dataloader import DataLoader
-from gpt import GPT, GPTConfig
+from train.dataloaders.fineweb import DataLoader
+from akane.gpt import GPT, GPTConfig
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist

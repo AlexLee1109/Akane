@@ -29,10 +29,10 @@ Akane is an AI VTuber chatbot built on a custom transformer trained from scratch
 - **Pre-Allocated KV Cache**: Eliminates per-step memory allocation during generation by writing into a fixed, pre-allocated tensor.
 
 ## Chat Interface
-Run `main.py` to start an interactive chat session with Akane:
+Run `cli/chat.py` to start an interactive chat session with Akane:
 
 ```bash
-python main.py
+python cli/chat.py
 ```
 
 The chat interface features:
@@ -94,13 +94,31 @@ pip install torch tiktoken rich
 ## Project Structure
 ```
 Akane/
-├── main.py                   # Chat interface entry point
-├── Akane/
-│   ├── gpt.py                # GPT model, attention, MLP, RoPE
-│   └── kv_cache.py           # Pre-allocated KV cache
-└── Train/
-    ├── train.py              # Pre-training loop
-    └── dataloader.py         # FineWeb data loader
+├── akane/                    # Core library
+│   ├── gpt.py               # GPT model, attention, MLP, RoPE
+│   └── kv_cache.py          # Pre-allocated KV cache
+├── cli/
+│   ├── chat.py              # Interactive chat (terminal UI)
+│   └── server.py            # HTTP server with SSE streaming
+├── train/
+│   ├── pretrain.py          # Pre-training script (DDP supported)
+│   └── dataloaders/
+│       ├── fineweb.py       # FineWeb sharded data loader
+│       └── ultrachat.py     # UltraChat instruction data loader
+├── data/
+│   └── downloaders/
+│       ├── fineweb.py       # FineWeb dataset downloader/tokenizer
+│       └── hellaswag.py     # HellaSwag dataset downloader
+├── eval/
+│   └── hellaswag.py         # HellaSwag evaluation script
+├── utils/
+│   ├── convert_checkpoint.py # Convert training checkpoints for inference
+│   ├── plot.py              # Plot training/validation loss curves
+│   └── splitdata.py         # Data splitting utility
+├── models/                  # Saved model checkpoints (.pt files)
+├── logs/                    # Training logs
+├── static/                  # Web UI assets for server.py
+└── configs/                 # Configuration files (generation, training)
 ```
 
 ## Future Implementations

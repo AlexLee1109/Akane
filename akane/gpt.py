@@ -31,8 +31,8 @@ class RotaryEmbedding(nn.Module):
         cos = self.cos[pos:pos + T].unsqueeze(0).unsqueeze(0)
         sin = self.sin[pos:pos + T].unsqueeze(0).unsqueeze(0)
 
-        x1 = x[..., ::2].clone()
-        x2 = x[..., 1::2].clone()
+        x1 = x[..., ::2].contiguous()
+        x2 = x[..., 1::2].contiguous()
         x[..., ::2] = x1 * cos - x2 * sin
         x[..., 1::2] = x1 * sin + x2 * cos
         return x 
@@ -138,6 +138,9 @@ class GPT(nn.Module):
         self.emb_norm = nn.RMSNorm(config.n_embd, eps=config.eps)
 
         self.apply(self._init_weights)
+        
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"Model initialized with {total_params / 1e6:.2f}M parameters.")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):

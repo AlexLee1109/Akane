@@ -1,13 +1,18 @@
-.DS_Store
-.idea
-.vscode
+# Common generated files
 __pycache__/
-*.bin
-*.pkl
-*.pt
 *.pyc
-models/
+*.pyo
+*.pyd
+.DS_Store
+.idea/
+.vscode/
+
+# Project output/data directories - ignore entirely
+cli/
+eval/
+utils/
 data/
-static/
-evals/
+models/
 logs/
+static/
+hellaswag/

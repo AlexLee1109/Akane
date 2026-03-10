@@ -6,8 +6,8 @@ class KVCache:
     __slots__ = ('k_cache', 'v_cache', 'seq_len', 'n_layer', 'max_seq_len', 
                  'batch_size', 'n_kv_head', 'head_dim', 'dtype', 'device')
     
-    def __init__(self, n_layer, max_seq_len=1024, batch_size=1, n_kv_head=6, 
-                 head_dim=64, dtype=torch.float16, device='cuda'):
+    def __init__(self, n_layer, max_seq_len=1024, batch_size=1, n_kv_head=6,
+                 head_dim=64, dtype=torch.bfloat16, device='cuda'):
         self.n_layer = n_layer
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size

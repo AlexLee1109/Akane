@@ -1,129 +1,172 @@
-# Akane: AI VTuber Chatbot
+# Akane: Custom GPT-style Transformer
 
-Akane is an AI VTuber companion chatbot powered by a custom GPT-style transformer, built from scratch in PyTorch. Akane delivers cheerful, expressive conversations with real-time streaming responses in the terminal. Under the hood, it features Grouped Query Attention (GQA) with QK normalization, shared rotary positional embeddings (RoPE), SwiGLU MLP, and pre-allocated KV caching for fast autoregressive inference.
+Akane is a PyTorch-based GPT-style transformer model, currently in the **pre-training phase** on 20B tokens from FineWeb. The project focuses on clean, performant implementation with modern transformer techniques. After pre-training completes, instruction fine-tuning will enable Akane to become a local AI VTuber companion.
 
-## Features
-- **Streaming Chat Interface**: A rich terminal UI (via `rich`) with live-updating response panels, token-per-second stats, and system info display.
-- **Custom Transformer Architecture**: A modular GPT-2-inspired model built for clarity, extensibility, and efficient on-device inference.
-- **Grouped Query Attention (GQA) with QK Normalization**: Multi-head attention with fewer KV heads than query heads, plus RMSNorm on Q and K for training stability.
-- **Shared Rotary Positional Embeddings (RoPE)**: A single `RotaryEmbedding` instance shared across all layers, applying precomputed cosine/sine rotations within self-attention.
-- **Pre-Allocated KV Cache**: A dedicated `KVCache` class pre-allocates contiguous memory for all layers upfront, enabling zero-allocation autoregressive inference via in-place writes and sliced views.
-- **SwiGLU MLP**: A gated feed-forward network using SiLU activation (`SiLU(W1·x) * W2·x`) with a ≈2.67x hidden expansion ratio, rounded to the nearest multiple of 256.
-- **Zero-Initialized Residual Projections**: Output projections in both attention and MLP blocks are initialized to zero for stable early training.
-- **Streaming Text Generation**: Autoregressive generation with KV caching, temperature scaling, top-k sampling, and token-level repetition penalty, yielded as a Python generator for real-time display.
+## Key Features
 
-## Table of Contents
-- [Overview](#overview)
-- [Chat Interface](#chat-interface)
-- [Model Architecture](#model-architecture)
-- [KV Cache](#kv-cache)
-- [Generation](#generation)
-- [Training & Fine-Tuning](#training--fine-tuning)
-- [Requirements](#requirements)
+- **Grouped Query Attention (GQA)** with QK normalization for training stability
+- **Shared Rotary Positional Embeddings (RoPE)** across all layers
+- **SwiGLU MLP** with zero-initialized output projections
+- **Pre-allocated KV cache** for efficient autoregressive inference
+- **Distributed training** support via PyTorch DDP
+- **LoRA fine-tuning** infrastructure ready for instruction tuning
 
-## Overview
-Akane is an AI VTuber chatbot built on a custom transformer trained from scratch on FineWeb. It incorporates modern techniques like GQA, RoPE, SwiGLU, and pre-allocated KV caching for responsive, on-device conversation.
+## Quick Start
 
-### Key Concepts
-- **Grouped Query Attention (GQA)**: Uses fewer KV heads than query heads (e.g., 12 query heads, 6 KV heads) for memory-efficient attention via PyTorch's `scaled_dot_product_attention` with `enable_gqa=True`.
-- **Pre-Allocated KV Cache**: Eliminates per-step memory allocation during generation by writing into a fixed, pre-allocated tensor.
+### Pre-training
 
-## Chat Interface
-Run `cli/chat.py` to start an interactive chat session with Akane:
-
+1. **Download FineWeb data** (20B tokens):
 ```bash
-python cli/chat.py
+# Requires `datasets` library
+python data/downloaders/fineweb.py
+```
+This creates shards in `data/processed/fineweb20B/` (~100M tokens each).
+
+2. **Start pre-training**:
+```bash
+# Single GPU
+torchrun train/pretrain.py
+
+# Multi-GPU
+torchrun --nproc_per_node=N train/pretrain.py
 ```
 
-The chat interface features:
-- **Live streaming responses** rendered in a bordered panel as tokens are generated.
-- **Performance stats** after each response (token count, tokens/sec, elapsed time).
-- **System info display** showing device and model parameter count on startup.
-- **MPS / CUDA support** with `torch.compile` for optimized inference.
+Checkpoints are saved to `logs/` (ignored by git). See `train/pretrain.py` to adjust:
+- Model configuration (layers, heads, embedding dim)
+- Batch size, learning rate, max steps
+- Data directory path if needed
 
-Type `quit`, `exit`, or `q` to end the session.
+### Inference & Testing
 
-## Model Architecture
-Akane is implemented in Python using **PyTorch**. The model consists of the following components:
-
-1. **Embedding Layer**:
-   - Token embedding (`wte`): Maps vocabulary tokens to dense representations (default: 50,304 tokens → 768 dimensions).
-   - Embedding normalization (`emb_norm`): RMSNorm applied directly to token embeddings before the transformer stack.
-   - No explicit positional embeddings; instead, RoPE is applied within the attention mechanism.
-
-2. **Transformer Blocks**: Each block (default: 12 layers) contains:
-   - **Causal Self-Attention**: Separate Q, K, V linear projections (all bias-free). Query heads (default: 12) and KV heads (default: 6) enable Grouped Query Attention. RoPE is applied to Q and K, followed by QK normalization via per-head RMSNorm. The output projection is zero-initialized.
-   - **SwiGLU MLP**: A gated feed-forward network with `≈2.67x` hidden expansion (e.g., 768 → 2048, rounded to nearest 256). Uses `SiLU(W1·x) * W2·x` followed by a zero-initialized output projection.
-   - **RMS Normalization**: Applied before both the attention and MLP sub-layers (pre-norm architecture).
-
-3. **Language Modeling Head**: A bias-free linear layer maps the final RMSNorm'd transformer outputs to vocabulary logits.
-
-4. **Shared Rotary Positional Embeddings (RoPE)**: A single `RotaryEmbedding` module is instantiated once in the `GPT` class and passed by reference to every attention layer. It precomputes cosine and sine embeddings for the full context length (default: 1,024 positions) in bfloat16 precision with a default theta of 10,000.
-
-## KV Cache
-The `KVCache` class provides memory-efficient caching for autoregressive inference:
-
-- **Pre-allocated contiguous memory**: A single tensor of shape `(n_layer, batch, n_kv_head, max_seq_len, head_dim)` is allocated once for both keys and values, eliminating per-step allocations.
-- **In-place writes**: New KV pairs are written directly into the pre-allocated buffer via slice assignment — no copies or concatenation.
-- **Sliced views**: Returns views (not copies) of the cached KV pairs up to the current sequence position.
-- **Sequence tracking**: Automatically tracks the current sequence length and updates it after the final layer processes each step.
-- **Factory method**: `KVCache.from_config(config, ...)` constructs a cache directly from a `GPTConfig` instance.
-- **Uses `__slots__`** for minimal memory overhead on the Python object itself.
-
-## Generation
-The `GPT.generate()` method supports streaming autoregressive generation:
-
-- **KV-cached inference**: Primes the cache with the full prompt in one forward pass, then generates one token at a time.
-- **Temperature scaling**: Logits are scaled by `1 / temperature` before sampling.
-- **Top-k sampling**: Only the top-k candidate tokens are considered at each step.
-- **Repetition penalty**: Tokens that have already been generated are penalized (positive logits divided, negative logits multiplied by the penalty factor).
-- **Streaming output**: Tokens are yielded one at a time via a Python generator, enabling real-time display.
-
-## Requirements
-To run this project, you need:
-- Python 3.10+
-- PyTorch 2.0+
-- `tiktoken` tokenizer library
-- `rich` library (for the chat interface)
-
-Install dependencies:
+After pre-training produces a checkpoint, convert it for inference:
 ```bash
-pip install torch tiktoken rich
+python utils/convert_checkpoint.py
+# Output: models/akane2.pt (or your chosen name)
 ```
 
-## Project Structure
+Then test with interactive chat:
+```bash
+python -m cli.chat
+```
+Or run the web server:
+```bash
+python -m cli.server
+```
+(Note: `cli/` and `utils/` are local development directories not tracked by git)
+
+## Repository Structure
+
+Only core library and training scripts are version-controlled:
+
 ```
 Akane/
-├── akane/                    # Core library
-│   ├── gpt.py               # GPT model, attention, MLP, RoPE
-│   └── kv_cache.py          # Pre-allocated KV cache
-├── cli/
-│   ├── chat.py              # Interactive chat (terminal UI)
-│   └── server.py            # HTTP server with SSE streaming
-├── train/
-│   ├── pretrain.py          # Pre-training script (DDP supported)
+├── akane/                    # Core model implementation
+│   ├── gpt.py               # GPT model with GQA, RoPE, SwiGLU
+│   ├── kv_cache.py          # Pre-allocated KV cache for generation
+│   └── __init__.py
+├── train/                   # Training scripts
+│   ├── pretrain.py          # Main pre-training loop (DDP)
+│   ├── finetune.py          # LoRA fine-tuning (for later phase)
 │   └── dataloaders/
-│       ├── fineweb.py       # FineWeb sharded data loader
-│       └── ultrachat.py     # UltraChat instruction data loader
-├── data/
-│   └── downloaders/
-│       ├── fineweb.py       # FineWeb dataset downloader/tokenizer
-│       └── hellaswag.py     # HellaSwag dataset downloader
-├── eval/
-│   └── hellaswag.py         # HellaSwag evaluation script
-├── utils/
-│   ├── convert_checkpoint.py # Convert training checkpoints for inference
-│   ├── plot.py              # Plot training/validation loss curves
-│   └── splitdata.py         # Data splitting utility
-├── models/                  # Saved model checkpoints (.pt files)
-├── logs/                    # Training logs
-├── static/                  # Web UI assets for server.py
-└── configs/                 # Configuration files (generation, training)
+│       ├── fineweb.py       # FineWeb shard loader
+│       ├── ultrachat.py     # UltraChat instruction data loader
+│       └── __init__.py
+├── README.md
+└── LICENSE
 ```
 
-## Future Implementations
-Planned enhancements for Akane include:
-- **Reinforcement Learning with Human Feedback (RLHF)**
-   - Integrate RLHF to refine model responses using human feedback, improving alignment with user expectations.
-- **Proximal Policy Optimization (PPO)**
-   - Implement PPO to optimize the model's policy, enhancing decision-making and response quality.
+**Local development files** (ignored by git, not tracked):
+- `cli/` - Chat CLI and HTTP server
+- `utils/` - Checkpoint conversion, plotting, data utilities
+- `data/` - Raw data, processed shards, downloaders
+- `models/` - Saved checkpoints
+- `logs/` - Training logs
+- `static/` - Web UI assets
+
+## Model Architecture
+
+### Components
+
+1. **Token Embeddings**: GPT-2 vocabulary (50,304 tokens) with RMSNorm
+2. **Transformer Blocks** (configurable count):
+   - Causal self-attention with GQA (Grouped Query Attention)
+   - Q/K normalization via RMSNorm
+   - SwiGLU feed-forward network (≈2.67× expansion)
+   - Pre-norm architecture (RMSNorm before each sub-layer)
+3. **Output Head**: Linear projection to vocabulary logits
+
+### Configuration
+
+Edit `GPTConfig` in `akane/gpt.py` or pass parameters directly:
+
+```python
+config = GPTConfig(
+    n_layer=36,      # Number of transformer blocks
+    n_head=16,       # Number of query heads
+    n_kv_head=4,     # Number of key/value heads (GQA)
+    n_embd=1536,     # Embedding dimension
+    block_size=1024, # Max sequence length
+)
+```
+
+### KV Cache
+
+During generation, a pre-allocated `KVCache` stores keys and values for all layers in a single contiguous tensor. This eliminates per-token allocation and enables fast, memory-efficient autoregressive decoding.
+
+## Data Preparation
+
+### FineWeb (Pre-training)
+
+The `data/downloaders/fineweb.py` script streams the FineWeb dataset from HuggingFace and writes tokenized shards:
+
+- Shard size: 100M tokens
+- Output: `data/processed/fineweb20B/fineweb_train_*.npy` and `fineweb_val_000000.npy`
+- Multiprocessing for fast tokenization
+- Target: ~20B training tokens (199 shards)
+
+The `train/dataloaders/fineweb.py` module loads these shards during training.
+
+### UltraChat (Fine-tuning)
+
+UltraChat 200k is loaded directly from HuggingFace by `train/dataloaders/ultrachat.py`. It uses ChatML formatting with special tokens `` and ` to mask non-assistant responses during training.
+
+## Training Details
+
+### Pre-training (`train/pretrain.py`)
+
+- **Optimizer**: AdamW (fused, betas=(0.9, 0.95), weight decay=0.1)
+- **Learning rate**: Cosine decay with warmup (adjustable)
+- **Gradient accumulation**: Achieves effective batch size of 524,288 tokens
+- **Mixed precision**: FP16 via autocast
+- **Gradient clipping**: Norm 1.0
+- **Checkpointing**: Every 250 steps (configurable), includes optimizer/scheduler state for resume
+- **Validation**: Every 250 steps (250 batches)
+
+### Fine-tuning (`train/finetune.py`)
+
+- **Method**: LoRA (rank 32, alpha 64) on attention and MLP projections
+- **Base model**: Load from pre-training checkpoint
+- **Loss**: Cross-entropy with `IGNORE_INDEX` masking for non-assistant tokens
+- **Merging**: LoRA weights merged into base model at end
+
+## Requirements
+
+- Python 3.10+
+- PyTorch 2.0+
+- Additional libraries: `tiktoken`, `rich`, `datasets`, `tqdm`, `peft`
+
+Install:
+```bash
+pip install torch tiktoken rich datasets tqdm peft
+```
+
+## Notes
+
+- The repository intentionally tracks only core model and training code.
+- Data, checkpoints, logs, and development utilities are excluded via `.gitignore` to keep the repo lightweight.
+- When cloning, you'll need to recreate the local `cli/`, `utils/`, and `data/downloaders/` directories if you want to use them (they are not tracked).
+- Adjust paths in config files if your data directories differ from defaults.
+
+## License
+
+MIT

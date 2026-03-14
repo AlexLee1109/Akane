@@ -7,7 +7,7 @@ class KVCache:
                  'batch_size', 'n_kv_head', 'head_dim', 'dtype', 'device')
     
     def __init__(self, n_layer, max_seq_len=1024, batch_size=1, n_kv_head=6,
-                 head_dim=64, dtype=torch.bfloat16, device='cuda'):
+                 head_dim=64, dtype=torch.float16, device='cuda'):
         self.n_layer = n_layer
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
@@ -16,17 +16,23 @@ class KVCache:
         self.dtype = dtype
         self.device = device
         self.seq_len = 0
-        
+
         # Pre-allocate contiguous memory for all layers
         # Shape: (n_layer, batch, n_kv_head, max_seq_len, head_dim)
         self.k_cache = torch.zeros(
             n_layer, batch_size, n_kv_head, max_seq_len, head_dim,
-            dtype=dtype, device=device
+            dtype=dtype, device=device, requires_grad=False
         )
         self.v_cache = torch.zeros(
             n_layer, batch_size, n_kv_head, max_seq_len, head_dim,
-            dtype=dtype, device=device
+            dtype=dtype, device=device, requires_grad=False
         )
+
+        # Ensure memory is contiguous for optimal MPS performance
+        if not self.k_cache.is_contiguous():
+            self.k_cache = self.k_cache.contiguous()
+        if not self.v_cache.is_contiguous():
+            self.v_cache = self.v_cache.contiguous()
     
     def append(self, layer_idx, k, v):
         """Append new KV pairs to cache (in-place, no allocation)."""
@@ -52,7 +58,7 @@ class KVCache:
         self.seq_len = 0
     
     @classmethod
-    def from_config(cls, config, max_seq_len=None, batch_size=1, dtype=torch.bfloat16, device='cuda'):
+    def from_config(cls, config, max_seq_len=None, batch_size=1, dtype=torch.float16, device='cuda'):
         """Create KVCache from GPTConfig."""
         return cls(
             n_layer=config.n_layer,

@@ -18,24 +18,50 @@ class GPTConfig:
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim, max_pos, theta = 10000.0):
+    def __init__(self, head_dim, max_pos, theta=10000.0):
         super().__init__()
+        # Compute in float32 for precision, then store as bfloat16 to avoid
+        # repeated dtype conversions during forward pass
         inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         t = torch.arange(max_pos, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
-        self.register_buffer("cos", freqs.cos().to(torch.bfloat16), persistent=False)
-        self.register_buffer("sin", freqs.sin().to(torch.bfloat16), persistent=False)
+        self.register_buffer("cos", freqs.cos().bfloat16(), persistent=False)
+        self.register_buffer("sin", freqs.sin().bfloat16(), persistent=False)
+        self._cos_cache = None
+        self._sin_cache = None
+        self._cache_pos = -1
+        self._cache_T = -1
+
+    def _get_cos_sin(self, pos, T, dtype):
+        """Get sliced cos/sin, cached to avoid repeated slicing."""
+        if self._cache_pos != pos or self._cache_T != T:
+            self._cos_cache = self.cos[pos:pos + T].view(1, 1, T, -1)
+            self._sin_cache = self.sin[pos:pos + T].view(1, 1, T, -1)
+            self._cache_pos = pos
+            self._cache_T = T
+        # Only cast if caller needs different dtype (rare with bfloat16 model)
+        if dtype != self.cos.dtype:
+            return self._cos_cache.to(dtype), self._sin_cache.to(dtype)
+        return self._cos_cache, self._sin_cache
 
     def rotate(self, x, pos):
-        _, _, T, _ = x.shape
-        cos = self.cos[pos:pos + T].unsqueeze(0).unsqueeze(0)
-        sin = self.sin[pos:pos + T].unsqueeze(0).unsqueeze(0)
-
-        x1 = x[..., ::2].contiguous()
-        x2 = x[..., 1::2].contiguous()
+        cos, sin = self._get_cos_sin(pos, x.size(2), x.dtype)
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
         x[..., ::2] = x1 * cos - x2 * sin
         x[..., 1::2] = x1 * sin + x2 * cos
-        return x 
+        return x
+
+    def rotate_inline(self, q, k, pos):
+        """Rotate both q and k in a single fused operation."""
+        cos, sin = self._get_cos_sin(pos, q.size(2), q.dtype)
+        q1, q2 = q[..., ::2], q[..., 1::2]
+        q[..., ::2] = q1 * cos - q2 * sin
+        q[..., 1::2] = q1 * sin + q2 * cos
+        k1, k2 = k[..., ::2], k[..., 1::2]
+        k[..., ::2] = k1 * cos - k2 * sin
+        k[..., 1::2] = k1 * sin + k2 * cos
+        return q, k
 
 
 class CausalSelfAttention(nn.Module):
@@ -65,23 +91,35 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor, pos: int, kv_cache=None, layer_idx=None):
         B, T, _ = x.shape
 
+        # Project and reshape: Linear is contiguous, view works directly
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
-        q = self.rotary_emb.rotate(q, pos)
-        k = self.rotary_emb.rotate(k, pos)
+        # Fused rotary for q and k (single operation instead of two separate calls)
+        q, k = self.rotary_emb.rotate_inline(q, k, pos)
 
+        # Apply QK normalization (keep contiguous layout)
         q = self.q_norm(q)
         k = self.k_norm(k)
 
+        # KV cache handling for autoregressive generation
         is_causal = True
         if kv_cache is not None and layer_idx is not None:
             k, v = kv_cache.append(layer_idx, k, v)
-            is_causal = T > 1
+            is_causal = T > 1  # Only causal during initial prefilling
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, enable_gqa=True)
-        return self.c_proj(out.transpose(1, 2).reshape(B, T, -1))
+        # Flash attention via scaled_dot_product_attention with GQA
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=is_causal,
+            dropout_p=0.0,  # Set via self.training check if needed
+            enable_gqa=True,
+        )
+
+        # Reshape output: (B, H, T, D) -> (B, T, H, D) -> (B, T, C)
+        out = out.transpose(1, 2).reshape(B, T, -1)
+        return self.c_proj(out)
 
 
 class MLP(nn.Module):
@@ -138,9 +176,6 @@ class GPT(nn.Module):
         self.emb_norm = nn.RMSNorm(config.n_embd, eps=config.eps)
 
         self.apply(self._init_weights)
-        
-        total_params = sum(p.numel() for p in self.parameters())
-        print(f"Model initialized with {total_params / 1e6:.2f}M parameters.")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -148,67 +183,76 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, kv_cache=None):
+    def forward(self, idx: torch.Tensor, kv_cache=None, include_lm_head=True):
         pos = 0 if kv_cache is None else kv_cache.seq_len
         x = self.emb_norm(self.transformer.wte(idx))
         for i, block in enumerate(self.transformer.h):
             x = block(x, pos, kv_cache, layer_idx=i)
-        return self.lm_head(self.transformer.ln_f(x))
+        if include_lm_head:
+            x = self.transformer.ln_f(x)
+            return self.lm_head(x)
+        return x
 
     @torch.inference_mode()
-    def generate(self, tokens, max_tokens=120, temperature=0.85, top_k=40, repetition_penalty=1.08):
+    def generate(self, tokens, max_tokens=120, temperature=0.85, top_k=40, top_p=0.95, repetition_penalty=1.08, kv_cache=None):
         device = self.transformer.wte.weight.device
+        model_dtype = self.transformer.wte.weight.dtype
         input_ids = torch.as_tensor(tokens, device=device, dtype=torch.long).unsqueeze(0)
         prompt_len = input_ids.size(1)
 
-        kv_cache = KVCache.from_config(
-            self.config,
-            max_seq_len=prompt_len + max_tokens,
-            batch_size=1,
-            dtype=torch.bfloat16,
-            device=device,
-        )
+        if kv_cache is None:
+            kv_cache = KVCache.from_config(
+                self.config,
+                max_seq_len=prompt_len + max_tokens,
+                batch_size=1,
+                dtype=model_dtype,
+                device=device,
+            )
 
         if prompt_len > 1:
-            self(input_ids[:, :-1], kv_cache)   # prime cache
+            self(input_ids[:, :-1], kv_cache)
 
-        last_token = input_ids[:, -1:]
+        last_token = input_ids[:, -1:].contiguous()
+        del input_ids
 
-        vocab_size = self.config.vocab_size
-        k = min(max(top_k, 1), vocab_size)
+        k = min(max(top_k, 1), self.config.vocab_size)
         inv_temp = 1.0 / temperature
         use_rep_pen = repetition_penalty != 1.0
-
-        seen = torch.zeros(vocab_size, dtype=torch.bool, device=device) if use_rep_pen else None
+        seen = set()
 
         for _ in range(max_tokens):
-            logits = self(last_token, kv_cache)[0, -1]   # (vocab,)
+            logits = self(last_token, kv_cache)[0, -1]
 
-            # Repetition penalty (only on seen tokens)
-            if seen is not None:
-                logits = torch.where(
-                    seen,
-                    torch.where(logits > 0, logits / repetition_penalty, logits * repetition_penalty),
-                    logits
-                )
+            # Repetition penalty
+            if use_rep_pen and seen:
+                idxs = torch.tensor(list(seen), device=device, dtype=torch.long)
+                vals = logits[idxs]
+                logits[idxs] = torch.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
 
-            logits = logits * inv_temp
+            logits.mul_(inv_temp)
 
-            # Fast top-k + top-p on candidates only
-            if k < vocab_size:
-                candidate_logits, candidate_idx = torch.topk(logits, k)
-                probs = candidate_logits.softmax(-1)
-                next_idx = torch.multinomial(probs, 1)
-                token_id = candidate_idx[next_idx].item()
+            # Top-k
+            cand_logits, cand_idx = torch.topk(logits, k)
+
+            # Top-p (nucleus) filtering
+            if top_p is not None and 0 < top_p < 1:
+                probs = F.softmax(cand_logits, dim=-1)
+                cumprobs = probs.cumsum(dim=-1)
+                # Keep tokens until cumulative probability exceeds top_p
+                cutoff = torch.searchsorted(cumprobs, top_p, right=False).item()
+                keep = min(cutoff + 1, k)
+                probs = probs[:keep]
+                probs.div_(probs.sum())
+                cand_idx = cand_idx[:keep]
             else:
-                probs = logits.softmax(-1)
-                token_id = torch.multinomial(probs, 1).item()
+                probs = F.softmax(cand_logits, dim=-1)
 
-            last_token = torch.tensor([[token_id]], device=device, dtype=torch.long)
+            token_id = cand_idx[torch.multinomial(probs, 1)].item()
+            last_token[0, 0] = token_id
             yield token_id
 
-            if seen is not None:
-                seen[token_id] = True
+            if use_rep_pen:
+                seen.add(token_id)
 
     def configure_optimizers(self, weight_decay, learning_rate, embedding_lr_scale=0.1):
         decay_params = []

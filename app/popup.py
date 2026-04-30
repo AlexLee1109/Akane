@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlencode, urljoin
 
@@ -6,6 +7,7 @@ import webview
 
 from app.config import POPUP_BACKEND_URL, popup_backend_is_local
 from app.server import serve_in_thread
+from app.ui_assets import IMAGES_DIR
 
 try:
     import AppKit
@@ -14,12 +16,42 @@ except ImportError:  # pragma: no cover - macOS-only popup behavior
 
 DEFAULT_SCREEN_WIDTH = 1440
 DEFAULT_SCREEN_HEIGHT = 900
-AVATAR_HEIGHT = 800
+HIDDEN_WINDOW_SIZE = 8
+AVATAR_HEIGHT = 350
 AVATAR_RIGHT_MARGIN = -20
-AVATAR_BOTTOM_MARGIN = -500
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-AVATAR_IMAGE_PATH = PROJECT_ROOT / "vtuber_model.png"
+AVATAR_BOTTOM_MARGIN = -40
+EDGE_MARGIN = 18
+BUBBLE_WIDTH = 430
+BUBBLE_HEIGHT = 520
+BUBBLE_LEFT_MARGIN = 60
+BUBBLE_TO_AVATAR_X = 275
+BUBBLE_TO_AVATAR_Y = -100
+COMPOSER_HEIGHT = 78
+COMPOSER_WIDTH_RATIO = 0.20
+COMPOSER_MIN_WIDTH = 400
+COMPOSER_MAX_WIDTH = 760
+COMPOSER_SAFE_MIN_WIDTH = 420
+BUBBLE_MIN_WIDTH = 220
+BUBBLE_MAX_WIDTH = 540
+BUBBLE_MIN_HEIGHT = 420
+BUBBLE_MAX_HEIGHT = 2200
+WINDOW_TITLES = {
+    "bubble": "Akane Bubble",
+    "avatar": "Akane Avatar",
+}
+AVATAR_IMAGE_PATH = IMAGES_DIR / "Vtuber_model.png"
 AVATAR_BOUNDS_WH = (530, 1334)
+
+
+@dataclass(frozen=True)
+class Frame:
+    x: int
+    y: int
+    width: int
+    height: int
+
+    def as_tuple(self) -> tuple[int, int, int, int]:
+        return (self.x, self.y, self.width, self.height)
 
 
 def _primary_screen_frame():
@@ -54,56 +86,35 @@ class PopupLayout:
         self.screen_x = screen_x
         self.screen_y = screen_y
 
-        edge_margin = 18
         avatar_width = _avatar_window_width(AVATAR_HEIGHT)
         avatar_height = AVATAR_HEIGHT
         avatar_x = screen_x + max(screen_width - avatar_width - AVATAR_RIGHT_MARGIN, 0)
         avatar_y = screen_y + max(screen_height - avatar_height - AVATAR_BOTTOM_MARGIN, 0)
-        bubble_width = 350
-        bubble_height = 200
-        bubble_x = max(screen_x + 40, avatar_x - bubble_width + 150)
-        bubble_y = max(screen_y + 36, avatar_y - 50)
-        composer_height = 78
-        composer_y = screen_y + max(screen_height - composer_height - edge_margin, 0)
-        composer_width = min(max(int(screen_width * 0.20), 400), 760)
-        composer_max_width = max(420, avatar_x - screen_x - (edge_margin * 2))
-        composer_width = min(composer_width, composer_max_width)
-        composer_hidden_frame = (
-            screen_x + screen_width - 8,
-            screen_y + screen_height - 8,
-            8,
-            8,
-        )
-        bubble_hidden_frame = (
-            screen_x + screen_width - 8,
-            screen_y + 8,
-            8,
-            8,
+        bubble_x = max(screen_x + BUBBLE_LEFT_MARGIN, avatar_x - BUBBLE_WIDTH + BUBBLE_TO_AVATAR_X)
+        bubble_y = max(screen_y + 40, avatar_y + BUBBLE_TO_AVATAR_Y)
+        bubble_hidden_frame = Frame(
+            screen_x + screen_width - HIDDEN_WINDOW_SIZE,
+            screen_y + HIDDEN_WINDOW_SIZE,
+            HIDDEN_WINDOW_SIZE,
+            HIDDEN_WINDOW_SIZE,
         )
 
         self.frames = {
-            "bubble": (
+            "bubble": Frame(
                 bubble_x,
                 bubble_y,
-                bubble_width,
-                bubble_height,
+                BUBBLE_WIDTH,
+                BUBBLE_HEIGHT,
             ),
-            "avatar": (
+            "avatar": Frame(
                 avatar_x,
                 avatar_y,
                 avatar_width,
                 avatar_height,
             ),
-            "composer": (
-                screen_x + edge_margin + 1100,
-                composer_y + 50,
-                composer_width,
-                composer_height,
-            ),
         }
         self.hidden_frames = {
             "bubble": bubble_hidden_frame,
-            "composer": composer_hidden_frame,
         }
 
 
@@ -159,8 +170,16 @@ class PopupApp:
         self._bubble_width = 0
         self._bubble_height = 0
         self._bubble_visible = False
+        self._bubble_text = ""
         self._composer_visible = False
         self._ensure_server()
+
+    @staticmethod
+    def _window_call(window, method: str, *args) -> None:
+        try:
+            getattr(window, method)(*args)
+        except Exception:
+            pass
 
     def _ensure_server(self):
         if not popup_backend_is_local():
@@ -201,7 +220,7 @@ class PopupApp:
     def _create_window(self, role: str, title: str, *, width: int, height: int):
         min_size = (width, height)
         if role in {"bubble", "composer"}:
-            min_size = (8, 8)
+            min_size = (HIDDEN_WINDOW_SIZE, HIDDEN_WINDOW_SIZE)
         window = webview.create_window(
             title,
             self._build_start_url(role),
@@ -217,6 +236,10 @@ class PopupApp:
             on_top=True,
         )
         window.events.closed += lambda: self._on_window_closed(role)
+        try:
+            window.events.loaded += lambda: self._on_window_loaded(role)
+        except Exception:
+            pass
         self.windows[role] = window
         return window
 
@@ -224,45 +247,27 @@ class PopupApp:
         layout = self._layout()
         for role, window in self.windows.items():
             frame = layout.frames[role]
-            if role == "composer" and not self._composer_visible:
-                frame = layout.hidden_frames["composer"]
-            x, y, width, height = frame
-            if role == "bubble":
-                self._bubble_base_x = x
-                self._bubble_base_y = y
-                self._bubble_width = width
-                self._bubble_height = height
-            try:
-                window.resize(width, height)
-            except Exception:
-                pass
-            window.move(x, y)
             if role == "bubble" and not self._bubble_visible:
-                try:
-                    window.hide()
-                except Exception:
-                    pass
+                frame = layout.hidden_frames["bubble"]
+            x, y, width, height = frame.as_tuple()
+            if role == "bubble":
+                visible_frame = layout.frames["bubble"]
+                self._bubble_base_x = visible_frame.x
+                self._bubble_base_y = visible_frame.y
+                if self._bubble_visible:
+                    self._bubble_width = width
+                    self._bubble_height = height
+            self._window_call(window, "resize", width, height)
+            self._window_call(window, "move", x, y)
 
     def _set_composer_visible(self, visible: bool) -> None:
         self._composer_visible = bool(visible)
-        composer = self.windows.get("composer")
-        if composer is None:
+        avatar = self.windows.get("avatar")
+        if avatar is None:
             return
-
-        layout = self._layout()
-        frame = layout.frames["composer"] if self._composer_visible else layout.hidden_frames["composer"]
-        x, y, width, height = frame
-        try:
-            composer.resize(width, height)
-        except Exception:
-            pass
-        try:
-            composer.move(x, y)
-        except Exception:
-            pass
         try:
             hook = "__akaneComposerShown" if self._composer_visible else "__akaneComposerHidden"
-            composer.evaluate_js(f"window.{hook} && window.{hook}();")
+            avatar.evaluate_js(f"window.{hook} && window.{hook}();")
         except Exception:
             pass
 
@@ -271,13 +276,18 @@ class PopupApp:
         bubble = self.windows.get("bubble")
         if bubble is None:
             return
-        try:
-            if self._bubble_visible:
-                bubble.show()
-            else:
-                bubble.hide()
-        except Exception:
-            pass
+        layout = self._layout()
+        frame = layout.frames["bubble"] if self._bubble_visible else layout.hidden_frames["bubble"]
+        x, y, width, height = frame.as_tuple()
+        if self._bubble_visible:
+            self._bubble_base_x = layout.frames["bubble"].x
+            self._bubble_base_y = layout.frames["bubble"].y
+            if self._bubble_width <= HIDDEN_WINDOW_SIZE:
+                self._bubble_width = width
+            if self._bubble_height <= HIDDEN_WINDOW_SIZE:
+                self._bubble_height = height
+        self._window_call(bubble, "resize", width, height)
+        self._window_call(bubble, "move", x, y)
 
     def _on_start(self) -> None:
         self._position_windows()
@@ -286,6 +296,10 @@ class PopupApp:
         if self._shutting_down:
             return
         self.close_all_windows()
+
+    def _on_window_loaded(self, role: str) -> None:
+        if role == "bubble":
+            self._apply_bubble_text()
 
     def minimize_all_windows(self) -> None:
         for window in self.windows.values():
@@ -323,11 +337,11 @@ class PopupApp:
             return
         else:
             self._set_bubble_visible(True)
-            target_width = max(220, min(int(width) + 2, 430))
-            target_height = max(92, min(int(height) + 12, 520))
+            target_width = max(BUBBLE_MIN_WIDTH, min(int(width) + 2, BUBBLE_MAX_WIDTH))
+            target_height = max(BUBBLE_MIN_HEIGHT, min(int(height) + 240, BUBBLE_MAX_HEIGHT))
         if not self._bubble_width:
             layout = self._layout()
-            x, y, width, default_height = layout.frames["bubble"]
+            x, y, width, default_height = layout.frames["bubble"].as_tuple()
             self._bubble_base_x = x
             self._bubble_base_y = y
             self._bubble_width = width
@@ -344,17 +358,22 @@ class PopupApp:
         except Exception:
             return
 
-        try:
-            window.move(self._bubble_base_x, self._bubble_base_y)
-        except Exception:
-            pass
+        self._window_call(window, "move", self._bubble_base_x, self._bubble_base_y)
 
     def push_bubble_text(self, text: str) -> None:
+        self._bubble_text = str(text or "")
+        self._apply_bubble_text()
+
+    def _apply_bubble_text(self) -> None:
         window = self.windows.get("bubble")
         if window is None:
             return
 
-        safe_text = json.dumps(text)
+        next_text = self._bubble_text
+        if next_text.strip():
+            self._set_bubble_visible(True)
+
+        safe_text = json.dumps(next_text)
         script = (
             "window.__akaneSetBubbleText && "
             f"window.__akaneSetBubbleText({safe_text});"
@@ -362,7 +381,10 @@ class PopupApp:
         try:
             window.evaluate_js(script)
         except Exception:
-            pass
+            return
+
+        if not next_text.strip():
+            self._set_bubble_visible(False)
 
     def close_all_windows(self) -> None:
         if self._shutting_down:
@@ -381,9 +403,9 @@ class PopupApp:
 
     def run(self):
         layout = self._layout()
-        self._create_window("bubble", "Akane Bubble", width=layout.frames["bubble"][2], height=layout.frames["bubble"][3])
-        self._create_window("avatar", "Akane Avatar", width=layout.frames["avatar"][2], height=layout.frames["avatar"][3])
-        self._create_window("composer", "Akane Composer", width=layout.frames["composer"][2], height=layout.frames["composer"][3])
+        for role in ("avatar", "bubble"):
+            frame = layout.frames[role]
+            self._create_window(role, WINDOW_TITLES[role], width=frame.width, height=frame.height)
         webview.start(self._on_start)
 
 

@@ -12,8 +12,7 @@ from typing import Callable
 
 import orjson
 
-# Import relationship configuration
-from app.config import MEMORY_FLUSH_INTERVAL, RELATIONSHIP_CHECK_INTERVAL, RELATIONSHIP_LEVELS
+from app.config import MEMORY_FLUSH_INTERVAL
 
 MEMORY_PATH = Path(__file__).parent / "memory.json"
 
@@ -22,7 +21,6 @@ DEFAULT_MEMORY = {
     "preferences": [],
     "facts": [],
     "history": [],
-    "relationships": [],
     "observations": [],
     "activities": {},
     "entities": {},
@@ -33,24 +31,29 @@ DEFAULT_MEMORY = {
         "first_seen": None,
         "last_seen": None,
         "interaction_count": 0,
-        "relationship_level": "stranger",
         "mood_trend": [],
-        "relationship_score": 0.0,
-        "connection_signals": {
-            "personal_sharing_depth": 0.0,
-            "emotional_intimacy": 0.0,
-            "reciprocity_score": 0.0,
-            "conversation_depth": 0.0,
-            "time_investment": 0.0,
-        },
-        "last_relationship_check": None,
-        "level_change_history": [],
     }
 }
 
 NEUTRAL = "neutral"
 POSITIVE = "positive"
 NEGATIVE = "negative"
+
+_ENTRY_LIMITS = {
+    "preferences": 24,
+    "facts": 32,
+    "history": 20,
+    "observations": 24,
+}
+_GENERIC_MEMORY_PREFIXES = (
+    "what ", "why ", "how ", "when ", "where ", "who ", "should ", "could ", "would ",
+    "can you ", "do you ", "is it ", "are you ",
+)
+_GENERIC_MEMORY_PHRASES = (
+    "what do you think", "tell me more", "show me", "go deeper", "full breakdown",
+    "can you help", "i need help", "look at", "check the code", "read the file",
+    "open vscode", "open the project", "thermal throttling", "reply faster",
+)
 
 
 def _fresh_default_memory() -> dict:
@@ -67,14 +70,9 @@ def _ensure_memory_shape(data: dict) -> dict:
         if isinstance(data.get(key), dict):
             normalized[key].update(copy.deepcopy(data[key]))
 
-    for key in ("preferences", "facts", "history", "relationships", "observations"):
+    for key in ("preferences", "facts", "history", "observations"):
         if isinstance(data.get(key), list):
             normalized[key] = copy.deepcopy(data[key])
-
-    if "metadata" in normalized and "connection_signals" in normalized["metadata"]:
-        existing_signals = data.get("metadata", {}).get("connection_signals", {})
-        if isinstance(existing_signals, dict):
-            normalized["metadata"]["connection_signals"].update(copy.deepcopy(existing_signals))
 
     if not isinstance(normalized["graph"].get("edges"), list):
         normalized["graph"]["edges"] = []
@@ -87,12 +85,15 @@ def _new_list_entry(content: str) -> dict:
 
 
 def _touch_list_entry(entries: list[dict], content: str) -> bool:
-    content_lower = content.lower()
+    normalized = _normalize_entry_text(content)
+    normalized_tokens = _entry_token_set(normalized)
     for entry in entries:
-        existing = entry.get("content", "").lower()
-        if existing == content_lower or content_lower in existing or existing in content_lower:
+        existing = _normalize_entry_text(entry.get("content", ""))
+        if _entries_match(existing, normalized, normalized_tokens):
             entry["mentions"] = entry.get("mentions", 1) + 1
             entry["last_seen"] = _now()
+            if len(normalized) > len(existing):
+                entry["content"] = content
             return True
     return False
 
@@ -114,6 +115,96 @@ def _normalize_user_field(key: str, value: str) -> str:
     if normalized_key == "name":
         return _normalize_person_name(normalized_value)
     return normalized_value
+
+
+def _normalize_entry_text(value: str) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def _entry_token_set(value: str) -> set[str]:
+    return {
+        token.lower()
+        for token in _tokenize_embedding_text(_normalize_entry_text(value))
+        if len(token) > 2 and token.lower() not in ENTITY_EMBEDDING_STOPWORDS
+    }
+
+
+def _entries_match(existing: str, candidate: str, candidate_tokens: set[str] | None = None) -> bool:
+    existing_norm = _normalize_entry_text(existing).lower()
+    candidate_norm = _normalize_entry_text(candidate).lower()
+    if not existing_norm or not candidate_norm:
+        return False
+    if existing_norm == candidate_norm:
+        return True
+    existing_tokens = _entry_token_set(existing_norm)
+    candidate_tokens = candidate_tokens if candidate_tokens is not None else _entry_token_set(candidate_norm)
+    if not existing_tokens or not candidate_tokens:
+        return False
+    overlap = len(existing_tokens & candidate_tokens)
+    smaller = min(len(existing_tokens), len(candidate_tokens))
+    return smaller > 0 and overlap >= smaller and abs(len(existing_tokens) - len(candidate_tokens)) <= 1
+
+
+def _looks_like_generic_memory(content: str) -> bool:
+    lowered = _normalize_entry_text(content).lower()
+    if not lowered:
+        return True
+    if "?" in lowered or "[" in lowered or "]" in lowered or "<" in lowered or ">" in lowered:
+        return True
+    if any(lowered.startswith(prefix) for prefix in _GENERIC_MEMORY_PREFIXES):
+        return True
+    return any(phrase in lowered for phrase in _GENERIC_MEMORY_PHRASES)
+
+
+def _memory_entry_allowed(category: str, content: str, *, weight: str = NEUTRAL) -> bool:
+    normalized = _normalize_entry_text(content)
+    lowered = normalized.lower()
+    if not normalized or len(normalized) < 4 or len(normalized) > 180:
+        return False
+    if _looks_like_generic_memory(normalized):
+        return False
+
+    tokens = _entry_token_set(normalized)
+    if category == "preferences":
+        return bool(tokens) and any(
+            lowered.startswith(prefix)
+            for prefix in ("prefers ", "likes ", "loves ", "enjoys ", "wants ", "needs ", "doesn't like ", "does not like ")
+        )
+    if category == "facts":
+        return len(tokens) >= 3 and (
+            lowered.startswith(("uses ", "has ", "runs ", "works on ", "working on "))
+            or any(char.isdigit() for char in normalized)
+        )
+    if category == "observations":
+        return weight != NEUTRAL and len(tokens) >= 2
+    if category == "history":
+        return len(tokens) >= 3
+    return True
+
+
+def _enforce_entry_limit(data: dict, category: str) -> None:
+    limit = _ENTRY_LIMITS.get(category)
+    if not limit or category not in data or len(data[category]) <= limit:
+        return
+    entries = data[category]
+    ranked = sorted(
+        entries,
+        key=lambda entry: (
+            -int(entry.get("mentions", 1)),
+            str(entry.get("last_seen", entry.get("created", ""))),
+            str(entry.get("created", "")),
+        ),
+        reverse=True,
+    )
+    keep_ids = {id(entry) for entry in ranked[:limit]}
+    kept: list[dict] = []
+    for entry in entries:
+        if id(entry) in keep_ids:
+            kept.append(entry)
+            continue
+        if category in {"preferences", "facts", "observations"}:
+            _release_graph_entry(data, category, entry)
+    data[category] = kept
 
 
 def _slugify(value: str) -> str:
@@ -255,7 +346,7 @@ def _touch_edge(data: dict, source: str, relation: str, target: str, *, attrs: d
 
 ENTITY_IGNORE_WORDS = {
     "using", "use", "with", "code", "memory", "graph", "user", "project",
-    "activity", "detail", "fact", "preference", "relationship", "observation",
+    "activity", "detail", "fact", "preference", "observation",
 }
 ENTITY_EMBEDDING_DIM = 96
 ENTITY_SEMANTIC_THRESHOLD = 0.34
@@ -275,7 +366,7 @@ ENTITY_TYPE_SEEDS = {
         "arcane", "alex", "jordan", "sam", "neko", "ayaka", "developer", "creator", "friend",
     },
     "topic": {
-        "memory", "graph", "project", "training", "prompt", "relationship", "model", "system",
+        "memory", "graph", "project", "training", "prompt", "model", "system",
     },
 }
 ENTITY_SEED_TOKENS = {
@@ -529,7 +620,7 @@ def _index_user_fields(data: dict, user_id: str) -> None:
 
 
 def _index_entry(data: dict, section: str, entry: dict, user_id: str) -> None:
-    """Index a single list entry (preference / fact / relationship / observation) into the graph."""
+    """Index a single list entry (preference / fact / observation) into the graph."""
     content = entry.get("content", "").strip()
     if not content:
         return
@@ -559,14 +650,6 @@ def _index_entry(data: dict, section: str, entry: dict, user_id: str) -> None:
         for entity_type, entity_name in _extract_entity_mentions(content):
             mention_id = _upsert_entity(data, entity_type, entity_name)
             _touch_edge(data, node_id, "mentions", mention_id)
-
-    elif section == "relationships":
-        node_id = _upsert_entity(data, "relationship", content)
-        _touch_edge(data, user_id, "has_relationship_note", node_id)
-        target_type = "person" if _looks_like_person_entity(content) else _infer_entity_type(content)
-        target_id = _upsert_entity(data, target_type, content)
-        _touch_edge(data, user_id, "knows", target_id)
-        _touch_edge(data, node_id, "about", target_id)
 
     elif section == "observations":
         node_id = _upsert_entity(
@@ -618,7 +701,7 @@ def _rebuild_graph(data: dict) -> None:
 
     _index_user_fields(data, user_id)
 
-    for section in ("preferences", "facts", "relationships", "observations"):
+    for section in ("preferences", "facts", "observations"):
         for entry in data.get(section, []):
             _index_entry(data, section, entry, user_id)
 
@@ -633,7 +716,7 @@ def _patch_graph_entry(data: dict, section: str, entry: dict) -> None:
     """
     _ensure_graph_shape(data)
     user_id = "user:self"
-    if section in ("preferences", "facts", "relationships", "observations"):
+    if section in ("preferences", "facts", "observations"):
         _index_entry(data, section, entry, user_id)
     # User-field and activity incremental patches are handled inline in
     # apply_tag_operations / add(), which call _patch_graph_user_field and
@@ -666,7 +749,6 @@ def _entry_node_type(section: str) -> str:
     return {
         "preferences": "preference",
         "facts": "fact",
-        "relationships": "relationship",
         "observations": "observation",
     }.get(section, section.rstrip("s"))
 
@@ -675,7 +757,6 @@ def _entry_primary_relation(section: str) -> str:
     return {
         "preferences": "has_preference",
         "facts": "has_fact",
-        "relationships": "has_relationship_note",
         "observations": "observed",
     }[section]
 
@@ -766,7 +847,7 @@ def _release_graph_entry(data: dict, section: str, entry: dict) -> None:
     _ensure_graph_shape(data)
     user_id = "user:self"
     content = str(entry.get("content", "") or "").strip()
-    if not content or section not in {"preferences", "facts", "relationships", "observations"}:
+    if not content or section not in {"preferences", "facts", "observations"}:
         return
 
     node_type = _entry_node_type(section)
@@ -787,14 +868,6 @@ def _release_graph_entry(data: dict, section: str, entry: dict) -> None:
                 _release_entity(data, object_id)
                 prunable.append(object_id)
         prunable.extend(_release_entry_mentions(data, node_id, content))
-    elif section == "relationships":
-        target_type = "person" if _looks_like_person_entity(content) else _infer_entity_type(content)
-        target_id = _entity_id_for(target_type, content)
-        if target_id:
-            _release_edge(data, user_id, "knows", target_id)
-            _release_edge(data, node_id, "about", target_id)
-            _release_entity(data, target_id)
-            prunable.append(target_id)
     elif section == "observations":
         prunable.extend(_release_entry_mentions(data, node_id, content))
 
@@ -937,7 +1010,7 @@ class MemoryStore:
             snapshot.get("graph", {}).pop("_edge_set", None)
             return snapshot
 
-    def update(self, updater_func: Callable[[dict], None]) -> None:
+    def update(self, updater_func: Callable[[dict], None], *, invalidate_prompt_cache: bool = True) -> None:
         """
         Atomically update memory in-place and mark as dirty.
         The updater_func receives the memory dict and can modify it freely.
@@ -947,10 +1020,11 @@ class MemoryStore:
         with self._flush_lock:
             result = updater_func(self.data)
             self.dirty = True
-            self._prompt_cache_gen += 1
+            if invalidate_prompt_cache:
+                self._prompt_cache_gen += 1
             return result
 
-    def update_incremental(self, updater_func: Callable[[dict], None]) -> None:
+    def update_incremental(self, updater_func: Callable[[dict], None], *, invalidate_prompt_cache: bool = True) -> None:
         """
         Like update(), but promises the graph has already been patched
         incrementally inside updater_func — skips the full-rebuild flag.
@@ -959,7 +1033,8 @@ class MemoryStore:
             self._ensure_graph_current_unlocked()  # make sure graph is fresh first
             result = updater_func(self.data)
             self.dirty = True
-            self._prompt_cache_gen += 1
+            if invalidate_prompt_cache:
+                self._prompt_cache_gen += 1
             return result
 
     def _flush(self, force: bool = False) -> bool:
@@ -1066,6 +1141,7 @@ def apply_tag_operations(
 
     def update(data):
         for mem_cat, content in mem_ops:
+            content = _normalize_entry_text(content)
             if mem_cat == "user":
                 if ":" in content:
                     key, value = content.split(":", 1)
@@ -1073,6 +1149,8 @@ def apply_tag_operations(
                     norm_value = _normalize_user_field(key, value)
                     data["user"][key] = norm_value
                     _patch_graph_user_field(data, key, norm_value)
+                continue
+            if not _memory_entry_allowed(mem_cat, content):
                 continue
 
             entry = None
@@ -1084,13 +1162,15 @@ def apply_tag_operations(
             # have nodes — just let the mention count update stand.
             if entry is not None:
                 _patch_graph_entry(data, mem_cat, entry)
+            _enforce_entry_limit(data, mem_cat)
 
         for content, weight in observe_ops:
+            content = _normalize_entry_text(content)
+            if not _memory_entry_allowed("observations", content, weight=weight):
+                continue
             found = False
-            content_lower = content.lower()
             for obs in data["observations"]:
-                existing = obs.get("content", "").lower()
-                if existing == content_lower or content_lower in existing or existing in content_lower:
+                if _entries_match(obs.get("content", ""), content):
                     obs["mentions"] = obs.get("mentions", 1) + 1
                     obs["last_seen"] = _now()
                     obs["weight"] = weight
@@ -1106,14 +1186,15 @@ def apply_tag_operations(
                 }
                 data["observations"].append(entry)
                 _patch_graph_entry(data, "observations", entry)
+            _enforce_entry_limit(data, "observations")
 
         for query in forget_queries:
             query_lower = query.lower()
-            for category in ("preferences", "facts", "history", "relationships", "observations"):
+            for category in ("preferences", "facts", "history", "observations"):
                 kept_entries = []
                 for entry in data[category]:
                     if query_lower in entry.get("content", "").lower():
-                        if category in {"preferences", "facts", "relationships", "observations"}:
+                        if category in {"preferences", "facts", "observations"}:
                             _release_graph_entry(data, category, entry)
                         continue
                     kept_entries.append(entry)
@@ -1137,6 +1218,8 @@ def apply_tag_operations(
                 del data["activities"][name]
 
         for name, detail in project_ops:
+            name = _normalize_entry_text(name).lower()
+            detail = _normalize_entry_text(detail).lower()
             activity = data["activities"].get(name)
             if detail in {"done", "inactive", "active", "resume", "resumed", "delete", "remove"}:
                 if detail in {"active", "resume", "resumed"} and activity is None:
@@ -1163,7 +1246,7 @@ def apply_tag_operations(
 
             if activity is None:
                 activity = data["activities"][name] = {"details": [], "status": "active", "created": _now()}
-            if detail and detail not in activity["details"]:
+            if detail and detail not in activity["details"] and not _looks_like_generic_memory(detail):
                 activity["details"].append(detail)
                 activity["updated"] = _now()
             _patch_graph_activity(data, name)
@@ -1175,28 +1258,8 @@ def apply_tag_operations(
 
 
 # Compatibility functions that use the store
-def _decay_signals(data: dict, decay_rate: float = 0.02) -> None:
-    """Apply slight decay to connection signals when interactions are shallow or infrequent."""
-    signals = data["metadata"]["connection_signals"]
-    time_since_last = data["metadata"].get("last_relationship_check")
-
-    if time_since_last:
-        from datetime import datetime
-        last_check = datetime.fromisoformat(time_since_last.replace("Z", "+00:00"))
-        now = datetime.now(last_check.tzinfo)
-        days_elapsed = (now - last_check).total_seconds() / 86400
-
-        if days_elapsed > 3:
-            decay_multiplier = min(days_elapsed / 7.0, 2.0)
-            decay_rate = decay_rate * decay_multiplier
-
-    for key in signals:
-        if signals[key] > 0:
-            signals[key] = max(signals[key] - decay_rate, 0.0)
-
-
 def record_interaction(conversation_context: dict = None) -> None:
-    """Record that an interaction occurred, update metadata and relationship signals."""
+    """Record that an interaction occurred and update basic metadata."""
     store = get_store()
 
     def update(data):
@@ -1209,172 +1272,8 @@ def record_interaction(conversation_context: dict = None) -> None:
         meta["last_seen"] = now
         meta["interaction_count"] += 1
 
-        is_meaningful = False
-        if conversation_context:
-            msg_count = conversation_context.get("message_count", 0)
-            avg_length = conversation_context.get("avg_length", 0)
-            personal_shares = conversation_context.get("user_personal_shares", 0)
-            emotional_cues = conversation_context.get("emotional_observations", 0) + conversation_context.get("vulnerability_markers", 0)
-
-            if msg_count >= 2 or avg_length >= 100 or personal_shares > 0 or emotional_cues > 0:
-                is_meaningful = True
-
-        if is_meaningful and conversation_context:
-            _update_connection_signals(data, conversation_context)
-        else:
-            _decay_signals(data)
-
-        check_interval = RELATIONSHIP_CHECK_INTERVAL
-        if meta["interaction_count"] % check_interval == 0:
-            _evaluate_relationship_progression(data)
-
     # Metadata updates don't touch the graph — use incremental path.
     store.update_incremental(update)
-
-
-def _update_connection_signals(data: dict, context: dict) -> None:
-    """Update relationship signals based on conversation quality - smaller, harder gains."""
-    signals = data["metadata"]["connection_signals"]
-
-    personal_shares = context.get("user_personal_shares", 0)
-    if personal_shares > 0:
-        increase = min(personal_shares * 0.015, 0.05)
-        signals["personal_sharing_depth"] = min(signals["personal_sharing_depth"] + increase, 1.0)
-
-    emotional_cues = context.get("emotional_observations", 0) + context.get("vulnerability_markers", 0)
-    if emotional_cues > 0:
-        increase = min(emotional_cues * 0.02, 0.08)
-        signals["emotional_intimacy"] = min(signals["emotional_intimacy"] + increase, 1.0)
-
-    if context.get("asked_about_akane", False):
-        signals["reciprocity_score"] = min(signals["reciprocity_score"] + 0.04, 1.0)
-
-    if context.get("reciprocal_sharing", False):
-        signals["reciprocity_score"] = min(signals["reciprocity_score"] + 0.03, 1.0)
-        signals["personal_sharing_depth"] = min(signals["personal_sharing_depth"] + 0.03, 1.0)
-
-    msg_count = context.get("message_count", 0)
-    avg_length = context.get("avg_length", 0)
-    if msg_count >= 4:
-        depth_score = min(msg_count * 0.015 + (avg_length / 750) * 0.04, 0.12)
-        signals["conversation_depth"] = min(signals["conversation_depth"] + depth_score, 1.0)
-
-
-def _evaluate_relationship_progression(data: dict) -> None:
-    """Evaluate whether relationship level should increase based purely on signal quality."""
-    import random
-
-    signals = data["metadata"]["connection_signals"]
-    current_level = data["metadata"]["relationship_level"]
-    interaction_count = data["metadata"]["interaction_count"]
-
-    data["metadata"]["last_relationship_check"] = _now()
-
-    weights = {
-        "personal_sharing_depth": 0.30,
-        "emotional_intimacy": 0.30,
-        "reciprocity_score": 0.25,
-        "conversation_depth": 0.15,
-    }
-
-    def scale_signal(value: float) -> float:
-        if value <= 0:
-            return 0.0
-        return value ** 1.2
-
-    scaled_signals = {k: scale_signal(v) for k, v in signals.items()}
-    calculated_score = sum(scaled_signals[key] * weights[key] for key in weights)
-
-    interaction_factor = min(interaction_count / 1666.0, 0.12)
-    final_score = calculated_score + interaction_factor
-    final_score += random.uniform(-0.02, 0.02)
-    final_score = max(0.0, min(1.0, final_score))
-
-    data["metadata"]["relationship_score"] = final_score
-
-    level_order = ["stranger", "acquaintance", "friend", "close_friend"]
-    current_index = level_order.index(current_level) if current_level in level_order else 0
-
-    new_index = current_index
-    for i in range(current_index + 1, len(level_order)):
-        level = level_order[i]
-        min_score = RELATIONSHIP_LEVELS[level]["min_score"]
-        if level == "acquaintance":
-            signal_requirement = (
-                signals["personal_sharing_depth"] > 0.25 or
-                signals["emotional_intimacy"] > 0.2 or
-                signals["reciprocity_score"] > 0.2
-            )
-        elif level == "friend":
-            # Slightly easier than before, but still requires a real signal foundation.
-            signal_requirement = (
-                signals["personal_sharing_depth"] > 0.3 and
-                (signals["emotional_intimacy"] > 0.3 or
-                 signals["reciprocity_score"] > 0.35 or
-                 signals["conversation_depth"] > 0.4)
-            )
-        elif level == "close_friend":
-            # Keep this meaningfully harder than friend so it still feels earned.
-            signal_requirement = (
-                signals["personal_sharing_depth"] > 0.5 and
-                signals["emotional_intimacy"] > 0.45 and
-                signals["reciprocity_score"] > 0.4
-            )
-
-        if final_score >= min_score and signal_requirement:
-            new_index = i
-        else:
-            break
-
-    new_level = level_order[new_index]
-
-    if new_level != current_level:
-        old_level = current_level
-        data["metadata"]["relationship_level"] = new_level
-
-        change_record = {
-            "from": old_level,
-            "to": new_level,
-            "date": _now(),
-            "score": final_score,
-            "signals": {k: v for k, v in signals.items()},
-        }
-        data["metadata"]["level_change_history"].append(change_record)
-
-        if len(data["metadata"]["level_change_history"]) > 10:
-            data["metadata"]["level_change_history"] = data["metadata"]["level_change_history"][-10:]
-
-
-def get_relationship_context() -> dict:
-    """Get relationship level and metadata for prompt context."""
-    data = get_store().get()
-    meta = data["metadata"]
-    from datetime import datetime
-
-    time_ago = None
-    if meta["last_seen"]:
-        last = datetime.fromisoformat(meta["last_seen"].replace("Z", "+00:00"))
-        now = datetime.now(last.tzinfo)
-        hours_ago = (now - last).total_seconds() / 3600
-        if hours_ago < 1:
-            time_ago = "just now"
-        elif hours_ago < 24:
-            time_ago = f"{int(hours_ago)} hours ago"
-        else:
-            days = int(hours_ago / 24)
-            time_ago = f"{days} day{'s' if days > 1 else ''} ago"
-
-    familiarity = meta.get("relationship_score", 0.0)
-
-    return {
-        "level": meta["relationship_level"],
-        "interaction_count": meta["interaction_count"],
-        "first_seen": meta["first_seen"],
-        "last_seen": meta["last_seen"],
-        "last_seen_ago": time_ago,
-        "familiarity": familiarity,
-        "score": familiarity,
-    }
 
 
 def has_memory(category: str, content: str) -> bool:
@@ -1391,7 +1290,7 @@ def has_memory(category: str, content: str) -> bool:
     if category == "activities":
         return any(content_lower in name for name in data.get("activities", {}))
 
-    if category in ("preferences", "facts", "history", "relationships", "observations"):
+    if category in ("preferences", "facts", "history", "observations"):
         return any(
             content_lower in e.get("content", "").lower()
             or e.get("content", "").lower() in content_lower
@@ -1404,6 +1303,10 @@ def has_memory(category: str, content: str) -> bool:
 def add(category: str, content: str, weight: str = NEUTRAL) -> dict:
     """Add a memory entry."""
     store = get_store()
+    content = _normalize_entry_text(content)
+
+    if category != "user" and category != "activities" and not _memory_entry_allowed(category, content, weight=weight):
+        return {"success": False, "category": category, "ignored": True}
 
     def update(data):
         nonlocal category, content, weight
@@ -1424,21 +1327,25 @@ def add(category: str, content: str, weight: str = NEUTRAL) -> dict:
                     data["user"][str(key)] = norm_val
                     _patch_graph_user_field(data, str(key), norm_val)
 
-        elif category in ("preferences", "facts", "history", "relationships"):
-            entry = {"content": content, "created": _now(), "mentions": 1}
-            data[category].append(entry)
-            _patch_graph_entry(data, category, entry)
+        elif category in ("preferences", "facts", "history"):
+            if not _touch_list_entry(data[category], content):
+                entry = {"content": content, "created": _now(), "mentions": 1}
+                data[category].append(entry)
+                _patch_graph_entry(data, category, entry)
+            _enforce_entry_limit(data, category)
 
         elif category == "observations":
-            entry = {
-                "content": content,
-                "created": _now(),
-                "last_seen": _now(),
-                "mentions": 1,
-                "weight": weight,
-            }
-            data["observations"].append(entry)
-            _patch_graph_entry(data, "observations", entry)
+            if not _touch_list_entry(data["observations"], content):
+                entry = {
+                    "content": content,
+                    "created": _now(),
+                    "last_seen": _now(),
+                    "mentions": 1,
+                    "weight": weight,
+                }
+                data["observations"].append(entry)
+                _patch_graph_entry(data, "observations", entry)
+            _enforce_entry_limit(data, "observations")
 
         elif category == "activities":
             if ":" in content:
@@ -1447,7 +1354,7 @@ def add(category: str, content: str, weight: str = NEUTRAL) -> dict:
                 detail = detail.strip()
                 if name not in data["activities"]:
                     data["activities"][name] = {"details": [], "status": "active", "created": _now()}
-                if detail and detail not in data["activities"][name]["details"]:
+                if detail and detail not in data["activities"][name]["details"] and not _looks_like_generic_memory(detail):
                     data["activities"][name]["details"].append(detail)
                     data["activities"][name]["updated"] = _now()
             else:
@@ -1492,12 +1399,12 @@ def forget(query: str) -> dict:
     def update(data):
         nonlocal removed, query_lower
 
-        for category in ("preferences", "facts", "history", "relationships", "observations"):
+        for category in ("preferences", "facts", "history", "observations"):
             kept_entries = []
             for entry in data[category]:
                 if query_lower in entry.get("content", "").lower():
                     removed.append({"category": category, "content": entry["content"]})
-                    if category in {"preferences", "facts", "relationships", "observations"}:
+                    if category in {"preferences", "facts", "observations"}:
                         _release_graph_entry(data, category, entry)
                     continue
                 kept_entries.append(entry)
@@ -1556,10 +1463,10 @@ def delete(category: str, index: int = None, key: str = None) -> dict:
                 return {"success": True}
             return {"error": f"Key '{key}' not found"}
 
-        if category in ("preferences", "facts", "history", "relationships", "observations"):
+        if category in ("preferences", "facts", "history", "observations"):
             if index is not None and 0 <= index < len(data[category]):
                 removed = data[category].pop(index)
-                if category in {"preferences", "facts", "relationships", "observations"}:
+                if category in {"preferences", "facts", "observations"}:
                     _release_graph_entry(data, category, removed)
                 return {"success": True, "removed": removed}
             return {"error": f"Invalid index {index}"}
@@ -1581,7 +1488,7 @@ def _memory_search_documents(data: dict) -> list[dict]:
             }
         )
 
-    for category in ("preferences", "facts", "history", "relationships", "observations"):
+    for category in ("preferences", "facts", "history", "observations"):
         for i, entry in enumerate(data.get(category, [])):
             documents.append(
                 {
@@ -1664,7 +1571,7 @@ def get_all() -> dict:
 
 
 def analyze_conversation_context(messages: list[dict]) -> dict:
-    """Analyze recent conversation for relationship signals."""
+    """Analyze recent conversation for lightweight interaction context."""
     if not messages:
         return {}
 
@@ -1739,101 +1646,90 @@ def format_for_prompt() -> str:
         return store._prompt_cache
 
     sections = []
+    user = data.get("user", {})
 
-    rel_ctx = get_relationship_context()
-    if rel_ctx["interaction_count"] > 0:
-        score_pct = int(rel_ctx['familiarity'] * 100)
-        time_info = f" (last: {rel_ctx['last_seen_ago']})" if rel_ctx["last_seen_ago"] else ""
-        sections.append(f"Relationship: {rel_ctx['interaction_count']} interactions, connection score: {score_pct}%, level: {rel_ctx['level']}{time_info}")
+    def _append_unique(lines: list[str], seen: set[str], label: str, value: str) -> None:
+        cleaned = " ".join(str(value or "").split()).strip()
+        if not cleaned:
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        lines.append(f"  - {label}: {cleaned}")
 
-        signals = data["metadata"].get("connection_signals", {})
-        if signals and any(v > 0 for v in signals.values()):
-            signal_lines = []
-            for key, value in signals.items():
-                if value > 0:
-                    pct = int(value * 100)
-                    signal_lines.append(f"  {key.replace('_', ' ')}: {pct}%")
-            if signal_lines:
-                sections.append("Connection signals (for your awareness):\n" + "\n".join(signal_lines))
+    preference_lines: list[str] = []
+    seen_preferences: set[str] = set()
+    name = str(user.get("name", "")).strip()
+    if name:
+        _append_unique(preference_lines, seen_preferences, "Name", name)
 
-    if data["user"]:
-        user_lines = [f"  - {k}: {v}" for k, v in data["user"].items()]
-        sections.append("About the user:\n" + "\n".join(user_lines))
+    for key, value in user.items():
+        if key == "name":
+            continue
+        lowered_key = str(key).lower()
+        label = str(key).replace("_", " ").title()
+        if any(token in lowered_key for token in ("communication", "tone", "style")):
+            _append_unique(preference_lines, seen_preferences, "Preferred communication style", value)
+        elif any(token in lowered_key for token in ("game", "genre")):
+            _append_unique(preference_lines, seen_preferences, "Favorite games/genres", value)
+        elif any(token in lowered_key for token in ("task", "workflow", "focus")):
+            _append_unique(preference_lines, seen_preferences, "Common tasks", value)
+        else:
+            _append_unique(preference_lines, seen_preferences, label, value)
 
-    if data["preferences"]:
-        pref_lines = [f"  - {e['content']}" for e in data["preferences"]]
-        sections.append("User's preferences:\n" + "\n".join(pref_lines))
-
-    if data["facts"]:
-        fact_lines = [f"  - {e['content']}" for e in data["facts"]]
-        sections.append("Things to remember:\n" + "\n".join(fact_lines))
-
-    if data["relationships"]:
-        rel_lines = [f"  - {e['content']}" for e in data["relationships"]]
-        sections.append("Relationships:\n" + "\n".join(rel_lines))
-
-    active = {k: v for k, v in data.get("activities", {}).items()
-              if v.get("status") == "active"}
-    if active:
-        act_lines = []
-        for name, proj in active.items():
-            details = "; ".join(proj["details"][:3]) if proj["details"] else "no details yet"
-            act_lines.append(f"  - {name}: {details}")
-        sections.append("Working on:\n" + "\n".join(act_lines))
-
-    entities = [
-        entity for entity_id, entity in data.get("entities", {}).items()
-        if entity_id != "user:self"
+    favorite_preferences = [
+        entry.get("content", "")
+        for entry in data.get("preferences", [])
+        if any(token in entry.get("content", "").lower() for token in ("game", "genre"))
     ]
-    if entities:
-        top_entities = sorted(
-            entities,
-            key=lambda entity: (entity.get("mentions", 0), entity.get("last_seen", "")),
-            reverse=True,
-        )[:6]
-        entity_lines = [
-            f"  - {entity['name']} [{entity.get('type', 'entity')}]"
-            for entity in top_entities
-        ]
-        sections.append("Important entities:\n" + "\n".join(entity_lines))
+    if favorite_preferences:
+        _append_unique(
+            preference_lines,
+            seen_preferences,
+            "Favorite games/genres",
+            "; ".join(favorite_preferences[:3]),
+        )
 
-    edges = data.get("graph", {}).get("edges", [])
-    if edges:
-        top_edges = sorted(
-            edges,
-            key=lambda edge: (edge.get("mentions", 0), edge.get("last_seen", "")),
-            reverse=True,
-        )[:8]
-        graph_lines = []
-        for edge in top_edges:
-            source = data["entities"].get(edge["source"], {}).get("name", edge["source"])
-            target = data["entities"].get(edge["target"], {}).get("name", edge["target"])
-            relation = edge["relation"].replace("_", " ")
-            graph_lines.append(f"  - {source} -> {relation} -> {target}")
-        if graph_lines:
-            sections.append("Memory graph:\n" + "\n".join(graph_lines))
+    common_tasks = list(data.get("activities", {}).keys())[:4]
+    if common_tasks:
+        _append_unique(preference_lines, seen_preferences, "Common tasks", "; ".join(common_tasks))
 
-    recent_mood = get_recent_mood(3)
-    if recent_mood:
-        mood_lines = []
-        for obs in recent_mood:
-            weight = obs.get("weight", "neutral")
-            emoji = "😊" if weight == "positive" else "😟" if weight == "negative" else "😐"
-            mood_lines.append(f"  {emoji} {obs['content']}")
-        if mood_lines:
-            sections.append("Recent emotional cues:\n" + "\n".join(mood_lines))
+    for entry in data.get("preferences", [])[:6]:
+        content = str(entry.get("content", "")).strip()
+        if any(token in content.lower() for token in ("game", "genre")):
+            continue
+        _append_unique(preference_lines, seen_preferences, "Preference", content)
 
-    top_obs = top_observations(5)
-    if top_obs:
-        obs_lines = [f"  - {e['content']} (mentioned {e.get('mentions', 1)}x)" for e in top_obs]
-        sections.append("Patterns you've noticed:\n" + "\n".join(obs_lines))
+    if preference_lines:
+        sections.append("User Preferences:\n" + "\n".join(preference_lines))
 
-    if data["history"]:
-        recent = data["history"][-5:]
-        hist_lines = [f"  - {e['content']}" for e in recent]
-        sections.append("Recent conversation:\n" + "\n".join(hist_lines))
+    active = {
+        k: v for k, v in data.get("activities", {}).items()
+        if v.get("status") == "active"
+    }
+    if active:
+        context_lines = []
+        for activity_name, proj in active.items():
+            details = "; ".join(proj["details"][:2]).strip()
+            if details:
+                context_lines.append(f"  - Recent files or projects: {activity_name} ({details})")
+            else:
+                context_lines.append(f"  - Recent files or projects: {activity_name}")
+        sections.append("System Context:\n" + "\n".join(context_lines))
 
-    result = "Here's what you know about this user:\n\n" + "\n\n".join(sections) if sections else ""
+    fact_lines: list[str] = []
+    seen_facts: set[str] = set()
+    for key, value in user.items():
+        lowered_key = str(key).lower()
+        if any(token in lowered_key for token in ("hardware", "spec", "schedule", "habit", "routine")):
+            _append_unique(fact_lines, seen_facts, str(key).replace("_", " ").title(), value)
+    for entry in data.get("facts", [])[:8]:
+        _append_unique(fact_lines, seen_facts, "Fact", entry.get("content", ""))
+    if fact_lines:
+        sections.append("Persistent Facts:\n" + "\n".join(fact_lines))
+
+    result = "\n\n".join(sections) if sections else ""
 
     with store._flush_lock:
         store._prompt_cache = result

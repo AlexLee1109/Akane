@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import re
 import time
 from pathlib import Path
 
 _FILE_SEARCH_STOPWORDS = {
-    "a", "an", "and", "at", "can", "check", "code", "do", "file", "files", "for", "get",
+    "a", "an", "and", "are", "at", "can", "check", "code", "do", "file", "files", "for", "get",
     "give", "how", "i", "im", "implementation", "improve", "improvements", "in", "into",
     "it", "look", "me", "my", "of", "on", "project", "review", "see", "show", "suggest",
-    "suggestions", "tell", "the", "this", "to", "what", "with", "you",
+    "suggestions", "tell", "the", "this", "thought", "thoughts", "to", "what", "with", "you", "your",
 }
 _TEXT_SEARCH_FILE_LIMIT = 250_000
 _TEXT_FILE_SUFFIXES = {
@@ -22,8 +21,125 @@ _CODE_FILE_SUFFIXES = {
     ".go", ".java",
 }
 _SECONDARY_TEXT_SUFFIXES = {".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".css", ".html"}
-_QUERY_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 _FILE_CACHE_TTL_SECONDS = 2.0
+_DEPRIORITIZED_ROOT_PREFIXES = (
+    "integrations/",
+    "extensions/",
+    ".vscode/",
+    ".idea/",
+    ".zed/",
+    ".github/",
+    ".gitlab/",
+    "dist/",
+    "build/",
+    "coverage/",
+    "storybook-static/",
+)
+_EXPLICIT_INFRA_KEYWORDS = (
+    "vscode",
+    "vs code",
+    "extension",
+    "extensions",
+    "bridge",
+    "integration",
+    "integrations",
+    "launch.json",
+    "editor context",
+    "github actions",
+    "workflow",
+    "workflows",
+    "ci",
+    "pipeline",
+    ".github",
+    ".gitlab",
+    "settings.json",
+)
+_SOURCE_ROOT_HINTS = (
+    "app",
+    "src",
+    "lib",
+    "server",
+    "backend",
+    "frontend",
+    "client",
+    "web",
+    "api",
+    "core",
+    "pkg",
+    "cmd",
+)
+_SELF_CODE_NOUNS = {
+    "memory", "popup", "prompt", "model", "server", "client", "backend",
+    "frontend", "editor", "bridge",
+}
+
+
+def _iter_word_tokens(text: str):
+    current: list[str] = []
+    for ch in str(text or ""):
+        if ch.isalnum() or ch == "_":
+            current.append(ch)
+            continue
+        if current:
+            yield "".join(current)
+            current = []
+    if current:
+        yield "".join(current)
+
+
+def _iter_path_like_tokens(text: str):
+    allowed = {"_", "-", ".", "/"}
+    current: list[str] = []
+    for ch in str(text or ""):
+        if ch.isalnum() or ch in allowed:
+            current.append(ch)
+            continue
+        if current:
+            yield "".join(current)
+            current = []
+    if current:
+        yield "".join(current)
+
+
+def _folder_reference_prefixes(text: str, roots: set[str]) -> list[str]:
+    tokens = list(_iter_path_like_tokens(str(text or "").lower()))
+    prefixes: list[str] = []
+    seen: set[str] = set()
+    for index, token in enumerate(tokens[:-1]):
+        if tokens[index + 1] not in {"folder", "directory", "dir"}:
+            continue
+        raw = token.strip().strip("/").lower()
+        if not raw:
+            continue
+        candidate = raw + "/"
+        first = raw.split("/", 1)[0]
+        if raw in roots and candidate not in seen:
+            seen.add(candidate)
+            prefixes.append(candidate)
+            continue
+        if first in roots and candidate not in seen:
+            seen.add(candidate)
+            prefixes.append(candidate)
+    return prefixes
+
+
+def _is_self_code_reference(text: str) -> bool:
+    words = [token.lower() for token in _iter_word_tokens(text)]
+    if not words:
+        return False
+    for index, word in enumerate(words):
+        if word == "code" and index > 0 and words[index - 1] in {"your", "own"}:
+            return True
+        if (
+            word == "code"
+            and index > 1
+            and words[index - 2] in {"your", "own"}
+            and words[index - 1] in _SELF_CODE_NOUNS
+        ):
+            return True
+        if word in _SELF_CODE_NOUNS and index > 0 and words[index - 1] == "your":
+            return True
+    return False
 
 
 class _IndexedFile:
@@ -36,7 +152,7 @@ class _IndexedFile:
         self.rel = rel
         self.lowered = lowered
         self.stem = path.stem.lower()
-        self.tokens = {part for part in _QUERY_TOKEN_PATTERN.findall(lowered)}
+        self.tokens = {part for part in _iter_word_tokens(lowered)}
         self.text_searchable = path.suffix.lower() in _TEXT_FILE_SUFFIXES
 
 
@@ -69,6 +185,48 @@ class CodebaseSearch:
         self._inventory_built_at = now
         return inventory
 
+    def _root_directory_names(self) -> set[str]:
+        roots: set[str] = set()
+        for entry in self._inventory_entries():
+            first = entry.rel.split("/", 1)[0].strip().lower()
+            if first:
+                roots.add(first)
+        return roots
+
+    def _primary_source_prefixes(self) -> list[str]:
+        counts: dict[str, int] = {}
+        for entry in self._inventory_entries():
+            rel = entry.rel.strip().lower()
+            if not rel or any(rel.startswith(prefix) for prefix in _DEPRIORITIZED_ROOT_PREFIXES):
+                continue
+            first = rel.split("/", 1)[0]
+            if entry.path.suffix.lower() in _CODE_FILE_SUFFIXES:
+                counts[first] = counts.get(first, 0) + 1
+
+        if not counts:
+            return []
+
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        preferred: list[str] = []
+        seen: set[str] = set()
+        for hint in _SOURCE_ROOT_HINTS:
+            if hint in counts and hint not in seen:
+                seen.add(hint)
+                preferred.append(hint + "/")
+        for name, count in ranked:
+            if count < 2:
+                continue
+            if name not in seen:
+                seen.add(name)
+                preferred.append(name + "/")
+            if len(preferred) >= 4:
+                break
+        return preferred
+
+    def _explicit_folder_prefixes(self, user_input: str) -> list[str]:
+        roots = self._root_directory_names()
+        return _folder_reference_prefixes(user_input, roots)
+
     def _read_lower_text(self, entry: _IndexedFile) -> str:
         try:
             stat = entry.path.stat()
@@ -92,6 +250,69 @@ class CodebaseSearch:
 
         self._text_cache[cache_key] = (mtime_ns, size, text)
         return text
+
+    @staticmethod
+    def _normalize_values(values: list[str] | None) -> list[str]:
+        return [str(value or "").strip() for value in (values or []) if str(value or "").strip()]
+
+    def _is_explicit_infra_context(self, lowered_input: str) -> bool:
+        return any(token in lowered_input for token in _EXPLICIT_INFRA_KEYWORDS)
+
+    def _candidate_search_context(self, user_input: str) -> dict[str, object]:
+        lowered = str(user_input or "").lower()
+        focused_prefixes = self._explicit_folder_prefixes(user_input)
+        self_code_context = _is_self_code_reference(lowered)
+        preferred_prefixes = (
+            []
+            if focused_prefixes
+            else (self._primary_source_prefixes() if self_code_context else [])
+        )
+        return {
+            "lowered": lowered,
+            "focused_prefixes": focused_prefixes,
+            "preferred_prefixes": preferred_prefixes,
+            "integration_context": self._is_explicit_infra_context(lowered),
+            "self_code_context": self_code_context,
+        }
+
+    def _path_allowed(self, rel: str, *, focused_prefixes: list[str], integration_context: bool) -> bool:
+        path = str(rel or "").strip().lower()
+        if not path:
+            return False
+        if focused_prefixes:
+            return any(path.startswith(prefix) for prefix in focused_prefixes)
+        if integration_context:
+            return True
+        if any(path.startswith(prefix) for prefix in _DEPRIORITIZED_ROOT_PREFIXES):
+            return False
+        if any(
+            marker in path
+            for marker in (
+                "/.vscode/",
+                "/.idea/",
+                "/.zed/",
+                "/.github/",
+                "/.gitlab/",
+            )
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _prioritize_paths(paths: list[str], preferred_prefixes: list[str]) -> list[str]:
+        if not preferred_prefixes:
+            return list(paths)
+        preferred = [rel for rel in paths if any(rel.lower().startswith(prefix) for prefix in preferred_prefixes)]
+        other = [rel for rel in paths if rel not in preferred]
+        return preferred + other
+
+    @staticmethod
+    def _append_unique(candidates: list[str], seen: set[str], rel: str) -> bool:
+        if rel in seen:
+            return False
+        seen.add(rel)
+        candidates.append(rel)
+        return True
 
     def get_project_file_index(self) -> dict[str, list[str]]:
         if self._file_index is not None:
@@ -118,7 +339,7 @@ class CodebaseSearch:
     def extract_query_tokens(self, user_input: str) -> list[str]:
         tokens: list[str] = []
         seen: set[str] = set()
-        for raw in _QUERY_TOKEN_PATTERN.findall(str(user_input or "").lower()):
+        for raw in _iter_word_tokens(str(user_input or "").lower()):
             token = self.normalize_search_token(raw)
             if len(token) <= 1 or token in _FILE_SEARCH_STOPWORDS or token in seen:
                 continue
@@ -180,7 +401,8 @@ class CodebaseSearch:
         self,
         user_input: str,
         *,
-        file_ref_pattern: re.Pattern[str],
+        file_refs: list[str] | None = None,
+        file_ref_pattern=None,
         recent_targets: list[str] | None = None,
         active_file: str = "",
         open_tabs: list[str] | None = None,
@@ -191,82 +413,122 @@ class CodebaseSearch:
         reuse_recent_targets: bool = False,
         limit: int = 3,
     ) -> list[str]:
-        recent_targets = [str(path or "").strip() for path in (recent_targets or []) if str(path or "").strip()]
-        open_tabs = [str(path or "").strip() for path in (open_tabs or []) if str(path or "").strip()]
-        recent_texts = [str(text or "").strip() for text in (recent_texts or []) if str(text or "").strip()]
+        recent_targets = self._normalize_values(recent_targets)
+        open_tabs = self._normalize_values(open_tabs)
+        recent_texts = self._normalize_values(recent_texts)
+        normalized_file_refs = self._normalize_values(file_refs)
+
+        if not normalized_file_refs and file_ref_pattern is not None:
+            extracted_refs: list[str] = []
+            seen_refs: set[str] = set()
+            try:
+                matches = file_ref_pattern.finditer(str(user_input or ""))
+            except AttributeError:
+                matches = ()
+            for match in matches:
+                try:
+                    raw = str(match.group(1) or "").strip()
+                except IndexError:
+                    continue
+                if raw and raw not in seen_refs:
+                    seen_refs.add(raw)
+                    extracted_refs.append(raw)
+            normalized_file_refs = extracted_refs
 
         seen: set[str] = set()
         candidates: list[str] = []
-        lowered = str(user_input or "").lower()
+        context = self._candidate_search_context(user_input)
+        lowered = str(context["lowered"])
+        focused_prefixes = list(context["focused_prefixes"])
+        preferred_prefixes = list(context["preferred_prefixes"])
+        integration_context = bool(context["integration_context"])
+        self_code_context = bool(context.get("self_code_context"))
 
-        for match in file_ref_pattern.finditer(str(user_input or "")):
-            raw = match.group(1).strip("`'\".,:;()[]{}")
+        for raw_value in normalized_file_refs:
+            raw = str(raw_value or "").strip("`'\".,:;()[]{}")
             if not raw:
                 continue
             if "/" in raw:
                 resolved = (self.project_root / raw).resolve()
                 if resolved.is_file() and str(resolved).startswith(str(self.project_root)):
                     rel = str(resolved.relative_to(self.project_root))
-                    if rel not in seen:
-                        seen.add(rel)
-                        candidates.append(rel)
+                    if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
+                        self._append_unique(candidates, seen, rel)
                 continue
 
             matches = self.get_project_file_index().get(raw.lower(), [])
-            if len(matches) == 1 and matches[0] not in seen:
-                seen.add(matches[0])
-                candidates.append(matches[0])
+            if len(matches) == 1 and self._path_allowed(
+                matches[0],
+                focused_prefixes=focused_prefixes,
+                integration_context=integration_context,
+            ):
+                self._append_unique(candidates, seen, matches[0])
 
-        if active_file and any(phrase in lowered for phrase in {"this file", "current file", "that file", "the file"}):
-            if active_file not in seen:
-                seen.add(active_file)
-                candidates.insert(0, active_file)
+        if (
+            active_file
+            and self._path_allowed(active_file, focused_prefixes=focused_prefixes, integration_context=integration_context)
+            and any(phrase in lowered for phrase in {"this file", "current file", "that file", "the file"})
+            and active_file not in seen
+        ):
+            seen.add(active_file)
+            candidates.insert(0, active_file)
 
         query_tokens = self.extract_query_tokens(user_input)
         search_queries = [user_input]
+
+        direct_query_scored = self._score_paths(user_input, limit=max(6, limit))
+        has_strong_direct_match = bool(direct_query_scored and direct_query_scored[0][0] >= 8)
+
         if recent_targets and reuse_recent_targets and coding_request and not explicit_file_reference:
             for rel in recent_targets:
-                if rel not in seen:
-                    seen.add(rel)
-                    candidates.append(rel)
+                if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
+                    self._append_unique(candidates, seen, rel)
 
-        if recent_targets or followup_reference or len(query_tokens) <= 3:
+        if (recent_targets or followup_reference or len(query_tokens) <= 3) and not (
+            self_code_context and has_strong_direct_match and not reuse_recent_targets
+        ):
             search_queries.extend(recent_texts)
 
         for remembered in recent_targets:
-            if followup_reference and remembered not in seen:
-                seen.add(remembered)
-                candidates.append(remembered)
+            if followup_reference and self._path_allowed(
+                remembered,
+                focused_prefixes=focused_prefixes,
+                integration_context=integration_context,
+            ):
+                self._append_unique(candidates, seen, remembered)
 
         strong_path_hits = 0
         for query in search_queries:
             prior_count = len(candidates)
-            query_scored = self._score_paths(query, limit=6)
+            query_scored = direct_query_scored if query == user_input else self._score_paths(query, limit=6)
+            query_scored.sort(
+                key=lambda item: (
+                    0 if any(item[1].lower().startswith(prefix) for prefix in preferred_prefixes) else 1,
+                    -item[0],
+                    item[1],
+                )
+            )
             for score, rel in query_scored:
-                if rel not in seen:
-                    seen.add(rel)
-                    candidates.append(rel)
+                if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
+                    self._append_unique(candidates, seen, rel)
                 if score >= 7:
                     strong_path_hits += 1
             if strong_path_hits < max(1, limit) and (len(candidates) < limit or len(candidates) == prior_count):
-                for rel in self.search_contents(query, limit=max(2, limit)):
-                    if rel not in seen:
-                        seen.add(rel)
-                        candidates.append(rel)
+                for rel in self._prioritize_paths(self.search_contents(query, limit=max(2, limit)), preferred_prefixes):
+                    if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
+                        self._append_unique(candidates, seen, rel)
 
-        for rel in recent_targets:
+        for rel in self._prioritize_paths(recent_targets, preferred_prefixes):
             if not reuse_recent_targets:
                 continue
-            if rel not in seen:
-                seen.add(rel)
-                candidates.append(rel)
+            if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
+                self._append_unique(candidates, seen, rel)
 
-        for rel in open_tabs[:5]:
+        for rel in self._prioritize_paths(open_tabs[:5], preferred_prefixes):
             if len(candidates) >= limit:
                 break
-            if rel and rel not in seen:
-                seen.add(rel)
-                candidates.append(rel)
+            if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
+                self._append_unique(candidates, seen, rel)
 
         return candidates[:limit]
 

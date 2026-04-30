@@ -1,8 +1,5 @@
-import queue
-import random
 import re
 import threading
-from datetime import datetime
 
 from app.config import (
     CHAT_HISTORY_CONTEXT_TOKENS,
@@ -13,11 +10,9 @@ from app.config import (
     TOP_P,
 )
 from app.character import build_system_prompt
-from app import memory
 from app.config import ADVISOR_ONLY
 from app.editor_bridge import get_editor_bridge
-from app.memory import format_for_prompt, get_store
-from app.memory_store import apply_tag_operations
+from app.memory_store import NEGATIVE, NEUTRAL, POSITIVE, apply_tag_operations, format_for_prompt, get_store
 from app.model_loader import LLM
 from app.vscode_launcher import launch_vscode
 
@@ -94,23 +89,74 @@ STREAM_HIDDEN_XML_TAGS = {
     "READ_RESULT": "</READ_RESULT>",
 }
 
-INLINE_CODE_PATTERN = re.compile(r"`([^`\n]+)`")
+_HIDDEN_SQUARE_TAG_NAMES = (
+    "MEM", "OBSERVE", "FORGET", "PROJECT", "EDITOR", "ASK_CODER", "CODE", "READ", "WRITE", "SHELL", "READ_RESULT",
+)
+_HIDDEN_XML_SIMPLE_TAG_NAMES = ("READ", "WRITE", "SHELL", "CODE", "READ_RESULT")
+
+
+def _strip_wrapped_tag_ranges(text: str, opener: str, closer: str) -> str:
+    source = str(text or "")
+    if opener not in source:
+        return source
+    parts: list[str] = []
+    index = 0
+    opener_len = len(opener)
+    closer_len = len(closer)
+    while True:
+        start = source.find(opener, index)
+        if start == -1:
+            parts.append(source[index:])
+            break
+        parts.append(source[index:start])
+        end = source.find(closer, start + opener_len)
+        if end == -1:
+            parts.append(source[start:])
+            break
+        index = end + closer_len
+    return "".join(parts)
+
+
+def _strip_hidden_square_tags(text: str) -> str:
+    cleaned = str(text or "")
+    for tag_name in _HIDDEN_SQUARE_TAG_NAMES:
+        cleaned = _strip_wrapped_tag_ranges(cleaned, f"[{tag_name}]", f"[/{tag_name}]")
+    return cleaned
+
+
+def _strip_hidden_xml_tags(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = _strip_wrapped_tag_ranges(cleaned, "<tool_call>", "</tool_call>")
+    for tag_name in _HIDDEN_XML_SIMPLE_TAG_NAMES:
+        cleaned = _strip_wrapped_tag_ranges(cleaned, f"<{tag_name}>", f"</{tag_name}>")
+    return cleaned
 
 
 def _strip_hidden_markup(text: str) -> str:
-    cleaned = str(text or "")
-    for pattern in (ALL_TAGS_PATTERN, EDITOR_TOOL_CALL_STRIP_PATTERN, XML_SIMPLE_TOOL_STRIP_PATTERN):
-        cleaned = pattern.sub("", cleaned)
+    cleaned = _strip_hidden_square_tags(text)
+    cleaned = _strip_hidden_xml_tags(cleaned)
     return collapse_hidden_tag_gaps(cleaned).strip()
 
 
 def _strip_inline_markdown_code(text: str) -> str:
     cleaned = str(text or "")
-    previous = None
-    while cleaned != previous:
-        previous = cleaned
-        cleaned = INLINE_CODE_PATTERN.sub(r"\1", cleaned)
-    return cleaned.replace("`", "")
+    if "`" not in cleaned:
+        return cleaned
+    parts: list[str] = []
+    index = 0
+    while index < len(cleaned):
+        start = cleaned.find("`", index)
+        if start == -1:
+            parts.append(cleaned[index:])
+            break
+        parts.append(cleaned[index:start])
+        end = cleaned.find("`", start + 1)
+        if end == -1 or "\n" in cleaned[start + 1 : end]:
+            parts.append(cleaned[start:].replace("`", ""))
+            break
+        parts.append(cleaned[start + 1 : end])
+        index = end + 1
+    return "".join(parts)
 
 CATEGORY_MAP = {
     "name": "user",
@@ -118,100 +164,23 @@ CATEGORY_MAP = {
     "facts": "facts",
     "preference": "preferences",
     "preferences": "preferences",
-    "relationship": "relationships",
-    "relationships": "relationships",
     "user": "user",
-}
-
-POSITIVE_WORDS = {
-    "happy", "excited", "loves", "enjoy", "great", "awesome", "fantastic", "wonderful",
-    "amazing", "fun", "passionate", " thrilled", "delighted", "pleased", "satisfied",
-    "grateful", "thankful", "blessed", "joy", "love it", "perfect", "nailed it",
-    "proud", "confident", "optimistic", "hopeful", "energized", "motivated",
-    "inspired", "impressed", "good news", "achievement", "success"
-}
-
-NEGATIVE_WORDS = {
-    "frustrated", "stressed", "hate", "struggling", "stuck", "annoyed", "worried",
-    "anxious", "overwhelmed", "exhausted", "tired", "disappointed", "sad", "upset",
-    "angry", "mad", "fuming", "annoying", "difficult", "hard", "impossible",
-    "terrible", "awful", "horrible", "bad news", "failure", "mistake", "regret",
-    "confused", "lost", "helpless", "hopeless", "burned out", "dread", "dreadful",
-    "pain", "hurting", "sick", "ill", "unhappy", "miserable", "depressed"
-}
-
-NAME_PREFIXES = (
-    "my name is ",
-    "name is ",
-    "name's ",
-    "call me ",
-    "i go by ",
-)
-
-CLAUSE_SPLIT_PATTERN = re.compile(r"[.!?;\n]+")
-SELF_CLAUSE_SPLIT_PATTERN = re.compile(
-    r"\s+(?:and|but)\s+(?=(?:i\b|i['’]?m\b|im\b|my name\b|name['’]?s\b|call me\b))",
-    re.IGNORECASE,
-)
-
-PREFERENCE_HEADS = {"prefer", "like", "love", "enjoy", "want", "need", "hate"}
-PROJECT_HEADS = {
-    "work", "working", "build", "building", "make", "making", "create", "creating",
-    "train", "training", "debug", "debugging", "fix", "fixing", "write", "writing",
-    "learn", "learning", "study", "studying", "develop", "developing", "prepare",
-    "preparing", "plan", "planning", "ship", "shipping", "deploy", "deploying",
-}
-FACT_HEADS = {"use", "using", "have", "having", "run", "running", "on", "with"}
-AUXILIARY_HEADS = {"am", "are", "was", "were", "be", "been", "do", "does", "did"}
-
-TECH_FACT_HINTS = {
-    "mac", "macos", "windows", "linux", "colab", "cuda", "mps", "bf16",
-    "bfloat16", "fp16", "gpu", "a100", "h100", "rtx", "vscode", "python",
-    "pytorch", "llama", "gguf",
-}
-
-NON_DURABLE_FACT_HINTS = {
-    "question", "questions", "problem", "problems", "issue", "issues",
-    "idea", "ideas", "thing", "things", "minute", "minutes",
 }
 
 
 def _detect_weight(text: str) -> str:
-    """Detect emotional weight of observation content."""
-    lower = text.lower()
-    # Count positive and negative word matches
-    pos_count = sum(1 for w in POSITIVE_WORDS if w in lower)
-    neg_count = sum(1 for w in NEGATIVE_WORDS if w in lower)
-
-    # Stronger signals: multiple hits or very strong words
-    if neg_count > 0 and neg_count >= pos_count:
-        return memory.NEGATIVE
-    if pos_count > 0 and pos_count > neg_count:
-        return memory.POSITIVE
-    return memory.NEUTRAL
+    """Detect emotional weight using explicit markers instead of keyword lists."""
+    lowered = str(text or "").strip().lower()
+    if lowered.startswith(("negative:", "bad:", "- ")):
+        return NEGATIVE
+    if lowered.startswith(("positive:", "good:", "+ ")):
+        return POSITIVE
+    return NEUTRAL
 
 
 def _looks_like_name(value: str) -> bool:
-    """Heuristic guard so random user facts do not overwrite the name field."""
     candidate = value.strip()
     if not candidate or len(candidate) > 40:
-        return False
-    lowered = candidate.lower()
-    forbidden_fragments = {
-        "working on",
-        "debugging",
-        "memory",
-        "project",
-        "prefer",
-        "likes",
-        "loves",
-        "using",
-        "building",
-        "coding",
-        "issue",
-        "bug",
-    }
-    if any(fragment in lowered for fragment in forbidden_fragments):
         return False
     parts = candidate.replace("-", " ").split()
     if not 1 <= len(parts) <= 3:
@@ -221,36 +190,107 @@ def _looks_like_name(value: str) -> bool:
 
 def _normalize_memory_text(value: str) -> str:
     value = " ".join(value.strip().split())
-    value = re.sub(r"^[,:;\-\s]+", "", value)
-    value = re.sub(r"[,:;\-\s]+$", "", value)
-    return value
+    return value.strip(",:;- ")
+
+
+def _replace_ci_word(text: str, source: str, target: str) -> str:
+    lowered = text.lower()
+    source_lower = source.lower()
+    index = 0
+    parts: list[str] = []
+    source_len = len(source)
+    while True:
+        found = lowered.find(source_lower, index)
+        if found == -1:
+            parts.append(text[index:])
+            break
+        before_ok = found == 0 or not (lowered[found - 1].isalnum() or lowered[found - 1] == "_")
+        after_index = found + source_len
+        after_ok = after_index >= len(text) or not (lowered[after_index].isalnum() or lowered[after_index] == "_")
+        if not (before_ok and after_ok):
+            parts.append(text[index : found + 1])
+            index = found + 1
+            continue
+        parts.append(text[index:found])
+        parts.append(target)
+        index = after_index
+    return "".join(parts)
 
 
 def _canonicalize_clause(clause: str) -> str:
     clause = clause.replace("’", "'")
-    clause = re.sub(r"\bi'm\b", "i am", clause, flags=re.IGNORECASE)
-    clause = re.sub(r"\bim\b", "i am", clause, flags=re.IGNORECASE)
-    clause = re.sub(r"\bdon't\b", "do not", clause, flags=re.IGNORECASE)
-    clause = re.sub(r"\bcan't\b", "can not", clause, flags=re.IGNORECASE)
+    clause = _replace_ci_word(clause, "i'm", "i am")
+    clause = _replace_ci_word(clause, "im", "i am")
+    clause = _replace_ci_word(clause, "don't", "do not")
+    clause = _replace_ci_word(clause, "can't", "can not")
     return " ".join(clause.split())
+
+
+def _split_on_punctuation(text: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    for ch in str(text or ""):
+        if ch in ".!?;\n":
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            continue
+        current.append(ch)
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _starts_self_clause(lowered: str) -> bool:
+    return lowered.startswith(("i ", "i'm ", "im ", "my name", "name's ", "call me ", "i go by "))
+
+
+def _split_self_subclauses(text: str) -> list[str]:
+    lowered = str(text or "").lower().replace("’", "'")
+    original = str(text or "")
+    parts: list[str] = []
+    start = 0
+    index = 0
+    for connector in (" and ", " but "):
+        pass
+    while index < len(lowered):
+        split_at = -1
+        split_len = 0
+        for connector in (" and ", " but "):
+            if lowered.startswith(connector, index):
+                remainder = lowered[index + len(connector) :].lstrip()
+                if _starts_self_clause(remainder):
+                    split_at = index
+                    split_len = len(connector)
+                    break
+        if split_at == -1:
+            index += 1
+            continue
+        part = original[start:split_at].strip()
+        if part:
+            parts.append(part)
+        start = split_at + split_len
+        index = start
+    tail = original[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
 
 
 def _extract_self_clauses(text: str) -> list[str]:
     clauses: list[str] = []
-    for chunk in CLAUSE_SPLIT_PATTERN.split(text):
+    for chunk in _split_on_punctuation(text):
         chunk = _normalize_memory_text(chunk)
         if not chunk:
             continue
-        for clause in SELF_CLAUSE_SPLIT_PATTERN.split(chunk):
+        for clause in _split_self_subclauses(chunk):
             clause = _normalize_memory_text(clause)
             if not clause:
                 continue
             normalized = _canonicalize_clause(clause).lower()
-            if normalized.startswith("i ") or normalized.startswith(("my name", "name's ", "call me ")):
-                clauses.append(clause)
-                continue
-            first_word = normalized.split(" ", 1)[0]
-            if first_word in PROJECT_HEADS or _stem_head(first_word) in PROJECT_HEADS:
+            if normalized.startswith(("i ", "my name", "name's ", "call me ", "i go by ")):
                 clauses.append(clause)
     return clauses
 
@@ -258,119 +298,126 @@ def _extract_self_clauses(text: str) -> list[str]:
 def _normalize_project_phrase(value: str) -> tuple[str, str]:
     """Split a project phrase into a short name plus optional detail."""
     value = _normalize_memory_text(value)
-    value = re.sub(r"^(?:a|an|the|my)\s+", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"^(?:project|app|tool)\s+called\s+", "", value, flags=re.IGNORECASE)
+    lowered = value.lower()
+    for prefix in ("a ", "an ", "the ", "my "):
+        if lowered.startswith(prefix):
+            value = value[len(prefix) :]
+            lowered = value.lower()
+            break
+    for prefix in ("project called ", "app called ", "tool called "):
+        if lowered.startswith(prefix):
+            value = value[len(prefix) :]
+            lowered = value.lower()
+            break
     if not value:
         return "", ""
 
-    parts = re.split(r"\b(?:using|with|for|on|at)\b", value, maxsplit=1, flags=re.IGNORECASE)
-    name = _normalize_memory_text(parts[0]).lower()
-    detail = _normalize_memory_text(parts[1]).lower() if len(parts) > 1 else ""
+    split_index = -1
+    split_len = 0
+    lowered = value.lower()
+    for connector in (" using ", " with ", " for ", " on ", " at "):
+        found = lowered.find(connector)
+        if found != -1 and (split_index == -1 or found < split_index):
+            split_index = found
+            split_len = len(connector)
+    if split_index == -1:
+        name_part = value
+        detail_part = ""
+    else:
+        name_part = value[:split_index]
+        detail_part = value[split_index + split_len :]
+    name = _normalize_memory_text(name_part).lower()
+    detail = _normalize_memory_text(detail_part).lower()
     if len(name) > 60:
         name = name[:60].rsplit(" ", 1)[0] or name[:60]
     return name, detail
 
 
-def _looks_like_technical_fact(value: str) -> bool:
+def _looks_like_durable_fact(value: str) -> bool:
     lowered = value.lower().strip()
-    if lowered in NON_DURABLE_FACT_HINTS:
+    if not lowered:
         return False
-    if any(lowered.startswith(f"{hint} ") or lowered.endswith(f" {hint}") for hint in NON_DURABLE_FACT_HINTS):
+    if len(lowered) <= 6:
         return False
-    if any(hint in lowered for hint in TECH_FACT_HINTS):
-        return True
-    return any(char.isdigit() for char in value)
+    meaningful_tokens = [token for token in lowered.split() if len(token) > 2]
+    return len(meaningful_tokens) >= 3 or any(char.isdigit() for char in value)
 
 
 def _extract_name_from_clause(clause: str) -> str | None:
     lowered = clause.lower()
-    for prefix in NAME_PREFIXES:
+    for prefix in ("my name is ", "name is ", "name's ", "call me ", "i go by "):
         if lowered.startswith(prefix):
             candidate = _normalize_memory_text(clause[len(prefix):])
             return candidate if _looks_like_name(candidate) else None
     return None
 
 
-def _stem_head(word: str) -> str:
-    for suffix in ("ing", "ed"):
-        if word.endswith(suffix) and len(word) > len(suffix) + 2:
-            return word[: -len(suffix)]
-    return word
-
-
-def _parse_statement(clause: str) -> tuple[str, str, bool] | None:
-    normalized = _canonicalize_clause(clause).lower()
-    tokens = normalized.split()
-    if not tokens:
-        return None
-
-    idx = 0
-    negated = False
-
-    if tokens[0] == "i":
-        idx = 1
-        while idx < len(tokens) and tokens[idx] in AUXILIARY_HEADS:
-            idx += 1
-
-    if idx < len(tokens) and tokens[idx] == "not":
-        negated = True
-        idx += 1
-    if idx >= len(tokens):
-        return None
-
-    head = tokens[idx]
-    remainder = _normalize_memory_text(" ".join(tokens[idx + 1:]))
-    return head, remainder, negated
-
-
-def _preference_memory(head: str, remainder: str, negated: bool) -> str | None:
-    if not remainder:
-        return None
-    value = remainder.lower()
-    base = _stem_head(head)
-    if base == "want":
-        prefix = "doesn't want" if negated else "wants"
-        return f"{prefix} {value}"
-    if base == "need":
-        prefix = "doesn't need" if negated else "needs"
-        return f"{prefix} {value}"
-    if base in {"like", "love", "enjoy"} and not negated:
-        return f"{base}s {value}"
-    if base == "hate" or negated:
-        return f"doesn't like {value}"
-    if base == "prefer":
-        return f"prefers {value}"
+def _extract_preference_memory(clause: str) -> str | None:
+    lowered = _canonicalize_clause(clause).lower()
+    for prefix, memory_prefix in (
+        ("i prefer ", "prefers "),
+        ("i like ", "likes "),
+        ("i love ", "loves "),
+        ("i enjoy ", "enjoys "),
+        ("i want ", "wants "),
+        ("i need ", "needs "),
+        ("i hate ", "doesn't like "),
+        ("i do not like ", "doesn't like "),
+        ("i don't like ", "doesn't like "),
+    ):
+        if lowered.startswith(prefix):
+            remainder = _normalize_memory_text(clause[len(prefix):]).lower()
+            return f"{memory_prefix}{remainder}" if remainder else None
     return None
 
 
-def _project_memory(head: str, remainder: str) -> tuple[str, str] | None:
-    if not remainder:
-        return None
-    value = remainder
-    if _stem_head(head) == "work" and value.lower().startswith("on "):
-        value = value[3:]
-    name, detail = _normalize_project_phrase(value)
-    if not name:
-        return None
-    return name, detail
+def _extract_project_memory(clause: str) -> tuple[str, str] | None:
+    lowered = _canonicalize_clause(clause).lower()
+    for prefix in (
+        "i am working on ",
+        "i'm working on ",
+        "im working on ",
+        "i am building ",
+        "i'm building ",
+        "im building ",
+        "i am making ",
+        "i'm making ",
+        "im making ",
+        "i am creating ",
+        "i'm creating ",
+        "im creating ",
+    ):
+        if lowered.startswith(prefix):
+            value = _normalize_memory_text(clause[len(prefix):])
+            name, detail = _normalize_project_phrase(value)
+            return (name, detail) if name else None
+    return None
 
 
-def _fact_memory(head: str, remainder: str) -> str | None:
-    if not remainder:
-        return None
-    value = _normalize_memory_text(remainder)
-    if not _looks_like_technical_fact(value):
-        return None
-    base = _stem_head(head)
-    if base == "use":
-        return f"uses {value.lower()}"
-    if base == "have":
-        return f"has {value.lower()}"
-    return f"{base} {value.lower()}"
+def _extract_fact_memory(clause: str) -> str | None:
+    lowered = _canonicalize_clause(clause).lower()
+    for prefix, fact_prefix in (
+        ("i use ", "uses "),
+        ("i'm using ", "uses "),
+        ("im using ", "uses "),
+        ("i have ", "has "),
+        ("i'm on ", "uses "),
+        ("im on ", "uses "),
+        ("i run ", "runs "),
+    ):
+        if lowered.startswith(prefix):
+            value = _normalize_memory_text(clause[len(prefix):]).lower()
+            if not _looks_like_durable_fact(value):
+                return None
+            return f"{fact_prefix}{value}" if value else None
+    return None
 
 
 def capture_explicit_user_memories(user_text: str) -> bool:
     """Store important explicit user details directly from the raw user message."""
+    lowered = str(user_text or "").lower()
+    if "i" not in lowered and "name" not in lowered and "call me" not in lowered:
+        return False
     mem_ops: list[tuple[str, str]] = []
     project_ops: list[tuple[str, str]] = []
     changed = False
@@ -385,31 +432,22 @@ def capture_explicit_user_memories(user_text: str) -> bool:
                 changed = True
             continue
 
-        parsed = _parse_statement(clause)
-        if not parsed:
-            continue
-        head, remainder, negated = parsed
-        base = _stem_head(head)
-
-        if head in PROJECT_HEADS or base in PROJECT_HEADS:
-            project = _project_memory(head, remainder)
-            if project:
-                project_ops.append(project)
-                changed = True
+        project = _extract_project_memory(clause)
+        if project:
+            project_ops.append(project)
+            changed = True
             continue
 
-        if head in PREFERENCE_HEADS or base in PREFERENCE_HEADS:
-            preference = _preference_memory(head, remainder, negated)
-            if preference:
-                mem_ops.append(("preferences", preference))
-                changed = True
+        preference = _extract_preference_memory(clause)
+        if preference:
+            mem_ops.append(("preferences", preference))
+            changed = True
             continue
 
-        if head in FACT_HEADS or base in FACT_HEADS:
-            fact = _fact_memory(head, remainder)
-            if fact:
-                mem_ops.append(("facts", fact))
-                changed = True
+        fact = _extract_fact_memory(clause)
+        if fact:
+            mem_ops.append(("facts", fact))
+            changed = True
 
     if not changed:
         return False
@@ -425,12 +463,23 @@ def capture_explicit_user_memories(user_text: str) -> bool:
 
 def collapse_hidden_tag_gaps(text: str) -> str:
     """Remove blank-line artifacts left behind when inline tags are hidden."""
-    text = text.replace("\r\n", "\n")
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n[ \t]+", "\n", text)
-    text = re.sub(r"\n(?:[ \t]*\n)+", "\n", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text
+    text = str(text or "").replace("\r\n", "\n")
+    if not text:
+        return text
+
+    normalized_lines: list[str] = []
+    previous_blank = False
+    for raw_line in text.split("\n"):
+        line = raw_line.replace("\t", " ")
+        if not line:
+            if previous_blank:
+                continue
+            normalized_lines.append("")
+            previous_blank = True
+            continue
+        normalized_lines.append(line)
+        previous_blank = False
+    return "\n".join(normalized_lines)
 
 
 class HiddenTagStreamFilter:
@@ -630,11 +679,6 @@ def finalize_model_response(text: str) -> str:
     return clean_model_text(text)
 
 
-def parse_and_store_tags(text: str) -> str:
-    """Backward-compatible wrapper for finalizing a model response."""
-    return finalize_model_response(text)
-
-
 def _parse_editor_tool(raw: str) -> tuple[str, str]:
     raw = raw.strip()
     if not raw:
@@ -756,44 +800,39 @@ def _first_parameter(parameters: dict[str, str], *names: str) -> str:
     return ""
 
 
-def _extract_editor_commands_from_tool_block(block: str) -> list[str]:
-    editor_ops: list[str] = []
+def _editor_ops_from_parameter_block(inner: str) -> list[str]:
+    parameters = _extract_tool_parameters(inner)
+    command = _first_parameter(parameters, "action", "command", "name")
+    argument = _first_parameter(parameters, "value", "argument", "file", "path", "text")
+    if command:
+        lowered = command.lower()
+        return [lowered if not argument else f"{lowered}: {argument}"]
+    return [
+        command if not argument else f"{command}: {argument}"
+        for command, argument in (
+            (
+                (nested_match.group(1) or "").strip().lower(),
+                (nested_match.group(2) or "").strip(),
+            )
+            for nested_match in NESTED_TOOL_ACTION_PATTERN.finditer(inner)
+        )
+        if command
+    ]
 
+
+def _extract_editor_commands_from_tool_block(block: str) -> list[str]:
     editor_match = EDITOR_TOOL_BLOCK_PATTERN.search(block)
     if editor_match:
         inner = (editor_match.group(1) or "").strip()
-        parameters = _extract_tool_parameters(inner)
-        command = _first_parameter(parameters, "action", "command", "name")
-        argument = _first_parameter(parameters, "value", "argument", "file", "path", "text")
-        if command:
-            editor_ops.append(command.lower() if not argument else f"{command.lower()}: {argument}")
-            return editor_ops
-        for nested_match in NESTED_TOOL_ACTION_PATTERN.finditer(inner):
-            command = (nested_match.group(1) or "").strip().lower()
-            argument = (nested_match.group(2) or "").strip()
-            if command:
-                editor_ops.append(command if not argument else f"{command}: {argument}")
-        return editor_ops
+        return _editor_ops_from_parameter_block(inner)
 
     function_name, inner = _extract_function_tool_block(block)
     if function_name == "editor":
-        parameters = _extract_tool_parameters(inner)
-        command = _first_parameter(parameters, "action", "command", "name")
-        argument = _first_parameter(parameters, "value", "argument", "file", "path", "text")
-        if command:
-            editor_ops.append(command.lower() if not argument else f"{command.lower()}: {argument}")
-            return editor_ops
-        for nested_match in NESTED_TOOL_ACTION_PATTERN.finditer(inner):
-            command = (nested_match.group(1) or "").strip().lower()
-            argument = (nested_match.group(2) or "").strip()
-            if command:
-                editor_ops.append(command if not argument else f"{command}: {argument}")
-        return editor_ops
+        return _editor_ops_from_parameter_block(inner)
 
     if function_name in {"open_vscode", "open_project", "open_workspace"}:
-        editor_ops.append(function_name)
-
-    return editor_ops
+        return [function_name]
+    return []
 
 
 # Cache for system prompt to avoid repeated formatting
@@ -802,19 +841,10 @@ _system_prompt_gen = -1
 _runtime_context_cache = ""
 
 
-def build_runtime_context() -> str:
-    now = datetime.now().astimezone()
-    time_context = "\n".join(
-        [
-            "CURRENT TIME:",
-            f"- Local date: {now.strftime('%A, %B %d, %Y')}",
-            f"- Local time: {now.strftime('%I:%M %p').lstrip('0')}",
-            f"- Timezone: {now.tzname() or 'local time'}",
-        ]
-    )
-    memory_context = format_for_prompt()
-    editor_context = get_editor_bridge().format_for_prompt()
-    parts = [time_context]
+def build_runtime_context(*, include_memory: bool = True, include_editor: bool = True) -> str:
+    memory_context = format_for_prompt() if include_memory else ""
+    editor_context = get_editor_bridge().format_for_prompt() if include_editor else ""
+    parts = []
     if memory_context:
         parts.append(memory_context)
     if editor_context:
@@ -822,148 +852,23 @@ def build_runtime_context() -> str:
     return "\n\n".join(parts)
 
 
-def build_messages(user_message: str) -> list[dict]:
-    """Build chat messages with cached system prompt when memory hasn't changed."""
+def _cached_system_prompt(runtime_context: str) -> str:
     global _system_prompt_cache, _system_prompt_gen, _runtime_context_cache
 
-    runtime_context = build_runtime_context()
-    store = memory.get_store()
-    current_gen = store._prompt_cache_gen
-
-    if (
-        _system_prompt_cache is not None
-        and _system_prompt_gen == current_gen
-        and _runtime_context_cache == runtime_context
-    ):
-        system_prompt = _system_prompt_cache
-    else:
-        system_prompt = build_system_prompt(runtime_context)
-        _system_prompt_cache = system_prompt
-        _system_prompt_gen = current_gen
-        _runtime_context_cache = runtime_context
-
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
-
-
-def generate_stream(user_message: str, token_queue: queue.Queue) -> str:
-    messages = build_messages(user_message)
-
-    stream = LLM.create_chat_completion(
-        messages=messages,
-        max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
-        top_k=TOP_K,
-        top_p=TOP_P,
-        repeat_penalty=REPETITION_PENALTY,
-        stream=True,
-    )
-
-    full_response = []
-    for chunk in stream:
-        delta = chunk["choices"][0]["delta"]
-        if "content" in delta and delta["content"]:
-            token_queue.put(delta["content"])
-            full_response.append(delta["content"])
-
-    token_queue.put(None)
-    return "".join(full_response)
-
-
-def run_generation(user_message: str, token_queue: queue.Queue) -> str:
-    with _generation_lock:
-        raw_response = generate_stream(user_message, token_queue)
-
-    cleaned = parse_and_store_tags(raw_response)
-    return cleaned
-
-
-def generate_proactive(messages_history: list[dict]) -> str | None:
-    """Generate an unprompted comment based on memory/context and relationship."""
-    if not messages_history:
-        return None
-
-    from app.memory import get_relationship_context
-
-    runtime_context = build_runtime_context()
-    store = memory.get_store()
-
-    # Use cached system prompt if available
-    global _system_prompt_cache, _system_prompt_gen, _runtime_context_cache
+    store = get_store()
     current_gen = store._prompt_cache_gen
     if (
         _system_prompt_cache is not None
         and _system_prompt_gen == current_gen
         and _runtime_context_cache == runtime_context
     ):
-        system_prompt = _system_prompt_cache
-    else:
-        system_prompt = build_system_prompt(runtime_context)
-        _system_prompt_cache = system_prompt
-        _system_prompt_gen = current_gen
-        _runtime_context_cache = runtime_context
+        return _system_prompt_cache
 
-    rel_ctx = get_relationship_context()
-    familiarity = rel_ctx.get("familiarity", 0.0)
-
-    # Context-aware proactive styles based on relationship and recent conversation
-    if familiarity < 0.3:
-        # Stranger/early acquaintance - cautious, helpful
-        styles = [
-            "You have a gentle follow-up question or helpful thought. Keep it warm but brief. No tags.",
-            "Offer a small piece of encouragement or acknowledgement based on what they said.",
-            "Ask a simple clarifying question to show you're engaged.",
-        ]
-    elif familiarity < 0.6:
-        # Friend - more personal, occasional humor
-        styles = [
-            "Share a brief thought that just occurred to you based on the conversation.",
-            "Offer encouragement or a gentle observation. Be friendly.",
-            "Ask a follow-up question that shows you're actually listening.",
-            "Mention something you remember slightly, if relevant.",
-        ]
-    else:
-        # Close friend - casual, authentic, can tease lightly
-        styles = [
-            "Mutter a passing thought out loud. Be natural, like you're talking to a friend.",
-            "React naturally to what they said — agreement, surprise, concern, etc.",
-            "Ask a casual follow-up question, like you're genuinely curious.",
-            "Reference something from your memories if it's relevant. Feel like talking to someone you know well.",
-            "If they seem stuck or uncertain, offer a gentle nudge or encouraging word.",
-        ]
-
-    proactive_prompt = random.choice(styles)
-
-    # Use truncation to ensure we fit in context window
-    chat_messages = truncate_messages(
-        list(messages_history) if messages_history else [],
-        system_prompt,
-        proactive_prompt,
-        max_context_tokens=CHAT_HISTORY_CONTEXT_TOKENS
-    )
-
-    with _generation_lock:
-        result = LLM.create_chat_completion(
-            messages=chat_messages,
-            max_tokens=96,  # Slightly longer for better quality
-            temperature=0.8,  # More creative/less rigid
-            top_k=TOP_K,
-            top_p=TOP_P,
-            repeat_penalty=REPETITION_PENALTY,
-        )
-
-    raw = result["choices"][0]["message"]["content"].strip()
-    if not raw:
-        return None
-
-    cleaned = parse_and_store_tags(raw)
-    return cleaned if cleaned else None
-
-
-def flush_memories() -> None:
-    memory.flush_now()
+    system_prompt = build_system_prompt(runtime_context)
+    _system_prompt_cache = system_prompt
+    _system_prompt_gen = current_gen
+    _runtime_context_cache = runtime_context
+    return system_prompt
 
 
 def truncate_messages(messages: list[dict], system_prompt: str, user_message: str, max_context_tokens: int = CHAT_HISTORY_CONTEXT_TOKENS) -> list[dict]:
@@ -998,18 +903,24 @@ def truncate_messages(messages: list[dict], system_prompt: str, user_message: st
         chat_messages.append({"role": "user", "content": user_message})
         return chat_messages
 
-    # Need to truncate: remove oldest messages until we fit
-    # Keep messages in pairs (user + assistant) to maintain conversation structure
-    trimmed = []
+    # Need to truncate: keep the most recent conversation first, while trying
+    # to preserve complete recent exchanges instead of a random cutoff.
+    trimmed: list[dict] = []
     current_tokens = 0
+    min_recent_messages = min(len(messages_list), 6)
 
-    for msg in reversed(messages_list):
+    for index in range(len(messages_list) - 1, -1, -1):
+        msg = messages_list[index]
         msg_tokens = len(msg.get("content", "")) // 4
         if current_tokens + msg_tokens <= available_for_history:
-            trimmed.insert(0, msg)  # Insert at beginning to maintain order
+            trimmed.insert(0, msg)
             current_tokens += msg_tokens
-        else:
-            break
+            continue
+        if len(trimmed) < min_recent_messages:
+            trimmed.insert(0, msg)
+            current_tokens += msg_tokens
+            continue
+        break
 
     # Build final message list
     chat_messages = [{"role": "system", "content": system_prompt}]

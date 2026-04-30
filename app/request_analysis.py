@@ -2,148 +2,186 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 from app.codebase_search import CodebaseSearch
 
-FILE_REF_PATTERN = re.compile(r"([A-Za-z0-9_./-]+\.[A-Za-z0-9_]+)")
-_WORD_PATTERN = re.compile(r"[A-Za-z0-9_]+")
-_CODING_REQUEST_PATTERN = re.compile(
-    r"\b(code|coding|program|function|class|method|script|module|file|vscode|debug|fix|bug|refactor|edit|change|rewrite|implement|add|create|write|save|format|patch|python|javascript|typescript|js|ts|html|css|json|yaml|toml|regex|sql)\b",
-    re.IGNORECASE,
-)
-_OPEN_VSCODE_REQUEST_PATTERN = re.compile(
-    r"\b(open|launch|start)\b.*\b(vs\s*code|vscode|project|workspace)\b",
-    re.IGNORECASE,
-)
-_CODEBASE_REQUEST_PATTERN = re.compile(
-    r"\b(look at|check|inspect|review|read|open|source|codebase|implementation|in my code|in the code|in the project|file|files)\b",
-    re.IGNORECASE,
-)
-_FOLLOWUP_REFERENCE_PATTERN = re.compile(
-    r"\b(it|this|that|those|them|same|specific|that one|this one|do that|fix that|change that|improve that)\b",
-    re.IGNORECASE,
-)
-_REFERENTIAL_FOLLOWUP_PATTERN = re.compile(
-    r"\b(?:it|that|this|those|them|the first one|the second one|that one|this one|same one)\b",
-    re.IGNORECASE,
-)
-_EXPLANATION_FOLLOWUP_PATTERN = re.compile(
-    r"\b(?:talk more about|more about|explain|go deeper on|expand on|tell me more about|what about)\b",
-    re.IGNORECASE,
-)
-_AFFIRMATION_PATTERN = re.compile(
-    r"^\s*(?:yes|yeah|yep|sure|ok|okay|please|do it|go ahead|show me|sounds good|let's do it)\s*[.!?]*\s*$",
-    re.IGNORECASE,
-)
-_AFFIRMATION_PREFIX_PATTERN = re.compile(
-    r"^\s*(?:yes|yeah|yep|sure|ok|okay|please|sounds good|go ahead|do it|do that|show me)\b",
-    re.IGNORECASE,
-)
-_ASSISTANT_OFFER_PATTERN = re.compile(
-    r"\b(?:would you like me|want me to|do you want me to|should i|can i|i can show|i can sketch|i can rewrite|i can walk you through|i can do that)\b",
-    re.IGNORECASE,
-)
-_ACTION_OFFER_PATTERN = re.compile(
-    r"\b(?:i(?:'|’)ll|i will|i can|want me to|do you want me to|should i|would you like me to)\b",
-    re.IGNORECASE,
-)
-_ACTION_VERB_PATTERN = re.compile(
-    r"\b(?:apply|change|edit|rewrite|update|fix|merge|implement|patch|make|refactor|replace|write)\b",
-    re.IGNORECASE,
-)
-_EXECUTION_REQUEST_PATTERN = re.compile(
-    r"\b(?:do it|do that|make the change|make those changes|apply it|apply that|change it|edit it|fix it|rewrite it|merge them|update the file|actually do it|actually change it)\b",
-    re.IGNORECASE,
-)
-_DETAIL_REQUEST_PATTERN = re.compile(
-    r"\b(detail|details|deeper|deep dive|full|full breakdown|walk through|walkthrough|show me|explain more|longer|full analysis)\b",
-    re.IGNORECASE,
-)
-_SUGGESTION_REQUEST_PATTERN = re.compile(
-    r"\b(suggest|suggestion|suggestions|improve|improvement|improvements|recommend|recommendation|recommendations|what should i change|how should i change|how can i improve)\b",
-    re.IGNORECASE,
-)
-_QUESTION_START_PATTERN = re.compile(
-    r"^\s*(?:how|why|what|when|where|who|which|can|could|would|should|do|does|did|is|are)\b",
-    re.IGNORECASE,
-)
-_TOPIC_SHIFT_PATTERN = re.compile(
-    r"\b(?:also|instead|switching|different|another|new topic|separately|unrelated|by the way|on a different note)\b",
-    re.IGNORECASE,
-)
-_BRAINSTORM_TOKENS = {
-    "idea",
-    "ideas",
-    "feature",
-    "features",
-    "brainstorm",
-    "integration",
-    "integrate",
-    "chrome",
-    "game",
-    "games",
-    "goal",
-    "companion",
-    "vtuber",
-    "access",
-    "ability",
-    "abilities",
-    "workflow",
+_FILE_SUFFIXES = {
+    ".py", ".js", ".ts", ".json", ".md", ".tsx", ".jsx", ".toml", ".yaml", ".yml",
+    ".css", ".html", ".sql", ".txt", ".sh",
 }
-_PLANNING_TOKENS = {
-    "add",
-    "build",
-    "make",
-    "create",
-    "use",
-    "do",
-    "thinking",
-    "think",
-    "improve",
-    "expand",
-}
-_SMALLTALK_TOKENS = {
-    "hello",
-    "hi",
-    "hey",
-    "yo",
-    "sup",
-    "morning",
-    "afternoon",
-    "evening",
-    "night",
-    "thanks",
-    "thank",
-    "cool",
-    "nice",
-    "awesome",
-    "lol",
-    "lmao",
-    "bye",
-    "goodbye",
-}
-_INTERROGATIVE_STARTERS = {
-    "how",
-    "why",
-    "what",
-    "when",
-    "where",
-    "who",
-    "which",
-    "can",
-    "could",
-    "would",
-    "should",
-    "do",
-    "does",
-    "did",
-    "is",
-    "are",
+_FOLLOWUP_REFERENCE_TOKENS = {"it", "this", "that", "those", "them", "same", "specific"}
+_QUESTION_STARTERS = {
+    "how", "why", "what", "when", "where", "who", "which", "can", "could", "would",
+    "should", "do", "does", "did", "is", "are",
 }
 _FIRST_PERSON_SUBJECTS = {"i", "we", "my", "our"}
 _ASSISTANT_TARGET_TOKENS = {"you", "akane"}
+
+
+def _normalize(text: str) -> str:
+    return " ".join(str(text or "").replace("’", "'").lower().split())
+
+
+def _word_tokens(text: str) -> list[str]:
+    chars: list[str] = []
+    tokens: list[str] = []
+    for ch in str(text or "").lower():
+        if ch.isalnum() or ch in {"_", ".", "/", "-"}:
+            chars.append(ch)
+        elif chars:
+            tokens.append("".join(chars))
+            chars = []
+    if chars:
+        tokens.append("".join(chars))
+    return tokens
+
+
+def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(phrase in text for phrase in phrases)
+
+
+def _contains_any_token(tokens: set[str], expected: set[str]) -> bool:
+    return bool(tokens & expected)
+
+
+def _starts_with_any(text: str, prefixes: tuple[str, ...]) -> bool:
+    return any(text.startswith(prefix) for prefix in prefixes)
+
+
+def _strip_trailing_punct(text: str) -> str:
+    return text.rstrip(" \t\r\n.!?,;:")
+
+
+def _starts_with_token_stem(token: str, stems: tuple[str, ...]) -> bool:
+    return any(token.startswith(stem) for stem in stems)
+
+
+def _is_pathish_token(token: str) -> bool:
+    return "/" in token or any(token.endswith(suffix) for suffix in _FILE_SUFFIXES)
+
+
+def _looks_like_code_token(token: str) -> bool:
+    return (
+        _is_pathish_token(token)
+        or "_" in token
+        or token in {"py", "js", "ts", "json", "yaml", "yml", "toml", "html", "css", "sql", "vscode"}
+        or _starts_with_token_stem(
+            token,
+            ("code", "file", "func", "clas", "meth", "scri", "modu", "debug", "bug", "fix",
+             "refa", "edit", "rewr", "impl", "patc", "writ", "format", "regex", "python", "java", "type"),
+        )
+    )
+
+
+def _looks_like_codebase_request(lowered: str, tokens: list[str], explicit_file_reference: bool) -> bool:
+    if explicit_file_reference or any(_looks_like_code_token(token) for token in tokens):
+        return True
+    if not tokens:
+        return False
+    first = tokens[0]
+    return first in {"look", "check", "inspect", "review", "read", "open"} and any(
+        token in {"code", "project", "source", "file", "files", "implementation"} for token in tokens[1:6]
+    )
+
+
+def _looks_like_open_editor(lowered: str, tokens: list[str]) -> bool:
+    if not tokens or tokens[0] not in {"open", "launch", "start"}:
+        return False
+    return "vscode" in tokens or ("vs" in tokens and "code" in tokens) or "project" in tokens or "workspace" in tokens
+
+
+def _looks_like_affirmation(lowered: str, tokens: list[str]) -> bool:
+    if not lowered or len(tokens) > 5:
+        return False
+    if lowered in {"yes", "yeah", "yep", "sure", "ok", "okay", "please"}:
+        return True
+    if not tokens:
+        return False
+    first = tokens[0]
+    return first in {"yes", "yeah", "yep", "sure", "ok", "okay", "please"} or (
+        len(tokens) <= 3 and first in {"do", "go", "show"}
+    )
+
+
+def _looks_like_assistant_offer(lowered: str, tokens: list[str]) -> bool:
+    if "?" not in lowered:
+        return False
+    if lowered.startswith(("can i ", "should i ", "want me ", "would you like me", "do you want me")):
+        return True
+    return lowered.startswith(("i can ", "i'll ", "i will "))
+
+
+def _looks_like_explanation_followup(lowered: str, tokens: list[str]) -> bool:
+    if lowered.startswith(("what about", "how about")):
+        return True
+    return any(_starts_with_token_stem(token, ("explain", "deeper", "expand", "detail", "more")) for token in tokens)
+
+
+def _looks_like_execution_request(lowered: str, tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    first = tokens[0]
+    if first in {"do", "make", "apply", "change", "edit", "fix", "rewrite", "merge", "update"}:
+        return True
+    return len(tokens) <= 4 and any(
+        _starts_with_token_stem(token, ("apply", "chang", "edit", "fix", "rewr", "merge", "updat", "make"))
+        for token in tokens
+    )
+
+
+def _looks_like_action_verb(token: str) -> bool:
+    return _starts_with_token_stem(token, ("apply", "chang", "edit", "rewr", "updat", "fix", "merge", "impl", "patch", "make", "refa", "repl", "writ"))
+
+
+def _looks_like_detail_request(lowered: str, tokens: list[str]) -> bool:
+    if "full " in lowered:
+        return True
+    return any(_starts_with_token_stem(token, ("detail", "deep", "walk", "long", "explain")) for token in tokens)
+
+
+def _looks_like_suggestion_request(lowered: str, tokens: list[str]) -> bool:
+    if lowered.startswith(("what should", "how should", "how can")):
+        return True
+    return any(_starts_with_token_stem(token, ("suggest", "improv", "recommend")) for token in tokens)
+
+
+def _looks_like_topic_shift(lowered: str, tokens: list[str]) -> bool:
+    if lowered.startswith(("by the way", "on a different", "new topic")):
+        return True
+    return bool(tokens and tokens[0] in {"also", "instead", "switching", "different", "another", "separately", "unrelated"})
+
+
+def _looks_like_self_identity_question(tokens: list[str]) -> bool:
+    if not tokens or tokens[0] not in {"who", "what"}:
+        return False
+    return (
+        "you" in tokens
+        or "your" in tokens
+        or any(_starts_with_token_stem(token, ("name", "creat", "made")) for token in tokens[1:5])
+    )
+
+
+def _looks_like_contextual_continuation_prefix(lowered: str, tokens: list[str]) -> bool:
+    if lowered.startswith(("what about", "how about")):
+        return True
+    return bool(tokens and tokens[0] in {"and", "also", "so", "then", "anyway", "okay", "ok", "right", "wait", "plus"})
+
+
+def _looks_like_brainstorm_tokens(tokens: set[str], lowered: str) -> bool:
+    planning = sum(1 for token in tokens if _starts_with_token_stem(token, ("add", "build", "make", "creat", "use", "think", "improv", "expand")))
+    ideation = sum(1 for token in tokens if _starts_with_token_stem(token, ("idea", "feature", "brain", "integrat", "goal", "workflow", "companion", "vtuber", "access", "abilit", "game", "chrome")))
+    return "?" in lowered or ideation >= 1 and planning >= 1
+
+
+def _looks_like_smalltalk_tokens(tokens: set[str], lowered: str) -> bool:
+    if lowered in {"hello", "hi", "hey", "thanks", "thank you", "good morning", "good afternoon", "good evening"}:
+        return True
+    return bool(tokens) and len(tokens) <= 3 and all(
+        token in {"hello", "hi", "hey", "yo", "sup", "morning", "afternoon", "evening", "night",
+                  "thanks", "thank", "cool", "nice", "awesome", "lol", "lmao", "bye", "goodbye"}
+        for token in tokens
+    )
 
 
 @dataclass(frozen=True)
@@ -198,94 +236,82 @@ class RequestAnalyzer:
     def extract_query_tokens(self, text: str) -> list[str]:
         return self.search.extract_query_tokens(text)
 
+    def extract_file_refs(self, text: str) -> list[str]:
+        refs: list[str] = []
+        seen: set[str] = set()
+        for token in _word_tokens(text):
+            cleaned = token.strip("`'\".,:;()[]{}")
+            if not cleaned:
+                continue
+            if "/" in cleaned or any(cleaned.endswith(suffix) for suffix in _FILE_SUFFIXES):
+                if cleaned not in seen:
+                    seen.add(cleaned)
+                    refs.append(cleaned)
+        return refs
+
     def has_recent_topic_overlap(self, user_input: str, recent_text: str) -> bool:
-        return self.search.has_recent_topic_overlap(user_input, recent_text)
+        current_tokens = set(self.extract_query_tokens(user_input))
+        recent_tokens = set(self.extract_query_tokens(recent_text))
+        if not current_tokens or not recent_tokens:
+            return False
+        return bool(current_tokens & recent_tokens)
 
     def is_affirmative_followup(self, text: str) -> bool:
-        lowered = str(text or "").strip().lower()
+        lowered = _strip_trailing_punct(_normalize(text))
         if not lowered:
             return False
-        return bool(_AFFIRMATION_PATTERN.match(lowered) or _AFFIRMATION_PREFIX_PATTERN.match(lowered))
+        return _looks_like_affirmation(lowered, _word_tokens(lowered))
 
     def assistant_invited_continuation(self, text: str) -> bool:
         message = str(text or "").strip()
         if not message or "?" not in message:
             return False
-        lowered = message.lower()
-        if _ASSISTANT_OFFER_PATTERN.search(lowered):
-            return True
-        return bool(_ACTION_OFFER_PATTERN.search(lowered) and _ACTION_VERB_PATTERN.search(lowered))
+        lowered = _normalize(message)
+        return _looks_like_assistant_offer(lowered, _word_tokens(lowered))
 
     def has_explicit_file_reference(self, text: str) -> bool:
-        if FILE_REF_PATTERN.search(str(text or "")):
-            return True
-        lowered = str(text or "").lower()
-        return any(token in lowered for token in (".py", ".js", ".ts", ".json", ".md", ".tsx", ".jsx", ".toml", ".yaml", ".yml"))
+        return bool(self.extract_file_refs(text))
 
-    def _token_count(self, text: str) -> int:
-        return len(_WORD_PATTERN.findall(str(text or "")))
-
-    def _token_set(self, query_tokens: tuple[str, ...]) -> set[str]:
-        return {token.lower() for token in query_tokens if token}
-
-    def _shape_tokens(self, text: str) -> list[str]:
-        return [token.lower() for token in _WORD_PATTERN.findall(str(text or "")) if token]
-
-    def _starts_with_first_person_update(self, tokens: list[str]) -> bool:
+    @staticmethod
+    def _starts_with_first_person_update(tokens: list[str]) -> bool:
         if not tokens:
             return False
         first = tokens[0]
         if first in _FIRST_PERSON_SUBJECTS:
             return True
-        if first.startswith("i") and len(first) <= 3:
-            return True
-        if first.startswith("we") and len(first) <= 4:
-            return True
-        return False
+        return (first.startswith("i") and len(first) <= 3) or (first.startswith("we") and len(first) <= 4)
 
-    def _looks_like_direct_assistant_request(self, tokens: list[str]) -> bool:
+    @staticmethod
+    def _looks_like_direct_assistant_request(tokens: list[str]) -> bool:
         if not tokens:
             return False
         if "please" in tokens:
             return True
-        if tokens[0] in _INTERROGATIVE_STARTERS:
+        if tokens[0] in _QUESTION_STARTERS:
             return True
         return any(token in _ASSISTANT_TARGET_TOKENS for token in tokens[:5])
 
     def _has_code_context(self, snapshot: RequestSnapshot, last_assistant: str) -> bool:
-        if snapshot.recent_code_targets or snapshot.active_file:
-            return True
-        context_text = " ".join(part for part in (snapshot.last_user, last_assistant, snapshot.recent_text) if part)
-        return bool(
-            context_text
-            and (
-                _CODING_REQUEST_PATTERN.search(context_text)
-                or _CODEBASE_REQUEST_PATTERN.search(context_text)
-            )
-        )
+        context_text = _normalize(" ".join(part for part in (snapshot.last_user, last_assistant) if part))
+        if not context_text:
+            return False
+        context_tokens = _word_tokens(context_text)
+        return _looks_like_codebase_request(context_text, context_tokens, False)
 
     def _looks_like_topic_shift(self, user_input: str, snapshot: RequestSnapshot) -> bool:
-        lowered = str(user_input or "").lower().strip()
+        lowered = _normalize(user_input)
         if not lowered:
             return False
-        if _TOPIC_SHIFT_PATTERN.search(lowered):
+        current_tokens = set(_word_tokens(lowered))
+        if _looks_like_topic_shift(lowered, list(current_tokens)):
             return True
-        recent_context = " ".join(
-            part for part in (snapshot.last_user, snapshot.last_assistant, snapshot.recent_text) if part
-        )
+        recent_context = _normalize(" ".join(part for part in (snapshot.last_user, snapshot.last_assistant, snapshot.recent_text) if part))
         if not recent_context:
             return False
-        recent_coding = bool(
-            _CODING_REQUEST_PATTERN.search(recent_context)
-            or _CODEBASE_REQUEST_PATTERN.search(recent_context)
-        )
-        current_coding = bool(
-            _CODING_REQUEST_PATTERN.search(lowered)
-            or _CODEBASE_REQUEST_PATTERN.search(lowered)
-        )
-        if recent_coding != current_coding and self._token_count(user_input) >= 5:
-            return True
-        return False
+        recent_tokens = set(_word_tokens(recent_context))
+        recent_coding = _looks_like_codebase_request(recent_context, list(recent_tokens), False)
+        current_coding = _looks_like_codebase_request(lowered, list(current_tokens), False)
+        return recent_coding != current_coding and len(current_tokens) >= 5
 
     def _looks_like_brainstorm(
         self,
@@ -298,29 +324,9 @@ class RequestAnalyzer:
     ) -> bool:
         if codebase_direct or explicit_file_reference or wants_execution:
             return False
-        lowered = str(user_input or "").lower()
-        tokens = self._token_set(query_tokens)
-        brainstorming_hits = len(tokens & _BRAINSTORM_TOKENS)
-        planning_hits = len(tokens & _PLANNING_TOKENS)
-        phrase_hits = sum(
-            1
-            for phrase in (
-                "what else can i",
-                "what other things can i",
-                "is this a good idea",
-                "what do you think",
-                "thinking about",
-                "maybe a way to",
-                "could i add",
-                "should i add",
-            )
-            if phrase in lowered
-        )
-        return bool(
-            phrase_hits >= 1
-            or (brainstorming_hits >= 1 and planning_hits >= 1)
-            or ("vscode" in tokens and brainstorming_hits >= 1)
-        )
+        lowered = _normalize(user_input)
+        tokens = set(query_tokens)
+        return _looks_like_brainstorm_tokens(tokens, lowered)
 
     def _looks_like_smalltalk(
         self,
@@ -335,13 +341,11 @@ class RequestAnalyzer:
     ) -> bool:
         if coding or explicit_file_reference or followup_reference or explanation_followup or affirmative_followup:
             return False
-        tokens = self._token_set(query_tokens)
+        tokens = set(query_tokens)
         if not tokens:
             return False
-        if len(tokens) <= 3 and tokens <= _SMALLTALK_TOKENS:
-            return True
-        lowered = str(user_input or "").lower().strip()
-        return lowered in {"hello", "hi", "hey", "thanks", "thank you", "good morning", "good afternoon", "good evening"}
+        lowered = _normalize(user_input)
+        return _looks_like_smalltalk_tokens(tokens, lowered)
 
     def _looks_like_status_update(
         self,
@@ -354,49 +358,96 @@ class RequestAnalyzer:
     ) -> bool:
         if explicit_file_reference or codebase_direct or wants_execution:
             return False
-        lowered = str(user_input or "").lower().strip()
+        lowered = _normalize(user_input)
         if not lowered or "?" in lowered:
             return False
-        shape_tokens = self._shape_tokens(user_input)
+        shape_tokens = _word_tokens(user_input)
         if not self._starts_with_first_person_update(shape_tokens):
             return False
         if self._looks_like_direct_assistant_request(shape_tokens):
             return False
-        if shape_tokens and shape_tokens[0] in _INTERROGATIVE_STARTERS:
+        return not (shape_tokens and shape_tokens[0] in _QUESTION_STARTERS)
+
+    def _looks_like_contextual_continuation(
+        self,
+        user_input: str,
+        *,
+        topic_shift: bool,
+        coding: bool,
+        explicit_file_reference: bool,
+    ) -> bool:
+        if topic_shift or coding or explicit_file_reference:
             return False
-        return True
+        lowered = _normalize(user_input)
+        if not lowered:
+            return False
+        tokens = _word_tokens(user_input)
+        if _looks_like_contextual_continuation_prefix(lowered, tokens):
+            return True
+        return bool(tokens and len(tokens) <= 14 and any(token in {"too", "though", "still", "instead", "that", "this", "it"} for token in tokens[:5]))
+
+    def _looks_like_short_question_continuation(
+        self,
+        user_input: str,
+        *,
+        topic_shift: bool,
+        coding: bool,
+        explicit_file_reference: bool,
+        topic_overlap: bool,
+    ) -> bool:
+        if topic_shift or coding or explicit_file_reference:
+            return False
+        lowered = _normalize(user_input)
+        if not lowered:
+            return False
+        tokens = _word_tokens(lowered)
+        if not tokens or len(tokens) > 8 or tokens[0] not in _QUESTION_STARTERS:
+            return False
+        if topic_overlap:
+            return True
+        if len(tokens) <= 3:
+            return True
+        return any(token in _FOLLOWUP_REFERENCE_TOKENS for token in tokens[1:6])
 
     def analyze(self, user_input: str, snapshot: RequestSnapshot) -> RequestAnalysis:
-        lowered = str(user_input or "").lower().strip()
+        lowered = _normalize(user_input)
         last_assistant = str(snapshot.last_assistant or "").strip()
         last_user = str(snapshot.last_user or "").strip()
         query_tokens = tuple(self.extract_query_tokens(user_input))
+        tokens = _word_tokens(lowered)
+        token_set = set(tokens)
+        token_count = len(tokens)
+        wants_execution = False
+        self_identity_request = _looks_like_self_identity_question(tokens)
 
-        open_vscode = bool(_OPEN_VSCODE_REQUEST_PATTERN.search(lowered))
+        open_vscode = _looks_like_open_editor(lowered, tokens)
         explicit_file_reference = self.has_explicit_file_reference(user_input)
-        codebase_direct = bool(explicit_file_reference or _CODEBASE_REQUEST_PATTERN.search(lowered))
-        coding = bool(_CODING_REQUEST_PATTERN.search(lowered) or codebase_direct)
+        codebase_direct = _looks_like_codebase_request(lowered, tokens, explicit_file_reference)
+        coding = bool(codebase_direct or any(_looks_like_code_token(token) for token in tokens))
 
-        referential_followup = bool(_REFERENTIAL_FOLLOWUP_PATTERN.search(lowered))
-        followup_reference = bool(_FOLLOWUP_REFERENCE_PATTERN.search(lowered) or referential_followup)
-        explanation_followup = bool(_EXPLANATION_FOLLOWUP_PATTERN.search(lowered))
+        referential_followup = bool(
+            _contains_any_token(token_set, {"it", "that", "this", "those", "them", "same"})
+            or lowered.startswith(("the first", "the second"))
+        )
+        followup_reference = bool(
+            referential_followup
+            or _contains_any_token(token_set, _FOLLOWUP_REFERENCE_TOKENS)
+            or (len(tokens) >= 2 and tokens[0] in {"do", "fix", "change", "improve"} and tokens[1] in _FOLLOWUP_REFERENCE_TOKENS)
+        )
+        explanation_followup = _looks_like_explanation_followup(lowered, tokens)
         affirmative_followup = self.is_affirmative_followup(user_input)
-        short_followup = self._token_count(user_input) <= 10
+        short_followup = token_count <= 10
         assistant_invited_continuation = self.assistant_invited_continuation(last_assistant)
         recent_context = " ".join(part for part in (last_user, last_assistant, snapshot.recent_text) if part)
         topic_overlap = self.has_recent_topic_overlap(user_input, recent_context)
         has_code_context = self._has_code_context(snapshot, last_assistant)
         topic_shift = self._looks_like_topic_shift(user_input, snapshot)
-        ambiguous_followup = bool(
-            followup_reference
-            or affirmative_followup
-            or explanation_followup
-            or short_followup
-            or len(query_tokens) <= 4
-        )
+        ambiguous_followup = bool(followup_reference or affirmative_followup or explanation_followup or short_followup or len(query_tokens) <= 4)
+        shape_tokens = tokens
         explicit_new_question = bool(
-            self._token_count(user_input) >= 4
-            and _QUESTION_START_PATTERN.search(lowered)
+            token_count >= 4
+            and bool(shape_tokens)
+            and shape_tokens[0] in _QUESTION_STARTERS
             and not followup_reference
             and not affirmative_followup
             and not explanation_followup
@@ -406,7 +457,7 @@ class RequestAnalyzer:
         explicit_new_subject = bool(
             has_code_context
             and coding
-            and self._token_count(user_input) >= 4
+            and token_count >= 4
             and not explicit_file_reference
             and not followup_reference
             and not affirmative_followup
@@ -417,11 +468,53 @@ class RequestAnalyzer:
             topic_shift = True
         if followup_reference or affirmative_followup or explanation_followup:
             topic_shift = False
+        contextual_continuation = self._looks_like_contextual_continuation(
+            user_input,
+            topic_shift=topic_shift,
+            coding=coding,
+            explicit_file_reference=explicit_file_reference,
+        )
+        short_question_continuation = self._looks_like_short_question_continuation(
+            user_input,
+            topic_shift=topic_shift,
+            coding=coding,
+            explicit_file_reference=explicit_file_reference,
+            topic_overlap=topic_overlap,
+        )
+        if short_question_continuation:
+            topic_shift = False
+        if has_code_context and _looks_like_execution_request(lowered, tokens):
+            wants_execution = True
+        elif has_code_context and any(_looks_like_action_verb(token) for token in token_set):
+            execution_score = 0
+            if followup_reference:
+                execution_score += 2
+            if affirmative_followup:
+                execution_score += 1
+            if topic_overlap:
+                execution_score += 1
+            if short_followup:
+                execution_score += 1
+            if assistant_invited_continuation:
+                execution_score += 1
+            wants_execution = execution_score >= 2
+
+        wants_detail = _looks_like_detail_request(lowered, tokens)
+        wants_single_suggestion = _looks_like_suggestion_request(lowered, tokens) and not wants_detail
+
+        code_followup_signal = bool(
+            coding
+            or explicit_file_reference
+            or followup_reference
+            or explanation_followup
+            or affirmative_followup
+            or wants_execution
+            or wants_detail
+            or wants_single_suggestion
+            or topic_overlap
+        )
         code_context_carry = bool(
-            has_code_context
-            and not topic_shift
-            and not explicit_file_reference
-            and (coding or ambiguous_followup or topic_overlap)
+            has_code_context and not topic_shift and not explicit_file_reference and code_followup_signal
         )
 
         carry_score = 0
@@ -437,11 +530,25 @@ class RequestAnalyzer:
             carry_score += 1
         if len(query_tokens) <= 2:
             carry_score += 1
+        if contextual_continuation:
+            carry_score += 2
+        if short_question_continuation:
+            carry_score += 2
         should_carry_last_reply = bool(last_assistant or last_user) and (
-            (carry_score >= 2 and not topic_shift)
-            or (ambiguous_followup and not topic_shift)
-            or code_context_carry
+            (carry_score >= 2 and not topic_shift) or (ambiguous_followup and not topic_shift) or code_context_carry
         )
+
+        conversational_carry = bool(
+            (last_assistant or last_user)
+            and not topic_shift
+            and not coding
+            and not codebase_direct
+            and not explicit_file_reference
+            and not wants_execution
+            and (short_followup or topic_overlap or assistant_invited_continuation or contextual_continuation or short_question_continuation or len(query_tokens) <= 16)
+        )
+        if conversational_carry:
+            should_carry_last_reply = True
 
         followup_score = 0
         if has_code_context:
@@ -457,38 +564,15 @@ class RequestAnalyzer:
                 followup_score += 1
             if assistant_invited_continuation:
                 followup_score += 1
-            if len(query_tokens) <= 4 and (_ACTION_VERB_PATTERN.search(lowered) or coding):
+            if contextual_continuation:
+                followup_score += 1
+            if len(query_tokens) <= 4 and (any(_looks_like_action_verb(token) for token in token_set) or coding):
                 followup_score += 1
         codebase_followup = bool(
-            has_code_context
-            and not open_vscode
-            and not topic_shift
-            and (
-                followup_score >= 2
-                or code_context_carry
-                or (assistant_invited_continuation and ambiguous_followup)
+            has_code_context and not open_vscode and not topic_shift and code_followup_signal and (
+                followup_score >= 2 or code_context_carry or (assistant_invited_continuation and ambiguous_followup)
             )
         )
-
-        wants_execution = False
-        if has_code_context and _EXECUTION_REQUEST_PATTERN.search(lowered):
-            wants_execution = True
-        elif has_code_context and _ACTION_VERB_PATTERN.search(lowered):
-            execution_score = 0
-            if followup_reference:
-                execution_score += 2
-            if affirmative_followup:
-                execution_score += 1
-            if topic_overlap:
-                execution_score += 1
-            if short_followup:
-                execution_score += 1
-            if assistant_invited_continuation:
-                execution_score += 1
-            wants_execution = execution_score >= 2
-
-        wants_detail = bool(_DETAIL_REQUEST_PATTERN.search(lowered))
-        wants_single_suggestion = bool(_SUGGESTION_REQUEST_PATTERN.search(lowered)) and not wants_detail
         wants_brainstorm = self._looks_like_brainstorm(
             user_input,
             query_tokens,
@@ -519,17 +603,18 @@ class RequestAnalyzer:
                 should_carry_last_reply = True
         should_force_vscode = bool(
             open_vscode
-            or (
-                snapshot.editor_connected
-                and (
-                    wants_execution
-                    or (coding and not wants_brainstorm and not (codebase_direct or codebase_followup))
-                )
-            )
+            or (snapshot.editor_connected and (wants_execution or (coding and not wants_brainstorm and not (codebase_direct or codebase_followup))))
         )
         if looks_like_status_update:
             coding = False
             codebase_followup = False
+            should_force_vscode = False
+        if self_identity_request:
+            coding = False
+            codebase_direct = False
+            codebase_followup = False
+            wants_execution = False
+            should_carry_last_reply = False
             should_force_vscode = False
 
         return RequestAnalysis(
@@ -568,7 +653,7 @@ class RequestAnalyzer:
             recent_texts.append(snapshot.last_user)
         return self.search.candidate_paths(
             user_input,
-            file_ref_pattern=FILE_REF_PATTERN,
+            file_refs=self.extract_file_refs(user_input),
             recent_targets=list(snapshot.recent_code_targets),
             active_file=snapshot.active_file,
             open_tabs=list(snapshot.open_tabs[:5]),

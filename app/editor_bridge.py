@@ -113,6 +113,8 @@ class EditorBridge:
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._next_action_id = 1
+        self._prompt_cache = ""
+        self._prompt_cache_dirty = True
         self._context = {
             "connected": False,
             "client": "",
@@ -138,6 +140,9 @@ class EditorBridge:
         }
         self._actions: list[dict] = []
         self._results = deque(maxlen=12)
+
+    def _mark_prompt_dirty(self) -> None:
+        self._prompt_cache_dirty = True
 
     def _build_preview_meta(self, command: str, argument: str) -> dict:
         preview: dict = {}
@@ -284,6 +289,7 @@ class EditorBridge:
                     "updated_at": _now_iso(),
                 }
             )
+            self._mark_prompt_dirty()
             return self._snapshot_unlocked()
 
     def snapshot(self) -> dict:
@@ -308,6 +314,7 @@ class EditorBridge:
             }
             self._next_action_id += 1
             self._actions.append(action)
+            self._mark_prompt_dirty()
             self._condition.notify_all()
             return action.copy()
 
@@ -337,6 +344,7 @@ class EditorBridge:
                 action["approved_at"] = _now_iso()
                 approved.append(action.copy())
             if approved:
+                self._mark_prompt_dirty()
                 self._condition.notify_all()
             return approved
 
@@ -360,6 +368,7 @@ class EditorBridge:
                 self._results.appendleft(summary)
                 rejected.append(action.copy())
             if rejected:
+                self._mark_prompt_dirty()
                 self._condition.notify_all()
             return rejected
 
@@ -383,6 +392,7 @@ class EditorBridge:
                     "completed_at": action["completed_at"],
                 }
                 self._results.appendleft(summary)
+                self._mark_prompt_dirty()
                 self._condition.notify_all()
                 return summary
             return None
@@ -418,10 +428,12 @@ class EditorBridge:
         with self._lock:
             if not self._context["connected"]:
                 return ""
+            if not self._prompt_cache_dirty:
+                return self._prompt_cache
 
             lines = [
-                "EDITOR CONTEXT:",
-                "- VS Code is connected through a local editor bridge.",
+                "System Context:",
+                "- VS Code is open and connected through the local editor bridge.",
             ]
 
             if self._context["workspace_name"]:
@@ -486,7 +498,9 @@ class EditorBridge:
                         f"  • {action['command']}: {_trim_text(label or str(action.get('argument', '')), 180)}"
                     )
 
-            return "\n".join(lines)
+            self._prompt_cache = "\n".join(lines)
+            self._prompt_cache_dirty = False
+            return self._prompt_cache
 
 
 _BRIDGE = EditorBridge()

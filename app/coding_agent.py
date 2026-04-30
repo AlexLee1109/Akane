@@ -46,6 +46,11 @@ _DEFERRED_SUMMARY_PATTERN = re.compile(
     r"(?:look|check|inspect|review|read|figure out|understand|analyze|see)\b",
     re.IGNORECASE,
 )
+_META_SUMMARY_PATTERN = re.compile(
+    r"\b(?:summary|done|read_requests|actions|reason|json|schema|return json|set done|provide suggestions|"
+    r"the user asks|the user asked|we need to output json|we have already read|without any actions)\b",
+    re.IGNORECASE,
+)
 _BLOCKER_PATTERN = re.compile(
     r"\b(?:blocked|missing|need|can't|cannot|unable|not enough|unclear|ambiguous|no file|no path|no code)\b",
     re.IGNORECASE,
@@ -167,6 +172,30 @@ def _render_action_results(results: list[dict]) -> str:
         outcome = item.get("result") if item.get("ok") else item.get("error") or "failed"
         lines.append(f"- {item.get('command', 'action')}: {outcome}")
     return "\n".join(lines)
+
+
+def _append_coder_feedback(messages: list[dict], raw: str, instruction: str) -> None:
+    messages.extend(
+        [
+            {"role": "assistant", "content": raw or "{}"},
+            {"role": "system", "content": instruction},
+        ]
+    )
+
+
+def _fresh_reads_system_message(results: list[str]) -> str:
+    return (
+        f"{_render_read_results(results)}\n\n"
+        "Those fresh reads are now the current source of truth."
+    )
+
+
+def _post_action_system_message(results: list[dict], verification_reads: list[str]) -> str:
+    return (
+        f"{_render_action_results(results)}\n\n{_render_read_results(verification_reads)}\n\n"
+        "Those are the latest action results and fresh post-edit reads. "
+        "Use them as the source of truth and now return your final JSON result."
+    )
 
 
 def _grounding_terms_for_paths(paths: list[str]) -> set[str]:
@@ -295,11 +324,76 @@ def _looks_like_deferred_summary(summary: str) -> bool:
     return bool(_DEFERRED_SUMMARY_PATTERN.search(text))
 
 
+def _looks_like_meta_summary(summary: str) -> bool:
+    text = collapse_hidden_tag_gaps(str(summary or "")).strip()
+    if not text:
+        return False
+    if _META_SUMMARY_PATTERN.search(text):
+        return True
+    lowered = text.lower()
+    return (
+        lowered.startswith("1.")
+        or lowered.startswith("2.")
+        or lowered.startswith("- ")
+    ) and any(token in lowered for token in ("done", "summary", "actions", "read", "json"))
+
+
 def _looks_like_blocker(reason: str) -> bool:
     text = collapse_hidden_tag_gaps(str(reason or "")).strip()
     if not text:
         return False
     return bool(_BLOCKER_PATTERN.search(text))
+
+
+def _summary_retry_instruction(
+    *,
+    summary: str,
+    grounded_reads_available: bool,
+    grounding_terms: set[str],
+    apply_now: bool,
+    action_results: list[dict],
+) -> str:
+    if not summary:
+        return ""
+    if _looks_like_meta_summary(summary):
+        return (
+            "Your summary leaked internal control language or JSON-instruction text. "
+            "Return only the user-facing answer. "
+            "Do not mention summary, done, actions, read_requests, reason, schema, or JSON."
+        )
+    if grounded_reads_available and (
+        _looks_like_deferred_summary(summary) or not _summary_references_grounding(summary, grounding_terms)
+    ):
+        return (
+            "You already have fresh authoritative code reads. "
+            "Do not say you will inspect the code later. "
+            "Analyze the current reads now and return a grounded summary that mentions the actual file or symbol you inspected."
+        )
+    if apply_now and not _has_successful_edit(action_results) and _looks_like_deferred_summary(summary):
+        return (
+            "The user asked you to apply the change now. "
+            "A promise to inspect or implement later does not count. "
+            "Either emit editor actions now, request specific missing reads, or return a concrete blocker."
+        )
+    return ""
+
+
+def _done_retry_instruction(
+    *,
+    done: bool,
+    summary: str,
+    reason: str,
+    apply_now: bool,
+    action_results: list[dict],
+) -> str:
+    if not done or not (summary or reason):
+        return ""
+    if apply_now and not _has_successful_edit(action_results) and reason and not _looks_like_blocker(reason):
+        return (
+            "If no edit was applied, the reason must be a concrete blocker grounded in the current code. "
+            "Otherwise emit editor actions or request the exact reads you still need."
+        )
+    return ""
 
 
 def _action_target_path(action: dict, active_file: str) -> str:
@@ -392,6 +486,7 @@ def _build_system_prompt(*, apply_now: bool) -> str:
         "- Prefer replace_file_range only when you have exact line numbers from fresh line-numbered reads.\n"
         "- Prefer write_file only when replacing an entire small file and you provide the complete updated file.\n"
         "- Keep summary concise and grounded. Mention the file or symbol you inspected.\n"
+        "- Do not include process labels or routing commentary like direct coding response, no editor needed, or no file operations needed.\n"
         f"- {mode_instruction}"
     )
 
@@ -598,7 +693,13 @@ def run_coder_specialist(
         summary = clean_model_text(str(payload.get("summary") or "")).strip()
         reason = clean_model_text(str(payload.get("reason") or "")).strip()
         raw_visible = collapse_hidden_tag_gaps(clean_model_text(raw)).strip() if raw else ""
-        if not payload and not summary and raw_visible and not raw_visible.startswith(("{", "[")):
+        if (
+            not payload
+            and not summary
+            and raw_visible
+            and not raw_visible.startswith(("{", "["))
+            and not _looks_like_meta_summary(raw_visible)
+        ):
             summary = raw_visible
         read_requests = _sanitize_read_requests(payload)
         actions = _sanitize_actions(payload)
@@ -640,18 +741,7 @@ def run_coder_specialist(
                 _grounding_terms_for_paths(read_requests),
                 _grounding_terms_for_reads(fresh_results),
             )
-            messages.extend(
-                [
-                    {"role": "assistant", "content": raw or "{}"},
-                    {
-                        "role": "system",
-                        "content": (
-                            f"{_render_read_results(fresh_results)}\n\n"
-                            "Those fresh reads are now the current source of truth."
-                        ),
-                    },
-                ]
-            )
+            _append_coder_feedback(messages, raw, _fresh_reads_system_message(fresh_results))
             continue
 
         if actions:
@@ -699,68 +789,30 @@ def run_coder_specialist(
                 _grounding_terms_for_paths(touched_paths),
                 _grounding_terms_for_reads(verification_reads),
             )
-            messages.extend(
-                [
-                    {"role": "assistant", "content": raw or "{}"},
-                    {
-                        "role": "system",
-                        "content": (
-                            f"{_render_action_results(results)}\n\n{_render_read_results(verification_reads)}\n\n"
-                            "Those are the latest action results and fresh post-edit reads. "
-                            "Use them as the source of truth and now return your final JSON result."
-                        ),
-                    },
-                ]
-            )
+            _append_coder_feedback(messages, raw, _post_action_system_message(results, verification_reads))
             continue
 
-        summary_is_deferred = _looks_like_deferred_summary(summary)
-        summary_is_grounded = _summary_references_grounding(summary, grounding_terms)
-        if summary and grounded_reads_available and (summary_is_deferred or not summary_is_grounded):
-            messages.extend(
-                [
-                    {"role": "assistant", "content": raw or "{}"},
-                    {
-                        "role": "system",
-                        "content": (
-                            "You already have fresh authoritative code reads. "
-                            "Do not say you will inspect the code later. "
-                            "Analyze the current reads now and return a grounded summary that mentions the actual file or symbol you inspected."
-                        ),
-                    },
-                ]
-            )
+        retry_instruction = _summary_retry_instruction(
+            summary=summary,
+            grounded_reads_available=grounded_reads_available,
+            grounding_terms=grounding_terms,
+            apply_now=apply_now,
+            action_results=all_action_results,
+        )
+        if retry_instruction:
+            _append_coder_feedback(messages, raw, retry_instruction)
             continue
-        if apply_now and summary and not _has_successful_edit(all_action_results) and summary_is_deferred:
-            messages.extend(
-                [
-                    {"role": "assistant", "content": raw or "{}"},
-                    {
-                        "role": "system",
-                        "content": (
-                            "The user asked you to apply the change now. "
-                            "A promise to inspect or implement later does not count. "
-                            "Either emit editor actions now, request specific missing reads, or return a concrete blocker."
-                        ),
-                    },
-                ]
-            )
+        done_retry_instruction = _done_retry_instruction(
+            done=done,
+            summary=summary,
+            reason=reason,
+            apply_now=apply_now,
+            action_results=all_action_results,
+        )
+        if done_retry_instruction:
+            _append_coder_feedback(messages, raw, done_retry_instruction)
             continue
         if done and (summary or reason):
-            if apply_now and not _has_successful_edit(all_action_results) and reason and not _looks_like_blocker(reason):
-                messages.extend(
-                    [
-                        {"role": "assistant", "content": raw or "{}"},
-                        {
-                            "role": "system",
-                            "content": (
-                                "If no edit was applied, the reason must be a concrete blocker grounded in the current code. "
-                                "Otherwise emit editor actions or request the exact reads you still need."
-                            ),
-                        },
-                    ]
-                )
-                continue
             break
         if summary and not apply_now:
             break
@@ -797,6 +849,9 @@ def run_coder_specialist(
         final_summary = last_reason or ""
     elif not final_summary:
         final_summary = last_reason or ""
+    if _looks_like_meta_summary(final_summary):
+        print("[Akane][coder] dropping leaked meta summary and falling back.", flush=True)
+        final_summary = ""
 
     print(
         f"[Akane][coder] done summary_len={len(final_summary)} actions_applied={actions_applied} tool_used={tool_used}",

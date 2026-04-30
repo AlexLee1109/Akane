@@ -2,37 +2,38 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 
 from app.generation import clean_model_text, collapse_hidden_tag_gaps, finalize_model_response
 from app.request_analysis import RequestAnalysis
 
-_INCOMPLETE_REPLY_PATTERN = re.compile(
-    r"(?:[`([{:/\\-]\s*$|\b(?:examine|inspect|open|read|look at|check)\s+`?\s*$)",
-    re.IGNORECASE,
-)
-_TRAILING_CONTINUATION_PATTERN = re.compile(
-    r"\b(?:to|for|with|by|and|or|if|when|while|because|so|then|into|from|that|which|where|using|like)\s*$",
-    re.IGNORECASE,
-)
-_CODE_DUMP_HINT_PATTERN = re.compile(
-    r"^\s*(?:from |import |def |class |return |if |elif |else:|for |while |try:|except |with |const |let |var |function |\{|\}|\]|\)|<\?|\#include)\b",
-    re.IGNORECASE,
-)
-_FOLLOWUP_QUESTION_START_PATTERN = re.compile(
-    r"^(?:how|what|why|when|where|who|anything|any|did|do|does|is|are|would|could|should|want|wanna|need)\b",
-    re.IGNORECASE,
-)
-_FOLLOWUP_QUESTION_PHRASE_PATTERN = re.compile(
-    r"\b(?:how(?:'s| is)|what(?:'s| is) new|anything exciting|how (?:is|was) your day|what have you been up to|how are you doing)\b",
-    re.IGNORECASE,
-)
-_FILLER_OPENER_PATTERN = re.compile(
-    r"^\s*(?:m+m+(?:[.!?…]+)?|mm+(?:[.!?…]+)?|h+m+(?:[.!?…]+)?|hmm+(?:[.!?…]+)?|ah+(?:[.!?…]+)?|oh+(?:[.!?…]+)?|heh+(?:[.!?…]+)?)\s*",
-    re.IGNORECASE,
-)
 _EMPTY_REPLY_SENTINEL = "__AKANE_EMPTY_REPLY__"
+_TRAILING_CONTINUATIONS = {
+    "to", "for", "with", "by", "and", "or", "if", "when", "while", "because", "so", "then",
+    "into", "from", "that", "which", "where", "using", "like",
+}
+_CODE_DUMP_PREFIXES = (
+    "from ", "import ", "def ", "class ", "return ", "if ", "elif ", "else:", "for ", "while ",
+    "try:", "except ", "with ", "const ", "let ", "var ", "function ", "{", "}", "]", ")", "<?", "#include",
+)
+_FOLLOWUP_QUESTION_STARTERS = {
+    "how", "what", "why", "when", "where", "who", "anything", "any", "did", "do", "does",
+    "is", "are", "would", "could", "should", "want", "wanna", "need",
+}
+_FOLLOWUP_QUESTION_PHRASES = (
+    "how's", "how is", "what's new", "what is new", "anything exciting",
+    "how is your day", "how was your day", "what have you been up to", "how are you doing",
+)
+_FILLER_OPENERS = ("mmm", "mm", "hmm", "hm", "ah", "oh", "heh")
+_ROBOTIC_REVIEW_PREFIXES = (
+    "after reviewing ", "after inspecting ", "after looking at ", "inspected ", "reviewed ", "based on ",
+)
+_CODING_PREFACE_MARKERS = (
+    "direct coding response",
+    "no editor or file operations needed",
+    "no file operations needed",
+    "no editor operations needed",
+)
 
 
 def clean_reply_text(raw: str) -> str:
@@ -83,6 +84,89 @@ def merge_visible_reply(prefix: str, continuation: str) -> str:
     return f"{prefix_clean} {continuation_clean}"
 
 
+def _split_sentences(text: str) -> list[str]:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return []
+    parts: list[str] = []
+    start = 0
+    for idx, ch in enumerate(stripped):
+        if ch not in ".!?":
+            continue
+        end = idx + 1
+        while end < len(stripped) and stripped[end].isspace():
+            end += 1
+        part = stripped[start:end].strip()
+        if part:
+            parts.append(part)
+        start = end
+    tail = stripped[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _nonempty_lines(text: str) -> list[str]:
+    return [line.strip() for line in str(text or "").splitlines() if line.strip()]
+
+
+def _extract_numbered_items(text: str) -> list[str]:
+    items: list[str] = []
+    current: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        head = line.split(" ", 1)[0] if " " in line else line
+        numbered = head[:-1].isdigit() and head.endswith((".", ")"))
+        if numbered:
+            if current:
+                items.append(" ".join(current).strip())
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        items.append(" ".join(current).strip())
+    return items
+
+
+def _extract_bulleted_items(text: str) -> list[str]:
+    items: list[str] = []
+    current: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        bulleted = line.startswith("- ") or line.startswith("* ")
+        if bulleted:
+            if current:
+                items.append(" ".join(current).strip())
+            current = [line[2:].strip()]
+        elif current:
+            current.append(line)
+    if current:
+        items.append(" ".join(current).strip())
+    return items
+
+
+def _normalize_reply_seed(reply: str) -> str:
+    return _strip_coding_preface(_strip_robotic_review_prefix(_strip_filler_opener(reply)))
+
+
+def _ends_with_incomplete_marker(text: str) -> bool:
+    stripped = text.rstrip()
+    if not stripped:
+        return False
+    trailing_chars = "`([{:/\\-"
+    if stripped[-1] in trailing_chars:
+        return True
+    lowered = stripped.lower().rstrip("` ").rstrip()
+    for phrase in ("examine", "inspect", "open", "read", "look at", "check"):
+        if lowered.endswith(f" {phrase}") or lowered == phrase:
+            return True
+    return False
+
+
 def _looks_incomplete_reply(text: str) -> bool:
     stripped = str(text or "").rstrip()
     if not stripped:
@@ -93,13 +177,14 @@ def _looks_incomplete_reply(text: str) -> bool:
         return True
     if stripped.count("`") % 2 == 1:
         return True
-    if _TRAILING_CONTINUATION_PATTERN.search(stripped):
+    last_word = stripped.rstrip(".,;:!?)]}\"' ").split()[-1].lower() if stripped.split() else ""
+    if last_word in _TRAILING_CONTINUATIONS:
         return True
     if stripped[-1] not in ".!?)]}\"'" and len(stripped.split()) >= 4:
         return True
     if len(stripped) > 120 and stripped[-1] not in ".!?)]}\"'":
         return True
-    return bool(_INCOMPLETE_REPLY_PATTERN.search(stripped))
+    return _ends_with_incomplete_marker(stripped)
 
 
 def _needs_visible_retry(reply: str, finish_reason: str = "") -> bool:
@@ -160,7 +245,7 @@ def _looks_like_raw_tool_dump(text: str) -> bool:
         return True
     lines = [line.rstrip() for line in stripped.splitlines() if line.strip()]
     if len(lines) >= 10:
-        code_like = sum(1 for line in lines if _CODE_DUMP_HINT_PATTERN.match(line))
+        code_like = sum(1 for line in lines if line.lstrip().lower().startswith(_CODE_DUMP_PREFIXES))
         if code_like >= 3:
             return True
     return len(stripped) > 1400
@@ -171,7 +256,10 @@ def _needs_compact_summary(analysis: RequestAnalysis, reply: str) -> bool:
         return False
     if _looks_like_raw_tool_dump(reply):
         return True
-    return len(str(reply or "").strip()) > 420 or str(reply or "").count("\n") > 5
+    text = str(reply or "").strip()
+    if analysis.coding_like or analysis.codebase_context:
+        return len(text) > 240 or text.count("\n") > 3
+    return len(text) > 280 or text.count("\n") > 4
 
 
 def _looks_like_single_suggestion_reply(reply: str) -> bool:
@@ -180,22 +268,22 @@ def _looks_like_single_suggestion_reply(reply: str) -> bool:
         return False
     if len(text) > 340 or text.count("\n") > 3:
         return False
-    if re.search(r"^\s*[-*]\s+", text, re.MULTILINE):
+    if any(line.lstrip().startswith(("- ", "* ")) for line in text.splitlines()):
         return False
-    if len(re.findall(r"(?:^|\n)\s*\d+[.)]\s+", text)) > 2:
+    if len(_extract_numbered_items(text)) > 1:
         return False
-    sentences = [part for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
-    return 1 <= len(sentences) <= 2
+    sentences = _split_sentences(text)
+    return 1 <= len(sentences) <= 3
 
 
 def _looks_like_companion_sized_reply(reply: str) -> bool:
     text = collapse_hidden_tag_gaps(str(reply or "")).strip()
     if not text:
         return False
-    if len(text) > 260 or text.count("\n") > 2:
+    if len(text) > 240 or text.count("\n") > 2:
         return False
-    sentences = [part for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
-    return 1 <= len(sentences) <= 2
+    sentences = _split_sentences(text)
+    return 1 <= len(sentences) <= 3
 
 
 def _strip_trailing_followup_question(reply: str) -> str:
@@ -203,20 +291,22 @@ def _strip_trailing_followup_question(reply: str) -> str:
     if not text:
         return ""
 
-    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+    sentences = _split_sentences(text)
     if not sentences:
         return text
 
     last_sentence = sentences[-1]
     if not last_sentence.endswith("?"):
         return text
+    last_lower = last_sentence.lower()
+    last_start = last_lower.lstrip().split(" ", 1)[0]
     if not (
-        _FOLLOWUP_QUESTION_START_PATTERN.match(last_sentence)
-        or _FOLLOWUP_QUESTION_PHRASE_PATTERN.search(last_sentence)
+        last_start in _FOLLOWUP_QUESTION_STARTERS
+        or any(phrase in last_lower for phrase in _FOLLOWUP_QUESTION_PHRASES)
     ):
         return text
     if len(sentences) == 1:
-        return re.sub(r"\?\s*$", ".", last_sentence).strip()
+        return last_sentence.rstrip().rstrip("?").rstrip() + "."
 
     kept = " ".join(sentences[:-1]).strip()
     return kept or text
@@ -226,54 +316,121 @@ def _strip_filler_opener(reply: str) -> str:
     text = collapse_hidden_tag_gaps(str(reply or "")).strip()
     if not text:
         return ""
-    return _FILLER_OPENER_PATTERN.sub("", text, count=1).strip()
+    lowered = text.lower().lstrip()
+    leading_ws_len = len(text) - len(text.lstrip())
+    for opener in _FILLER_OPENERS:
+        if not lowered.startswith(opener):
+            continue
+        idx = leading_ws_len + len(opener)
+        while idx < len(text) and text[idx] in ".!?… ":
+            idx += 1
+        return text[idx:].strip()
+    return text
+
+
+def _strip_robotic_review_prefix(reply: str) -> str:
+    text = collapse_hidden_tag_gaps(str(reply or "")).strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if lines:
+        first_line = lines[0].strip().lower()
+        if any(first_line.startswith(prefix) for prefix in _ROBOTIC_REVIEW_PREFIXES):
+            if "." in first_line or first_line.endswith("suggestions:") or first_line.endswith("suggestion:"):
+                text = "\n".join(lines[1:]).strip()
+
+    lowered = text.lower().lstrip()
+    stripped = text
+    if lowered.startswith("noted unused imports"):
+        first_period = stripped.find(".")
+        stripped = stripped[first_period + 1 :].strip() if first_period != -1 else ""
+    elif lowered.startswith("(") and ") and " in lowered:
+        _, _, rest = stripped.partition(") and ")
+        stripped = rest.strip()
+    lowered = stripped.lower().lstrip()
+    for prefix in _ROBOTIC_REVIEW_PREFIXES:
+        if not lowered.startswith(prefix):
+            continue
+        cut = len(stripped) - len(stripped.lstrip()) + len(prefix)
+        stripped = stripped[cut:].lstrip()
+        while stripped[:1] in ".,:":
+            stripped = stripped[1:].lstrip()
+        if stripped.lower().startswith("suggestions:") or stripped.lower().startswith("suggestion:"):
+            stripped = stripped.split(":", 1)[1].lstrip()
+        break
+    if stripped and stripped != text:
+        return stripped[0].upper() + stripped[1:] if len(stripped) > 1 else stripped.upper()
+    return text
+
+
+def _strip_coding_preface(reply: str) -> str:
+    text = collapse_hidden_tag_gaps(str(reply or "")).strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if not lines:
+        return text
+    first_line = lines[0].strip()
+    lowered = first_line.lower()
+    if not any(marker in lowered for marker in _CODING_PREFACE_MARKERS):
+        return text
+    rest = "\n".join(lines[1:]).strip()
+    if rest:
+        return rest
+    for marker in _CODING_PREFACE_MARKERS:
+        idx = lowered.find(marker)
+        if idx != -1:
+            candidate = first_line[idx + len(marker):].lstrip(" -:.")
+            if candidate:
+                return candidate
+    return ""
 
 
 def _clamp_suggestion_reply(reply: str) -> str:
-    text = _strip_filler_opener(reply)
+    text = _normalize_reply_seed(reply)
     if not text:
         return ""
 
-    numbered = re.findall(r"(?:^|\n)\s*(\d+[.)]\s+.*?)(?=(?:\n\s*\d+[.)]\s+)|\Z)", text, re.DOTALL)
+    numbered = _extract_numbered_items(text)
     if numbered:
-        return "\n".join(item.strip() for item in numbered[:2])
+        return numbered[0].strip()
 
-    bulleted = re.findall(r"(?:^|\n)\s*[-*]\s+(.*?)(?=(?:\n\s*[-*]\s+)|\Z)", text, re.DOTALL)
+    bulleted = _extract_bulleted_items(text)
     if bulleted:
-        return "\n".join(f"- {item.strip()}" for item in bulleted[:2])
+        return f"- {bulleted[0].strip()}"
 
-    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
-    if len(sentences) > 2:
-        text = " ".join(sentences[:2]).strip()
+    sentences = _split_sentences(text)
+    if len(sentences) > 3:
+        text = " ".join(sentences[:3]).strip()
     return _strip_trailing_followup_question(text)
 
 
 def _clamp_companion_reply(reply: str) -> str:
-    text = _strip_filler_opener(reply)
+    text = _normalize_reply_seed(reply)
     if not text:
         return ""
 
-    numbered = re.findall(r"(?:^|\n)\s*(\d+[.)]\s+.*?)(?=(?:\n\s*\d+[.)]\s+)|\Z)", text, re.DOTALL)
+    numbered = _extract_numbered_items(text)
     if numbered:
-        text = " ".join(item.strip() for item in numbered[:2]).strip()
+        text = " ".join(item.strip() for item in numbered[:3]).strip()
     else:
-        bulleted = re.findall(r"(?:^|\n)\s*[-*]\s+(.*?)(?=(?:\n\s*[-*]\s+)|\Z)", text, re.DOTALL)
+        bulleted = _extract_bulleted_items(text)
         if bulleted:
-            text = " ".join(item.strip() for item in bulleted[:2]).strip()
+            text = " ".join(item.strip() for item in bulleted[:3]).strip()
 
-    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
-    if len(sentences) > 2:
-        text = " ".join(sentences[:2]).strip()
+    sentences = _split_sentences(text)
+    if len(sentences) > 3:
+        text = " ".join(sentences[:3]).strip()
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) > 2:
-        text = " ".join(lines[:2]).strip()
+    lines = _nonempty_lines(text)
+    if len(lines) > 3:
+        text = " ".join(lines[:3]).strip()
 
     return _strip_trailing_followup_question(text)
 
 
 def _locally_compact_reply(reply: str) -> str:
-    text = _strip_filler_opener(reply)
+    text = _normalize_reply_seed(reply)
     if not text:
         return ""
     if _looks_like_raw_tool_dump(text):
@@ -286,11 +443,12 @@ def _locally_compact_reply(reply: str) -> str:
 def _retry_messages_for_concise_reply(chat_messages: list[dict], verbose_reply: str) -> list[dict]:
     retry_instruction = (
         "Rewrite your last reply as a compact desktop-companion response. "
-        "Use 1-2 short sentences only. "
-        "Prefer a single short sentence unless a second sentence is required to finish the thought. "
+        "Use 2-3 short sentences max, and prefer 1-2 when possible. "
+        "Keep the total reply short, ideally under about 220 characters when possible. "
+        "Shorten overly long sentences instead of packing too much into one sentence. "
         "Do not print raw code, raw file contents, READ_RESULT blocks, or long bullet lists. "
         "Keep only the most important findings in plain conversational language. "
-        "Stop after the second sentence."
+        "Stop after the third sentence."
     )
     return [
         *chat_messages,
@@ -302,11 +460,13 @@ def _retry_messages_for_concise_reply(chat_messages: list[dict], verbose_reply: 
 def _retry_messages_for_single_suggestion(chat_messages: list[dict], verbose_reply: str) -> list[dict]:
     retry_instruction = (
         "Rewrite your last reply for a tiny desktop companion bubble. "
-        "Give one or two best suggestions, not a long list. "
-        "Use 1-2 short sentences only. "
+        "Give only the single best suggestion, not a list. "
+        "Use 2-3 short sentences max, and prefer 1-2 when possible. "
+        "Keep the total reply short, ideally under about 220 characters when possible. "
+        "Shorten overly long sentences instead of packing too much into one sentence. "
         "Say what to change and why it matters in plain language. "
-        "Do not include raw code, file dumps, bullet lists, or more than two recommendations. "
-        "Stop after the second sentence."
+        "Do not include raw code, file dumps, bullet lists, or more than one recommendation. "
+        "Stop after the third sentence."
     )
     return [
         *chat_messages,
@@ -347,7 +507,7 @@ def postprocess_reply(
     extract_message_text: Callable[[dict], str],
     extract_finish_reason: Callable[[dict], str],
 ) -> str:
-    cleaned = _strip_filler_opener(reply)
+    cleaned = _normalize_reply_seed(reply)
 
     if analysis.wants_single_suggestion:
         locally_clamped = _clamp_suggestion_reply(cleaned) or cleaned

@@ -17,7 +17,11 @@ def main() -> None:
         from app.popup import launch_popup
         launch_popup()
         return
-    raise SystemExit(f"Unknown mode '{mode}'. Use 'popup' or 'server'.")
+    if mode == "discord":
+        from app.discord_bot import run_discord_bot
+        run_discord_bot()
+        return
+    raise SystemExit(f"Unknown mode '{mode}'. Use 'popup', 'server', or 'discord'.")
 
 
 if __name__ == "__main__":

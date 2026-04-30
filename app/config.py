@@ -22,14 +22,36 @@ def _secret_or_env(name: str, default: str = "") -> str:
     env_name = f"AKANE_{name}"
     return os.environ.get(env_name, str(_local_secret(name, default) or "")).strip()
 
+
+def _csv_ints(name: str, default: str = "") -> tuple[int, ...]:
+    raw = _secret_or_env(name, default)
+    values: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(int(part))
+        except ValueError:
+            continue
+    return tuple(values)
+
 DEVICE = "mps" if torch and torch.backends.mps.is_available() else "cpu"
 
 APP_MODE = (_secret_or_env("APP_MODE", "popup") or "popup").lower()
 SERVER_HOST = _secret_or_env("SERVER_HOST", "127.0.0.1") or "127.0.0.1"
 SERVER_PORT = int((_secret_or_env("SERVER_PORT", "8000") or "8000"))
 POPUP_BACKEND_URL = (
-    _secret_or_env("POPUP_BACKEND_URL", "http://192.168.1.199:8000")
-    or "http://192.168.1.199:8000"
+    _secret_or_env("POPUP_BACKEND_URL", f"http://127.0.0.1:{SERVER_PORT}")
+    or f"http://127.0.0.1:{SERVER_PORT}"
+).rstrip("/")
+DISCORD_BOT_TOKEN = _secret_or_env("DISCORD_BOT_TOKEN", "")
+DISCORD_PREFIX = _secret_or_env("DISCORD_PREFIX", "!akane")
+DISCORD_ALLOWED_CHANNEL_IDS = _csv_ints("DISCORD_ALLOWED_CHANNEL_IDS", "")
+DISCORD_REPLY_TO_DMS = _secret_or_env("DISCORD_REPLY_TO_DMS", "1").lower() in {"1", "true", "yes", "on"}
+DISCORD_SERVER_URL = (
+    _secret_or_env("DISCORD_SERVER_URL", f"http://127.0.0.1:{SERVER_PORT}")
+    or f"http://127.0.0.1:{SERVER_PORT}"
 ).rstrip("/")
 
 
@@ -88,7 +110,7 @@ LLAMA_IDLE_UNLOAD_SECONDS = float(
 CHAT_HISTORY_CONTEXT_TOKENS = int(
     os.environ.get(
         "AKANE_CHAT_HISTORY_CONTEXT_TOKENS",
-        str(_local_secret("CHAT_HISTORY_CONTEXT_TOKENS", 3000)),
+        str(_local_secret("CHAT_HISTORY_CONTEXT_TOKENS", 4096)),
     ).strip()
 )
 CODER_MAX_TURNS = int(

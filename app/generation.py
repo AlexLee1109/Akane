@@ -1,71 +1,15 @@
-import re
 import threading
 
 from app.config import (
     CHAT_HISTORY_CONTEXT_TOKENS,
-    MAX_TOKENS,
-    REPETITION_PENALTY,
-    TEMPERATURE,
-    TOP_K,
-    TOP_P,
 )
 from app.character import build_system_prompt
 from app.config import ADVISOR_ONLY
 from app.editor_bridge import get_editor_bridge
 from app.memory_store import NEGATIVE, NEUTRAL, POSITIVE, apply_tag_operations, format_for_prompt, get_store
-from app.model_loader import LLM
 from app.vscode_launcher import launch_vscode
 
 _generation_lock = threading.Lock()
-
-# Tag patterns
-MEM_PATTERN = re.compile(r"\[MEM\](.*?)\[/MEM\]", re.DOTALL)
-OBSERVE_PATTERN = re.compile(r"\[OBSERVE\](.*?)\[/OBSERVE\]", re.DOTALL)
-FORGET_PATTERN = re.compile(r"\[FORGET\](.*?)\[/FORGET\]", re.DOTALL)
-PROJECT_PATTERN = re.compile(r"\[PROJECT\](.*?)\[/PROJECT\]", re.DOTALL)
-EDITOR_PATTERN = re.compile(r"\[EDITOR\](.*?)\[/EDITOR\]", re.DOTALL)
-ASK_CODER_PATTERN = re.compile(r"\[ASK_CODER\](.*?)\[/ASK_CODER\]", re.DOTALL)
-TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
-EDITOR_TOOL_BLOCK_PATTERN = re.compile(r"<editor>\s*(.*?)\s*</editor>", re.DOTALL | re.IGNORECASE)
-FUNCTION_TOOL_BLOCK_PATTERN = re.compile(
-    r"<function=([A-Z_][A-Z0-9_]*)>\s*(.*?)\s*</function>",
-    re.DOTALL | re.IGNORECASE,
-)
-FUNCTION_PARAMETER_PATTERN = re.compile(
-    r"<parameter=([a-z_][a-z0-9_]*)>\s*(.*?)\s*</parameter>",
-    re.DOTALL | re.IGNORECASE,
-)
-NESTED_TOOL_ACTION_PATTERN = re.compile(
-    r"<([a-z_][a-z0-9_]*)>\s*(.*?)\s*</\1>",
-    re.DOTALL | re.IGNORECASE,
-)
-XML_SIMPLE_TOOL_PATTERN = re.compile(
-    r"<([A-Z_][A-Z0-9_]*)>\s*(.*?)\s*</\1>",
-    re.DOTALL | re.IGNORECASE,
-)
-XML_READ_PATTERN = re.compile(r"<READ>\s*(.*?)\s*</READ>", re.DOTALL | re.IGNORECASE)
-
-# Tool tags (for future implementation)
-TOOL_PATTERNS = {
-    "CODE": re.compile(r"\[CODE\](.*?)\[/CODE\]", re.DOTALL),
-    "READ": re.compile(r"\[READ\](.*?)\[/READ\]", re.DOTALL),
-    "WRITE": re.compile(r"\[WRITE\](.*?)\[/WRITE\]", re.DOTALL),
-    "SHELL": re.compile(r"\[SHELL\](.*?)\[/SHELL\]", re.DOTALL),
-}
-
-# Strip all special tags from displayed text
-ALL_TAGS_PATTERN = re.compile(
-    r"\[(?:MEM|OBSERVE|FORGET|PROJECT|EDITOR|ASK_CODER|CODE|READ|WRITE|SHELL|READ_RESULT)\].*?\[/(?:MEM|OBSERVE|FORGET|PROJECT|EDITOR|ASK_CODER|CODE|READ|WRITE|SHELL|READ_RESULT)\]",
-    re.DOTALL,
-)
-EDITOR_TOOL_CALL_STRIP_PATTERN = re.compile(
-    r"<tool_call>.*?(?:</tool_call>|$)",
-    re.DOTALL | re.IGNORECASE,
-)
-XML_SIMPLE_TOOL_STRIP_PATTERN = re.compile(
-    r"<(?:READ|WRITE|SHELL|CODE|READ_RESULT)>\s*.*?\s*</(?:READ|WRITE|SHELL|CODE|READ_RESULT)>",
-    re.DOTALL | re.IGNORECASE,
-)
 
 STREAM_HIDDEN_TAGS = {
     "MEM": "[/MEM]",
@@ -95,47 +39,146 @@ _HIDDEN_SQUARE_TAG_NAMES = (
 _HIDDEN_XML_SIMPLE_TAG_NAMES = ("READ", "WRITE", "SHELL", "CODE", "READ_RESULT")
 
 
-def _strip_wrapped_tag_ranges(text: str, opener: str, closer: str) -> str:
+def _extract_wrapped_sections(text: str, opener: str, closer: str, *, case_insensitive: bool = False) -> list[str]:
     source = str(text or "")
-    if opener not in source:
-        return source
-    parts: list[str] = []
+    if not source:
+        return []
+    haystack = source.lower() if case_insensitive else source
+    open_token = opener.lower() if case_insensitive else opener
+    close_token = closer.lower() if case_insensitive else closer
+    items: list[str] = []
     index = 0
-    opener_len = len(opener)
-    closer_len = len(closer)
+    open_len = len(opener)
+    close_len = len(closer)
     while True:
-        start = source.find(opener, index)
+        start = haystack.find(open_token, index)
         if start == -1:
-            parts.append(source[index:])
-            break
-        parts.append(source[index:start])
-        end = source.find(closer, start + opener_len)
+            return items
+        content_start = start + open_len
+        end = haystack.find(close_token, content_start)
         if end == -1:
-            parts.append(source[start:])
-            break
-        index = end + closer_len
-    return "".join(parts)
+            return items
+        items.append(source[content_start:end].strip())
+        index = end + close_len
 
 
-def _strip_hidden_square_tags(text: str) -> str:
-    cleaned = str(text or "")
-    for tag_name in _HIDDEN_SQUARE_TAG_NAMES:
-        cleaned = _strip_wrapped_tag_ranges(cleaned, f"[{tag_name}]", f"[/{tag_name}]")
-    return cleaned
+def _extract_named_xml_sections(text: str, tag_name: str) -> list[str]:
+    return _extract_wrapped_sections(
+        text,
+        f"<{tag_name}>",
+        f"</{tag_name}>",
+        case_insensitive=True,
+    )
 
 
-def _strip_hidden_xml_tags(text: str) -> str:
-    cleaned = str(text or "")
-    cleaned = _strip_wrapped_tag_ranges(cleaned, "<tool_call>", "</tool_call>")
-    for tag_name in _HIDDEN_XML_SIMPLE_TAG_NAMES:
-        cleaned = _strip_wrapped_tag_ranges(cleaned, f"<{tag_name}>", f"</{tag_name}>")
-    return cleaned
+def _extract_assignment_blocks(text: str, prefix: str, closing_tag: str) -> list[tuple[str, str]]:
+    source = str(text or "")
+    lowered = source.lower()
+    prefix_lower = prefix.lower()
+    closing_lower = closing_tag.lower()
+    items: list[tuple[str, str]] = []
+    index = 0
+    while True:
+        start = lowered.find(prefix_lower, index)
+        if start == -1:
+            return items
+        name_start = start + len(prefix)
+        name_end = source.find(">", name_start)
+        if name_end == -1:
+            return items
+        name = source[name_start:name_end].strip()
+        content_start = name_end + 1
+        end = lowered.find(closing_lower, content_start)
+        if end == -1:
+            return items
+        items.append((name, source[content_start:end].strip()))
+        index = end + len(closing_tag)
+
+
+def _extract_simple_xml_pairs(text: str) -> list[tuple[str, str]]:
+    source = str(text or "")
+    items: list[tuple[str, str]] = []
+    index = 0
+    while True:
+        start = source.find("<", index)
+        if start == -1:
+            return items
+        end = source.find(">", start + 1)
+        if end == -1:
+            return items
+        name = source[start + 1 : end].strip()
+        if not name or name.startswith("/") or not name.replace("_", "").isalnum():
+            index = end + 1
+            continue
+        closing = f"</{name}>"
+        close_at = source.lower().find(closing.lower(), end + 1)
+        if close_at == -1:
+            index = end + 1
+            continue
+        items.append((name, source[end + 1 : close_at].strip()))
+        index = close_at + len(closing)
+
+
+def _consume_hidden_tag(text: str, start: int) -> int:
+    if text.startswith("[", start):
+        end = text.find("]", start + 1)
+        if end == -1:
+            return start
+        tag_name = text[start + 1 : end].strip().upper()
+        if not tag_name or tag_name.startswith("/"):
+            return start
+        if tag_name not in _HIDDEN_SQUARE_TAG_NAMES:
+            return start
+        closing = f"[/{tag_name}]"
+        close_at = text.find(closing, end + 1)
+        return len(text) if close_at == -1 else close_at + len(closing)
+
+    if text.startswith("<", start):
+        end = text.find(">", start + 1)
+        if end == -1:
+            return start
+        tag_name = text[start + 1 : end].strip().upper()
+        if not tag_name or tag_name.startswith("/"):
+            return start
+        if tag_name == "TOOL_CALL":
+            closing = "</tool_call>"
+        elif tag_name in _HIDDEN_XML_SIMPLE_TAG_NAMES:
+            closing = f"</{tag_name}>"
+        else:
+            return start
+        close_at = text.lower().find(closing.lower(), end + 1)
+        return len(text) if close_at == -1 else close_at + len(closing)
+
+    return start
 
 
 def _strip_hidden_markup(text: str) -> str:
-    cleaned = _strip_hidden_square_tags(text)
-    cleaned = _strip_hidden_xml_tags(cleaned)
-    return collapse_hidden_tag_gaps(cleaned).strip()
+    source = str(text or "")
+    if not source:
+        return ""
+    if "[" not in source and "<" not in source:
+        return collapse_hidden_tag_gaps(source).strip()
+
+    parts: list[str] = []
+    index = 0
+    length = len(source)
+    while index < length:
+        next_square = source.find("[", index)
+        next_angle = source.find("<", index)
+        candidates = [pos for pos in (next_square, next_angle) if pos != -1]
+        if not candidates:
+            parts.append(source[index:])
+            break
+        start = min(candidates)
+        if start > index:
+            parts.append(source[index:start])
+        consumed = _consume_hidden_tag(source, start)
+        if consumed == start:
+            parts.append(source[start])
+            index = start + 1
+            continue
+        index = consumed
+    return collapse_hidden_tag_gaps("".join(parts)).strip()
 
 
 def _strip_inline_markdown_code(text: str) -> str:
@@ -466,6 +509,8 @@ def collapse_hidden_tag_gaps(text: str) -> str:
     text = str(text or "").replace("\r\n", "\n")
     if not text:
         return text
+    if "\n" not in text and "\t" not in text:
+        return text
 
     normalized_lines: list[str] = []
     previous_blank = False
@@ -590,8 +635,7 @@ def _collect_memory_and_tool_ops(text: str) -> tuple[
     project_ops: list[tuple[str, str]] = []
     editor_ops = extract_editor_commands(text)
 
-    for match in MEM_PATTERN.finditer(text):
-        raw = match.group(1).strip()
+    for raw in _extract_wrapped_sections(text, "[MEM]", "[/MEM]"):
         if ":" in raw:
             cat, content = raw.split(":", 1)
             cat = cat.strip().lower()
@@ -600,18 +644,15 @@ def _collect_memory_and_tool_ops(text: str) -> tuple[
             if mem_cat and content:
                 mem_ops.append((mem_cat, content))
 
-    for match in OBSERVE_PATTERN.finditer(text):
-        content = match.group(1).strip()
+    for content in _extract_wrapped_sections(text, "[OBSERVE]", "[/OBSERVE]"):
         if content:
             observe_ops.append((content, _detect_weight(content)))
 
-    for match in FORGET_PATTERN.finditer(text):
-        query = match.group(1).strip()
+    for query in _extract_wrapped_sections(text, "[FORGET]", "[/FORGET]"):
         if query:
             forget_queries.append(query)
 
-    for match in PROJECT_PATTERN.finditer(text):
-        raw = match.group(1).strip()
+    for raw in _extract_wrapped_sections(text, "[PROJECT]", "[/PROJECT]"):
         if ":" in raw:
             name, detail = raw.split(":", 1)
             name = name.strip().lower()
@@ -666,8 +707,7 @@ def clean_model_text(text: str) -> str:
 
 def extract_coder_requests(text: str) -> list[str]:
     requests: list[str] = []
-    for match in ASK_CODER_PATTERN.finditer(str(text or "")):
-        content = (match.group(1) or "").strip()
+    for content in _extract_wrapped_sections(text, "[ASK_CODER]", "[/ASK_CODER]"):
         if content:
             requests.append(content)
     return requests
@@ -692,8 +732,7 @@ def _parse_editor_tool(raw: str) -> tuple[str, str]:
 def extract_editor_commands(text: str) -> list[str]:
     editor_ops: list[str] = []
 
-    for match in EDITOR_PATTERN.finditer(text):
-        raw = (match.group(1) or "").strip()
+    for raw in _extract_wrapped_sections(text, "[EDITOR]", "[/EDITOR]"):
         if raw:
             editor_ops.append(raw)
 
@@ -707,8 +746,7 @@ def extract_read_requests(text: str) -> list[str]:
     read_requests: list[str] = []
     seen: set[str] = set()
 
-    for match in TOOL_PATTERNS["READ"].finditer(text):
-        filepath = (match.group(1) or "").strip()
+    for filepath in _extract_wrapped_sections(text, "[READ]", "[/READ]"):
         if filepath and filepath not in seen:
             seen.add(filepath)
             read_requests.append(filepath)
@@ -723,8 +761,7 @@ def extract_read_requests(text: str) -> list[str]:
             seen.add(filepath)
             read_requests.append(filepath)
 
-    for match in XML_READ_PATTERN.finditer(text):
-        filepath = (match.group(1) or "").strip()
+    for filepath in _extract_named_xml_sections(text, "READ"):
         if filepath and filepath not in seen:
             seen.add(filepath)
             read_requests.append(filepath)
@@ -775,20 +812,22 @@ def execute_read_requests(filepaths: list[str]) -> list[str]:
 
 
 def _extract_tool_call_blocks(text: str) -> list[str]:
-    return [(match.group(1) or "").strip() for match in TOOL_CALL_PATTERN.finditer(text)]
+    return _extract_named_xml_sections(text, "tool_call")
 
 
 def _extract_function_tool_block(block: str) -> tuple[str, str]:
-    match = FUNCTION_TOOL_BLOCK_PATTERN.search(block)
-    if not match:
+    matches = _extract_assignment_blocks(block, "<function=", "</function>")
+    if not matches:
         return "", ""
-    return (match.group(1) or "").strip().lower(), (match.group(2) or "")
+    name, content = matches[0]
+    return name.strip().lower(), content
 
 
 def _extract_tool_parameters(block: str) -> dict[str, str]:
     return {
-        (match.group(1) or "").strip().lower(): (match.group(2) or "").strip()
-        for match in FUNCTION_PARAMETER_PATTERN.finditer(block)
+        name.strip().lower(): content.strip()
+        for name, content in _extract_assignment_blocks(block, "<parameter=", "</parameter>")
+        if name.strip()
     }
 
 
@@ -810,20 +849,17 @@ def _editor_ops_from_parameter_block(inner: str) -> list[str]:
     return [
         command if not argument else f"{command}: {argument}"
         for command, argument in (
-            (
-                (nested_match.group(1) or "").strip().lower(),
-                (nested_match.group(2) or "").strip(),
-            )
-            for nested_match in NESTED_TOOL_ACTION_PATTERN.finditer(inner)
+            (name.strip().lower(), content.strip())
+            for name, content in _extract_simple_xml_pairs(inner)
         )
         if command
     ]
 
 
 def _extract_editor_commands_from_tool_block(block: str) -> list[str]:
-    editor_match = EDITOR_TOOL_BLOCK_PATTERN.search(block)
-    if editor_match:
-        inner = (editor_match.group(1) or "").strip()
+    editor_blocks = _extract_named_xml_sections(block, "editor")
+    if editor_blocks:
+        inner = editor_blocks[0]
         return _editor_ops_from_parameter_block(inner)
 
     function_name, inner = _extract_function_tool_block(block)

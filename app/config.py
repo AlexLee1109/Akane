@@ -167,8 +167,8 @@ ADVISOR_ONLY = os.environ.get(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 # Generation parameters
-MAX_TOKENS = 768
-TEMPERATURE = 0.7
+MAX_TOKENS = 1024
+TEMPERATURE = 0.9
 TOP_K = 40
 TOP_P = 0.95
 REPETITION_PENALTY = 1.1

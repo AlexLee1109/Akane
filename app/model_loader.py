@@ -394,38 +394,6 @@ class ModelManager:
             self.ensure_coder_loaded()
         return self._coder_llm
 
-    @staticmethod
-    def _normalize_messages(messages) -> list[dict]:
-        normalized: list[dict] = []
-        system_parts: list[str] = []
-        for message in messages or []:
-            if not isinstance(message, dict):
-                continue
-            role = str(message.get("role") or "").strip().lower()
-            content = message.get("content")
-            if isinstance(content, list):
-                content_text = "".join(
-                    str(item.get("text") if isinstance(item, dict) else item or "")
-                    for item in content
-                ).strip()
-            else:
-                content_text = str(content or "").strip()
-            if not role or not content_text:
-                continue
-            if role == "system":
-                system_parts.append(content_text)
-                continue
-            normalized.append({"role": role, "content": content_text})
-        if system_parts:
-            normalized.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
-        return normalized
-
-    def _should_inject_no_think(self, role: str) -> bool:
-        if str(role or "main").strip().lower() != "main":
-            return False
-        model_name = self.model_name_for_role(role).lower()
-        return "qwen" in model_name
-
     def create_chat_completion(
         self,
         *,
@@ -438,7 +406,6 @@ class ModelManager:
         stream=False,
         role: str = "main",
     ):
-        messages = self._normalize_messages(messages)
         model_name = self.model_name_for_role(role)
         if role == "coder" and self.OPENROUTER_CODER_MODEL:
             llm = self.coder_llm

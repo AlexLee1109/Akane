@@ -6,14 +6,13 @@ from app.config import (
 from app.character import build_system_prompt
 from app.config import ADVISOR_ONLY
 from app.editor_bridge import get_editor_bridge
-from app.memory_store import NEGATIVE, NEUTRAL, POSITIVE, apply_tag_operations, format_for_prompt, get_store
+from app.memory_store import apply_tag_operations, format_for_prompt, get_store
 from app.vscode_launcher import launch_vscode
 
 _generation_lock = threading.Lock()
 
 STREAM_HIDDEN_TAGS = {
     "MEM": "[/MEM]",
-    "OBSERVE": "[/OBSERVE]",
     "FORGET": "[/FORGET]",
     "PROJECT": "[/PROJECT]",
     "EDITOR": "[/EDITOR]",
@@ -34,7 +33,7 @@ STREAM_HIDDEN_XML_TAGS = {
 }
 
 _HIDDEN_SQUARE_TAG_NAMES = (
-    "MEM", "OBSERVE", "FORGET", "PROJECT", "EDITOR", "ASK_CODER", "CODE", "READ", "WRITE", "SHELL", "READ_RESULT",
+    "MEM", "FORGET", "PROJECT", "EDITOR", "ASK_CODER", "CODE", "READ", "WRITE", "SHELL", "READ_RESULT",
 )
 _HIDDEN_XML_SIMPLE_TAG_NAMES = ("READ", "WRITE", "SHELL", "CODE", "READ_RESULT")
 
@@ -209,16 +208,6 @@ CATEGORY_MAP = {
     "preferences": "preferences",
     "user": "user",
 }
-
-
-def _detect_weight(text: str) -> str:
-    """Detect emotional weight using explicit markers instead of keyword lists."""
-    lowered = str(text or "").strip().lower()
-    if lowered.startswith(("negative:", "bad:", "- ")):
-        return NEGATIVE
-    if lowered.startswith(("positive:", "good:", "+ ")):
-        return POSITIVE
-    return NEUTRAL
 
 
 def _looks_like_name(value: str) -> bool:
@@ -497,7 +486,6 @@ def capture_explicit_user_memories(user_text: str) -> bool:
 
     apply_tag_operations(
         mem_ops=mem_ops,
-        observe_ops=[],
         forget_queries=[],
         project_ops=project_ops,
     )
@@ -624,13 +612,11 @@ class HiddenTagStreamFilter:
 
 def _collect_memory_and_tool_ops(text: str) -> tuple[
     list[tuple[str, str]],
-    list[tuple[str, str]],
     list[str],
     list[tuple[str, str]],
     list[str],
 ]:
     mem_ops: list[tuple[str, str]] = []
-    observe_ops: list[tuple[str, str]] = []
     forget_queries: list[str] = []
     project_ops: list[tuple[str, str]] = []
     editor_ops = extract_editor_commands(text)
@@ -643,10 +629,6 @@ def _collect_memory_and_tool_ops(text: str) -> tuple[
             mem_cat = CATEGORY_MAP.get(cat)
             if mem_cat and content:
                 mem_ops.append((mem_cat, content))
-
-    for content in _extract_wrapped_sections(text, "[OBSERVE]", "[/OBSERVE]"):
-        if content:
-            observe_ops.append((content, _detect_weight(content)))
 
     for query in _extract_wrapped_sections(text, "[FORGET]", "[/FORGET]"):
         if query:
@@ -661,12 +643,12 @@ def _collect_memory_and_tool_ops(text: str) -> tuple[
         elif raw:
             project_ops.append((raw.strip().lower(), ""))
 
-    return mem_ops, observe_ops, forget_queries, project_ops, editor_ops
+    return mem_ops, forget_queries, project_ops, editor_ops
 
 
 def apply_response_side_effects(text: str) -> None:
     """Apply memory and editor side effects without mutating visible text."""
-    mem_ops, observe_ops, forget_queries, project_ops, editor_ops = _collect_memory_and_tool_ops(text)
+    mem_ops, forget_queries, project_ops, editor_ops = _collect_memory_and_tool_ops(text)
 
     filtered_mem_ops = []
     for mem_cat, content in mem_ops:
@@ -678,10 +660,9 @@ def apply_response_side_effects(text: str) -> None:
         elif _looks_like_name(content):
             filtered_mem_ops.append((mem_cat, f"name: {content.strip()}"))
 
-    if filtered_mem_ops or observe_ops or forget_queries or project_ops:
+    if filtered_mem_ops or forget_queries or project_ops:
         apply_tag_operations(
             mem_ops=filtered_mem_ops,
-            observe_ops=observe_ops,
             forget_queries=forget_queries,
             project_ops=project_ops,
         )

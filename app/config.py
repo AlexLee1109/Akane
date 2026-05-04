@@ -76,25 +76,17 @@ LLAMA_CONTEXT_WINDOW = int(
 LLAMA_BATCH_SIZE = int(
     os.environ.get(
         "AKANE_LLAMA_BATCH_SIZE",
-        str(_local_secret("LLAMA_BATCH_SIZE", 64)),
+        str(_local_secret("LLAMA_BATCH_SIZE", 256)),
     ).strip()
 )
 LLAMA_UBATCH_SIZE = int(
     os.environ.get(
         "AKANE_LLAMA_UBATCH_SIZE",
-        str(_local_secret("LLAMA_UBATCH_SIZE", 32)),
+        str(_local_secret("LLAMA_UBATCH_SIZE", 64)),
     ).strip()
 )
-LLAMA_THREADS = int(
-    os.environ.get(
-        "AKANE_LLAMA_THREADS",
-        str(_local_secret("LLAMA_THREADS", max(1, (os.cpu_count() or 4) - 2))),
-    ).strip()
-)
-LLAMA_FLASH_ATTN = os.environ.get(
-    "AKANE_LLAMA_FLASH_ATTN",
-    "1" if _local_secret("LLAMA_FLASH_ATTN", True) else "0",
-).strip().lower() in {"1", "true", "yes", "on"}
+LLAMA_THREADS = 3
+LLAMA_FLASH_ATTN = False
 LLAMA_GPU_LAYERS = int(
     os.environ.get(
         "AKANE_LLAMA_GPU_LAYERS",

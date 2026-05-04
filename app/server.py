@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,7 +32,7 @@ from app.generation import (
     extract_read_requests,
     truncate_messages,
 )
-from app.memory_store import MEMORY_PATH, analyze_conversation_context, format_for_prompt, record_interaction, reload_from_disk
+from app.memory_store import MEMORY_PATH, format_for_prompt, record_interaction, reload_from_disk
 from app.model_loader import LLM, ModelManager
 from app.reply_pipeline import (
     clean_reply_text,
@@ -44,8 +45,6 @@ from app.request_analysis import RequestAnalyzer, RequestSnapshot
 from app.ui_assets import resolve_ui_asset
 from app.vscode_launcher import launch_vscode
 
-HOST = SERVER_HOST
-PORT = SERVER_PORT
 STATIC_DIR = Path(__file__).parent / "static"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -160,13 +159,17 @@ def _technical_answer_instruction(*, single_suggestion: bool = False) -> str:
     )
 
 
+_STATIC_ROUTES: dict[str, tuple[str, str]] = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+}
+
+
 def _static_response_path(route: str) -> tuple[Path, str] | None:
-    if route == "/":
-        return STATIC_DIR / "index.html", "text/html; charset=utf-8"
-    if route == "/app.js":
-        return STATIC_DIR / "app.js", "application/javascript; charset=utf-8"
-    if route == "/styles.css":
-        return STATIC_DIR / "styles.css", "text/css; charset=utf-8"
+    if entry := _STATIC_ROUTES.get(route):
+        filename, content_type = entry
+        return STATIC_DIR / filename, content_type
 
     asset_path = resolve_ui_asset(route)
     if asset_path is not None:
@@ -301,10 +304,8 @@ def _clear_streaming_reply_preview(session_id: str | None = None) -> None:
 
 
 def _log_terminal_stream(label: str, text: str = "") -> None:
-    message = f"[Akane:{label}]"
-    if text:
-        message = f"{message} {text}"
-    print(message, flush=True)
+    suffix = f" {text}" if text else ""
+    print(f"[Akane:{label}]{suffix}", flush=True)
 
 
 def _explicit_paths_in_text(text: str) -> list[str]:
@@ -331,11 +332,7 @@ def _explicit_paths_in_text(text: str) -> list[str]:
 
 
 def _remember_codebase_targets(paths: list[str], session_id: str | None = None) -> None:
-    remembered = [
-        str(path or "").strip()
-        for path in paths
-        if str(path or "").strip() and not _is_infra_path(str(path or "").strip())
-    ]
+    remembered = [p for raw in paths if (p := str(raw or "").strip()) and not _is_infra_path(p)]
     if not remembered:
         return
     state = _session_state(session_id)
@@ -360,15 +357,13 @@ def _last_message(role: str, session_id: str | None = None) -> str:
     return ""
 
 
-def _recent_exchange_context(limit: int = 8, session_id: str | None = None) -> str:
-    del limit
+def _recent_exchange_context(session_id: str | None = None) -> str:
     state = _session_state(session_id)
     _refresh_session_history_cache(state)
     return state.cached_recent_exchange_context
 
 
-def _recent_exchange_note(limit: int = 8, session_id: str | None = None) -> str:
-    del limit
+def _recent_exchange_note(session_id: str | None = None) -> str:
     state = _session_state(session_id)
     _refresh_session_history_cache(state)
     return state.cached_recent_exchange_note
@@ -397,8 +392,7 @@ def _analyze_request(user_input: str, *, session_id: str | None = None, last_ass
 
 
 def _record_recent_interaction(session_id: str | None = None) -> None:
-    context = analyze_conversation_context(_snapshot_messages(session_id)[-12:])
-    record_interaction(conversation_context=context)
+    record_interaction()
 
 
 def _runtime_context_for_request(*, skip_memory: bool = False, include_editor: bool = True) -> str:
@@ -411,9 +405,7 @@ def _runtime_context_for_request(*, skip_memory: bool = False, include_editor: b
 
 
 def _coerce_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
+    if isinstance(value, (bool, int, float)):
         return bool(value)
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -424,7 +416,6 @@ def _append_message(role: str, content: str, session_id: str | None = None) -> N
     state.version += 1
     if role == "assistant":
         state.streaming_reply_preview = ""
-    if role == "assistant":
         _remember_codebase_targets(_explicit_paths_in_text(content), session_id)
 
 
@@ -510,10 +501,7 @@ def _preview_action_change(action: dict) -> str:
         return "\n".join(parts)
     command = str(action.get("command", "") or "").lower()
     argument = str(action.get("argument", "") or "")
-    if command == "replace_file_range":
-        header, _, content = argument.partition("\n")
-        return f"{header} -> {collapse_hidden_tag_gaps(content).strip()[:180]}"
-    if command in {"write_file", "append_file"}:
+    if command in {"replace_file_range", "write_file", "append_file"}:
         header, _, content = argument.partition("\n")
         return f"{header} -> {collapse_hidden_tag_gaps(content).strip()[:180]}"
     if command in {"replace_selection", "insert_text"}:
@@ -568,13 +556,6 @@ def _looks_like_deferred_action_reply(reply: str) -> bool:
     )
 
 
-def _recent_conversation_text(limit: int = 8, session_id: str | None = None) -> str:
-    del limit
-    state = _session_state(session_id)
-    _refresh_session_history_cache(state)
-    return state.cached_recent_text
-
-
 def _candidate_codebase_paths(user_input: str, limit: int = 3, session_id: str | None = None) -> list[str]:
     return _REQUEST_ANALYZER.candidate_paths(user_input, _request_snapshot(session_id=session_id), limit=limit)
 
@@ -583,18 +564,7 @@ def _is_infra_path(path: str) -> bool:
     lowered = str(path or "").strip().lower()
     if not lowered:
         return False
-    if any(lowered.startswith(prefix) for prefix in _INFRA_PATH_PREFIXES):
-        return True
-    return any(
-        marker in lowered
-        for marker in (
-            "/.vscode/",
-            "/.idea/",
-            "/.zed/",
-            "/.github/",
-            "/.gitlab/",
-        )
-    )
+    return any(lowered.startswith(prefix) for prefix in _INFRA_PATH_PREFIXES)
 
 
 def _filter_coder_preload_paths(paths: list[str], user_input: str) -> list[str]:
@@ -929,11 +899,6 @@ def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id
     if _should_force_vscode(user_input, analysis, session_id=session_id):
         chat_messages = _enforce_vscode_for_coding(chat_messages)
     return chat_messages, analysis
-
-
-def _build_chat_messages(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> list[dict]:
-    chat_messages, _ = _prepare_chat_turn(user_input, skip_memory=skip_memory, session_id=session_id)
-    return chat_messages
 
 
 def _run_coder_handoff(
@@ -1449,7 +1414,7 @@ def _request_completion(
         messages = _fit_messages_to_context(messages)
     return LLM.create_chat_completion(
         messages=messages,
-        max_tokens=max_tokens_override if max_tokens_override is not None else MAX_TOKENS,
+        max_tokens=max_tokens_override or MAX_TOKENS,
         temperature=temperature_override if temperature_override is not None else TEMPERATURE,
         top_k=TOP_K,
         top_p=TOP_P,
@@ -1856,7 +1821,6 @@ def create_app() -> FastAPI:
     @app.post("/api/quit")
     async def api_quit():
         def _quit_soon() -> None:
-            import time
             time.sleep(0.15)
             os._exit(0)
 
@@ -1954,7 +1918,7 @@ class BackgroundUvicornServer:
             self._thread.join(timeout=2.0)
 
 
-def serve(host: str = HOST, port: int = PORT) -> None:
+def serve(host: str = SERVER_HOST, port: int = SERVER_PORT) -> None:
     print(f"Akane web chat running at http://{host}:{port}", flush=True)
     _warm_model_now()
     server = BackgroundUvicornServer(host, port)
@@ -1964,7 +1928,7 @@ def serve(host: str = HOST, port: int = PORT) -> None:
         print("\nStopping Akane web chat...", flush=True)
 
 
-def serve_in_thread(host: str = HOST, port: int = PORT) -> tuple[BackgroundUvicornServer, threading.Thread]:
+def serve_in_thread(host: str = SERVER_HOST, port: int = SERVER_PORT) -> tuple[BackgroundUvicornServer, threading.Thread]:
     _start_model_loading()
     server = BackgroundUvicornServer(host, port)
     thread = threading.Thread(

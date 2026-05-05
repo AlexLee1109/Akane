@@ -76,13 +76,13 @@ LLAMA_CONTEXT_WINDOW = int(
 LLAMA_BATCH_SIZE = int(
     os.environ.get(
         "AKANE_LLAMA_BATCH_SIZE",
-        str(_local_secret("LLAMA_BATCH_SIZE", 256)),
+        str(_local_secret("LLAMA_BATCH_SIZE", 512)),
     ).strip()
 )
 LLAMA_UBATCH_SIZE = int(
     os.environ.get(
         "AKANE_LLAMA_UBATCH_SIZE",
-        str(_local_secret("LLAMA_UBATCH_SIZE", 64)),
+        str(_local_secret("LLAMA_UBATCH_SIZE", 128)),
     ).strip()
 )
 LLAMA_THREADS = 3
@@ -160,6 +160,7 @@ ADVISOR_ONLY = os.environ.get(
 
 # Generation parameters
 MAX_TOKENS = 1024
+CODER_MAX_TOKENS = 2048  # Higher limit for coding suggestions
 TEMPERATURE = 0.9
 TOP_K = 40
 TOP_P = 0.95

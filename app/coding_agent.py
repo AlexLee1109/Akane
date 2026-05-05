@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 
 from app.config import (
     CODER_INITIAL_CHUNKS_PER_FILE,
     CODER_MAX_INITIAL_TARGETS,
     CODER_MAX_READ_CHUNKS_PER_FILE,
+    CODER_MAX_TOKENS,
     CODER_MAX_TURNS,
     CODER_READ_CHUNK_LINES,
-    MAX_TOKENS,
     REPETITION_PENALTY,
     TEMPERATURE,
     TOP_K,
@@ -38,22 +37,56 @@ _EDIT_ACTION_COMMANDS = {
 _ALLOWED_ACTIONS = _READ_ACTION_COMMANDS | _EDIT_ACTION_COMMANDS | _EDITOR_LAUNCH_COMMANDS
 _ACTIVE_EDITOR_COMMANDS = {"replace_selection", "insert_text", "format_document", "save_file"}
 _ACTION_WAIT_SECONDS = 5.5
-_JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
-_FILE_RESULT_PATH_PATTERN = re.compile(r"^FILE\s+(.+?)\s+\(line-numbered(?:\s+lines\s+(\d+)-(\d+)\s+of\s+(\d+))?\)", re.IGNORECASE)
-_SYMBOL_PATTERN = re.compile(r"^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
-_DEFERRED_SUMMARY_PATTERN = re.compile(
-    r"\b(?:let me|i(?:'|’)ll|i will|i need to|first i(?:'|’)ll|before i|i should)\b.*\b"
-    r"(?:look|check|inspect|review|read|figure out|understand|analyze|see)\b",
-    re.IGNORECASE,
+_DEFERRED_SUMMARY_STARTERS = (
+    "let me",
+    "i'll",
+    "i will",
+    "i need to",
+    "first i'll",
+    "before i",
+    "i should",
 )
-_META_SUMMARY_PATTERN = re.compile(
-    r"\b(?:summary|done|read_requests|actions|reason|json|schema|return json|set done|provide suggestions|"
-    r"the user asks|the user asked|we need to output json|we have already read|without any actions)\b",
-    re.IGNORECASE,
+_DEFERRED_SUMMARY_VERBS = (
+    "look",
+    "check",
+    "inspect",
+    "review",
+    "read",
+    "figure out",
+    "understand",
+    "analyze",
+    "see",
 )
-_BLOCKER_PATTERN = re.compile(
-    r"\b(?:blocked|missing|need|can't|cannot|unable|not enough|unclear|ambiguous|no file|no path|no code)\b",
-    re.IGNORECASE,
+_META_SUMMARY_KEYWORDS = (
+    "summary",
+    "done",
+    "read_requests",
+    "actions",
+    "reason",
+    "json",
+    "schema",
+    "return json",
+    "set done",
+    "provide suggestions",
+    "the user asks",
+    "the user asked",
+    "we need to output json",
+    "we have already read",
+    "without any actions",
+)
+_BLOCKER_KEYWORDS = (
+    "blocked",
+    "missing",
+    "need",
+    "can't",
+    "cannot",
+    "unable",
+    "not enough",
+    "unclear",
+    "ambiguous",
+    "no file",
+    "no path",
+    "no code",
 )
 
 
@@ -93,7 +126,7 @@ def _extract_message_text(result: dict) -> str:
 def _request_coder_completion(messages: list[dict]) -> dict:
     return ModelManager.get_instance().create_chat_completion(
         messages=messages,
-        max_tokens=MAX_TOKENS,
+        max_tokens=CODER_MAX_TOKENS,
         temperature=TEMPERATURE,
         top_k=TOP_K,
         top_p=TOP_P,
@@ -108,18 +141,21 @@ def _extract_json_payload(raw: str) -> dict:
     if not text:
         return {}
     if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    for candidate in (text,):
-        try:
-            parsed = json.loads(candidate)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            pass
-    match = _JSON_BLOCK_PATTERN.search(text)
-    if not match:
+        fence_end = text.find("\n")
+        if fence_end != -1:
+            text = text[fence_end + 1 :]
+        if text.endswith("```"):
+            text = text[: -3].strip()
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
         return {}
-    snippet = match.group(0)
+    snippet = text[start : end + 1]
     try:
         parsed = json.loads(snippet)
         return parsed if isinstance(parsed, dict) else {}
@@ -215,19 +251,35 @@ def _grounding_terms_for_paths(paths: list[str]) -> set[str]:
     return {term for term in terms if len(term) >= 3}
 
 
+def _parse_int_from_text(text: str) -> int | None:
+    digits = "".join(ch for ch in str(text or "") if ch.isdigit())
+    return int(digits) if digits else None
+
+
+def _extract_symbol_from_line(line: str) -> str:
+    stripped = str(line or "").lstrip()
+    if stripped.startswith("def "):
+        name = stripped[4:].split("(", 1)[0].split(":", 1)[0].strip()
+        return name
+    if stripped.startswith("class "):
+        name = stripped[6:].split("(", 1)[0].split(":", 1)[0].strip()
+        return name
+    return ""
+
+
 def _grounding_terms_for_reads(read_results: list[str]) -> set[str]:
     terms: set[str] = set()
     for block in read_results:
         text = str(block or "")
         if not text:
             continue
-        for match in _FILE_RESULT_PATH_PATTERN.finditer(text):
-            path = match.group(1).strip().lower()
-            if path:
-                terms.update(_grounding_terms_for_paths([path]))
-        for match in _SYMBOL_PATTERN.finditer(text):
-            symbol = match.group(1).strip().lower()
-            if len(symbol) >= 3:
+        first_line = text.splitlines()[0] if text else ""
+        path, _, _, _ = _parse_read_result_header(first_line)
+        if path:
+            terms.update(_grounding_terms_for_paths([path.lower()]))
+        for line in text.splitlines():
+            symbol = _extract_symbol_from_line(line)
+            if symbol and len(symbol) >= 3:
                 terms.add(symbol)
                 terms.add(f"{symbol}()")
     return terms
@@ -235,13 +287,25 @@ def _grounding_terms_for_reads(read_results: list[str]) -> set[str]:
 
 def _parse_read_result_header(result_text: str) -> tuple[str, int | None, int | None, int | None]:
     first_line = str(result_text or "").splitlines()[0] if str(result_text or "") else ""
-    match = _FILE_RESULT_PATH_PATTERN.search(first_line)
-    if not match:
+    if not first_line.lower().startswith("file "):
         return "", None, None, None
-    path = match.group(1).strip()
-    start_line = int(match.group(2)) if match.group(2) else None
-    end_line = int(match.group(3)) if match.group(3) else None
-    total_lines = int(match.group(4)) if match.group(4) else None
+    rest = first_line[5:]
+    lower = rest.lower()
+    marker = " (line-numbered"
+    path = rest
+    if marker in lower:
+        path = rest[: lower.index(marker)].strip()
+    else:
+        path = rest.strip()
+    start_line = end_line = total_lines = None
+    if "lines " in lower and " of " in lower:
+        after_lines = lower.split("lines ", 1)[1]
+        range_part, _, total_part = after_lines.partition(" of ")
+        if "-" in range_part:
+            start_str, end_str = range_part.split("-", 1)
+            start_line = _parse_int_from_text(start_str)
+            end_line = _parse_int_from_text(end_str)
+        total_lines = _parse_int_from_text(total_part)
     return path, start_line, end_line, total_lines
 
 
@@ -321,16 +385,19 @@ def _looks_like_deferred_summary(summary: str) -> bool:
     text = collapse_hidden_tag_gaps(str(summary or "")).strip()
     if not text:
         return False
-    return bool(_DEFERRED_SUMMARY_PATTERN.search(text))
+    lowered = text.lower()
+    return any(starter in lowered for starter in _DEFERRED_SUMMARY_STARTERS) and any(
+        verb in lowered for verb in _DEFERRED_SUMMARY_VERBS
+    )
 
 
 def _looks_like_meta_summary(summary: str) -> bool:
     text = collapse_hidden_tag_gaps(str(summary or "")).strip()
     if not text:
         return False
-    if _META_SUMMARY_PATTERN.search(text):
-        return True
     lowered = text.lower()
+    if any(keyword in lowered for keyword in _META_SUMMARY_KEYWORDS):
+        return True
     return (
         lowered.startswith("1.")
         or lowered.startswith("2.")
@@ -338,11 +405,28 @@ def _looks_like_meta_summary(summary: str) -> bool:
     ) and any(token in lowered for token in ("done", "summary", "actions", "read", "json"))
 
 
+def _strip_meta_lines(summary: str) -> str:
+    lines = [line.strip() for line in str(summary or "").splitlines()]
+    kept: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if any(keyword in line.lower() for keyword in _META_SUMMARY_KEYWORDS):
+            continue
+        if line.lower().startswith(("1.", "2.", "- ")) and any(
+            token in line.lower() for token in ("done", "summary", "actions", "read", "json")
+        ):
+            continue
+        kept.append(line)
+    return " ".join(kept).strip()
+
+
 def _looks_like_blocker(reason: str) -> bool:
     text = collapse_hidden_tag_gaps(str(reason or "")).strip()
     if not text:
         return False
-    return bool(_BLOCKER_PATTERN.search(text))
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in _BLOCKER_KEYWORDS)
 
 
 def _summary_retry_instruction(
@@ -714,6 +798,12 @@ def run_coder_specialist(
         if reason:
             last_reason = reason
 
+        if done and summary and _looks_like_meta_summary(summary):
+            cleaned_summary = _strip_meta_lines(summary)
+            last_summary = cleaned_summary
+            last_reason = ""
+            break
+
         if read_requests:
             signature = tuple(read_requests)
             if signature in used_read_signatures:
@@ -850,8 +940,12 @@ def run_coder_specialist(
     elif not final_summary:
         final_summary = last_reason or ""
     if _looks_like_meta_summary(final_summary):
-        print("[Akane][coder] dropping leaked meta summary and falling back.", flush=True)
-        final_summary = ""
+        stripped = _strip_meta_lines(final_summary)
+        if stripped:
+            final_summary = stripped
+        else:
+            print("[Akane][coder] dropping leaked meta summary and falling back.", flush=True)
+            final_summary = ""
 
     print(
         f"[Akane][coder] done summary_len={len(final_summary)} actions_applied={actions_applied} tool_used={tool_used}",

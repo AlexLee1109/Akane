@@ -68,6 +68,7 @@ _INFRA_PATH_PREFIXES = (
     ".gitlab/",
 )
 DEFAULT_SESSION_ID = "popup"
+_POPUP_STRIP_TAGS = ("MEM", "FORGET", "PROJECT", "NEXT")
 
 
 @dataclass
@@ -93,70 +94,26 @@ _ACTIVE_EDITOR_COMMANDS = {"replace_selection", "insert_text", "format_document"
 _CODEBASE_SEARCH = CodebaseSearch(PROJECT_ROOT)
 _REQUEST_ANALYZER = RequestAnalyzer(_CODEBASE_SEARCH)
 _SESSIONS: dict[str, SessionState] = {}
-_IMPLEMENTATION_WALKTHROUGH_PHRASES = (
-    "show me how", "how to implement", "walk me through", "implementation steps",
-    "wire it up", "wire this up", "wire that up", "where should i change",
-    "where should i put", "where should i add", "what should i change",
-)
-_CODER_SPECIALIST_HINTS = (
-    "debug", "trace", "root cause", "failing", "failure", "broken", "bug", "regression",
-    "refactor", "rewrite", "migrate", "investigate", "diagnose", "test failure",
-    "stack trace", "exception", "error",
-)
-_CODER_SPECIALIST_WHY_PREFIXES = ("why is", "why does", "why did")
-_INFRA_CONTEXT_KEYWORDS = (
-    "vscode", "vs code", "extension", "extensions", "integration", "integrations",
-    "bridge", "launch.json", "settings.json", "workflow", "workflows", "github actions", "ci", "pipeline",
-)
-_DEFERRED_ACTION_OPENERS = ("i'll", "i’ll", "i will", "let me", "i can")
-_DEFERRED_ACTION_VERBS = (
-    "check", "look at", "inspect", "review", "read", "implement", "change", "update",
-    "fix", "patch", "edit", "outline", "sketch", "draft", "split", "refactor", "rewrite",
-    "restructure", "reorganize",
-)
+_IMPLEMENTATION_WALKTHROUGH_PHRASES = ("show me how", "how to implement", "walk me through")
+_CODER_SPECIALIST_HINTS = ("debug", "trace", "bug", "refactor", "rewrite")
+_CODER_SPECIALIST_WHY_PREFIXES = ("why is", "why does")
+_INFRA_CONTEXT_KEYWORDS = ("vscode", "extension", "integration")
+_DEFERRED_ACTION_OPENERS = ("i'll", "i will", "let me")
+_DEFERRED_ACTION_VERBS = ("check", "inspect", "review", "fix", "update")
 
-_COMPACT_REPLY_RULES = (
-    "Use one to three short declarative sentences max, and prefer one or two when possible. "
-    "Stop immediately after the first complete thought unless a second or third short sentence is genuinely needed. "
-    "Start immediately with the real reply content. "
-    "Answer the user's literal question first before discussing nearby or related topics. "
-    "Do not replace the asked topic with an adjacent one. "
-    "If they ask whether they should do something, answer that recommendation directly in the first sentence. "
-    "Do not begin with filler like Mm..., Mmm..., Hmm..., Ah..., Oh..., Well..., or Heh.... "
-    "Do not generate a filler opener and then continue into the real answer. "
-    "Do not add a follow-up question or end with a question mark unless the user explicitly needs clarification or emotional support. "
-    "Do not use routine check-in questions like 'How was your day so far?' or 'How's your day going so far?'."
-)
-_TECHNICAL_FOCUS_RULES = (
-    "Stay focused on the inspected code and the user's actual engineering question. "
-    "Do not switch into emotional support, life advice, productivity coaching, or generic encouragement. "
-    "Do not restate the user's request. "
-    "Do not print raw code, READ_RESULT blocks, or a file dump."
-)
+# Compact instruction snippets (short to reduce file size and parsing cost)
+_COMPACT_REPLY_RULES = "Respond in 1-3 short declarative sentences; start with the answer."
+_TECHNICAL_FOCUS_RULES = "Focus only on the code and the user's engineering question."
 
 
 def _compact_companion_instruction() -> str:
-    return (
-        "For this turn, reply like a compact desktop companion message. "
-        f"{_COMPACT_REPLY_RULES} "
-        "If the user is asking for suggestions or improvements, give only the single best recommendation first, not a list. "
-        "Stay coherent with the immediately previous exchange and continue the same conversational thread unless the user clearly changes topics. "
-        "Prefer a simple reaction, answer, or observation, then stop. "
-        "Do not add extra elaboration, examples, or sign-off sentences."
-    )
+    return f"For this turn, reply like a compact companion. {_COMPACT_REPLY_RULES}"
 
 
 def _technical_answer_instruction(*, single_suggestion: bool = False) -> str:
-    suggestion_rule = (
-        "Give only the single best technical suggestion first, grounded in the fresh reads. "
-        if single_suggestion
-        else "Summarize the important findings and give the most useful suggestion first. "
-    )
-    return (
-        f"Answer the user now in 1-3 short technical sentences by default. {_COMPACT_REPLY_RULES} "
-        f"{_TECHNICAL_FOCUS_RULES} "
-        f"{suggestion_rule}"
-    )
+    if single_suggestion:
+        return f"Answer in 1 short technical sentence. {_TECHNICAL_FOCUS_RULES}"
+    return f"Answer in 1-3 short technical sentences. {_TECHNICAL_FOCUS_RULES}"
 
 
 _STATIC_ROUTES: dict[str, tuple[str, str]] = {
@@ -306,6 +263,25 @@ def _clear_streaming_reply_preview(session_id: str | None = None) -> None:
 def _log_terminal_stream(label: str, text: str = "") -> None:
     suffix = f" {text}" if text else ""
     print(f"[Akane:{label}]{suffix}", flush=True)
+
+
+def _strip_popup_tags(text: str) -> str:
+    if not text:
+        return text
+    cleaned = str(text)
+    for tag in _POPUP_STRIP_TAGS:
+        open_tag = f"[{tag}]"
+        close_tag = f"[/{tag}]"
+        while True:
+            start = cleaned.find(open_tag)
+            if start == -1:
+                break
+            end = cleaned.find(close_tag, start + len(open_tag))
+            if end == -1:
+                cleaned = cleaned[:start].strip()
+                break
+            cleaned = (cleaned[:start] + cleaned[end + len(close_tag):]).strip()
+    return "\n".join(line for line in cleaned.splitlines() if line.strip())
 
 
 def _explicit_paths_in_text(text: str) -> list[str]:
@@ -557,6 +533,9 @@ def _looks_like_deferred_action_reply(reply: str) -> bool:
 
 
 def _candidate_codebase_paths(user_input: str, limit: int = 3, session_id: str | None = None) -> list[str]:
+    explicit = _explicit_paths_in_text(user_input)
+    if explicit:
+        return explicit[:limit]
     return _REQUEST_ANALYZER.candidate_paths(user_input, _request_snapshot(session_id=session_id), limit=limit)
 
 
@@ -586,15 +565,10 @@ def _filter_coder_preload_paths(paths: list[str], user_input: str) -> list[str]:
 
 def _enforce_vscode_for_coding(chat_messages: list[dict]) -> list[dict]:
     instruction = (
-        "The user is asking for coding or editor help. "
-        "You must inspect the relevant code before replying with only plain advice or fenced code. "
-        "If VS Code is connected, prefer VS Code editor actions. If not, use [READ] to inspect the relevant files. "
-        "If the user wants the project opened in VS Code, emit [EDITOR]open_vscode[/EDITOR]. "
-        "If code needs to be created or changed, emit [EDITOR] tags to read files, open files, write files, replace ranges, save files, or format files. "
-        "For implementation or codebase questions, read the relevant file(s) first, then continue in the SAME reply with a short summary of what you found. "
-        "Use only the square-bracket tag forms like [EDITOR]...[/EDITOR] and [READ]...[/READ]. "
-        "Do not emit XML-style tool markup like <tool_call>, <editor>, <READ>, or <function=...>. "
-        "Do not tell the user to copy, save, or paste code manually."
+        "Use VS Code editor actions for coding tasks. "
+        "If you need context, use [READ]file[/READ]. "
+        "Use only [EDITOR]...[/EDITOR] and [READ]...[/READ]; no XML tool tags. "
+        "Do the work now and summarize findings briefly."
     )
     return [*chat_messages[:-1], {"role": "system", "content": instruction}, chat_messages[-1]]
 
@@ -607,85 +581,19 @@ def _should_force_vscode(user_input: str, analysis=None, *, session_id: str | No
 
 
 def _should_use_coder_specialist(user_input: str, analysis=None, *, session_id: str | None = None) -> bool:
+    # Lightweight, conservative check: only use coder for explicit coding/execution turns
     analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    coding_like = analysis.coding_like
-    current_turn_explicitly_non_code = bool(
-        not analysis.coding
-        and not analysis.codebase_direct
-        and not analysis.explicit_file_reference
-        and not analysis.wants_execution
-        and not analysis.wants_single_suggestion
-        and not analysis.wants_detail
-    )
-    if current_turn_explicitly_non_code:
-        return False
-    if analysis.wants_brainstorm and not analysis.codebase_context and not analysis.wants_execution:
-        return False
-    if ADVISOR_ONLY:
-        if coding_like:
-            print("[Akane] Skipping coding model: advisor-only mode enabled.", flush=True)
-        return False
-    if analysis.open_vscode:
-        if coding_like:
-            print("[Akane] Skipping coding model: open-vscode request.", flush=True)
+    if ADVISOR_ONLY or analysis.open_vscode:
         return False
     manager = ModelManager.get_instance()
     status = manager.status()
-    if status.get("coder_backend") != "openrouter":
-        if coding_like:
-            print(
-                "[Akane] Skipping coding model: no OpenRouter coder backend configured.",
-                flush=True,
-            )
+    if status.get("coder_backend") != "openrouter" or not status.get("openrouter_coder_model"):
         return False
-    coder_model = str(status.get("openrouter_coder_model") or "")
-    if not coder_model:
-        if coding_like:
-            print("[Akane] Skipping coding model: no coder model configured.", flush=True)
+    if not analysis.coding_like:
         return False
-    if not coding_like:
-        return False
-    lowered = str(user_input or "").lower()
-    explicit_codebase_followup = bool(
-        analysis.codebase_followup
-        and (
-            analysis.followup_reference
-            or analysis.explanation_followup
-            or analysis.affirmative_followup
-            or analysis.assistant_invited_continuation
-        )
-    )
-    explicit_coder_turn = bool(
-        analysis.wants_execution
-        or analysis.codebase_direct
-        or explicit_codebase_followup
-        or analysis.explicit_file_reference
-        or analysis.wants_single_suggestion
-        or analysis.wants_detail
-        or any(hint in lowered for hint in _CODER_SPECIALIST_HINTS)
-        or any(lowered.startswith(prefix) for prefix in _CODER_SPECIALIST_WHY_PREFIXES)
-        or (analysis.coding and not analysis.short_followup and len(analysis.query_tokens) >= 3)
-    )
-    if not explicit_coder_turn:
-        print("[Akane] Skipping coding model: current turn is a lightweight follow-up.", flush=True)
-        return False
-    if analysis.wants_execution:
-        specialist_reason = "execution request"
-    elif analysis.codebase_context:
-        specialist_reason = "codebase request"
-    elif analysis.wants_single_suggestion:
-        specialist_reason = "code review request"
-    elif analysis.wants_detail:
-        specialist_reason = "detailed coding request"
-    elif any(hint in lowered for hint in _CODER_SPECIALIST_HINTS) or any(lowered.startswith(prefix) for prefix in _CODER_SPECIALIST_WHY_PREFIXES):
-        specialist_reason = "complex coding request"
-    else:
-        specialist_reason = "general coding request"
-    print(
-        f"[Akane] Coding model eligible ({specialist_reason}). main={status.get('model_name')} coder={coder_model}",
-        flush=True,
-    )
-    return True
+    if analysis.wants_execution or analysis.codebase_direct or analysis.explicit_file_reference:
+        return True
+    return False
 
 
 def _response_uses_editor_tools(raw: str) -> bool:
@@ -748,12 +656,10 @@ def _is_simple_factual_turn(user_input: str, analysis) -> bool:
     return len(analysis.query_tokens) <= 8
 
 
-def _completion_overrides_for_turn(user_input: str, analysis) -> dict[str, float | int]:
+def _completion_overrides_for_turn(user_input: str, analysis, *, session_id: str | None = None) -> dict[str, float | int]:
+    # Reduce token budget for simple factual/light turns to save compute
     if _is_simple_factual_turn(user_input, analysis):
-        return {
-            "max_tokens_override": _FACTUAL_CHAT_MAX_TOKENS,
-            "temperature_override": min(TEMPERATURE, 0.45),
-        }
+        return {"max_tokens_override": _FACTUAL_CHAT_MAX_TOKENS, "temperature_override": min(TEMPERATURE, 0.45)}
     if _is_light_chat_turn(analysis):
         return {"max_tokens_override": _FAST_CHAT_MAX_TOKENS}
     return {}
@@ -907,6 +813,7 @@ def _run_coder_handoff(
     initial_raw: str,
     *,
     session_id: str | None = None,
+    analysis=None,
     progress_callback=None,
 ) -> str:
     def _fallback_from_coder_result(coder_text: str, fallback_hint: str = "") -> str:
@@ -923,6 +830,7 @@ def _run_coder_handoff(
             chat_messages,
             user_input,
             coder_failed=True,
+            analysis=analysis,
         )
         if fallback_messages:
             fallback_response = _request_completion(fallback_messages, stream=False, role="main")
@@ -943,7 +851,7 @@ def _run_coder_handoff(
     print("[Akane] Using coding model for coding specialist handoff.", flush=True)
     requests = extract_coder_requests(initial_raw)
     task = "\n\n".join(requests).strip() or user_input
-    analysis = _analyze_request(user_input, session_id=session_id)
+    analysis = analysis or _analyze_request(user_input, session_id=session_id)
     if analysis.should_carry_last_reply:
         exchange = _recent_exchange_context(session_id=session_id)
         if exchange:
@@ -953,7 +861,10 @@ def _run_coder_handoff(
             )
     preload_query = task if task and task != user_input else user_input
     preload_paths: list[str] = []
-    if analysis.codebase_context or analysis.explicit_file_reference:
+    explicit_paths = _explicit_paths_in_text(preload_query)
+    if explicit_paths:
+        preload_paths = explicit_paths[:3]
+    elif analysis.codebase_context or analysis.explicit_file_reference:
         preload_paths = _filter_coder_preload_paths(
             _candidate_codebase_paths(preload_query, limit=6, session_id=session_id),
             preload_query,
@@ -980,7 +891,7 @@ def _run_coder_handoff(
     )
     return postprocess_reply(
         cleaned,
-        analysis=_analyze_request(user_input, session_id=session_id),
+        analysis=analysis,
         working_messages=chat_messages,
         request_completion=lambda messages: _request_completion(messages, stream=False),
         extract_message_text=_extract_message_text,
@@ -990,13 +901,9 @@ def _run_coder_handoff(
 
 def _retry_messages_for_editor_actions(chat_messages: list[dict]) -> list[dict]:
     retry_instruction = (
-        "You are handling a coding request and VS Code is connected. "
-        "Retry this answer using VS Code editor actions. "
-        "Use only square-bracket tool tags such as [EDITOR]...[/EDITOR] or [READ]...[/READ]. "
-        "Do not emit XML-style tool markup. "
-        "Do not say you will inspect, outline, split, refactor, or update the code later. "
-        "Do the work now in this same reply. "
-        "Do not answer with fenced code, copy-paste instructions, or a plain explanation alone."
+        "Retry with VS Code editor actions now. "
+        "Use only [EDITOR]...[/EDITOR] or [READ]...[/READ], no XML tool tags. "
+        "Do not defer or reply with plain fenced code."
     )
     return [*chat_messages, {"role": "system", "content": retry_instruction}]
 
@@ -1007,15 +914,10 @@ def _retry_messages_for_codebase_action(
     user_input: str,
 ) -> list[dict]:
     retry_instruction = (
-        "The user asked for real codebase help, not a promise of future work. "
-        "Your previous reply sounded like a plan or intention instead of doing the task. "
-        "Do the work now in this same reply. "
-        "If you need file context, use [READ]path/to/file[/READ] now. "
-        "If VS Code is connected and files need to change, emit [EDITOR] actions now. "
-        "If you already have enough context, answer concretely now. "
-        "Do not say you will outline, inspect, split, refactor, rewrite, review, or update something later. "
-        "Do not narrate intent. "
-        "For requests like reorganizing, splitting, or refactoring a file, either inspect the file now or give the actual grounded split/refactor answer now."
+        "Do the codebase work now. "
+        "If context is missing, use [READ]path/to/file[/READ]. "
+        "If edits are needed and VS Code is connected, emit [EDITOR] actions now. "
+        "No plans or deferred intent."
     )
     return [
         *chat_messages,
@@ -1026,11 +928,8 @@ def _retry_messages_for_codebase_action(
 
 def _retry_messages_for_advisor_only_tools(chat_messages: list[dict], raw: str) -> list[dict]:
     retry_instruction = (
-        "Advisor-only mode is enabled. "
-        "Do not use [ASK_CODER] or [EDITOR] tags. "
-        "Do not offer to directly change files. "
-        "If you need code context, use only [READ]path/to/file[/READ]. "
-        "Otherwise answer directly with suggested updates and improvements."
+        "Advisor-only mode: do not use [ASK_CODER] or [EDITOR]. "
+        "Use [READ]path/to/file[/READ] only if needed; otherwise answer directly."
     )
     return [
         *chat_messages,
@@ -1039,7 +938,7 @@ def _retry_messages_for_advisor_only_tools(chat_messages: list[dict], raw: str) 
     ]
 
 
-def _wants_implementation_walkthrough(user_input: str, *, session_id: str | None = None) -> bool:
+def _wants_implementation_walkthrough(user_input: str, *, session_id: str | None = None, analysis=None) -> bool:
     text = str(user_input or "").strip()
     if not text:
         return False
@@ -1048,7 +947,7 @@ def _wants_implementation_walkthrough(user_input: str, *, session_id: str | None
         return True
     if ("how do i" in lowered or "how would i" in lowered or "how can i" in lowered) and "implement" in lowered:
         return True
-    analysis = _analyze_request(user_input, session_id=session_id)
+    analysis = analysis or _analyze_request(user_input, session_id=session_id)
     return analysis.coding_like and analysis.wants_detail
 
 
@@ -1186,6 +1085,7 @@ def _build_codebase_fallback_messages(
     user_input: str,
     *,
     session_id: str | None = None,
+    analysis=None,
     coder_failed: bool = False,
 ) -> list[dict]:
     targets = _candidate_codebase_paths(user_input, session_id=session_id)
@@ -1201,18 +1101,16 @@ def _build_codebase_fallback_messages(
     if not read_results:
         return []
 
-    if _wants_implementation_walkthrough(user_input, session_id=session_id):
+    analysis = analysis or _analyze_request(user_input, session_id=session_id)
+    if _wants_implementation_walkthrough(user_input, session_id=session_id, analysis=analysis):
         answer_instruction = (
-            "Answer the user's exact implementation question now. "
-            "Give a concrete walkthrough grounded in the fresh reads. "
-            "Explain which file or symbol to change first, what to add or update, and the order of the steps. "
-            "A short numbered list is okay when it makes the implementation clearer. "
-            "Do not print raw code, READ_RESULT blocks, or a file dump unless the user explicitly asked for code."
+            "Answer the implementation question using the fresh reads. "
+            "Explain which file/symbol to change and the step order. "
+            "No raw code or file dumps unless asked."
         )
-    elif _analyze_request(user_input, session_id=session_id).wants_single_suggestion:
+    elif analysis.wants_single_suggestion:
         answer_instruction = (
-            "Answer the user's technical code-review or improvement request now. "
-            "Stay strictly focused on the inspected code, files, functions, structure, performance, or maintainability. "
+            "Answer the code-review request using the inspected code. "
             + _technical_answer_instruction(single_suggestion=True)
         )
     else:
@@ -1226,11 +1124,9 @@ def _build_codebase_fallback_messages(
 
     instruction = (
         f"{_render_read_results(read_results)}\n\n"
-        "I already inspected the most relevant file(s) for this question. "
-        "Treat those freshly read file contents as the current source of truth. "
-        "If anything in earlier conversation history conflicts with the fresh file contents, trust the fresh file contents and correct yourself. "
-        "Do not ask to read the files again unless absolutely necessary. "
-        "Do not emit tool tags unless you truly still need another tool step. "
+        "Use the freshly read files as source of truth. "
+        "Do not re-read unless truly necessary. "
+        "Avoid tool tags unless required. "
         f"{answer_instruction}"
     )
     return [*chat_messages, {"role": "system", "content": instruction}]
@@ -1242,10 +1138,16 @@ def _maybe_get_codebase_messages(
     user_input: str,
     *,
     session_id: str | None = None,
+    analysis=None,
 ) -> list[dict]:
     if working_messages is not base_messages:
         return working_messages
-    return _build_codebase_fallback_messages(base_messages, user_input, session_id=session_id)
+    return _build_codebase_fallback_messages(
+        base_messages,
+        user_input,
+        session_id=session_id,
+        analysis=analysis,
+    )
 
 
 def _should_preload_codebase_context(user_input: str, analysis=None, *, session_id: str | None = None, use_coder_specialist: bool | None = None) -> bool:
@@ -1499,6 +1401,7 @@ def _complete_reply(
             working_messages,
             current_raw,
             session_id=session_id,
+            analysis=analysis,
             progress_callback=progress_callback,
         )
     else:
@@ -1531,6 +1434,7 @@ def _complete_reply(
                 working_messages,
                 user_input,
                 session_id=session_id,
+                analysis=analysis,
             )
             if codebase_messages is working_messages and working_messages is not base_messages:
                 if _response_uses_tool_calls(current_raw):
@@ -1588,14 +1492,25 @@ def _generate_reply(user_input: str, *, skip_memory: bool = False, session_id: s
         chat_messages, analysis = _prepare_chat_turn(user_input, skip_memory=skip_memory, session_id=session_id)
         _append_message("user", user_input, session_id)
         light_chat_turn = _is_light_chat_turn(analysis)
-        completion_overrides = _completion_overrides_for_turn(user_input, analysis)
+        completion_overrides = _completion_overrides_for_turn(user_input, analysis, session_id=session_id)
         use_coder_specialist = False if light_chat_turn else _should_use_coder_specialist(user_input, analysis, session_id=session_id)
         if use_coder_specialist:
-            cleaned = _run_coder_handoff(user_input, chat_messages, user_input, session_id=session_id)
+            cleaned = _run_coder_handoff(
+                user_input,
+                chat_messages,
+                user_input,
+                session_id=session_id,
+                analysis=analysis,
+            )
         else:
             working_messages = chat_messages
             if not light_chat_turn and _should_preload_codebase_context(user_input, analysis, session_id=session_id, use_coder_specialist=use_coder_specialist):
-                fallback_messages = _build_codebase_fallback_messages(chat_messages, user_input, session_id=session_id)
+                fallback_messages = _build_codebase_fallback_messages(
+                    chat_messages,
+                    user_input,
+                    session_id=session_id,
+                    analysis=analysis,
+                )
                 if fallback_messages:
                     working_messages = fallback_messages
 
@@ -1611,6 +1526,8 @@ def _generate_reply(user_input: str, *, skip_memory: bool = False, session_id: s
                 use_coder_specialist=use_coder_specialist,
             )
 
+    if _normalize_session_id(session_id) == DEFAULT_SESSION_ID:
+        cleaned = _strip_popup_tags(cleaned)
     _append_message("assistant", cleaned, session_id)
     if not skip_memory:
         _record_recent_interaction(session_id)
@@ -1630,13 +1547,18 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
             _append_message("user", text, session_id)
             yield _json_line({"type": "start", "messages": _snapshot_messages(session_id)})
             light_chat_turn = _is_light_chat_turn(analysis)
-            completion_overrides = _completion_overrides_for_turn(text, analysis)
+            completion_overrides = _completion_overrides_for_turn(text, analysis, session_id=session_id)
             use_coder_specialist = False if light_chat_turn else _should_use_coder_specialist(text, analysis, session_id=session_id)
             if use_coder_specialist:
-                cleaned = _run_coder_handoff(text, chat_messages, text, session_id=session_id)
+                cleaned = _run_coder_handoff(
+                    text,
+                    chat_messages,
+                    text,
+                    session_id=session_id,
+                    analysis=analysis,
+                )
                 yield _json_line({"type": "delta", "content": cleaned})
                 _set_streaming_reply_preview(cleaned, session_id)
-                _log_terminal_stream("assistant", cleaned)
             else:
                 suppress_intermediate_text = False if light_chat_turn else (
                     _should_force_vscode(text, analysis, session_id=session_id)
@@ -1644,9 +1566,13 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
                 )
                 working_messages = chat_messages
                 if not light_chat_turn and _should_preload_codebase_context(text, analysis, session_id=session_id, use_coder_specialist=use_coder_specialist):
-                    _log_terminal_stream("status", "Reading files...")
                     yield _json_line({"type": "status", "label": "Reading files..."})
-                    fallback_messages = _build_codebase_fallback_messages(chat_messages, text, session_id=session_id)
+                    fallback_messages = _build_codebase_fallback_messages(
+                        chat_messages,
+                        text,
+                        session_id=session_id,
+                        analysis=analysis,
+                    )
                     if fallback_messages:
                         working_messages = fallback_messages
 
@@ -1654,7 +1580,6 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
                 hidden_filter = HiddenTagStreamFilter()
                 full_response: list[str] = []
                 displayed_text = ""
-                last_logged_text = ""
                 stream_finish_reason = ""
 
                 for chunk in stream:
@@ -1671,24 +1596,20 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
                     if not visible:
                         continue
                     displayed_text = clean_model_text(collapse_hidden_tag_gaps(displayed_text + visible))
+                    if _normalize_session_id(session_id) == DEFAULT_SESSION_ID:
+                        displayed_text = _strip_popup_tags(displayed_text)
                     if not suppress_intermediate_text:
                         _set_streaming_reply_preview(displayed_text, session_id)
                         yield _json_line({"type": "delta", "content": displayed_text})
-                        logged_delta = displayed_text[len(last_logged_text):] if displayed_text.startswith(last_logged_text) else displayed_text
-                        if logged_delta:
-                            print(logged_delta, end="", flush=True)
-                            last_logged_text = displayed_text
 
                 visible = hidden_filter.flush()
                 if visible:
                     displayed_text = clean_model_text(collapse_hidden_tag_gaps(displayed_text + visible))
+                    if _normalize_session_id(session_id) == DEFAULT_SESSION_ID:
+                        displayed_text = _strip_popup_tags(displayed_text)
                     if not suppress_intermediate_text:
                         _set_streaming_reply_preview(displayed_text, session_id)
                         yield _json_line({"type": "delta", "content": displayed_text})
-                        logged_delta = displayed_text[len(last_logged_text):] if displayed_text.startswith(last_logged_text) else displayed_text
-                        if logged_delta:
-                            print(logged_delta, end="", flush=True)
-                            last_logged_text = displayed_text
 
                 raw = "".join(full_response).strip()
                 streamed_visible = clean_model_text(displayed_text).strip()
@@ -1706,14 +1627,12 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
                         analysis=analysis,
                         use_coder_specialist=use_coder_specialist,
                     )
+                if _normalize_session_id(session_id) == DEFAULT_SESSION_ID:
+                    cleaned = _strip_popup_tags(cleaned)
                 if suppress_intermediate_text or cleaned != displayed_text:
                     _set_streaming_reply_preview(cleaned, session_id)
                     yield _json_line({"type": "delta", "content": cleaned})
-                    if last_logged_text:
-                        print("", flush=True)
-                    _log_terminal_stream("assistant", cleaned)
-                elif last_logged_text:
-                    print("", flush=True)
+                
             _append_message("assistant", cleaned, session_id)
             if not skip_memory:
                 _record_recent_interaction(session_id)

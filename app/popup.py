@@ -18,19 +18,10 @@ DEFAULT_SCREEN_WIDTH = 1440
 DEFAULT_SCREEN_HEIGHT = 900
 HIDDEN_WINDOW_SIZE = 8
 AVATAR_HEIGHT = 350
-AVATAR_RIGHT_MARGIN = -20
-AVATAR_BOTTOM_MARGIN = -40
-EDGE_MARGIN = 18
+AVATAR_RIGHT_MARGIN = 0
+AVATAR_BOTTOM_MARGIN = 0
 BUBBLE_WIDTH = 430
 BUBBLE_HEIGHT = 520
-BUBBLE_LEFT_MARGIN = 60
-BUBBLE_TO_AVATAR_X = 275
-BUBBLE_TO_AVATAR_Y = -100
-COMPOSER_HEIGHT = 78
-COMPOSER_WIDTH_RATIO = 0.20
-COMPOSER_MIN_WIDTH = 400
-COMPOSER_MAX_WIDTH = 760
-COMPOSER_SAFE_MIN_WIDTH = 420
 BUBBLE_MIN_WIDTH = 220
 BUBBLE_MAX_WIDTH = 540
 BUBBLE_MIN_HEIGHT = 420
@@ -53,15 +44,27 @@ class Frame:
     def as_tuple(self) -> tuple[int, int, int, int]:
         return (self.x, self.y, self.width, self.height)
 
-
 def _primary_screen_frame():
     if AppKit is None:
         return None
     screens = AppKit.NSScreen.screens()
     if not screens:
         return None
-    return screens[0].visibleFrame()
-
+    try:
+        point = AppKit.NSEvent.mouseLocation()
+        for screen in screens:
+            frame = screen.frame()
+            if AppKit.NSPointInRect(point, frame):
+                return frame
+    except Exception:
+        pass
+    main_screen = AppKit.NSScreen.mainScreen()
+    if main_screen is not None:
+        return main_screen.frame()
+    return max(
+        (screen.frame() for screen in screens),
+        key=lambda rect: rect.size.width * rect.size.height,
+    )
 
 def _avatar_window_width(height: int) -> int:
     bounds_width, bounds_height = AVATAR_BOUNDS_WH
@@ -80,43 +83,35 @@ def _avatar_window_width(height: int) -> int:
 
 
 class PopupLayout:
-    def __init__(self, screen_width: int, screen_height: int, screen_x: int = 0, screen_y: int = 0):
-        self.screen_width = screen_width
-        self.screen_height = screen_height
-        self.screen_x = screen_x
-        self.screen_y = screen_y
+    def __init__(self, screen):
+        f = screen.frame()
+
+        self.screen_x = int(f.origin.x)
+        self.screen_y = int(f.origin.y)
+        self.screen_width = int(f.size.width)
+        self.screen_height = int(f.size.height)
 
         avatar_width = _avatar_window_width(AVATAR_HEIGHT)
-        avatar_height = AVATAR_HEIGHT
-        avatar_x = screen_x + max(screen_width - avatar_width - AVATAR_RIGHT_MARGIN, 0)
-        avatar_y = screen_y + max(screen_height - avatar_height - AVATAR_BOTTOM_MARGIN, 0)
-        bubble_x = max(screen_x + BUBBLE_LEFT_MARGIN, avatar_x - BUBBLE_WIDTH + BUBBLE_TO_AVATAR_X)
-        bubble_y = max(screen_y + 40, avatar_y + BUBBLE_TO_AVATAR_Y)
-        bubble_hidden_frame = Frame(
-            screen_x + screen_width - HIDDEN_WINDOW_SIZE,
-            screen_y + HIDDEN_WINDOW_SIZE,
-            HIDDEN_WINDOW_SIZE,
-            HIDDEN_WINDOW_SIZE,
-        )
+
+        avatar_x = self.screen_x + self.screen_width - avatar_width
+        avatar_y = self.screen_y + self.screen_height - AVATAR_HEIGHT
+
+        bubble_x = avatar_x + 20
+        bubble_y = avatar_y - 200
 
         self.frames = {
-            "bubble": Frame(
-                bubble_x,
-                bubble_y,
-                BUBBLE_WIDTH,
-                BUBBLE_HEIGHT,
-            ),
-            "avatar": Frame(
-                avatar_x,
-                avatar_y,
-                avatar_width,
-                avatar_height,
-            ),
-        }
-        self.hidden_frames = {
-            "bubble": bubble_hidden_frame,
+            "avatar": Frame(avatar_x, avatar_y, avatar_width, AVATAR_HEIGHT),
+            "bubble": Frame(bubble_x, bubble_y, BUBBLE_WIDTH, BUBBLE_HEIGHT),
         }
 
+        self.hidden_frames = {
+            "bubble": Frame(
+                self.screen_x + self.screen_width - HIDDEN_WINDOW_SIZE,
+                self.screen_y + HIDDEN_WINDOW_SIZE,
+                HIDDEN_WINDOW_SIZE,
+                HIDDEN_WINDOW_SIZE,
+            )
+        }
 
 class WindowApi:
     def __init__(self, app) -> None:
@@ -206,16 +201,21 @@ class PopupApp:
         )
         return f"file://{self.static_index}?{query}"
 
-    def _layout(self) -> PopupLayout:
-        frame = _primary_screen_frame()
-        if frame is None:
-            return PopupLayout(DEFAULT_SCREEN_WIDTH, DEFAULT_SCREEN_HEIGHT)
-        return PopupLayout(
-            int(frame.size.width),
-            int(frame.size.height),
-            int(frame.origin.x),
-            int(frame.origin.y),
-        )
+    def _layout(self):
+        if AppKit is None:
+            return PopupLayout(AppKit.NSScreen.mainScreen())
+
+        screens = AppKit.NSScreen.screens()
+
+        try:
+            mouse = AppKit.NSEvent.mouseLocation()
+            for s in screens:
+                if AppKit.NSPointInRect(mouse, s.frame()):
+                    return PopupLayout(s)
+        except Exception:
+            pass
+
+        return PopupLayout(AppKit.NSScreen.mainScreen())
 
     def _create_window(self, role: str, title: str, *, width: int, height: int):
         min_size = (width, height)
@@ -245,19 +245,21 @@ class PopupApp:
 
     def _position_windows(self) -> None:
         layout = self._layout()
+
+        sx = layout.screen_x
+        sy = layout.screen_y
+
         for role, window in self.windows.items():
             frame = layout.frames[role]
+
             if role == "bubble" and not self._bubble_visible:
                 frame = layout.hidden_frames["bubble"]
-            x, y, width, height = frame.as_tuple()
-            if role == "bubble":
-                visible_frame = layout.frames["bubble"]
-                self._bubble_base_x = visible_frame.x
-                self._bubble_base_y = visible_frame.y
-                if self._bubble_visible:
-                    self._bubble_width = width
-                    self._bubble_height = height
-            self._window_call(window, "resize", width, height)
+
+            # ✅ convert GLOBAL → LOCAL for BOTH avatar and bubble
+            x = frame.x - sx
+            y = frame.y - sy
+
+            self._window_call(window, "resize", frame.width, frame.height)
             self._window_call(window, "move", x, y)
 
     def _set_composer_visible(self, visible: bool) -> None:
@@ -276,16 +278,28 @@ class PopupApp:
         bubble = self.windows.get("bubble")
         if bubble is None:
             return
+
         layout = self._layout()
-        frame = layout.frames["bubble"] if self._bubble_visible else layout.hidden_frames["bubble"]
-        x, y, width, height = frame.as_tuple()
+
+        sx = layout.screen_x
+        sy = layout.screen_y
+
+        frame = (
+            layout.frames["bubble"]
+            if self._bubble_visible
+            else layout.hidden_frames["bubble"]
+        )
+
+        # ✅ FIX: convert GLOBAL → LOCAL
+        x = frame.x - sx
+        y = frame.y - sy
+        width = frame.width
+        height = frame.height
+
         if self._bubble_visible:
-            self._bubble_base_x = layout.frames["bubble"].x
-            self._bubble_base_y = layout.frames["bubble"].y
-            if self._bubble_width <= HIDDEN_WINDOW_SIZE:
-                self._bubble_width = width
-            if self._bubble_height <= HIDDEN_WINDOW_SIZE:
-                self._bubble_height = height
+            self._bubble_base_x = frame.x
+            self._bubble_base_y = frame.y
+
         self._window_call(bubble, "resize", width, height)
         self._window_call(bubble, "move", x, y)
 

@@ -147,6 +147,7 @@ def _stream_chat_request(prompt: str, session_id: str) -> dict:
             return {"error": "Akane server returned invalid JSON."}
 
     final_reply = ""
+    latest_delta = ""
     error_message = ""
     for raw_line in body.splitlines():
         line = raw_line.strip()
@@ -163,13 +164,15 @@ def _stream_chat_request(prompt: str, session_id: str) -> dict:
         if event_type == "done":
             final_reply = str(event.get("reply", "") or "").strip()
             break
-        if event_type == "delta" and not final_reply:
-            final_reply = str(event.get("content", "") or "").strip()
+        if event_type == "delta":
+            latest_delta = str(event.get("content", "") or "").strip()
 
     if error_message:
         return {"error": error_message}
     if final_reply:
         return {"reply": final_reply}
+    if latest_delta:
+        return {"reply": latest_delta}
     return {"error": "Akane server returned no reply."}
 
 
@@ -230,6 +233,7 @@ def run_discord_bot() -> None:
                             result = payload if payload else {"error": "Akane server returned invalid JSON."}
                         else:
                             final_reply = ""
+                            latest_delta = ""
                             async for raw_line in resp.content:
                                 line = raw_line.decode("utf-8", errors="ignore").strip()
                                 if not line:
@@ -246,12 +250,14 @@ def run_discord_bot() -> None:
                                 if event_type == "done":
                                     final_reply = str(event.get("reply", "") or "").strip()
                                     break
-                                if event_type == "delta" and not final_reply:
-                                    final_reply = str(event.get("content", "") or "").strip()
+                                if event_type == "delta":
+                                    latest_delta = str(event.get("content", "") or "").strip()
                             else:
                                 result = {"error": "Akane server returned no reply."}
                             if final_reply:
                                 result = {"reply": final_reply}
+                            elif latest_delta:
+                                result = {"reply": latest_delta}
                 except Exception:
                     result = await asyncio.to_thread(_stream_chat_request, prompt, session_id)
             if not _is_connection_refused_error(result.get("error", "")):

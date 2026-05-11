@@ -1,12 +1,9 @@
 import threading
 
-from app.config import (
-    CHAT_HISTORY_CONTEXT_TOKENS,
-)
+from app.config import ADVISOR_ONLY, CHAT_HISTORY_CONTEXT_TOKENS
 from app.character import build_system_prompt
-from app.config import ADVISOR_ONLY
 from app.editor_bridge import get_editor_bridge
-from app.memory_store import apply_tag_operations, format_for_prompt, get_store
+from app.memory_store import apply_tag_operations, format_for_prompt, get_store, remember_user_message
 from app.vscode_launcher import launch_vscode
 
 _generation_lock = threading.Lock()
@@ -22,44 +19,70 @@ STREAM_HIDDEN_TAGS = {
     "WRITE": "[/WRITE]",
     "SHELL": "[/SHELL]",
     "READ_RESULT": "[/READ_RESULT]",
+    "THINK": "[/THINK]",
 }
 STREAM_HIDDEN_XML_TAGS = {
-    "tool_call": "</tool_call>",
+    "think": "</think>",
+    "thinking": "</thinking>",
+    "tool_call": "/tool",
     "READ": "</READ>",
     "WRITE": "</WRITE>",
     "SHELL": "</SHELL>",
     "CODE": "</CODE>",
     "READ_RESULT": "</READ_RESULT>",
 }
+_STREAM_OPENERS = tuple(
+    sorted(
+        [
+            *((f"[{name}]", closer) for name, closer in STREAM_HIDDEN_TAGS.items()),
+            *((f"<{name}>", closer) for name, closer in STREAM_HIDDEN_XML_TAGS.items()),
+        ],
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
 
 _HIDDEN_SQUARE_TAG_NAMES = (
-    "MEM", "FORGET", "PROJECT", "EDITOR", "ASK_CODER", "CODE", "READ", "WRITE", "SHELL", "READ_RESULT",
+    "MEM", "FORGET", "PROJECT", "EDITOR", "ASK_CODER", "CODE", "READ", "WRITE", "SHELL", "READ_RESULT", "THINK",
 )
-_HIDDEN_XML_SIMPLE_TAG_NAMES = ("READ", "WRITE", "SHELL", "CODE", "READ_RESULT")
+_HIDDEN_XML_SIMPLE_TAG_NAMES = ("READ", "WRITE", "SHELL", "CODE", "READ_RESULT", "THINK")
 
 
 def _extract_wrapped_sections(text: str, opener: str, closer: str, *, case_insensitive: bool = False) -> list[str]:
     source = str(text or "")
     if not source:
         return []
-    haystack = source.lower() if case_insensitive else source
-    open_token = opener.lower() if case_insensitive else opener
-    close_token = closer.lower() if case_insensitive else closer
-    items: list[str] = []
-    index = 0
-    open_len = len(opener)
-    close_len = len(closer)
-    while True:
-        start = haystack.find(open_token, index)
-        if start == -1:
-            return items
-        content_start = start + open_len
-        end = haystack.find(close_token, content_start)
-        if end == -1:
-            return items
-        items.append(source[content_start:end].strip())
-        index = end + close_len
-
+    if case_insensitive:
+        source_lower = source.lower()
+        opener_lower = opener.lower()
+        closer_lower = closer.lower()
+        items = []
+        start = 0
+        while True:
+            open_pos = source_lower.find(opener_lower, start)
+            if open_pos == -1:
+                break
+            content_start = open_pos + len(opener)
+            close_pos = source_lower.find(closer_lower, content_start)
+            if close_pos == -1:
+                break
+            items.append(source[content_start:close_pos].strip())
+            start = close_pos + len(closer)
+        return items
+    else:
+        items = []
+        start = 0
+        while True:
+            open_pos = source.find(opener, start)
+            if open_pos == -1:
+                break
+            content_start = open_pos + len(opener)
+            close_pos = source.find(closer, content_start)
+            if close_pos == -1:
+                break
+            items.append(source[content_start:close_pos].strip())
+            start = close_pos + len(closer)
+        return items
 
 def _extract_named_xml_sections(text: str, tag_name: str) -> list[str]:
     return _extract_wrapped_sections(
@@ -164,11 +187,15 @@ def _strip_hidden_markup(text: str) -> str:
     while index < length:
         next_square = source.find("[", index)
         next_angle = source.find("<", index)
-        candidates = [pos for pos in (next_square, next_angle) if pos != -1]
-        if not candidates:
+        if next_square == -1 and next_angle == -1:
             parts.append(source[index:])
             break
-        start = min(candidates)
+        elif next_square == -1:
+            start = next_angle
+        elif next_angle == -1:
+            start = next_square
+        else:
+            start = min(next_square, next_angle)
         if start > index:
             parts.append(source[index:start])
         consumed = _consume_hidden_tag(source, start)
@@ -220,284 +247,19 @@ def _looks_like_name(value: str) -> bool:
     return all(part.isalpha() for part in parts)
 
 
-def _normalize_memory_text(value: str) -> str:
-    value = " ".join(value.strip().split())
-    return value.strip(",:;- ")
-
-
-def _replace_ci_word(text: str, source: str, target: str) -> str:
-    lowered = text.lower()
-    source_lower = source.lower()
-    index = 0
-    parts: list[str] = []
-    source_len = len(source)
-    while True:
-        found = lowered.find(source_lower, index)
-        if found == -1:
-            parts.append(text[index:])
-            break
-        before_ok = found == 0 or not (lowered[found - 1].isalnum() or lowered[found - 1] == "_")
-        after_index = found + source_len
-        after_ok = after_index >= len(text) or not (lowered[after_index].isalnum() or lowered[after_index] == "_")
-        if not (before_ok and after_ok):
-            parts.append(text[index : found + 1])
-            index = found + 1
-            continue
-        parts.append(text[index:found])
-        parts.append(target)
-        index = after_index
-    return "".join(parts)
-
-
-def _canonicalize_clause(clause: str) -> str:
-    clause = clause.replace("’", "'")
-    clause = _replace_ci_word(clause, "i'm", "i am")
-    clause = _replace_ci_word(clause, "im", "i am")
-    clause = _replace_ci_word(clause, "don't", "do not")
-    clause = _replace_ci_word(clause, "can't", "can not")
-    return " ".join(clause.split())
-
-
-def _split_on_punctuation(text: str) -> list[str]:
-    parts: list[str] = []
-    current: list[str] = []
-    for ch in str(text or ""):
-        if ch in ".!?;\n":
-            part = "".join(current).strip()
-            if part:
-                parts.append(part)
-            current = []
-            continue
-        current.append(ch)
-    tail = "".join(current).strip()
-    if tail:
-        parts.append(tail)
-    return parts
-
-
-def _starts_self_clause(lowered: str) -> bool:
-    return lowered.startswith(("i ", "i'm ", "im ", "my name", "name's ", "call me ", "i go by "))
-
-
-def _split_self_subclauses(text: str) -> list[str]:
-    lowered = str(text or "").lower().replace("’", "'")
-    original = str(text or "")
-    parts: list[str] = []
-    start = 0
-    index = 0
-    for connector in (" and ", " but "):
-        pass
-    while index < len(lowered):
-        split_at = -1
-        split_len = 0
-        for connector in (" and ", " but "):
-            if lowered.startswith(connector, index):
-                remainder = lowered[index + len(connector) :].lstrip()
-                if _starts_self_clause(remainder):
-                    split_at = index
-                    split_len = len(connector)
-                    break
-        if split_at == -1:
-            index += 1
-            continue
-        part = original[start:split_at].strip()
-        if part:
-            parts.append(part)
-        start = split_at + split_len
-        index = start
-    tail = original[start:].strip()
-    if tail:
-        parts.append(tail)
-    return parts
-
-
-def _extract_self_clauses(text: str) -> list[str]:
-    clauses: list[str] = []
-    for chunk in _split_on_punctuation(text):
-        chunk = _normalize_memory_text(chunk)
-        if not chunk:
-            continue
-        for clause in _split_self_subclauses(chunk):
-            clause = _normalize_memory_text(clause)
-            if not clause:
-                continue
-            normalized = _canonicalize_clause(clause).lower()
-            if normalized.startswith(("i ", "my name", "name's ", "call me ", "i go by ")):
-                clauses.append(clause)
-    return clauses
-
-
-def _normalize_project_phrase(value: str) -> tuple[str, str]:
-    """Split a project phrase into a short name plus optional detail."""
-    value = _normalize_memory_text(value)
-    lowered = value.lower()
-    for prefix in ("a ", "an ", "the ", "my "):
-        if lowered.startswith(prefix):
-            value = value[len(prefix) :]
-            lowered = value.lower()
-            break
-    for prefix in ("project called ", "app called ", "tool called "):
-        if lowered.startswith(prefix):
-            value = value[len(prefix) :]
-            lowered = value.lower()
-            break
-    if not value:
-        return "", ""
-
-    split_index = -1
-    split_len = 0
-    lowered = value.lower()
-    for connector in (" using ", " with ", " for ", " on ", " at "):
-        found = lowered.find(connector)
-        if found != -1 and (split_index == -1 or found < split_index):
-            split_index = found
-            split_len = len(connector)
-    if split_index == -1:
-        name_part = value
-        detail_part = ""
-    else:
-        name_part = value[:split_index]
-        detail_part = value[split_index + split_len :]
-    name = _normalize_memory_text(name_part).lower()
-    detail = _normalize_memory_text(detail_part).lower()
-    if len(name) > 60:
-        name = name[:60].rsplit(" ", 1)[0] or name[:60]
-    return name, detail
-
-
-def _looks_like_durable_fact(value: str) -> bool:
-    lowered = value.lower().strip()
-    if not lowered:
-        return False
-    if len(lowered) <= 6:
-        return False
-    meaningful_tokens = [token for token in lowered.split() if len(token) > 2]
-    return len(meaningful_tokens) >= 3 or any(char.isdigit() for char in value)
-
-
-def _extract_name_from_clause(clause: str) -> str | None:
-    lowered = clause.lower()
-    for prefix in ("my name is ", "name is ", "name's ", "call me ", "i go by "):
-        if lowered.startswith(prefix):
-            candidate = _normalize_memory_text(clause[len(prefix):])
-            return candidate if _looks_like_name(candidate) else None
-    return None
-
-
-def _extract_preference_memory(clause: str) -> str | None:
-    lowered = _canonicalize_clause(clause).lower()
-    for prefix, memory_prefix in (
-        ("i prefer ", "prefers "),
-        ("i like ", "likes "),
-        ("i love ", "loves "),
-        ("i enjoy ", "enjoys "),
-        ("i want ", "wants "),
-        ("i need ", "needs "),
-        ("i hate ", "doesn't like "),
-        ("i do not like ", "doesn't like "),
-        ("i don't like ", "doesn't like "),
-    ):
-        if lowered.startswith(prefix):
-            remainder = _normalize_memory_text(clause[len(prefix):]).lower()
-            return f"{memory_prefix}{remainder}" if remainder else None
-    return None
-
-
-def _extract_project_memory(clause: str) -> tuple[str, str] | None:
-    lowered = _canonicalize_clause(clause).lower()
-    for prefix in (
-        "i am working on ",
-        "i'm working on ",
-        "im working on ",
-        "i am building ",
-        "i'm building ",
-        "im building ",
-        "i am making ",
-        "i'm making ",
-        "im making ",
-        "i am creating ",
-        "i'm creating ",
-        "im creating ",
-    ):
-        if lowered.startswith(prefix):
-            value = _normalize_memory_text(clause[len(prefix):])
-            name, detail = _normalize_project_phrase(value)
-            return (name, detail) if name else None
-    return None
-
-
-def _extract_fact_memory(clause: str) -> str | None:
-    lowered = _canonicalize_clause(clause).lower()
-    for prefix, fact_prefix in (
-        ("i use ", "uses "),
-        ("i'm using ", "uses "),
-        ("im using ", "uses "),
-        ("i have ", "has "),
-        ("i'm on ", "uses "),
-        ("im on ", "uses "),
-        ("i run ", "runs "),
-    ):
-        if lowered.startswith(prefix):
-            value = _normalize_memory_text(clause[len(prefix):]).lower()
-            if not _looks_like_durable_fact(value):
-                return None
-            return f"{fact_prefix}{value}" if value else None
-    return None
-
-
 def capture_explicit_user_memories(user_text: str) -> bool:
     """Store important explicit user details directly from the raw user message."""
-    lowered = str(user_text or "").lower()
-    if "i" not in lowered and "name" not in lowered and "call me" not in lowered:
-        return False
-    mem_ops: list[tuple[str, str]] = []
-    project_ops: list[tuple[str, str]] = []
-    changed = False
-    store = get_store().get()
-    known_name = store.get("user", {}).get("name", "").strip().lower()
-
-    for clause in _extract_self_clauses(user_text):
-        name = _extract_name_from_clause(clause)
-        if name:
-            if known_name != name.lower():
-                mem_ops.append(("user", f"name: {name}"))
-                changed = True
-            continue
-
-        project = _extract_project_memory(clause)
-        if project:
-            project_ops.append(project)
-            changed = True
-            continue
-
-        preference = _extract_preference_memory(clause)
-        if preference:
-            mem_ops.append(("preferences", preference))
-            changed = True
-            continue
-
-        fact = _extract_fact_memory(clause)
-        if fact:
-            mem_ops.append(("facts", fact))
-            changed = True
-
-    if not changed:
-        return False
-
-    apply_tag_operations(
-        mem_ops=mem_ops,
-        forget_queries=[],
-        project_ops=project_ops,
-    )
-    return True
+    return remember_user_message(user_text)
 
 
 def collapse_hidden_tag_gaps(text: str) -> str:
     """Remove blank-line artifacts left behind when inline tags are hidden."""
-    text = str(text or "").replace("\r\n", "\n")
     if not text:
+        return text or ""
+    if "\n" not in text and "\t" not in text and "\r" not in text:
         return text
-    if "\n" not in text and "\t" not in text:
+    text = text.replace("\r\n", "\n")
+    if not text:
         return text
 
     normalized_lines: list[str] = []
@@ -519,14 +281,7 @@ class HiddenTagStreamFilter:
     """Hide inline tags during streaming while preserving surrounding text."""
 
     def __init__(self):
-        self._openers = sorted(
-            [
-                *((f"[{name}]", closer) for name, closer in STREAM_HIDDEN_TAGS.items()),
-                *((f"<{name}>", closer) for name, closer in STREAM_HIDDEN_XML_TAGS.items()),
-            ],
-            key=lambda item: len(item[0]),
-            reverse=True,
-        )
+        self._openers = _STREAM_OPENERS
         self._visible_buffer = ""
         self._pending_visible = ""
         self._in_tag = False
@@ -537,7 +292,8 @@ class HiddenTagStreamFilter:
         if not self._pending_visible:
             return ""
 
-        normalized = collapse_hidden_tag_gaps(self._pending_visible)
+        pv = self._pending_visible
+        normalized = collapse_hidden_tag_gaps(pv) if ("\n" in pv or "\t" in pv or "\r" in pv) else pv
         if flush:
             self._pending_visible = ""
             return normalized
@@ -568,12 +324,16 @@ class HiddenTagStreamFilter:
 
             bracket_idx = self._visible_buffer.find("[")
             angle_idx = self._visible_buffer.find("<")
-            indices = [idx for idx in (bracket_idx, angle_idx) if idx != -1]
-            if not indices:
+            if bracket_idx == -1 and angle_idx == -1:
                 self._pending_visible += self._visible_buffer
                 self._visible_buffer = ""
                 break
-            tag_idx = min(indices)
+            elif bracket_idx == -1:
+                tag_idx = angle_idx
+            elif angle_idx == -1:
+                tag_idx = bracket_idx
+            else:
+                tag_idx = min(bracket_idx, angle_idx)
 
             if tag_idx > 0:
                 self._pending_visible += self._visible_buffer[:tag_idx]
@@ -621,27 +381,30 @@ def _collect_memory_and_tool_ops(text: str) -> tuple[
     project_ops: list[tuple[str, str]] = []
     editor_ops = extract_editor_commands(text)
 
-    for raw in _extract_wrapped_sections(text, "[MEM]", "[/MEM]"):
-        if ":" in raw:
-            cat, content = raw.split(":", 1)
-            cat = cat.strip().lower()
-            content = content.strip()
-            mem_cat = CATEGORY_MAP.get(cat)
-            if mem_cat and content:
-                mem_ops.append((mem_cat, content))
+    if "[MEM]" in text:
+        for raw in _extract_wrapped_sections(text, "[MEM]", "[/MEM]"):
+            if ":" in raw:
+                cat, content = raw.split(":", 1)
+                cat = cat.strip().lower()
+                content = content.strip()
+                mem_cat = CATEGORY_MAP.get(cat)
+                if mem_cat and content:
+                    mem_ops.append((mem_cat, content))
 
-    for query in _extract_wrapped_sections(text, "[FORGET]", "[/FORGET]"):
-        if query:
-            forget_queries.append(query)
+    if "[FORGET]" in text:
+        for query in _extract_wrapped_sections(text, "[FORGET]", "[/FORGET]"):
+            if query:
+                forget_queries.append(query)
 
-    for raw in _extract_wrapped_sections(text, "[PROJECT]", "[/PROJECT]"):
-        if ":" in raw:
-            name, detail = raw.split(":", 1)
-            name = name.strip().lower()
-            detail = detail.strip().lower()
-            project_ops.append((name, detail))
-        elif raw:
-            project_ops.append((raw.strip().lower(), ""))
+    if "[PROJECT]" in text:
+        for raw in _extract_wrapped_sections(text, "[PROJECT]", "[/PROJECT]"):
+            if ":" in raw:
+                name, detail = raw.split(":", 1)
+                name = name.strip().lower()
+                detail = detail.strip().lower()
+                project_ops.append((name, detail))
+            elif raw:
+                project_ops.append((raw.strip().lower(), ""))
 
     return mem_ops, forget_queries, project_ops, editor_ops
 
@@ -687,6 +450,8 @@ def clean_model_text(text: str) -> str:
 
 
 def extract_coder_requests(text: str) -> list[str]:
+    if "[ASK_CODER]" not in str(text or ""):
+        return []
     requests: list[str] = []
     for content in _extract_wrapped_sections(text, "[ASK_CODER]", "[/ASK_CODER]"):
         if content:
@@ -711,28 +476,35 @@ def _parse_editor_tool(raw: str) -> tuple[str, str]:
 
 
 def extract_editor_commands(text: str) -> list[str]:
+    source = str(text or "")
+    if "[EDITOR]" not in source and "<tool_call>" not in source.lower():
+        return []
     editor_ops: list[str] = []
 
-    for raw in _extract_wrapped_sections(text, "[EDITOR]", "[/EDITOR]"):
+    for raw in _extract_wrapped_sections(source, "[EDITOR]", "[/EDITOR]"):
         if raw:
             editor_ops.append(raw)
 
-    for block in _extract_tool_call_blocks(text):
+    for block in _extract_tool_call_blocks(source):
         editor_ops.extend(_extract_editor_commands_from_tool_block(block))
 
     return editor_ops
 
 
 def extract_read_requests(text: str) -> list[str]:
+    source = str(text or "")
+    source_lower = source.lower()
+    if "[READ]" not in source and "<tool_call>" not in source_lower and "<read>" not in source_lower:
+        return []
     read_requests: list[str] = []
     seen: set[str] = set()
 
-    for filepath in _extract_wrapped_sections(text, "[READ]", "[/READ]"):
+    for filepath in _extract_wrapped_sections(source, "[READ]", "[/READ]"):
         if filepath and filepath not in seen:
             seen.add(filepath)
             read_requests.append(filepath)
 
-    for block in _extract_tool_call_blocks(text):
+    for block in _extract_tool_call_blocks(source):
         function_name, inner = _extract_function_tool_block(block)
         if function_name != "read":
             continue
@@ -742,7 +514,7 @@ def extract_read_requests(text: str) -> list[str]:
             seen.add(filepath)
             read_requests.append(filepath)
 
-    for filepath in _extract_named_xml_sections(text, "READ"):
+    for filepath in _extract_named_xml_sections(source, "READ"):
         if filepath and filepath not in seen:
             seen.add(filepath)
             read_requests.append(filepath)
@@ -856,12 +628,57 @@ def _extract_editor_commands_from_tool_block(block: str) -> list[str]:
 _system_prompt_cache = None
 _system_prompt_gen = -1
 _runtime_context_cache = ""
+_include_memory_cache: bool | None = None
 
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int):
+    """nth occurrence of weekday (0=Mon,6=Sun) in month. n=-1 = last."""
+    from datetime import date, timedelta
+    if n > 0:
+        d = date(year, month, 1)
+        count = 0
+        while True:
+            if d.weekday() == weekday:
+                count += 1
+                if count == n:
+                    return d
+            d += timedelta(days=1)
+    else:
+        nxt = date(year, month + 1, 1) if month < 12 else date(year + 1, 1, 1)
+        d = nxt - timedelta(days=1)
+        while d.weekday() != weekday:
+            d -= timedelta(days=1)
+        return d
+
+
+def _current_datetime_context() -> str:
+    """Return current date/time plus yesterday/today/tomorrow holiday facts."""
+    from datetime import datetime as _datetime, timedelta
+    now = _datetime.now()
+    today = now.date()
+    weekday = now.strftime("%A")
+    month = now.strftime("%B")
+    year = now.year
+    hour = now.hour % 12 or 12
+    minute = now.strftime("%M")
+    am_pm = "AM" if now.hour < 12 else "PM"
+    date_str = f"{weekday}, {month} {today.day}, {year} at {hour}:{minute} {am_pm}"
+
+    lines: list[str] = [f"CURRENT DATE AND TIME: {date_str}"]
+    for offset, label in ((-1, "Yesterday"), (0, "Today"), (1, "Tomorrow")):
+        d = today + timedelta(days=offset)
+        day_str = d.strftime("%A, %B ") + str(d.day)
+        lines.append(f"{label}: {day_str}")
+    lines.append(
+        "Use this to answer any date, day-of-week, or holiday questions. "
+        "Never invent or guess the date."
+    )
+    return "\n".join(lines)
 
 def build_runtime_context(*, include_memory: bool = True, include_editor: bool = True) -> str:
     memory_context = format_for_prompt() if include_memory else ""
     editor_context = get_editor_bridge().format_for_prompt() if include_editor else ""
-    parts = []
+    parts = [_current_datetime_context()]
     if memory_context:
         parts.append(memory_context)
     if editor_context:
@@ -869,8 +686,8 @@ def build_runtime_context(*, include_memory: bool = True, include_editor: bool =
     return "\n\n".join(parts)
 
 
-def _cached_system_prompt(runtime_context: str) -> str:
-    global _system_prompt_cache, _system_prompt_gen, _runtime_context_cache
+def _cached_system_prompt(runtime_context: str, *, include_memory: bool = True) -> str:
+    global _system_prompt_cache, _system_prompt_gen, _runtime_context_cache, _include_memory_cache
 
     store = get_store()
     current_gen = store._prompt_cache_gen
@@ -878,13 +695,15 @@ def _cached_system_prompt(runtime_context: str) -> str:
         _system_prompt_cache is not None
         and _system_prompt_gen == current_gen
         and _runtime_context_cache == runtime_context
+        and _include_memory_cache == include_memory
     ):
         return _system_prompt_cache
 
-    system_prompt = build_system_prompt(runtime_context)
+    system_prompt = build_system_prompt(runtime_context, include_memory=include_memory)
     _system_prompt_cache = system_prompt
     _system_prompt_gen = current_gen
     _runtime_context_cache = runtime_context
+    _include_memory_cache = include_memory
     return system_prompt
 
 
@@ -910,6 +729,11 @@ def truncate_messages(messages: list[dict], system_prompt: str, user_message: st
 
     # Convert deque to list if needed
     messages_list = list(messages)
+    if not messages_list:
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
 
     # Calculate current history tokens
     history_tokens = sum(len(m.get("content", "")) // 4 for m in messages_list)
@@ -930,14 +754,15 @@ def truncate_messages(messages: list[dict], system_prompt: str, user_message: st
         msg = messages_list[index]
         msg_tokens = len(msg.get("content", "")) // 4
         if current_tokens + msg_tokens <= available_for_history:
-            trimmed.insert(0, msg)
+            trimmed.append(msg)
             current_tokens += msg_tokens
             continue
         if len(trimmed) < min_recent_messages:
-            trimmed.insert(0, msg)
+            trimmed.append(msg)
             current_tokens += msg_tokens
             continue
         break
+    trimmed.reverse()
 
     # Build final message list
     chat_messages = [{"role": "system", "content": system_prompt}]

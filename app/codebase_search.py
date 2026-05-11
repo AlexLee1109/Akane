@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from functools import lru_cache
 from pathlib import Path
 
 _FILE_SEARCH_STOPWORDS = {
@@ -21,57 +22,13 @@ _CODE_FILE_SUFFIXES = {
     ".go", ".java",
 }
 _SECONDARY_TEXT_SUFFIXES = {".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".css", ".html"}
-_FILE_CACHE_TTL_SECONDS = 2.0
 _DEPRIORITIZED_ROOT_PREFIXES = (
-    "integrations/",
-    "extensions/",
-    ".vscode/",
-    ".idea/",
-    ".zed/",
-    ".github/",
-    ".gitlab/",
-    "dist/",
-    "build/",
-    "coverage/",
-    "storybook-static/",
+    "integrations/", "extensions/", ".vscode/", ".idea/", ".zed/",
+    ".github/", ".gitlab/", "dist/", "build/", "coverage/", "storybook-static/",
 )
-_EXPLICIT_INFRA_KEYWORDS = (
-    "vscode",
-    "vs code",
-    "extension",
-    "extensions",
-    "bridge",
-    "integration",
-    "integrations",
-    "launch.json",
-    "editor context",
-    "github actions",
-    "workflow",
-    "workflows",
-    "ci",
-    "pipeline",
-    ".github",
-    ".gitlab",
-    "settings.json",
-)
-_SOURCE_ROOT_HINTS = (
-    "app",
-    "src",
-    "lib",
-    "server",
-    "backend",
-    "frontend",
-    "client",
-    "web",
-    "api",
-    "core",
-    "pkg",
-    "cmd",
-)
-_SELF_CODE_NOUNS = {
-    "memory", "popup", "prompt", "model", "server", "client", "backend",
-    "frontend", "editor", "bridge",
-}
+_REFERENCE_TRAILING_PUNCT = " \t\r\n`'\".,:;()[]{}"
+_FILE_CACHE_TTL_SECONDS = 5.0
+_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
 
 
 def _iter_word_tokens(text: str):
@@ -87,63 +44,8 @@ def _iter_word_tokens(text: str):
         yield "".join(current)
 
 
-def _iter_path_like_tokens(text: str):
-    allowed = {"_", "-", ".", "/"}
-    current: list[str] = []
-    for ch in str(text or ""):
-        if ch.isalnum() or ch in allowed:
-            current.append(ch)
-            continue
-        if current:
-            yield "".join(current)
-            current = []
-    if current:
-        yield "".join(current)
-
-
-def _folder_reference_prefixes(text: str, roots: set[str]) -> list[str]:
-    tokens = list(_iter_path_like_tokens(str(text or "").lower()))
-    prefixes: list[str] = []
-    seen: set[str] = set()
-    for index, token in enumerate(tokens[:-1]):
-        if tokens[index + 1] not in {"folder", "directory", "dir"}:
-            continue
-        raw = token.strip().strip("/").lower()
-        if not raw:
-            continue
-        candidate = raw + "/"
-        first = raw.split("/", 1)[0]
-        if raw in roots and candidate not in seen:
-            seen.add(candidate)
-            prefixes.append(candidate)
-            continue
-        if first in roots and candidate not in seen:
-            seen.add(candidate)
-            prefixes.append(candidate)
-    return prefixes
-
-
-def _is_self_code_reference(text: str) -> bool:
-    words = [token.lower() for token in _iter_word_tokens(text)]
-    if not words:
-        return False
-    for index, word in enumerate(words):
-        if word == "code" and index > 0 and words[index - 1] in {"your", "own"}:
-            return True
-        if (
-            word == "code"
-            and index > 1
-            and words[index - 2] in {"your", "own"}
-            and words[index - 1] in _SELF_CODE_NOUNS
-        ):
-            return True
-        if word in _SELF_CODE_NOUNS and index > 0 and words[index - 1] == "your":
-            return True
-    return False
-
-
 class _IndexedFile:
-    __slots__ = ("path", "rel", "lowered", "stem", "tokens", "text_searchable")
+    __slots__ = ("path", "rel", "lowered", "stem", "normalized_stem", "tokens", "normalized_tokens", "text_searchable")
 
     def __init__(self, path: Path, project_root: Path):
         rel = str(path.relative_to(project_root))
@@ -152,7 +54,9 @@ class _IndexedFile:
         self.rel = rel
         self.lowered = lowered
         self.stem = path.stem.lower()
+        self.normalized_stem = CodebaseSearch.normalize_search_token_static(self.stem)
         self.tokens = {part for part in _iter_word_tokens(lowered)}
+        self.normalized_tokens = {CodebaseSearch.normalize_search_token_static(p) for p in self.tokens}
         self.text_searchable = path.suffix.lower() in _TEXT_FILE_SUFFIXES
 
 
@@ -166,164 +70,39 @@ class CodebaseSearch:
         self._inventory_built_at = 0.0
         self._text_cache: dict[str, tuple[int, int, str]] = {}
 
+    # ------------------------------------------------------------------ #
+    # Inventory                                                            #
+    # ------------------------------------------------------------------ #
+
     def _inventory_entries(self) -> list[_IndexedFile]:
         now = time.monotonic()
         if self._inventory is not None and (now - self._inventory_built_at) < _FILE_CACHE_TTL_SECONDS:
             return self._inventory
-
         inventory: list[_IndexedFile] = []
         index: dict[str, list[str]] = {}
         for path in self.project_root.rglob("*"):
-            if not path.is_file() or self._should_skip_path(path):
+            if not path.is_file() or any(part in _SKIP_DIRS for part in path.parts):
                 continue
             entry = _IndexedFile(path, self.project_root)
             inventory.append(entry)
             index.setdefault(path.name.lower(), []).append(entry.rel)
-
         self._inventory = inventory
         self._file_index = index
         self._inventory_built_at = now
         return inventory
 
-    def _root_directory_names(self) -> set[str]:
-        roots: set[str] = set()
-        for entry in self._inventory_entries():
-            first = entry.rel.split("/", 1)[0].strip().lower()
-            if first:
-                roots.add(first)
-        return roots
-
-    def _primary_source_prefixes(self) -> list[str]:
-        counts: dict[str, int] = {}
-        for entry in self._inventory_entries():
-            rel = entry.rel.strip().lower()
-            if not rel or any(rel.startswith(prefix) for prefix in _DEPRIORITIZED_ROOT_PREFIXES):
-                continue
-            first = rel.split("/", 1)[0]
-            if entry.path.suffix.lower() in _CODE_FILE_SUFFIXES:
-                counts[first] = counts.get(first, 0) + 1
-
-        if not counts:
-            return []
-
-        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        preferred: list[str] = []
-        seen: set[str] = set()
-        for hint in _SOURCE_ROOT_HINTS:
-            if hint in counts and hint not in seen:
-                seen.add(hint)
-                preferred.append(hint + "/")
-        for name, count in ranked:
-            if count < 2:
-                continue
-            if name not in seen:
-                seen.add(name)
-                preferred.append(name + "/")
-            if len(preferred) >= 4:
-                break
-        return preferred
-
-    def _explicit_folder_prefixes(self, user_input: str) -> list[str]:
-        roots = self._root_directory_names()
-        return _folder_reference_prefixes(user_input, roots)
-
-    def _read_lower_text(self, entry: _IndexedFile) -> str:
-        try:
-            stat = entry.path.stat()
-        except OSError:
-            return ""
-
-        size = int(stat.st_size)
-        if size > _TEXT_SEARCH_FILE_LIMIT:
-            return ""
-
-        cache_key = entry.rel
-        mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
-        cached = self._text_cache.get(cache_key)
-        if cached and cached[0] == mtime_ns and cached[1] == size:
-            return cached[2]
-
-        try:
-            text = entry.path.read_text(encoding="utf-8", errors="ignore").lower()
-        except OSError:
-            return ""
-
-        self._text_cache[cache_key] = (mtime_ns, size, text)
-        return text
-
-    @staticmethod
-    def _normalize_values(values: list[str] | None) -> list[str]:
-        return [str(value or "").strip() for value in (values or []) if str(value or "").strip()]
-
-    def _is_explicit_infra_context(self, lowered_input: str) -> bool:
-        return any(token in lowered_input for token in _EXPLICIT_INFRA_KEYWORDS)
-
-    def _candidate_search_context(self, user_input: str) -> dict[str, object]:
-        lowered = str(user_input or "").lower()
-        focused_prefixes = self._explicit_folder_prefixes(user_input)
-        self_code_context = _is_self_code_reference(lowered)
-        preferred_prefixes = (
-            []
-            if focused_prefixes
-            else (self._primary_source_prefixes() if self_code_context else [])
-        )
-        return {
-            "lowered": lowered,
-            "focused_prefixes": focused_prefixes,
-            "preferred_prefixes": preferred_prefixes,
-            "integration_context": self._is_explicit_infra_context(lowered),
-            "self_code_context": self_code_context,
-        }
-
-    def _path_allowed(self, rel: str, *, focused_prefixes: list[str], integration_context: bool) -> bool:
-        path = str(rel or "").strip().lower()
-        if not path:
-            return False
-        if focused_prefixes:
-            return any(path.startswith(prefix) for prefix in focused_prefixes)
-        if integration_context:
-            return True
-        if any(path.startswith(prefix) for prefix in _DEPRIORITIZED_ROOT_PREFIXES):
-            return False
-        if any(
-            marker in path
-            for marker in (
-                "/.vscode/",
-                "/.idea/",
-                "/.zed/",
-                "/.github/",
-                "/.gitlab/",
-            )
-        ):
-            return False
-        return True
-
-    @staticmethod
-    def _prioritize_paths(paths: list[str], preferred_prefixes: list[str]) -> list[str]:
-        if not preferred_prefixes:
-            return list(paths)
-        preferred = [rel for rel in paths if any(rel.lower().startswith(prefix) for prefix in preferred_prefixes)]
-        other = [rel for rel in paths if rel not in preferred]
-        return preferred + other
-
-    @staticmethod
-    def _append_unique(candidates: list[str], seen: set[str], rel: str) -> bool:
-        if rel in seen:
-            return False
-        seen.add(rel)
-        candidates.append(rel)
-        return True
-
     def get_project_file_index(self) -> dict[str, list[str]]:
-        if self._file_index is not None:
-            self._inventory_entries()
-            return self._file_index or {}
-
         self._inventory_entries()
         return self._file_index or {}
 
-    def normalize_search_token(self, token: str) -> str:
-        value = token.lower().strip("_-. ")
+    # ------------------------------------------------------------------ #
+    # Token normalisation                                                  #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    @lru_cache(maxsize=4096)
+    def normalize_search_token_static(token: str) -> str:
+        value = str(token or "").lower().strip("_-. ")
         if len(value) > 4 and value.endswith("ies"):
             value = value[:-3] + "y"
         elif len(value) > 3 and value.endswith("es"):
@@ -336,46 +115,105 @@ class CodebaseSearch:
                 break
         return value
 
-    def extract_query_tokens(self, user_input: str) -> list[str]:
+    def normalize_search_token(self, token: str) -> str:
+        return self.normalize_search_token_static(token)
+
+    @lru_cache(maxsize=1024)
+    def _cached_query_tokens(self, user_input: str) -> tuple[str, ...]:
         tokens: list[str] = []
         seen: set[str] = set()
         for raw in _iter_word_tokens(str(user_input or "").lower()):
-            token = self.normalize_search_token(raw)
+            token = self.normalize_search_token_static(raw)
             if len(token) <= 1 or token in _FILE_SEARCH_STOPWORDS or token in seen:
                 continue
             seen.add(token)
             tokens.append(token)
-        return tokens
+        return tuple(tokens)
+
+    def extract_query_tokens(self, user_input: str) -> list[str]:
+        return list(self._cached_query_tokens(str(user_input or "")))
 
     def has_recent_topic_overlap(self, user_input: str, recent_text: str) -> bool:
-        current_tokens = set(self.extract_query_tokens(user_input))
-        recent_tokens = set(self.extract_query_tokens(recent_text))
-        if not current_tokens or not recent_tokens:
-            return False
-        return bool(current_tokens & recent_tokens)
+        current = set(self.extract_query_tokens(user_input))
+        recent = set(self.extract_query_tokens(recent_text))
+        return bool(current and recent and current & recent)
 
     def looks_like_text_file(self, path: Path) -> bool:
         return path.suffix.lower() in _TEXT_FILE_SUFFIXES
 
-    def search_paths(self, user_input: str, limit: int = 3) -> list[str]:
-        query_tokens = self.extract_query_tokens(user_input)
-        if not query_tokens:
+    # ------------------------------------------------------------------ #
+    # Scoring                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _path_score(self, entry: _IndexedFile, query_tokens: list[str]) -> int:
+        score = 0
+        exact_hits = 0
+        path_parts = entry.lowered.split("/")
+        for token in query_tokens:
+            if entry.stem == token:
+                score += 10; exact_hits += 1
+            elif entry.normalized_stem == token:
+                score += 8; exact_hits += 1
+            elif token in entry.normalized_tokens:
+                score += 6; exact_hits += 1
+            elif any(part.startswith(token) for part in path_parts):
+                score += 5
+            elif token in entry.stem:
+                score += 4
+            elif token in entry.lowered:
+                score += 2
+        if exact_hits >= 2:
+            score += 4
+        if entry.lowered.startswith(("app/", "src/", "lib/")):
+            score += 1
+        if any(entry.lowered.startswith(p) for p in _DEPRIORITIZED_ROOT_PREFIXES):
+            score -= 2
+        suffix = entry.path.suffix.lower()
+        if suffix in _CODE_FILE_SUFFIXES:
+            score += 1
+        elif suffix in _SECONDARY_TEXT_SUFFIXES:
+            score -= 1
+        return score
+
+    def _score_all(self, user_input: str, *, limit: int = 8) -> list[tuple[int, str]]:
+        tokens = self.extract_query_tokens(user_input)
+        if not tokens:
             return []
+        scored = [
+            (s, e.rel)
+            for e in self._inventory_entries()
+            if (s := self._path_score(e, tokens)) > 0
+        ]
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return scored[:limit]
 
-        scored: list[tuple[int, str]] = []
-        for entry in self._inventory_entries():
-            score = self._path_score(entry, query_tokens)
-            if score > 0:
-                scored.append((score, entry.rel))
+    # ------------------------------------------------------------------ #
+    # Content search                                                       #
+    # ------------------------------------------------------------------ #
 
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return [rel for _, rel in scored[:limit]]
+    def _read_lower_text(self, entry: _IndexedFile) -> str:
+        try:
+            stat = entry.path.stat()
+        except OSError:
+            return ""
+        size = int(stat.st_size)
+        if size > _TEXT_SEARCH_FILE_LIMIT:
+            return ""
+        mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+        cached = self._text_cache.get(entry.rel)
+        if cached and cached[0] == mtime_ns and cached[1] == size:
+            return cached[2]
+        try:
+            text = entry.path.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            return ""
+        self._text_cache[entry.rel] = (mtime_ns, size, text)
+        return text
 
     def search_contents(self, user_input: str, limit: int = 3) -> list[str]:
-        query_tokens = self.extract_query_tokens(user_input)
-        if not query_tokens:
+        tokens = self.extract_query_tokens(user_input)
+        if not tokens:
             return []
-
         scored: list[tuple[int, str]] = []
         for entry in self._inventory_entries():
             if not entry.text_searchable:
@@ -383,26 +221,67 @@ class CodebaseSearch:
             text = self._read_lower_text(entry)
             if not text:
                 continue
-
-            score = 0
-            for token in query_tokens:
-                hits = text.count(token)
-                if hits:
-                    score += min(hits, 6)
-                    if f"def _{token}" in text or f"{token}(" in text:
-                        score += 3
+            present = [t for t in tokens if t in text]
+            if not present:
+                continue
+            score = sum(
+                min(text.count(t), 6) + (3 if f"def _{t}" in text or f"{t}(" in text else 0)
+                for t in present
+            )
             if score > 0:
                 scored.append((score, entry.rel))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [r for _, r in scored[:limit]]
 
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return [rel for _, rel in scored[:limit]]
+    def search_paths(self, user_input: str, limit: int = 3) -> list[str]:
+        return [r for _, r in self._score_all(user_input, limit=limit)]
+
+    # ------------------------------------------------------------------ #
+    # Reference resolution                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _is_deprioritized(self, rel: str) -> bool:
+        lower = rel.lower()
+        return any(lower.startswith(p) for p in _DEPRIORITIZED_ROOT_PREFIXES)
+
+    def _resolve_ref(self, raw_ref: str) -> list[str]:
+        """Resolve a file-reference token to zero or more repo-relative paths."""
+        raw = str(raw_ref or "").strip(_REFERENCE_TRAILING_PUNCT)
+        if not raw:
+            return []
+        # Exact path on disk
+        if "/" in raw:
+            resolved = (self.project_root / raw).resolve()
+            if resolved.is_file() and str(resolved).startswith(str(self.project_root)):
+                return [str(resolved.relative_to(self.project_root))]
+        index = self.get_project_file_index()
+        lowered = raw.lower()
+        bare = lowered.rsplit("/", 1)[-1]
+        stem = bare.rsplit(".", 1)[0]
+        # Exact basename / stem lookup
+        matches = list(dict.fromkeys(index.get(bare, []) + index.get(stem, [])))
+        if matches:
+            return matches[:3]
+        # Fuzzy: substring or token-subset match
+        raw_tokens = set(self.extract_query_tokens(raw))
+        fuzzy = [
+            e.rel for e in self._inventory_entries()
+            if (bare and (e.lowered.endswith("/" + bare) or e.lowered == bare))
+            or (stem and stem == e.stem)
+            or (raw_tokens and raw_tokens.issubset(e.normalized_tokens))
+        ]
+        return fuzzy[:3]
+
+    # ------------------------------------------------------------------ #
+    # Main entry point                                                     #
+    # ------------------------------------------------------------------ #
 
     def candidate_paths(
         self,
         user_input: str,
         *,
         file_refs: list[str] | None = None,
-        file_ref_pattern=None,
+        file_ref_pattern=None,           # accepted but unused (refs are passed pre-extracted)
         recent_targets: list[str] | None = None,
         active_file: str = "",
         open_tabs: list[str] | None = None,
@@ -413,166 +292,60 @@ class CodebaseSearch:
         reuse_recent_targets: bool = False,
         limit: int = 3,
     ) -> list[str]:
-        recent_targets = self._normalize_values(recent_targets)
-        open_tabs = self._normalize_values(open_tabs)
-        recent_texts = self._normalize_values(recent_texts)
-        normalized_file_refs = self._normalize_values(file_refs)
-
-        if not normalized_file_refs and file_ref_pattern is not None:
-            extracted_refs: list[str] = []
-            seen_refs: set[str] = set()
-            try:
-                matches = file_ref_pattern.finditer(str(user_input or ""))
-            except AttributeError:
-                matches = ()
-            for match in matches:
-                try:
-                    raw = str(match.group(1) or "").strip()
-                except IndexError:
-                    continue
-                if raw and raw not in seen_refs:
-                    seen_refs.add(raw)
-                    extracted_refs.append(raw)
-            normalized_file_refs = extracted_refs
+        file_refs     = [s for s in (file_refs     or []) if s and s.strip()]
+        recent_targets = [s for s in (recent_targets or []) if s and s.strip()]
+        open_tabs     = [s for s in (open_tabs     or []) if s and s.strip()]
+        recent_texts  = [s for s in (recent_texts  or []) if s and s.strip()]
 
         seen: set[str] = set()
         candidates: list[str] = []
-        context = self._candidate_search_context(user_input)
-        lowered = str(context["lowered"])
-        focused_prefixes = list(context["focused_prefixes"])
-        preferred_prefixes = list(context["preferred_prefixes"])
-        integration_context = bool(context["integration_context"])
-        self_code_context = bool(context.get("self_code_context"))
 
-        for raw_value in normalized_file_refs:
-            raw = str(raw_value or "").strip("`'\".,:;()[]{}")
-            if not raw:
-                continue
-            if "/" in raw:
-                resolved = (self.project_root / raw).resolve()
-                if resolved.is_file() and str(resolved).startswith(str(self.project_root)):
-                    rel = str(resolved.relative_to(self.project_root))
-                    if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
-                        self._append_unique(candidates, seen, rel)
-                continue
+        def _add(rel: str) -> bool:
+            if rel and rel not in seen:
+                seen.add(rel)
+                candidates.append(rel)
+                return True
+            return False
 
-            matches = self.get_project_file_index().get(raw.lower(), [])
-            if len(matches) == 1 and self._path_allowed(
-                matches[0],
-                focused_prefixes=focused_prefixes,
-                integration_context=integration_context,
-            ):
-                self._append_unique(candidates, seen, matches[0])
+        # 1. Explicit file references (highest priority)
+        for ref in file_refs:
+            for rel in self._resolve_ref(ref):
+                _add(rel)
 
-        if (
-            active_file
-            and self._path_allowed(active_file, focused_prefixes=focused_prefixes, integration_context=integration_context)
-            and any(phrase in lowered for phrase in {"this file", "current file", "that file", "the file"})
-            and active_file not in seen
+        # 2. Active file when the message refers to it by phrase
+        lowered_input = str(user_input or "").lower()
+        if active_file and active_file not in seen and any(
+            phrase in lowered_input for phrase in ("this file", "current file", "that file", "the file")
         ):
-            seen.add(active_file)
-            candidates.insert(0, active_file)
+            _add(active_file)
 
-        query_tokens = self.extract_query_tokens(user_input)
-        search_queries = [user_input]
+        # 3. Score-based path search on the current query
+        for _score, rel in self._score_all(user_input, limit=max(10, limit * 3)):
+            if not self._is_deprioritized(rel) or explicit_file_reference:
+                _add(rel)
 
-        direct_query_scored = self._score_paths(user_input, limit=max(6, limit))
-        has_strong_direct_match = bool(direct_query_scored and direct_query_scored[0][0] >= 8)
+        # 4. Content search if still short
+        if len(candidates) < limit:
+            for rel in self.search_contents(user_input, limit=limit):
+                if not self._is_deprioritized(rel):
+                    _add(rel)
 
-        if recent_targets and reuse_recent_targets and coding_request and not explicit_file_reference:
+        # 5. Carry recent targets for followup turns
+        if reuse_recent_targets or followup_reference:
             for rel in recent_targets:
-                if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
-                    self._append_unique(candidates, seen, rel)
+                _add(rel)
 
-        if (recent_targets or followup_reference or len(query_tokens) <= 3) and not (
-            self_code_context and has_strong_direct_match and not reuse_recent_targets
-        ):
-            search_queries.extend(recent_texts)
+        # 6. Score recent context text for additional signal
+        if len(candidates) < limit and recent_texts:
+            combined = " ".join(recent_texts[:3])
+            for _score, rel in self._score_all(combined, limit=limit):
+                if not self._is_deprioritized(rel):
+                    _add(rel)
 
-        for remembered in recent_targets:
-            if followup_reference and self._path_allowed(
-                remembered,
-                focused_prefixes=focused_prefixes,
-                integration_context=integration_context,
-            ):
-                self._append_unique(candidates, seen, remembered)
-
-        strong_path_hits = 0
-        for query in search_queries:
-            prior_count = len(candidates)
-            query_scored = direct_query_scored if query == user_input else self._score_paths(query, limit=6)
-            query_scored.sort(
-                key=lambda item: (
-                    0 if any(item[1].lower().startswith(prefix) for prefix in preferred_prefixes) else 1,
-                    -item[0],
-                    item[1],
-                )
-            )
-            for score, rel in query_scored:
-                if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
-                    self._append_unique(candidates, seen, rel)
-                if score >= 7:
-                    strong_path_hits += 1
-            if strong_path_hits < max(1, limit) and (len(candidates) < limit or len(candidates) == prior_count):
-                for rel in self._prioritize_paths(self.search_contents(query, limit=max(2, limit)), preferred_prefixes):
-                    if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
-                        self._append_unique(candidates, seen, rel)
-
-        for rel in self._prioritize_paths(recent_targets, preferred_prefixes):
-            if not reuse_recent_targets:
-                continue
-            if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
-                self._append_unique(candidates, seen, rel)
-
-        for rel in self._prioritize_paths(open_tabs[:5], preferred_prefixes):
+        # 7. Open tabs as last resort
+        for rel in open_tabs[:5]:
             if len(candidates) >= limit:
                 break
-            if self._path_allowed(rel, focused_prefixes=focused_prefixes, integration_context=integration_context):
-                self._append_unique(candidates, seen, rel)
+            _add(rel)
 
         return candidates[:limit]
-
-    def _score_paths(self, user_input: str, limit: int = 3) -> list[tuple[int, str]]:
-        query_tokens = self.extract_query_tokens(user_input)
-        if not query_tokens:
-            return []
-
-        scored: list[tuple[int, str]] = []
-        for entry in self._inventory_entries():
-            score = self._path_score(entry, query_tokens)
-            if score > 0:
-                scored.append((score, entry.rel))
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return scored[:limit]
-
-    def _path_score(self, entry: _IndexedFile, query_tokens: list[str]) -> int:
-        path_tokens = {self.normalize_search_token(part) for part in entry.tokens}
-        score = 0
-        exact_hits = 0
-        for token in query_tokens:
-            if entry.stem == token:
-                score += 10
-                exact_hits += 1
-            elif self.normalize_search_token(entry.stem) == token:
-                score += 8
-                exact_hits += 1
-            elif token in path_tokens:
-                score += 6
-                exact_hits += 1
-            elif token in entry.stem:
-                score += 4
-            elif token in entry.lowered:
-                score += 2
-        if exact_hits >= 2:
-            score += 4
-        suffix = entry.path.suffix.lower()
-        if suffix in _CODE_FILE_SUFFIXES:
-            score += 1
-        elif suffix in _SECONDARY_TEXT_SUFFIXES:
-            score -= 1
-        return score
-
-    @staticmethod
-    def _should_skip_path(path: Path) -> bool:
-        skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
-        return any(part in skip_dirs for part in path.parts)

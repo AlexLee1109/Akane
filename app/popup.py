@@ -2,10 +2,12 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlencode, urljoin
+import threading
 
 import webview
 
 from app.config import POPUP_BACKEND_URL, popup_backend_is_local
+from app.editor_bridge import get_editor_bridge
 from app.server import serve_in_thread
 from app.ui_assets import IMAGES_DIR
 
@@ -16,9 +18,8 @@ except ImportError:  # pragma: no cover - macOS-only popup behavior
 
 DEFAULT_SCREEN_WIDTH = 1440
 DEFAULT_SCREEN_HEIGHT = 900
-HIDDEN_WINDOW_SIZE = 8
 AVATAR_HEIGHT = 350
-AVATAR_RIGHT_MARGIN = 0
+AVATAR_RIGHT_MARGIN = -145
 AVATAR_BOTTOM_MARGIN = 0
 BUBBLE_WIDTH = 430
 BUBBLE_HEIGHT = 520
@@ -26,9 +27,12 @@ BUBBLE_MIN_WIDTH = 220
 BUBBLE_MAX_WIDTH = 540
 BUBBLE_MIN_HEIGHT = 420
 BUBBLE_MAX_HEIGHT = 2200
+# Single companion window — wide enough for the bubble, tall enough for
+# the bubble + avatar with a comfortable overlap between them.
+COMPANION_WIDTH = 460
+COMPANION_HEIGHT = 560
 WINDOW_TITLES = {
-    "bubble": "Akane Bubble",
-    "avatar": "Akane Avatar",
+    "companion": "Akane",
 }
 AVATAR_IMAGE_PATH = IMAGES_DIR / "Vtuber_model.png"
 AVATAR_BOUNDS_WH = (530, 1334)
@@ -43,6 +47,7 @@ class Frame:
 
     def as_tuple(self) -> tuple[int, int, int, int]:
         return (self.x, self.y, self.width, self.height)
+
 
 def _primary_screen_frame():
     if AppKit is None:
@@ -66,6 +71,7 @@ def _primary_screen_frame():
         key=lambda rect: rect.size.width * rect.size.height,
     )
 
+
 def _avatar_window_width(height: int) -> int:
     bounds_width, bounds_height = AVATAR_BOUNDS_WH
     if AVATAR_IMAGE_PATH.exists():
@@ -83,6 +89,8 @@ def _avatar_window_width(height: int) -> int:
 
 
 class PopupLayout:
+    """Single companion window anchored to the bottom-right corner."""
+
     def __init__(self, screen):
         f = screen.frame()
 
@@ -91,27 +99,14 @@ class PopupLayout:
         self.screen_width = int(f.size.width)
         self.screen_height = int(f.size.height)
 
-        avatar_width = _avatar_window_width(AVATAR_HEIGHT)
-
-        avatar_x = self.screen_x + self.screen_width - avatar_width
-        avatar_y = self.screen_y + self.screen_height - AVATAR_HEIGHT
-
-        bubble_x = avatar_x + 20
-        bubble_y = avatar_y - 200
+        # Keep the window compact — just the bottom-right corner.
+        window_x = self.screen_x + self.screen_width - COMPANION_WIDTH - AVATAR_RIGHT_MARGIN
+        window_y = self.screen_y + self.screen_height - COMPANION_HEIGHT - AVATAR_BOTTOM_MARGIN
 
         self.frames = {
-            "avatar": Frame(avatar_x, avatar_y, avatar_width, AVATAR_HEIGHT),
-            "bubble": Frame(bubble_x, bubble_y, BUBBLE_WIDTH, BUBBLE_HEIGHT),
+            "companion": Frame(window_x, window_y, COMPANION_WIDTH, COMPANION_HEIGHT),
         }
 
-        self.hidden_frames = {
-            "bubble": Frame(
-                self.screen_x + self.screen_width - HIDDEN_WINDOW_SIZE,
-                self.screen_y + HIDDEN_WINDOW_SIZE,
-                HIDDEN_WINDOW_SIZE,
-                HIDDEN_WINDOW_SIZE,
-            )
-        }
 
 class WindowApi:
     def __init__(self, app) -> None:
@@ -151,6 +146,18 @@ class WindowApi:
     def toggle_composer(self) -> None:
         self.app.toggle_composer()
 
+    def toggle_memory(self) -> None:
+        self.app.toggle_memory()
+
+    def show_code_approval(self) -> None:
+        self.app.show_code_approval()
+
+    def approve_approval(self) -> None:
+        self.app.approve_pending_changes()
+
+    def reject_approval(self) -> None:
+        self.app.reject_pending_changes()
+
 
 class PopupApp:
     def __init__(self):
@@ -160,13 +167,10 @@ class PopupApp:
         self.static_index = Path(__file__).parent / "static" / "index.html"
         self.windows: dict[str, object] = {}
         self._shutting_down = False
-        self._bubble_base_x = 0
-        self._bubble_base_y = 0
-        self._bubble_width = 0
-        self._bubble_height = 0
         self._bubble_visible = False
         self._bubble_text = ""
         self._composer_visible = False
+        self._memory_visible = False
         self._ensure_server()
 
     @staticmethod
@@ -201,9 +205,17 @@ class PopupApp:
         )
         return f"file://{self.static_index}?{query}"
 
+    _layout_cache = None
+
     def _layout(self):
+        # Return cached layout if available and AppKit is available
+        if self._layout_cache is not None and AppKit is not None:
+            return self._layout_cache
+
         if AppKit is None:
-            return PopupLayout(AppKit.NSScreen.mainScreen())
+            layout = PopupLayout(AppKit.NSScreen.mainScreen())
+            self._layout_cache = layout
+            return layout
 
         screens = AppKit.NSScreen.screens()
 
@@ -211,23 +223,24 @@ class PopupApp:
             mouse = AppKit.NSEvent.mouseLocation()
             for s in screens:
                 if AppKit.NSPointInRect(mouse, s.frame()):
-                    return PopupLayout(s)
+                    layout = PopupLayout(s)
+                    self._layout_cache = layout
+                    return layout
         except Exception:
             pass
 
-        return PopupLayout(AppKit.NSScreen.mainScreen())
+        layout = PopupLayout(AppKit.NSScreen.mainScreen())
+        self._layout_cache = layout
+        return layout
 
     def _create_window(self, role: str, title: str, *, width: int, height: int):
-        min_size = (width, height)
-        if role in {"bubble", "composer"}:
-            min_size = (HIDDEN_WINDOW_SIZE, HIDDEN_WINDOW_SIZE)
         window = webview.create_window(
             title,
             self._build_start_url(role),
             js_api=self.api,
             width=width,
             height=height,
-            min_size=min_size,
+            min_size=(width, height),
             frameless=True,
             easy_drag=False,
             shadow=False,
@@ -245,63 +258,53 @@ class PopupApp:
 
     def _position_windows(self) -> None:
         layout = self._layout()
-
         sx = layout.screen_x
         sy = layout.screen_y
 
-        for role, window in self.windows.items():
-            frame = layout.frames[role]
-
-            if role == "bubble" and not self._bubble_visible:
-                frame = layout.hidden_frames["bubble"]
-
-            # ✅ convert GLOBAL → LOCAL for BOTH avatar and bubble
-            x = frame.x - sx
-            y = frame.y - sy
-
-            self._window_call(window, "resize", frame.width, frame.height)
-            self._window_call(window, "move", x, y)
-
-    def _set_composer_visible(self, visible: bool) -> None:
-        self._composer_visible = bool(visible)
-        avatar = self.windows.get("avatar")
-        if avatar is None:
+        window = self.windows.get("companion")
+        if window is None:
             return
-        try:
-            hook = "__akaneComposerShown" if self._composer_visible else "__akaneComposerHidden"
-            avatar.evaluate_js(f"window.{hook} && window.{hook}();")
-        except Exception:
-            pass
+
+        frame = layout.frames["companion"]
+        # Convert global screen coords → local (relative to the screen origin).
+        x = frame.x - sx
+        y = frame.y - sy
+        self._window_call(window, "resize", frame.width, frame.height)
+        self._window_call(window, "move", x, y)
+
+    # ── Bubble visibility (JS-driven; no window movement needed) ──────────
 
     def _set_bubble_visible(self, visible: bool) -> None:
         self._bubble_visible = bool(visible)
-        bubble = self.windows.get("bubble")
-        if bubble is None:
+        window = self.windows.get("companion")
+        if window is None:
             return
+        attr_value = "true" if self._bubble_visible else "false"
+        try:
+            window.evaluate_js(
+                f"document.body.setAttribute('data-bubble-visible', '{attr_value}');"
+            )
+        except Exception:
+            pass
 
-        layout = self._layout()
+    # ── Composer visibility ───────────────────────────────────────────────
 
-        sx = layout.screen_x
-        sy = layout.screen_y
+    def _set_composer_visible(self, visible: bool) -> None:
+        self._composer_visible = bool(visible)
+        window = self.windows.get("companion")
+        if window is None:
+            return
+        attr_value = "true" if self._composer_visible else "false"
+        try:
+            window.evaluate_js(
+                f"document.body.setAttribute('data-composer-open', '{attr_value}');"
+            )
+            hook = "__akaneComposerShown" if self._composer_visible else "__akaneComposerHidden"
+            window.evaluate_js(f"window.{hook} && window.{hook}();")
+        except Exception:
+            pass
 
-        frame = (
-            layout.frames["bubble"]
-            if self._bubble_visible
-            else layout.hidden_frames["bubble"]
-        )
-
-        # ✅ FIX: convert GLOBAL → LOCAL
-        x = frame.x - sx
-        y = frame.y - sy
-        width = frame.width
-        height = frame.height
-
-        if self._bubble_visible:
-            self._bubble_base_x = frame.x
-            self._bubble_base_y = frame.y
-
-        self._window_call(bubble, "resize", width, height)
-        self._window_call(bubble, "move", x, y)
+    # ── Event handlers ────────────────────────────────────────────────────
 
     def _on_start(self) -> None:
         self._position_windows()
@@ -312,8 +315,10 @@ class PopupApp:
         self.close_all_windows()
 
     def _on_window_loaded(self, role: str) -> None:
-        if role == "bubble":
+        if role == "companion":
             self._apply_bubble_text()
+
+    # ── Public API ────────────────────────────────────────────────────────
 
     def minimize_all_windows(self) -> None:
         for window in self.windows.values():
@@ -338,48 +343,137 @@ class PopupApp:
     def toggle_composer(self) -> None:
         self._set_composer_visible(not self._composer_visible)
 
-    def sync_bubble_height(self, height: int) -> None:
-        self.sync_bubble_size(self._bubble_width or 430, height)
+    def toggle_memory(self) -> None:
+        self._memory_visible = not self._memory_visible
+        window = self.windows.get("companion")
+        if window is None:
+            return
+        try:
+            window.evaluate_js(
+                f"document.body.setAttribute('data-memory-visible', '{'true' if self._memory_visible else 'false'}');"
+                f"window.__akaneToggleMemory && window.__akaneToggleMemory();"
+            )
+        except Exception:
+            pass
 
-    def sync_bubble_size(self, width: int, height: int) -> None:
-        window = self.windows.get("bubble")
+    def show_code_approval(self) -> None:
+        bridge = get_editor_bridge()
+        pending = bridge.pending_approval_actions()
+        if not pending:
+            return
+        window = self.windows.get("companion")
         if window is None:
             return
 
+        html = self._build_approval_html(pending)
+        try:
+            window.evaluate_js(f"document.body.insertAdjacentHTML('beforeend', {json.dumps(html)});")
+        except Exception:
+            pass
+
+    def approve_pending_changes(self) -> None:
+        get_editor_bridge().approve_all_pending_actions()
+        self._close_approval_overlay()
+
+    def reject_pending_changes(self, reason: str = "User rejected in popup") -> None:
+        get_editor_bridge().reject_all_pending_actions(reason)
+        self._close_approval_overlay()
+
+    def _close_approval_overlay(self) -> None:
+        window = self.windows.get("companion")
+        if window is None:
+            return
+        try:
+            window.evaluate_js("const el = document.getElementById('codeApprovalOverlay'); if (el) el.remove();")
+        except Exception:
+            pass
+
+    def _build_approval_html(self, actions: list[dict]) -> str:
+        changes = []
+        for action in actions:
+            preview = (action.get("meta") or {}).get("preview") or {}
+            cmd = action.get("command", "")
+            changes.append({
+                "filepath": preview.get("path", "unknown"),
+                "description": preview.get("label", cmd),
+                "before": preview.get("before", ""),
+                "after": preview.get("after", ""),
+            })
+
+        return f'''
+<div id="codeApprovalOverlay" style="
+  position:fixed;top:0;left:0;right:0;bottom:0;
+  background:rgba(20,20,20,0.95);z-index:10000;
+  padding:20px;overflow-y:auto;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  color:#ddd;font-size:13px;">
+  <h2 style="margin-top:0;color:#fff;">Code Review Required</h2>
+  <div id="changesContainer"></div>
+  <div style="display:flex;gap:12px;justify-content:flex-end;margin-top:16px;padding-top:16px;border-top:1px solid #444;">
+    <button onclick="pywebview.api.reject_approval()" style="padding:10px 20px;background:#e03131;color:white;border:none;border-radius:4px;cursor:pointer;">Reject</button>
+    <button onclick="pywebview.api.approve_approval()" style="padding:10px 20px;background:#2f9e44;color:white;border:none;border-radius:4px;cursor:pointer;">Approve</button>
+  </div>
+  <script>
+    (function() {{
+      const changes = {json.dumps(changes)};
+      function escapeHtml(text) {{
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+      }}
+      function renderDiff(old, newText) {{
+        const oldLines = (old || '').split('\\n');
+        const newLines = (newText || '').split('\\n');
+        const max = Math.max(oldLines.length, newLines.length);
+        let html = '';
+        for (let i = 0; i < max; i++) {{
+          const oldL = oldLines[i] || null;
+          const newL = newLines[i] || null;
+          if (oldL === null && newL !== null) {{
+            html += '<div style="color:#69db7c;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + escapeHtml(newL) + '</div>';
+          }} else if (oldL !== null && newL === null) {{
+            html += '<div style="color:#ff6b6b;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + escapeHtml(oldL) + '</div>';
+          }} else if (oldL !== newL) {{
+            if (oldL) html += '<div style="color:#ff6b6b;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + escapeHtml(oldL) + '</div>';
+            if (newL) html += '<div style="color:#69db7c;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + escapeHtml(newL) + '</div>';
+          }} else {{
+            html += '<div style="color:#ddd;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + escapeHtml(oldL || '') + '</div>';
+          }}
+        }}
+        return html;
+      }}
+      const container = document.getElementById('changesContainer');
+      container.innerHTML = changes.map(c =>
+        '<div style="margin-bottom:20px;padding:12px;background:#1a1a1a;border-radius:6px;border-left:3px solid #4a9eff;">' +
+        '<div style="font-weight:600;color:#fff;margin-bottom:8px;word-break:break-all;">' + escapeHtml(c.filepath) + '</div>' +
+        (c.description ? '<div style="color:#888;font-size:12px;margin-bottom:10px;">' + escapeHtml(c.description) + '</div>' : '') +
+        '<div style="background:#0a0a0a;border-radius:4px;padding:10px;max-height:180px;overflow:auto;">' + renderDiff(c.before, c.after) + '</div>' +
+        '</div>'
+      ).join('');
+    }})();
+  </script>
+</div>'''
+
+    def sync_bubble_height(self, height: int) -> None:
+        # Width stays fixed in the combined window; just re-evaluate visibility.
+        self.sync_bubble_size(BUBBLE_WIDTH, height)
+
+    def sync_bubble_size(self, width: int, height: int) -> None:
+        """Show or hide the bubble div based on reported content size.
+
+        The companion window itself never resizes — only the bubble div's
+        visibility is toggled so the avatar is always present.
+        """
         if int(width) <= 8 or int(height) <= 8:
             self._set_bubble_visible(False)
-            return
         else:
             self._set_bubble_visible(True)
-            target_width = max(BUBBLE_MIN_WIDTH, min(int(width) + 2, BUBBLE_MAX_WIDTH))
-            target_height = max(BUBBLE_MIN_HEIGHT, min(int(height) + 240, BUBBLE_MAX_HEIGHT))
-        if not self._bubble_width:
-            layout = self._layout()
-            x, y, width, default_height = layout.frames["bubble"].as_tuple()
-            self._bubble_base_x = x
-            self._bubble_base_y = y
-            self._bubble_width = width
-            self._bubble_height = default_height
-
-        if abs(target_width - self._bubble_width) < 3 and abs(target_height - self._bubble_height) < 3:
-            return
-
-        self._bubble_width = target_width
-        self._bubble_height = target_height
-
-        try:
-            window.resize(target_width, target_height)
-        except Exception:
-            return
-
-        self._window_call(window, "move", self._bubble_base_x, self._bubble_base_y)
 
     def push_bubble_text(self, text: str) -> None:
         self._bubble_text = str(text or "")
         self._apply_bubble_text()
 
     def _apply_bubble_text(self) -> None:
-        window = self.windows.get("bubble")
+        window = self.windows.get("companion")
         if window is None:
             return
 
@@ -417,9 +511,13 @@ class PopupApp:
 
     def run(self):
         layout = self._layout()
-        for role in ("avatar", "bubble"):
-            frame = layout.frames[role]
-            self._create_window(role, WINDOW_TITLES[role], width=frame.width, height=frame.height)
+        frame = layout.frames["companion"]
+        self._create_window(
+            "companion",
+            WINDOW_TITLES["companion"],
+            width=frame.width,
+            height=frame.height,
+        )
         webview.start(self._on_start)
 
 

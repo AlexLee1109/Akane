@@ -70,7 +70,7 @@ MODEL_PATH = os.environ.get(
 LLAMA_CONTEXT_WINDOW = int(
     os.environ.get(
         "AKANE_LLAMA_CONTEXT_WINDOW",
-        str(_local_secret("LLAMA_CONTEXT_WINDOW", 4096)),
+        str(_local_secret("LLAMA_CONTEXT_WINDOW", 2048)),
     ).strip()
 )
 LLAMA_BATCH_SIZE = int(
@@ -102,7 +102,7 @@ LLAMA_IDLE_UNLOAD_SECONDS = float(
 CHAT_HISTORY_CONTEXT_TOKENS = int(
     os.environ.get(
         "AKANE_CHAT_HISTORY_CONTEXT_TOKENS",
-        str(_local_secret("CHAT_HISTORY_CONTEXT_TOKENS", 4096)),
+        str(_local_secret("CHAT_HISTORY_CONTEXT_TOKENS", 2048)),
     ).strip()
 )
 CODER_MAX_TURNS = int(
@@ -159,30 +159,22 @@ ADVISOR_ONLY = os.environ.get(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 # Generation parameters
-MAX_TOKENS = 1024
-CODER_MAX_TOKENS = 2048  # Higher limit for coding suggestions
-TEMPERATURE = 0.9
+MAX_TOKENS = int(
+    os.environ.get(
+        "AKANE_MAX_TOKENS",
+        str(_local_secret("MAX_TOKENS", 256)),
+    ).strip()
+)
+CODER_MAX_TOKENS = int(
+    os.environ.get(
+        "AKANE_CODER_MAX_TOKENS",
+        str(_local_secret("CODER_MAX_TOKENS", 1024)),
+    ).strip()
+)  # Higher limit for coding suggestions
+TEMPERATURE = 0.2
 TOP_K = 40
 TOP_P = 0.95
-REPETITION_PENALTY = 1.1
-
-# Chance (0.0-1.0) that Akane chimes in unprompted after a response
-PROACTIVE_CHANCE = 0.05
-
-# Seconds of idle before Akane might speak up on her own (0 = disable)
-IDLE_INTERJECT_SECONDS = 120
-
-# Relationship levels (determined dynamically by AI based on interaction quality + time)
-# More progression-resistant with higher thresholds and slower accumulation
-RELATIONSHIP_LEVELS = {
-    "stranger": {"min_score": 0.0, "familiarity": 0.0},
-    "acquaintance": {"min_score": 0.4, "familiarity": 0.3},
-    "friend": {"min_score": 0.65, "familiarity": 0.6},
-    "close_friend": {"min_score": 0.85, "familiarity": 1.0},
-}
-
-# Threshold for automatic relationship level check (score evaluation every N interactions)
-RELATIONSHIP_CHECK_INTERVAL = 10
+REPETITION_PENALTY = 1.2
 
 # System prompt is now in app/character.py — edit that file to change personality.
 

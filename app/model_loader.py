@@ -11,7 +11,6 @@ import time
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from typing import Optional
 
 try:
     import certifi
@@ -45,25 +44,32 @@ class OpenRouterBackend:
         self.app_name = app_name or "Akane"
         self.ca_bundle = ca_bundle.strip()
         self.skip_ssl_verify = skip_ssl_verify
+        self._cached_headers: dict[str, str] | None = None
+        self._cached_ssl_ctx = None
 
     def _headers(self) -> dict[str, str]:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "X-Title": self.app_name,
-        }
-        if self.site_url:
-            headers["HTTP-Referer"] = self.site_url
-        return headers
+        if self._cached_headers is None:
+            h = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "X-Title": self.app_name,
+            }
+            if self.site_url:
+                h["HTTP-Referer"] = self.site_url
+            self._cached_headers = h
+        return self._cached_headers
 
     def _ssl_context(self):
-        if self.skip_ssl_verify:
-            return ssl._create_unverified_context()
-        if self.ca_bundle:
-            return ssl.create_default_context(cafile=self.ca_bundle)
-        if certifi is not None:
-            return ssl.create_default_context(cafile=certifi.where())
-        return ssl.create_default_context()
+        if self._cached_ssl_ctx is None:
+            if self.skip_ssl_verify:
+                self._cached_ssl_ctx = ssl._create_unverified_context()
+            elif self.ca_bundle:
+                self._cached_ssl_ctx = ssl.create_default_context(cafile=self.ca_bundle)
+            elif certifi is not None:
+                self._cached_ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+            else:
+                self._cached_ssl_ctx = ssl.create_default_context()
+        return self._cached_ssl_ctx
 
     def _request(self, payload: dict):
         req = urlrequest.Request(
@@ -151,7 +157,7 @@ class OpenRouterBackend:
 class ModelManager:
     """Singleton manager for the LLM model with lazy loading."""
 
-    _instance: Optional["ModelManager"] = None
+    _instance: "ModelManager | None" = None
     _lock = threading.Lock()
 
     def __init__(self):
@@ -182,7 +188,8 @@ class ModelManager:
         self.LLAMA_FLASH_ATTN = LLAMA_FLASH_ATTN
         self.LLAMA_GPU_LAYERS = LLAMA_GPU_LAYERS
         self.LLAMA_IDLE_UNLOAD_SECONDS = max(0.0, float(LLAMA_IDLE_UNLOAD_SECONDS))
-        self.MODEL_PATH = Path(MODEL_PATH)
+        self._local_model_path = Path(MODEL_PATH)
+        self.MODEL_PATH = self._local_model_path
         self.OPENROUTER_API_KEY = OPENROUTER_API_KEY
         self.OPENROUTER_CODER_MODEL = OPENROUTER_CODER_MODEL
         self.OPENROUTER_BASE_URL = OPENROUTER_BASE_URL
@@ -190,7 +197,6 @@ class ModelManager:
         self.OPENROUTER_SITE_URL = OPENROUTER_SITE_URL
         self.OPENROUTER_APP_NAME = OPENROUTER_APP_NAME
         self.OPENROUTER_SKIP_SSL_VERIFY = OPENROUTER_SKIP_SSL_VERIFY
-        self._local_model_path = Path(MODEL_PATH)
         self._llm = None
         self._coder_llm = None
         self._loading = False
@@ -337,13 +343,7 @@ class ModelManager:
                 elif self.LLAMA_THREADS > 0:
                     llm_kwargs["n_threads"] = self.LLAMA_THREADS
 
-                try:
-                    self._llm = Llama(**llm_kwargs)
-                except TypeError:
-                    fallback_kwargs = dict(llm_kwargs)
-                    fallback_kwargs.pop("flash_attn", None)
-                    fallback_kwargs.pop("n_ubatch", None)
-                    self._llm = Llama(**fallback_kwargs)
+                self._llm = Llama(**llm_kwargs)
                 self._last_llama_use_at = time.monotonic()
                 print(f"Model loaded on {self.DEVICE}.", flush=True)
                 self._loading = False

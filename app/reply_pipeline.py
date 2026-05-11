@@ -36,18 +36,24 @@ _CODING_PREFACE_MARKERS = (
 )
 
 
+def _collapse_visible(text: str) -> str:
+    if not text:
+        return ""
+    return collapse_hidden_tag_gaps(text).strip()
+
+
 def clean_reply_text(raw: str) -> str:
     cleaned = clean_model_text(raw) if raw else ""
-    return collapse_hidden_tag_gaps(cleaned).strip() if cleaned else ""
+    return _collapse_visible(cleaned) if cleaned else ""
 
 
 def finalize_reply(raw: str, visible_fallback: str = "") -> str:
     cleaned = finalize_model_response(raw) if raw else ""
-    cleaned = collapse_hidden_tag_gaps(cleaned).strip() if cleaned else ""
+    cleaned = _collapse_visible(cleaned) if cleaned else ""
     if cleaned:
         return cleaned
 
-    visible_fallback = collapse_hidden_tag_gaps(visible_fallback).strip() if visible_fallback else ""
+    visible_fallback = _collapse_visible(visible_fallback) if visible_fallback else ""
     if visible_fallback:
         return visible_fallback
 
@@ -62,10 +68,8 @@ def normalize_final_reply(reply: str) -> str:
 
 
 def merge_visible_reply(prefix: str, continuation: str) -> str:
-    prefix_clean = collapse_hidden_tag_gaps(str(prefix or "").replace(_EMPTY_REPLY_SENTINEL, "")).strip()
-    continuation_clean = collapse_hidden_tag_gaps(
-        str(continuation or "").replace(_EMPTY_REPLY_SENTINEL, "")
-    ).strip()
+    prefix_clean = _collapse_visible(str(prefix or "").replace(_EMPTY_REPLY_SENTINEL, ""))
+    continuation_clean = _collapse_visible(str(continuation or "").replace(_EMPTY_REPLY_SENTINEL, ""))
     if not prefix_clean:
         return continuation_clean
     if not continuation_clean:
@@ -85,7 +89,9 @@ def merge_visible_reply(prefix: str, continuation: str) -> str:
 
 
 def _split_sentences(text: str) -> list[str]:
-    stripped = str(text or "").strip()
+    if not text:
+        return []
+    stripped = text.strip()
     if not stripped:
         return []
     parts: list[str] = []
@@ -150,7 +156,8 @@ def _extract_bulleted_items(text: str) -> list[str]:
 
 
 def _normalize_reply_seed(reply: str) -> str:
-    return _strip_coding_preface(_strip_robotic_review_prefix(_strip_filler_opener(reply)))
+    collapsed = _collapse_visible(reply)
+    return _strip_coding_preface(_strip_robotic_review_prefix(_strip_filler_opener(collapsed)))
 
 
 def _ends_with_incomplete_marker(text: str) -> bool:
@@ -276,18 +283,8 @@ def _looks_like_single_suggestion_reply(reply: str) -> bool:
     return 1 <= len(sentences) <= 3
 
 
-def _looks_like_companion_sized_reply(reply: str) -> bool:
-    text = collapse_hidden_tag_gaps(str(reply or "")).strip()
-    if not text:
-        return False
-    if len(text) > 240 or text.count("\n") > 2:
-        return False
-    sentences = _split_sentences(text)
-    return 1 <= len(sentences) <= 3
-
-
 def _strip_trailing_followup_question(reply: str) -> str:
-    text = collapse_hidden_tag_gaps(str(reply or "")).strip()
+    text = str(reply or "").strip()
     if not text:
         return ""
 
@@ -313,7 +310,7 @@ def _strip_trailing_followup_question(reply: str) -> str:
 
 
 def _strip_filler_opener(reply: str) -> str:
-    text = collapse_hidden_tag_gaps(str(reply or "")).strip()
+    text = reply
     if not text:
         return ""
     lowered = text.lower().lstrip()
@@ -329,7 +326,7 @@ def _strip_filler_opener(reply: str) -> str:
 
 
 def _strip_robotic_review_prefix(reply: str) -> str:
-    text = collapse_hidden_tag_gaps(str(reply or "")).strip()
+    text = reply
     if not text:
         return ""
     lines = text.splitlines()
@@ -364,7 +361,7 @@ def _strip_robotic_review_prefix(reply: str) -> str:
 
 
 def _strip_coding_preface(reply: str) -> str:
-    text = collapse_hidden_tag_gaps(str(reply or "")).strip()
+    text = reply
     if not text:
         return ""
     lines = text.splitlines()
@@ -502,12 +499,18 @@ def postprocess_reply(
     reply: str,
     *,
     analysis: RequestAnalysis,
+    compact_mode: bool = True,
     working_messages: list[dict],
     request_completion: Callable[[list[dict]], dict],
     extract_message_text: Callable[[dict], str],
     extract_finish_reason: Callable[[dict], str],
 ) -> str:
     cleaned = _normalize_reply_seed(reply)
+    if not compact_mode:
+        return cleaned
+    if cleaned and not analysis.wants_detail and not analysis.wants_single_suggestion:
+        if len(cleaned) <= 160 and "\n" not in cleaned and "```" not in cleaned:
+            return _strip_trailing_followup_question(cleaned)
 
     if analysis.wants_single_suggestion:
         locally_clamped = _clamp_suggestion_reply(cleaned) or cleaned
@@ -540,6 +543,4 @@ def postprocess_reply(
         if locally_compacted:
             return _clamp_companion_reply(locally_compacted)
 
-    if not analysis.wants_detail and _looks_like_companion_sized_reply(cleaned):
-        return _clamp_companion_reply(cleaned)
     return _clamp_companion_reply(cleaned)

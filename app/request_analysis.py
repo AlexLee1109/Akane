@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 from app.codebase_search import CodebaseSearch
 
@@ -19,14 +20,20 @@ _FIRST_PERSON_SUBJECTS = {"i", "we", "my", "our"}
 _ASSISTANT_TARGET_TOKENS = {"you", "akane"}
 
 
+@lru_cache(maxsize=2048)
 def _normalize(text: str) -> str:
-    return " ".join(str(text or "").replace("’", "'").lower().split())
+    if not text:
+        return ""
+    return " ".join(str(text).replace("’", "'").lower().split())
 
 
-def _word_tokens(text: str) -> list[str]:
+@lru_cache(maxsize=2048)
+def _word_tokens(text: str) -> tuple[str, ...]:
+    if not text:
+        return ()
     chars: list[str] = []
     tokens: list[str] = []
-    for ch in str(text or "").lower():
+    for ch in str(text).lower():
         if ch.isalnum() or ch in {"_", ".", "/", "-"}:
             chars.append(ch)
         elif chars:
@@ -34,19 +41,11 @@ def _word_tokens(text: str) -> list[str]:
             chars = []
     if chars:
         tokens.append("".join(chars))
-    return tokens
-
-
-def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
-    return any(phrase in text for phrase in phrases)
+    return tuple(tokens)
 
 
 def _contains_any_token(tokens: set[str], expected: set[str]) -> bool:
     return bool(tokens & expected)
-
-
-def _starts_with_any(text: str, prefixes: tuple[str, ...]) -> bool:
-    return any(text.startswith(prefix) for prefix in prefixes)
 
 
 def _strip_trailing_punct(text: str) -> str:
@@ -126,6 +125,24 @@ def _looks_like_execution_request(lowered: str, tokens: list[str]) -> bool:
         return True
     return len(tokens) <= 4 and any(
         _starts_with_token_stem(token, ("apply", "chang", "edit", "fix", "rewr", "merge", "updat", "make"))
+        for token in tokens
+    )
+
+
+def _looks_like_direct_codegen_request(lowered: str, tokens: list[str]) -> bool:
+    if not lowered or not tokens:
+        return False
+    asks = ("can you ", "could you ", "please ", "write ", "create ", "generate ", "build ", "make ")
+    if not lowered.startswith(asks):
+        return False
+    has_codegen_verb = any(
+        _starts_with_token_stem(token, ("writ", "creat", "gener", "build", "make", "edit", "patch", "impl", "refa"))
+        for token in tokens[:10]
+    )
+    if not has_codegen_verb:
+        return False
+    return any(
+        _starts_with_token_stem(token, ("code", "script", "file", "func", "clas", "program", "robot", "c", "cpp", "python", "java", "type"))
         for token in tokens
     )
 
@@ -237,6 +254,10 @@ class RequestAnalyzer:
         return self.search.extract_query_tokens(text)
 
     def extract_file_refs(self, text: str) -> list[str]:
+        return list(self._cached_file_refs(str(text or "")))
+
+    @lru_cache(maxsize=1024)
+    def _cached_file_refs(self, text: str) -> tuple[str, ...]:
         refs: list[str] = []
         seen: set[str] = set()
         for token in _word_tokens(text):
@@ -247,7 +268,7 @@ class RequestAnalyzer:
                 if cleaned not in seen:
                     seen.add(cleaned)
                     refs.append(cleaned)
-        return refs
+        return tuple(refs)
 
     def has_recent_topic_overlap(self, user_input: str, recent_text: str) -> bool:
         current_tokens = set(self.extract_query_tokens(user_input))
@@ -298,24 +319,21 @@ class RequestAnalyzer:
         context_tokens = _word_tokens(context_text)
         return _looks_like_codebase_request(context_text, context_tokens, False)
 
-    def _looks_like_topic_shift(self, user_input: str, snapshot: RequestSnapshot) -> bool:
-        lowered = _normalize(user_input)
+    def _looks_like_topic_shift(self, lowered: str, tokens: list[str], recent_context: str) -> bool:
         if not lowered:
             return False
-        current_tokens = set(_word_tokens(lowered))
-        if _looks_like_topic_shift(lowered, list(current_tokens)):
+        if _looks_like_topic_shift(lowered, tokens):
             return True
-        recent_context = _normalize(" ".join(part for part in (snapshot.last_user, snapshot.last_assistant, snapshot.recent_text) if part))
         if not recent_context:
             return False
-        recent_tokens = set(_word_tokens(recent_context))
-        recent_coding = _looks_like_codebase_request(recent_context, list(recent_tokens), False)
-        current_coding = _looks_like_codebase_request(lowered, list(current_tokens), False)
-        return recent_coding != current_coding and len(current_tokens) >= 5
+        recent_tokens = _word_tokens(recent_context)
+        recent_coding = _looks_like_codebase_request(recent_context, recent_tokens, False)
+        current_coding = _looks_like_codebase_request(lowered, tokens, False)
+        return recent_coding != current_coding and len(tokens) >= 5
 
     def _looks_like_brainstorm(
         self,
-        user_input: str,
+        lowered: str,
         query_tokens: tuple[str, ...],
         *,
         codebase_direct: bool,
@@ -324,13 +342,12 @@ class RequestAnalyzer:
     ) -> bool:
         if codebase_direct or explicit_file_reference or wants_execution:
             return False
-        lowered = _normalize(user_input)
         tokens = set(query_tokens)
         return _looks_like_brainstorm_tokens(tokens, lowered)
 
     def _looks_like_smalltalk(
         self,
-        user_input: str,
+        lowered: str,
         query_tokens: tuple[str, ...],
         *,
         coding: bool,
@@ -344,13 +361,12 @@ class RequestAnalyzer:
         tokens = set(query_tokens)
         if not tokens:
             return False
-        lowered = _normalize(user_input)
         return _looks_like_smalltalk_tokens(tokens, lowered)
 
     def _looks_like_status_update(
         self,
-        user_input: str,
-        query_tokens: tuple[str, ...],
+        lowered: str,
+        tokens: list[str],
         *,
         explicit_file_reference: bool,
         codebase_direct: bool,
@@ -358,19 +374,18 @@ class RequestAnalyzer:
     ) -> bool:
         if explicit_file_reference or codebase_direct or wants_execution:
             return False
-        lowered = _normalize(user_input)
         if not lowered or "?" in lowered:
             return False
-        shape_tokens = _word_tokens(user_input)
-        if not self._starts_with_first_person_update(shape_tokens):
+        if not self._starts_with_first_person_update(tokens):
             return False
-        if self._looks_like_direct_assistant_request(shape_tokens):
+        if self._looks_like_direct_assistant_request(tokens):
             return False
-        return not (shape_tokens and shape_tokens[0] in _QUESTION_STARTERS)
+        return not (tokens and tokens[0] in _QUESTION_STARTERS)
 
     def _looks_like_contextual_continuation(
         self,
-        user_input: str,
+        lowered: str,
+        tokens: list[str],
         *,
         topic_shift: bool,
         coding: bool,
@@ -378,17 +393,16 @@ class RequestAnalyzer:
     ) -> bool:
         if topic_shift or coding or explicit_file_reference:
             return False
-        lowered = _normalize(user_input)
         if not lowered:
             return False
-        tokens = _word_tokens(user_input)
         if _looks_like_contextual_continuation_prefix(lowered, tokens):
             return True
         return bool(tokens and len(tokens) <= 14 and any(token in {"too", "though", "still", "instead", "that", "this", "it"} for token in tokens[:5]))
 
     def _looks_like_short_question_continuation(
         self,
-        user_input: str,
+        lowered: str,
+        tokens: list[str],
         *,
         topic_shift: bool,
         coding: bool,
@@ -397,10 +411,8 @@ class RequestAnalyzer:
     ) -> bool:
         if topic_shift or coding or explicit_file_reference:
             return False
-        lowered = _normalize(user_input)
         if not lowered:
             return False
-        tokens = _word_tokens(lowered)
         if not tokens or len(tokens) > 8 or tokens[0] not in _QUESTION_STARTERS:
             return False
         if topic_overlap:
@@ -410,6 +422,10 @@ class RequestAnalyzer:
         return any(token in _FOLLOWUP_REFERENCE_TOKENS for token in tokens[1:6])
 
     def analyze(self, user_input: str, snapshot: RequestSnapshot) -> RequestAnalysis:
+        return self._analyze_cached(user_input, snapshot)
+
+    @lru_cache(maxsize=256)
+    def _analyze_cached(self, user_input: str, snapshot: RequestSnapshot) -> RequestAnalysis:
         lowered = _normalize(user_input)
         last_assistant = str(snapshot.last_assistant or "").strip()
         last_user = str(snapshot.last_user or "").strip()
@@ -439,9 +455,10 @@ class RequestAnalyzer:
         short_followup = token_count <= 10
         assistant_invited_continuation = self.assistant_invited_continuation(last_assistant)
         recent_context = " ".join(part for part in (last_user, last_assistant, snapshot.recent_text) if part)
+        recent_context_lowered = _normalize(recent_context)
         topic_overlap = self.has_recent_topic_overlap(user_input, recent_context)
         has_code_context = self._has_code_context(snapshot, last_assistant)
-        topic_shift = self._looks_like_topic_shift(user_input, snapshot)
+        topic_shift = self._looks_like_topic_shift(lowered, tokens, recent_context_lowered)
         ambiguous_followup = bool(followup_reference or affirmative_followup or explanation_followup or short_followup or len(query_tokens) <= 4)
         shape_tokens = tokens
         explicit_new_question = bool(
@@ -469,13 +486,15 @@ class RequestAnalyzer:
         if followup_reference or affirmative_followup or explanation_followup:
             topic_shift = False
         contextual_continuation = self._looks_like_contextual_continuation(
-            user_input,
+            lowered,
+            tokens,
             topic_shift=topic_shift,
             coding=coding,
             explicit_file_reference=explicit_file_reference,
         )
         short_question_continuation = self._looks_like_short_question_continuation(
-            user_input,
+            lowered,
+            tokens,
             topic_shift=topic_shift,
             coding=coding,
             explicit_file_reference=explicit_file_reference,
@@ -484,6 +503,8 @@ class RequestAnalyzer:
         if short_question_continuation:
             topic_shift = False
         if has_code_context and _looks_like_execution_request(lowered, tokens):
+            wants_execution = True
+        elif coding and _looks_like_direct_codegen_request(lowered, tokens):
             wants_execution = True
         elif has_code_context and any(_looks_like_action_verb(token) for token in token_set):
             execution_score = 0
@@ -574,21 +595,21 @@ class RequestAnalyzer:
             )
         )
         wants_brainstorm = self._looks_like_brainstorm(
-            user_input,
+            lowered,
             query_tokens,
             codebase_direct=codebase_direct,
             explicit_file_reference=explicit_file_reference,
             wants_execution=wants_execution,
         )
         looks_like_status_update = self._looks_like_status_update(
-            user_input,
-            query_tokens,
+            lowered,
+            tokens,
             explicit_file_reference=explicit_file_reference,
             codebase_direct=codebase_direct,
             wants_execution=wants_execution,
         )
         looks_like_smalltalk = self._looks_like_smalltalk(
-            user_input,
+            lowered,
             query_tokens,
             coding=coding,
             explicit_file_reference=explicit_file_reference,

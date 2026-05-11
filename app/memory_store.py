@@ -3,7 +3,6 @@
 import asyncio
 import copy
 import math
-import re
 import threading
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -44,6 +43,7 @@ _GENERIC_MEMORY_PHRASES = (
     "can you help", "i need help", "look at", "check the code", "read the file",
     "open vscode", "open the project", "thermal throttling", "reply faster",
 )
+_CLAUSE_SPLIT_CHARS = ".!?\n"
 
 
 def _fresh_default_memory() -> dict:
@@ -87,7 +87,21 @@ def _touch_list_entry(entries: list[dict], content: str) -> bool:
 
 def _normalize_person_name(value: str) -> str:
     value = " ".join(value.strip().split()).lower()
-    return re.sub(r"(^|[\s'-])([a-z])", lambda m: f"{m.group(1)}{m.group(2).upper()}", value)
+    if not value:
+        return ""
+    out: list[str] = []
+    cap_next = True
+    for ch in value:
+        if cap_next and "a" <= ch <= "z":
+            out.append(ch.upper())
+            cap_next = False
+            continue
+        out.append(ch)
+        if ch in {" ", "-", "'"}:
+            cap_next = True
+        elif ch.isalpha():
+            cap_next = False
+    return "".join(out)
 
 
 def _normalize_user_field(key: str, value: str) -> str:
@@ -152,13 +166,145 @@ def _memory_entry_allowed(category: str, content: str) -> bool:
             for prefix in ("prefers ", "likes ", "loves ", "enjoys ", "wants ", "needs ", "doesn't like ", "does not like ")
         )
     if category == "facts":
-        return len(tokens) >= 3 and (
-            lowered.startswith(("uses ", "has ", "runs ", "works on ", "working on "))
-            or any(char.isdigit() for char in normalized)
+        starts_like_fact = lowered.startswith(("uses ", "has ", "runs ", "works on ", "working on "))
+        return (
+            (starts_like_fact and len(tokens) >= 2)
+            or (len(tokens) >= 3 and any(char.isdigit() for char in normalized))
         )
     if category == "history":
         return len(tokens) >= 3
     return True
+
+
+def _clean_extracted_value(value: str) -> str:
+    cleaned = _normalize_entry_text(value)
+    cleaned = cleaned.strip(" ,;:-")
+    return cleaned
+
+
+def _looks_like_valid_name(value: str) -> bool:
+    candidate = _clean_extracted_value(value)
+    if not candidate:
+        return False
+    if len(candidate) > 48 or any(ch.isdigit() for ch in candidate):
+        return False
+    parts = candidate.replace("-", " ").replace("'", " ").split()
+    return 1 <= len(parts) <= 4 and all(part.isalpha() for part in parts)
+
+
+def _split_user_clauses(text: str) -> list[str]:
+    clauses: list[str] = []
+    current: list[str] = []
+    for ch in str(text or ""):
+        if ch in _CLAUSE_SPLIT_CHARS:
+            clause = _clean_extracted_value("".join(current))
+            if clause:
+                clauses.append(clause)
+            current = []
+            continue
+        current.append(ch)
+    tail = _clean_extracted_value("".join(current))
+    if tail:
+        clauses.append(tail)
+    return clauses
+
+
+def _extract_memory_ops_from_user_text(user_text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    text = str(user_text or "").strip()
+    if not text:
+        return [], []
+
+    mem_ops: list[tuple[str, str]] = []
+    project_ops: list[tuple[str, str]] = []
+    seen_mem: set[tuple[str, str]] = set()
+    seen_projects: set[tuple[str, str]] = set()
+
+    name_prefixes = ("my name is ", "name's ", "name is ", "call me ", "i am ", "i'm ", "i go by ")
+    preference_prefixes = (
+        ("i prefer ", "prefers "),
+        ("i like ", "likes "),
+        ("i love ", "loves "),
+        ("i enjoy ", "enjoys "),
+        ("i want ", "wants "),
+        ("i need ", "needs "),
+        ("i don't like ", "doesn't like "),
+        ("i do not like ", "doesn't like "),
+        ("i hate ", "doesn't like "),
+    )
+    fact_prefixes = (
+        ("i use ", "uses "),
+        ("i'm using ", "uses "),
+        ("im using ", "uses "),
+        ("i have ", "has "),
+        ("i'm on ", "uses "),
+        ("im on ", "uses "),
+        ("i run ", "runs "),
+    )
+    project_prefixes = (
+        "i am working on ", "i'm working on ", "im working on ",
+        "i am building ", "i'm building ", "im building ",
+        "i am making ", "i'm making ", "im making ",
+        "i am creating ", "i'm creating ", "im creating ",
+    )
+
+    for clause in _split_user_clauses(text):
+        lowered = clause.lower()
+
+        for prefix in name_prefixes:
+            if not lowered.startswith(prefix):
+                continue
+            name = _clean_extracted_value(clause[len(prefix):])
+            if _looks_like_valid_name(name):
+                op = ("user", f"name: {name}")
+                if op not in seen_mem:
+                    seen_mem.add(op)
+                    mem_ops.append(op)
+            break
+
+        for prefix, mapped in preference_prefixes:
+            if not lowered.startswith(prefix):
+                continue
+            value = _clean_extracted_value(clause[len(prefix):])
+            if value:
+                op = ("preferences", f"{mapped}{value.lower()}")
+                if op not in seen_mem:
+                    seen_mem.add(op)
+                    mem_ops.append(op)
+            break
+
+        for prefix, mapped in fact_prefixes:
+            if not lowered.startswith(prefix):
+                continue
+            value = _clean_extracted_value(clause[len(prefix):])
+            if value:
+                op = ("facts", f"{mapped}{value.lower()}")
+                if op not in seen_mem:
+                    seen_mem.add(op)
+                    mem_ops.append(op)
+            break
+
+        for prefix in project_prefixes:
+            if not lowered.startswith(prefix):
+                continue
+            raw_project = _clean_extracted_value(clause[len(prefix):]).lower()
+            if not raw_project:
+                break
+            name = raw_project
+            detail = ""
+            for connector in (" using ", " with ", " for ", " on ", " at "):
+                if connector in name:
+                    left, right = name.split(connector, 1)
+                    name = _clean_extracted_value(left).lower()
+                    detail = _clean_extracted_value(right).lower()
+                    break
+            if name:
+                op = (name, detail)
+                if op not in seen_projects:
+                    seen_projects.add(op)
+                    project_ops.append(op)
+            break
+
+    return mem_ops, project_ops
 
 
 def _enforce_entry_limit(data: dict, category: str) -> None:
@@ -180,7 +326,18 @@ def _enforce_entry_limit(data: dict, category: str) -> None:
 
 
 def _slugify(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    lowered = str(value or "").lower()
+    chars: list[str] = []
+    prev_dash = False
+    for ch in lowered:
+        if ch.isalnum():
+            chars.append(ch)
+            prev_dash = False
+            continue
+        if not prev_dash:
+            chars.append("-")
+            prev_dash = True
+    slug = "".join(chars).strip("-")
     return slug or "item"
 
 
@@ -202,7 +359,9 @@ _PUNCT_TRANSLATION = str.maketrans({
 
 
 def _tokenize_embedding_text(text: str) -> list[str]:
-    cleaned = " ".join(str(text or "").translate(_PUNCT_TRANSLATION).split())
+    if not text:
+        return []
+    cleaned = " ".join(str(text).translate(_PUNCT_TRANSLATION).split())
     if not cleaned:
         return []
     return cleaned.split()
@@ -504,6 +663,18 @@ def apply_tag_operations(
     return True
 
 
+def remember_user_message(user_text: str) -> bool:
+    """Infer durable memory from a raw user message and persist it."""
+    mem_ops, project_ops = _extract_memory_ops_from_user_text(user_text)
+    if not mem_ops and not project_ops:
+        return False
+    return apply_tag_operations(
+        mem_ops=mem_ops,
+        forget_queries=[],
+        project_ops=project_ops,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -761,10 +932,10 @@ def format_for_prompt() -> str:
     with store._flush_lock:
         data = store.data
         cache_gen = store._prompt_cache_gen
+        prompt_cache = store._prompt_cache
 
-    current_gen = (cache_gen, store.data["metadata"]["interaction_count"])
-    if store._prompt_cache is not None and store._prompt_cache_gen == current_gen[0]:
-        return store._prompt_cache
+    if prompt_cache is not None and store._prompt_cache_gen == cache_gen:
+        return prompt_cache
 
     sections = []
     user = data.get("user", {})

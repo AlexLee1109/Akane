@@ -8,6 +8,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote
+import re
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -68,8 +69,11 @@ _INFRA_PATH_PREFIXES = (
     ".gitlab/",
 )
 DEFAULT_SESSION_ID = "popup"
-_POPUP_STRIP_TAGS = ("MEM", "FORGET", "PROJECT", "NEXT")
-
+# Compile this once at the module level
+_POPUP_STRIP_REGEX = re.compile(
+    r"\[(MEM|FORGET|PROJECT|NEXT)\].*?(?:\[/\1\]|$)",
+    re.DOTALL | re.IGNORECASE
+)
 
 @dataclass
 class SessionState:
@@ -121,13 +125,9 @@ _CODEBASE_TARGET_HINTS = (
     "fix ",
 )
 
-# Compact instruction snippets (short to reduce file size and parsing cost)
-_COMPACT_REPLY_RULES = "Respond in 1-3 short declarative sentences; start with the answer."
 _TECHNICAL_FOCUS_RULES = "Focus only on the code and the user's engineering question."
 
-
-def _compact_companion_instruction() -> str:
-    return f"For this turn, reply like a compact companion. {_COMPACT_REPLY_RULES}"
+_COMPACT_COMPANION_INSTRUCTION = "For this turn, reply like a compact companion. Respond in 1-3 short declarative sentences; start with the answer."
 
 
 def _technical_answer_instruction(*, single_suggestion: bool = False) -> str:
@@ -153,29 +153,26 @@ class _StreamVisibleCleaner:
             return ""
 
         working = self._buffer + text
-        has_newline = "\n" in working
-        if not has_newline and not flush:
-            self._buffer = ""
-            return working.replace("\t", " ")
+        # Fast path to avoid redundant checks
+        if "\n" not in working and not flush:
+            self._buffer = working
+            return ""
 
         parts = working.split("\n")
-        if not flush:
-            self._buffer = parts.pop()
-        else:
-            self._buffer = ""
+        self._buffer = "" if flush else parts.pop()
 
-        normalized: list[str] = []
+        normalized = []
         for raw_line in parts:
             line = raw_line.replace("\t", " ")
             if not line:
-                if self._previous_blank:
-                    continue
-                normalized.append("")
-                self._previous_blank = True
+                if not self._previous_blank:
+                    normalized.append("")
+                    self._previous_blank = True
                 continue
             normalized.append(line)
             self._previous_blank = False
-        return "\n".join(normalized)
+            
+        return "\n".join(normalized) + ("\n" if normalized else "")
 
     def feed(self, text: str) -> str:
         if not text:
@@ -338,19 +335,10 @@ def _log_terminal_stream(label: str, text: str = "") -> None:
 def _strip_popup_tags(text: str) -> str:
     if not text:
         return text
-    cleaned = str(text)
-    for tag in _POPUP_STRIP_TAGS:
-        open_tag = f"[{tag}]"
-        close_tag = f"[/{tag}]"
-        while True:
-            start = cleaned.find(open_tag)
-            if start == -1:
-                break
-            end = cleaned.find(close_tag, start + len(open_tag))
-            if end == -1:
-                cleaned = cleaned[:start].strip()
-                break
-            cleaned = (cleaned[:start] + cleaned[end + len(close_tag):]).strip()
+    
+    # Let the C-optimized regex engine handle the replacements
+    cleaned = _POPUP_STRIP_REGEX.sub("", str(text))
+    
     return "\n".join(line for line in cleaned.splitlines() if line.strip())
 
 
@@ -360,33 +348,42 @@ def _explicit_paths_in_text(text: str) -> list[str]:
     fallback_suffixes = (
         ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md", ".txt", ".css", ".html", ".sh",
     )
+    
     for raw_value in _REQUEST_ANALYZER.extract_file_refs(text):
         raw = str(raw_value or "").strip("`'\".,:;()[]{}")
         if not raw:
             continue
+            
         if "/" in raw:
-            resolved = (PROJECT_ROOT / raw).resolve()
-            if resolved.is_file() and str(resolved).startswith(str(PROJECT_ROOT)):
-                rel = str(resolved.relative_to(PROJECT_ROOT))
-                if rel not in seen:
-                    seen.add(rel)
-                    matches.append(rel)
+            candidate = PROJECT_ROOT / raw
+            if candidate.is_file():
+                resolved = candidate.resolve()
+                if str(resolved).startswith(str(PROJECT_ROOT)):
+                    rel = str(resolved.relative_to(PROJECT_ROOT))
+                    if rel not in seen:
+                        seen.add(rel)
+                        matches.append(rel)
                 continue
+                
             if not Path(raw).suffix:
                 for suffix in fallback_suffixes:
-                    candidate = (PROJECT_ROOT / f"{raw}{suffix}").resolve()
-                    if candidate.is_file() and str(candidate).startswith(str(PROJECT_ROOT)):
-                        rel = str(candidate.relative_to(PROJECT_ROOT))
-                        if rel not in seen:
-                            seen.add(rel)
-                            matches.append(rel)
-                        break
+                    candidate_with_suffix = PROJECT_ROOT / f"{raw}{suffix}"
+                    # OPTIMIZATION: Check .is_file() first here too
+                    if candidate_with_suffix.is_file():
+                        resolved = candidate_with_suffix.resolve()
+                        if str(resolved).startswith(str(PROJECT_ROOT)):
+                            rel = str(resolved.relative_to(PROJECT_ROOT))
+                            if rel not in seen:
+                                seen.add(rel)
+                                matches.append(rel)
+                            break
             continue
 
         for rel in _CODEBASE_SEARCH.get_project_file_index().get(raw.lower(), []):
             if rel not in seen:
                 seen.add(rel)
                 matches.append(rel)
+                
     return matches
 
 
@@ -409,14 +406,10 @@ def _recent_codebase_targets(session_id: str | None = None) -> list[str]:
         return list(state.recent_code_targets)
 
 
-def _last_message(role: str, session_id: str | None = None) -> str:
+def _last_assistant_message(session_id: str | None = None) -> str:
     state = _session_state(session_id)
     _refresh_session_history_cache(state)
-    if role == "user":
-        return state.cached_last_user
-    if role == "assistant":
-        return state.cached_last_assistant
-    return ""
+    return state.cached_last_assistant
 
 
 def _recent_exchange_context(session_id: str | None = None) -> str:
@@ -425,10 +418,11 @@ def _recent_exchange_context(session_id: str | None = None) -> str:
     return state.cached_recent_exchange_context
 
 
-def _recent_exchange_note(session_id: str | None = None) -> str:
+def _recent_exchange_pair(session_id: str | None = None) -> tuple[str, str]:
+    """Return (context, note) with a single cache refresh."""
     state = _session_state(session_id)
     _refresh_session_history_cache(state)
-    return state.cached_recent_exchange_note
+    return state.cached_recent_exchange_context, state.cached_recent_exchange_note
 
 
 def _request_snapshot(*, session_id: str | None = None, last_assistant_override: str | None = None) -> RequestSnapshot:
@@ -598,22 +592,6 @@ def _format_pending_approval_reply(actions: list[dict]) -> str:
     lines.append("Use /approve to apply them or /reject to cancel them.")
     return "\n".join(lines)
 
-
-def _is_open_vscode_request(user_input: str, analysis=None, *, session_id: str | None = None) -> bool:
-    analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    return analysis.open_vscode
-
-
-def _is_codebase_context_request(user_input: str, analysis=None, *, session_id: str | None = None) -> bool:
-    analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    return analysis.codebase_context
-
-
-def _wants_code_execution(user_input: str, analysis=None, *, session_id: str | None = None) -> bool:
-    analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    return analysis.wants_execution
-
-
 def _looks_like_deferred_action_reply(reply: str) -> bool:
     text = collapse_hidden_tag_gaps(str(reply or "")).strip()
     if not text:
@@ -737,8 +715,6 @@ def _needs_editor_retry(user_input: str, raw: str) -> bool:
         return False
     if _looks_like_deferred_action_reply(raw):
         return True
-    if "```" in str(raw or ""):
-        return True
     return True
 
 
@@ -751,7 +727,7 @@ def _needs_codebase_action_retry(analysis, raw: str) -> bool:
 
 
 def _is_light_chat_turn(analysis) -> bool:
-    return bool(
+    return (
         not analysis.coding_like
         and not analysis.wants_execution
         and not analysis.open_vscode
@@ -802,44 +778,37 @@ def _should_attach_recent_exchange(analysis, user_input: str) -> bool:
 
 
 def _is_referential_question(user_input: str) -> bool:
-    """Detect short questions that likely refer to the previous topic (e.g., 'What's it about?')."""
+    """Detect short questions that likely refer to the previous topic."""
     if not user_input:
         return False
 
     text = collapse_hidden_tag_gaps(user_input).strip()
-    if not text:
-        return False
-
-    # Must be a question
-    if "?" not in text:
-        return False
-
-    # Must be relatively short (likely a follow-up)
-    if len(text) > 50:
+    if not text or "?" not in text or len(text) > 50:
         return False
 
     lowered = text.lower()
 
-    # Check for referential pronouns
+    # Pre-define sets
     referential_pronouns = {"it", "this", "that", "they", "them", "he", "she", "his", "her", "its"}
-    words = set(lowered.split())
-    if any(pronoun in words for pronoun in referential_pronouns):
-        return True
-
-    # Check for common follow-up phrases
     follow_up_phrases = {
         "what", "how", "why", "tell me", "explain", "more about", "details",
         "elaborate", "go on", "continue", "what happened", "what is", "what are"
     }
-    for phrase in follow_up_phrases:
-        if phrase in lowered:
-            return True
+    
+    # 1. Faster evaluation using set intersection
+    words = set(lowered.split())
+    if referential_pronouns & words:  
+        return True
+
+    # 2. Iterate follow_up_phrases efficiently
+    if any(phrase in lowered for phrase in follow_up_phrases):
+        return True
 
     return False
 
 
 def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> tuple[list[dict], object]:
-    last_assistant = _last_message("assistant", session_id)
+    last_assistant = _last_assistant_message(session_id)
     analysis = _analyze_request(user_input, session_id=session_id, last_assistant_override=last_assistant)
     if not skip_memory:
         capture_explicit_user_memories(user_input)
@@ -857,8 +826,7 @@ def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id
     chat_messages = truncate_messages(messages, system_prompt, user_input, max_context_tokens=CHAT_HISTORY_CONTEXT_TOKENS)
 
     if _should_attach_recent_exchange(analysis, user_input):
-        exchange = _recent_exchange_context(session_id=session_id)
-        exchange_note = _recent_exchange_note(session_id=session_id)
+        exchange, exchange_note = _recent_exchange_pair(session_id=session_id)
         if exchange or exchange_note:
             chat_messages = [
                 *chat_messages[:-1],
@@ -884,7 +852,7 @@ def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id
             *chat_messages[:-1],
             {
                 "role": "system",
-                "content": _compact_companion_instruction(),
+                "content": _COMPACT_COMPANION_INSTRUCTION,
             },
             chat_messages[-1],
         ]
@@ -1056,7 +1024,7 @@ def _route_coder_generation(
         coder_outcome = run_coder_specialist(
             task,
             preload_paths=preload_paths,
-            apply_now=_wants_code_execution(user_input, analysis, session_id=session_id),
+            apply_now=analysis.wants_execution,
             progress_callback=progress_callback,
         )
     except Exception as exc:
@@ -1349,7 +1317,7 @@ def _maybe_get_codebase_messages(
 
 def _should_preload_codebase_context(user_input: str, analysis=None, *, session_id: str | None = None, use_coder_specialist: bool | None = None) -> bool:
     analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    if _is_open_vscode_request(user_input, analysis, session_id=session_id):
+    if analysis.open_vscode:
         return False
     if use_coder_specialist is None:
         use_coder_specialist = _should_use_coder_specialist(user_input, analysis, session_id=session_id)
@@ -1362,7 +1330,6 @@ def _run_editor_followup_loop(
     user_input: str,
     chat_messages: list[dict],
     initial_raw: str,
-    initial_visible: str = "",
     initial_finish_reason: str = "",
     session_id: str | None = None,
     progress_callback=None,
@@ -1374,8 +1341,6 @@ def _run_editor_followup_loop(
     last_finish_reason = initial_finish_reason
     last_cleaned = ""
     saw_tool_work = False
-
-    del initial_visible
 
     for _ in range(_EDITOR_AUTONOMY_MAX_TURNS):
         snapshot = bridge.snapshot().get("context", {})
@@ -1410,7 +1375,7 @@ def _run_editor_followup_loop(
             return _format_pending_approval_reply(queued_actions)
 
         if not actionable and not read_results:
-            if _wants_code_execution(user_input, session_id=session_id) and _looks_like_deferred_action_reply(cleaned):
+            if _analyze_request(user_input, session_id=session_id).wants_execution and _looks_like_deferred_action_reply(cleaned):
                 forced_result = _request_completion(
                     [
                         *loop_messages,
@@ -1618,12 +1583,11 @@ def _complete_reply(
                 user_input,
                 working_messages,
                 current_raw,
-                visible_fallback,
                 initial_finish_reason=current_finish_reason,
                 session_id=session_id,
                 progress_callback=progress_callback,
             )
-        elif _is_codebase_context_request(user_input, analysis, session_id=session_id):
+        elif analysis.codebase_context:
             codebase_messages = _maybe_get_codebase_messages(
                 base_messages,
                 working_messages,
@@ -1632,17 +1596,7 @@ def _complete_reply(
                 analysis=analysis,
             )
             if codebase_messages is working_messages and working_messages is not base_messages:
-                if _response_uses_tool_calls(current_raw):
-                    cleaned = _run_editor_followup_loop(
-                        user_input,
-                        working_messages,
-                        current_raw,
-                        initial_finish_reason=current_finish_reason,
-                        session_id=session_id,
-                        progress_callback=progress_callback,
-                    )
-                else:
-                    cleaned = finalize_reply(current_raw, visible_fallback)
+                cleaned = finalize_reply(current_raw, visible_fallback)
             elif codebase_messages:
                 fallback_result = _request_completion(codebase_messages, stream=False)
                 fallback_raw = _extract_message_text(fallback_result)
@@ -1671,13 +1625,12 @@ def _complete_reply(
         extract_message_text=_extract_message_text,
         extract_finish_reason=_extract_finish_reason,
     )
-    _no_stream_complete = lambda msgs: _request_completion(msgs, stream=False)
     cleaned = postprocess_reply(
         cleaned,
         analysis=analysis,
         compact_mode=is_popup_session,
         working_messages=working_messages,
-        request_completion=_no_stream_complete,
+        request_completion=lambda msgs: _request_completion(msgs, stream=False),
         extract_message_text=_extract_message_text,
         extract_finish_reason=_extract_finish_reason,
     )
@@ -1767,7 +1720,7 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
             else:
                 suppress_intermediate_text = False if light_chat_turn else (
                     _should_force_vscode(text, analysis, session_id=session_id)
-                    or _is_codebase_context_request(text, analysis, session_id=session_id)
+                    or analysis.codebase_context
                 )
                 if is_popup_session:
                     suppress_intermediate_text = False

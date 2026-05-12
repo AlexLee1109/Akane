@@ -321,7 +321,8 @@ def _strip_filler_opener(reply: str) -> str:
         idx = leading_ws_len + len(opener)
         while idx < len(text) and text[idx] in ".!?… ":
             idx += 1
-        return text[idx:].strip()
+        remainder = text[idx:].strip()
+        return remainder[0].upper() + remainder[1:] if len(remainder) > 1 else remainder.upper()
     return text
 
 

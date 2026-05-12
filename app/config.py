@@ -171,10 +171,10 @@ CODER_MAX_TOKENS = int(
         str(_local_secret("CODER_MAX_TOKENS", 1024)),
     ).strip()
 )  # Higher limit for coding suggestions
-TEMPERATURE = 0.2
+TEMPERATURE = 0.9
 TOP_K = 40
 TOP_P = 0.95
-REPETITION_PENALTY = 1.2
+REPETITION_PENALTY = 1.1
 
 # System prompt is now in app/character.py — edit that file to change personality.
 

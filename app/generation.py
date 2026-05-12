@@ -1,3 +1,4 @@
+import re
 import threading
 
 from app.config import ADVISOR_ONLY, CHAT_HISTORY_CONTEXT_TOKENS
@@ -47,42 +48,44 @@ _HIDDEN_SQUARE_TAG_NAMES = (
 )
 _HIDDEN_XML_SIMPLE_TAG_NAMES = ("READ", "WRITE", "SHELL", "CODE", "READ_RESULT", "THINK")
 
+# ── Pre-compiled regex patterns (compiled once at import time) ──────────────
+_SQ_NAMES = "MEM|FORGET|PROJECT|EDITOR|ASK_CODER|CODE|READ|WRITE|SHELL|READ_RESULT|THINK"
+_XML_NAMES = "think|thinking|tool_call|READ|WRITE|SHELL|CODE|READ_RESULT|THINK"
+
+# Complete tag pairs (non-greedy)
+_HIDDEN_SQUARE_TAG_RE = re.compile(
+    rf"\[({_SQ_NAMES})\].*?\[/\1\]", re.DOTALL | re.IGNORECASE
+)
+_HIDDEN_XML_TAG_RE = re.compile(
+    rf"<({_XML_NAMES})>.*?</\1>", re.DOTALL | re.IGNORECASE
+)
+# Unclosed tags — consume to end of string (mirrors original _consume_hidden_tag behaviour)
+_UNCLOSED_SQUARE_TAG_RE = re.compile(
+    rf"\[({_SQ_NAMES})\].*", re.DOTALL | re.IGNORECASE
+)
+_UNCLOSED_XML_TAG_RE = re.compile(
+    rf"<({_XML_NAMES})>.*", re.DOTALL | re.IGNORECASE
+)
+# Consecutive blank lines (2+ blank lines → 1 blank line)
+_MULTI_BLANK_LINE_RE = re.compile(r"[ \t]*\n([ \t]*\n)+")
+# Inline backtick pairs (no newlines inside)
+_INLINE_BACKTICK_RE = re.compile(r"`([^`\n]*)`")
+
+
+from functools import lru_cache as _lru_cache
+
+
+@_lru_cache(maxsize=64)
+def _make_section_re(opener: str, closer: str, case_insensitive: bool) -> re.Pattern:
+    flags = re.DOTALL | (re.IGNORECASE if case_insensitive else 0)
+    return re.compile(re.escape(opener) + r"(.*?)" + re.escape(closer), flags)
+
 
 def _extract_wrapped_sections(text: str, opener: str, closer: str, *, case_insensitive: bool = False) -> list[str]:
     source = str(text or "")
     if not source:
         return []
-    if case_insensitive:
-        source_lower = source.lower()
-        opener_lower = opener.lower()
-        closer_lower = closer.lower()
-        items = []
-        start = 0
-        while True:
-            open_pos = source_lower.find(opener_lower, start)
-            if open_pos == -1:
-                break
-            content_start = open_pos + len(opener)
-            close_pos = source_lower.find(closer_lower, content_start)
-            if close_pos == -1:
-                break
-            items.append(source[content_start:close_pos].strip())
-            start = close_pos + len(closer)
-        return items
-    else:
-        items = []
-        start = 0
-        while True:
-            open_pos = source.find(opener, start)
-            if open_pos == -1:
-                break
-            content_start = open_pos + len(opener)
-            close_pos = source.find(closer, content_start)
-            if close_pos == -1:
-                break
-            items.append(source[content_start:close_pos].strip())
-            start = close_pos + len(closer)
-        return items
+    return [m.group(1).strip() for m in _make_section_re(opener, closer, case_insensitive).finditer(source)]
 
 def _extract_named_xml_sections(text: str, tag_name: str) -> list[str]:
     return _extract_wrapped_sections(
@@ -93,85 +96,31 @@ def _extract_named_xml_sections(text: str, tag_name: str) -> list[str]:
     )
 
 
+@_lru_cache(maxsize=32)
+def _make_assignment_re(prefix: str, closing_tag: str) -> re.Pattern:
+    # Matches e.g. <function=name>content</function>
+    return re.compile(
+        re.escape(prefix) + r"([^>]*?)>" + r"(.*?)" + re.escape(closing_tag),
+        re.DOTALL | re.IGNORECASE,
+    )
+
+
 def _extract_assignment_blocks(text: str, prefix: str, closing_tag: str) -> list[tuple[str, str]]:
     source = str(text or "")
-    lowered = source.lower()
-    prefix_lower = prefix.lower()
-    closing_lower = closing_tag.lower()
-    items: list[tuple[str, str]] = []
-    index = 0
-    while True:
-        start = lowered.find(prefix_lower, index)
-        if start == -1:
-            return items
-        name_start = start + len(prefix)
-        name_end = source.find(">", name_start)
-        if name_end == -1:
-            return items
-        name = source[name_start:name_end].strip()
-        content_start = name_end + 1
-        end = lowered.find(closing_lower, content_start)
-        if end == -1:
-            return items
-        items.append((name, source[content_start:end].strip()))
-        index = end + len(closing_tag)
+    if not source:
+        return []
+    return [(m.group(1).strip(), m.group(2).strip()) for m in _make_assignment_re(prefix, closing_tag).finditer(source)]
+
+
+# Pre-compiled for _extract_simple_xml_pairs — matches <tagname>content</tagname>
+_SIMPLE_XML_PAIR_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_]*)>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
 
 
 def _extract_simple_xml_pairs(text: str) -> list[tuple[str, str]]:
     source = str(text or "")
-    items: list[tuple[str, str]] = []
-    index = 0
-    while True:
-        start = source.find("<", index)
-        if start == -1:
-            return items
-        end = source.find(">", start + 1)
-        if end == -1:
-            return items
-        name = source[start + 1 : end].strip()
-        if not name or name.startswith("/") or not name.replace("_", "").isalnum():
-            index = end + 1
-            continue
-        closing = f"</{name}>"
-        close_at = source.lower().find(closing.lower(), end + 1)
-        if close_at == -1:
-            index = end + 1
-            continue
-        items.append((name, source[end + 1 : close_at].strip()))
-        index = close_at + len(closing)
-
-
-def _consume_hidden_tag(text: str, start: int) -> int:
-    if text.startswith("[", start):
-        end = text.find("]", start + 1)
-        if end == -1:
-            return start
-        tag_name = text[start + 1 : end].strip().upper()
-        if not tag_name or tag_name.startswith("/"):
-            return start
-        if tag_name not in _HIDDEN_SQUARE_TAG_NAMES:
-            return start
-        closing = f"[/{tag_name}]"
-        close_at = text.find(closing, end + 1)
-        return len(text) if close_at == -1 else close_at + len(closing)
-
-    if text.startswith("<", start):
-        end = text.find(">", start + 1)
-        if end == -1:
-            return start
-        tag_name = text[start + 1 : end].strip().upper()
-        if not tag_name or tag_name.startswith("/"):
-            return start
-        if tag_name == "TOOL_CALL":
-            closing = "</tool_call>"
-        elif tag_name in _HIDDEN_XML_SIMPLE_TAG_NAMES:
-            closing = f"</{tag_name}>"
-        else:
-            return start
-        close_at = text.lower().find(closing.lower(), end + 1)
-        return len(text) if close_at == -1 else close_at + len(closing)
-
-    return start
+    if not source:
+        return []
+    return [(m.group(1), m.group(2).strip()) for m in _SIMPLE_XML_PAIR_RE.finditer(source)]
 
 
 def _strip_hidden_markup(text: str) -> str:
@@ -180,52 +129,23 @@ def _strip_hidden_markup(text: str) -> str:
         return ""
     if "[" not in source and "<" not in source:
         return collapse_hidden_tag_gaps(source).strip()
-
-    parts: list[str] = []
-    index = 0
-    length = len(source)
-    while index < length:
-        next_square = source.find("[", index)
-        next_angle = source.find("<", index)
-        if next_square == -1 and next_angle == -1:
-            parts.append(source[index:])
-            break
-        elif next_square == -1:
-            start = next_angle
-        elif next_angle == -1:
-            start = next_square
-        else:
-            start = min(next_square, next_angle)
-        if start > index:
-            parts.append(source[index:start])
-        consumed = _consume_hidden_tag(source, start)
-        if consumed == start:
-            parts.append(source[start])
-            index = start + 1
-            continue
-        index = consumed
-    return collapse_hidden_tag_gaps("".join(parts)).strip()
+    # Remove complete tag pairs first (non-greedy match)
+    source = _HIDDEN_SQUARE_TAG_RE.sub("", source)
+    source = _HIDDEN_XML_TAG_RE.sub("", source)
+    # Remove unclosed tags — consume everything from the opener to end of string,
+    # matching the original _consume_hidden_tag behaviour for truncated model output.
+    source = _UNCLOSED_SQUARE_TAG_RE.sub("", source)
+    source = _UNCLOSED_XML_TAG_RE.sub("", source)
+    return collapse_hidden_tag_gaps(source).strip()
 
 
 def _strip_inline_markdown_code(text: str) -> str:
-    cleaned = str(text or "")
-    if "`" not in cleaned:
-        return cleaned
-    parts: list[str] = []
-    index = 0
-    while index < len(cleaned):
-        start = cleaned.find("`", index)
-        if start == -1:
-            parts.append(cleaned[index:])
-            break
-        parts.append(cleaned[index:start])
-        end = cleaned.find("`", start + 1)
-        if end == -1 or "\n" in cleaned[start + 1 : end]:
-            parts.append(cleaned[start:].replace("`", ""))
-            break
-        parts.append(cleaned[start + 1 : end])
-        index = end + 1
-    return "".join(parts)
+    if "`" not in text:
+        return text
+    # Strip paired inline backticks (no newlines inside)
+    result = _INLINE_BACKTICK_RE.sub(r"\1", text)
+    # Remove any remaining unpaired backticks
+    return result.replace("`", "") if "`" in result else result
 
 CATEGORY_MAP = {
     "name": "user",
@@ -258,30 +178,27 @@ def collapse_hidden_tag_gaps(text: str) -> str:
         return text or ""
     if "\n" not in text and "\t" not in text and "\r" not in text:
         return text
-    text = text.replace("\r\n", "\n")
-    if not text:
-        return text
+    text = text.replace("\r\n", "\n").replace("\t", " ")
+    return _MULTI_BLANK_LINE_RE.sub("\n\n", text)
 
-    normalized_lines: list[str] = []
-    previous_blank = False
-    for raw_line in text.split("\n"):
-        line = raw_line.replace("\t", " ")
-        if not line:
-            if previous_blank:
-                continue
-            normalized_lines.append("")
-            previous_blank = True
-            continue
-        normalized_lines.append(line)
-        previous_blank = False
-    return "\n".join(normalized_lines)
+
+# ── Fast lookup tables for HiddenTagStreamFilter ────────────────────────────
+# Dict: full opener string → closer string (O(1) full-match lookup)
+_OPENER_DICT: dict[str, str] = {op: cl for op, cl in _STREAM_OPENERS}
+# Group openers by their first two characters (usually narrows candidates to 1-2)
+_OPENERS_BY_PREFIX2: dict[str, list[tuple[str, str]]] = {}
+for _op, _cl in _STREAM_OPENERS:
+    _OPENERS_BY_PREFIX2.setdefault(_op[:2], []).append((_op, _cl))
+# All possible prefixes of all openers — used for O(1) partial-match detection
+_OPENER_PREFIXES: frozenset[str] = frozenset(
+    _op[:i] for _op, _ in _STREAM_OPENERS for i in range(1, len(_op) + 1)
+)
 
 
 class HiddenTagStreamFilter:
     """Hide inline tags during streaming while preserving surrounding text."""
 
     def __init__(self):
-        self._openers = _STREAM_OPENERS
         self._visible_buffer = ""
         self._pending_visible = ""
         self._in_tag = False
@@ -311,12 +228,8 @@ class HiddenTagStreamFilter:
                 close_idx = self._visible_buffer.find(self._closing)
                 if close_idx == -1:
                     keep = max(len(self._closing) - 1, 0)
-                    if keep:
-                        self._visible_buffer = self._visible_buffer[-keep:]
-                    else:
-                        self._visible_buffer = ""
+                    self._visible_buffer = self._visible_buffer[-keep:] if keep else ""
                     break
-
                 self._visible_buffer = self._visible_buffer[close_idx + len(self._closing):]
                 self._in_tag = False
                 self._closing = ""
@@ -339,26 +252,27 @@ class HiddenTagStreamFilter:
                 self._pending_visible += self._visible_buffer[:tag_idx]
                 self._visible_buffer = self._visible_buffer[tag_idx:]
 
-            partial_match = False
-            for opener, closer in self._openers:
-                if self._visible_buffer.startswith(opener):
-                    self._visible_buffer = self._visible_buffer[len(opener):]
+            buf = self._visible_buffer
+            # Fast path: group by first two chars to narrow candidates, then startswith check
+            matched = False
+            for opener, closer in _OPENERS_BY_PREFIX2.get(buf[:2], ()):
+                if buf.startswith(opener):
+                    self._visible_buffer = buf[len(opener):]
                     self._in_tag = True
                     self._closing = closer
-                    partial_match = False
-                    break
-                if opener.startswith(self._visible_buffer):
-                    partial_match = True
+                    matched = True
                     break
 
-            if self._in_tag:
+            if matched:
                 continue
 
-            if partial_match:
-                break
+            # O(1) partial-match check: is buf a possible prefix of any opener?
+            if buf in _OPENER_PREFIXES:
+                break  # wait for more data to arrive
 
-            self._pending_visible += "["
-            self._visible_buffer = self._visible_buffer[1:]
+            # Not an opener — emit the bracket character and advance
+            self._pending_visible += buf[0]
+            self._visible_buffer = buf[1:]
 
         return self._drain_pending()
 

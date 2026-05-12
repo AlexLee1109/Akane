@@ -782,6 +782,9 @@ def _completion_overrides_for_turn(user_input: str, analysis, *, session_id: str
 
 def _should_attach_recent_exchange(analysis, user_input: str) -> bool:
     if not analysis.should_carry_last_reply:
+        # Check for referential questions that should carry context even if analyzer didn't flag them
+        if _is_referential_question(user_input):
+            return True
         return False
     if analysis.coding_like or analysis.wants_execution or analysis.wants_detail:
         return True
@@ -796,6 +799,43 @@ def _should_attach_recent_exchange(analysis, user_input: str) -> bool:
     if len(lowered) <= 40 and " " not in lowered:
         return False
     return len(lowered.split()) >= 3
+
+
+def _is_referential_question(user_input: str) -> bool:
+    """Detect short questions that likely refer to the previous topic (e.g., 'What's it about?')."""
+    if not user_input:
+        return False
+
+    text = collapse_hidden_tag_gaps(user_input).strip()
+    if not text:
+        return False
+
+    # Must be a question
+    if "?" not in text:
+        return False
+
+    # Must be relatively short (likely a follow-up)
+    if len(text) > 50:
+        return False
+
+    lowered = text.lower()
+
+    # Check for referential pronouns
+    referential_pronouns = {"it", "this", "that", "they", "them", "he", "she", "his", "her", "its"}
+    words = set(lowered.split())
+    if any(pronoun in words for pronoun in referential_pronouns):
+        return True
+
+    # Check for common follow-up phrases
+    follow_up_phrases = {
+        "what", "how", "why", "tell me", "explain", "more about", "details",
+        "elaborate", "go on", "continue", "what happened", "what is", "what are"
+    }
+    for phrase in follow_up_phrases:
+        if phrase in lowered:
+            return True
+
+    return False
 
 
 def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> tuple[list[dict], object]:

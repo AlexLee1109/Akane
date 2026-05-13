@@ -25,7 +25,6 @@ from app.core.generation import (
     _generation_lock,
     build_runtime_context,
     capture_explicit_user_memories,
-    clean_model_text,
     collapse_hidden_tag_gaps,
     execute_read_requests,
     extract_coder_requests,
@@ -46,7 +45,7 @@ from app.core.request_analysis import RequestAnalyzer, RequestSnapshot
 from app.ui.assets import resolve_ui_asset
 from app.integrations.vscode_launcher import launch_vscode
 
-STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR = Path(__file__).parent / "ui" / "static"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 _state_lock = threading.Lock()
@@ -1765,13 +1764,15 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
                     visible = feed_hidden(token)
                     if not visible:
                         continue
-                    cleaned_delta = feed_visible(visible)
+                    cleaned_delta = visible.replace("\r\n", "\n").replace("`", "") if is_popup_session else feed_visible(visible)
+                    if is_popup_session and not visible_parts:
+                        cleaned_delta = cleaned_delta.lstrip()
                     if not cleaned_delta:
                         continue
                     append_visible(cleaned_delta)
                     visible_len += len(cleaned_delta)
                     if not suppress_intermediate_text:
-                        if (visible_len - emitted_len) < emit_threshold and "\n" not in cleaned_delta:
+                        if not is_popup_session and (visible_len - emitted_len) < emit_threshold and "\n" not in cleaned_delta:
                             continue
                         output_text = "".join(visible_parts)
                         if strip_popup and "[" in output_text:
@@ -1782,11 +1783,13 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
 
                 visible = hidden_filter.flush()
                 if visible:
-                    cleaned_delta = feed_visible(visible)
+                    cleaned_delta = visible.replace("\r\n", "\n").replace("`", "") if is_popup_session else feed_visible(visible)
+                    if is_popup_session and not visible_parts:
+                        cleaned_delta = cleaned_delta.lstrip()
                     if cleaned_delta:
                         append_visible(cleaned_delta)
                         visible_len += len(cleaned_delta)
-                flushed_tail = visible_cleaner.flush()
+                flushed_tail = "" if is_popup_session else visible_cleaner.flush()
                 if flushed_tail:
                     append_visible(flushed_tail)
                     visible_len += len(flushed_tail)
@@ -1992,7 +1995,10 @@ def create_app() -> FastAPI:
                 session_id=chat_request.session_id,
             ),
             media_type="application/x-ndjson; charset=utf-8",
-            headers={"Cache-Control": "no-store"},
+            headers={
+                "Cache-Control": "no-store, no-transform",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @app.get("/{asset_path:path}", include_in_schema=False)

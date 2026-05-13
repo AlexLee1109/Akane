@@ -2,13 +2,14 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlencode, urljoin
+from urllib.error import HTTPError, URLError
+import urllib.request
 import threading
 
 import webview
 
 from app.core.config import POPUP_BACKEND_URL, popup_backend_is_local
 from app.integrations.editor_bridge import get_editor_bridge
-from app.ui.server import serve_in_thread
 from app.ui.assets import IMAGES_DIR
 
 try:
@@ -27,6 +28,7 @@ BUBBLE_MIN_WIDTH = 220
 BUBBLE_MAX_WIDTH = 540
 BUBBLE_MIN_HEIGHT = 420
 BUBBLE_MAX_HEIGHT = 2200
+DEFAULT_SESSION_ID = "popup"
 # Single companion window — wide enough for the bubble, tall enough for
 # the bubble + avatar with a comfortable overlap between them.
 COMPANION_WIDTH = 460
@@ -137,6 +139,9 @@ class WindowApi:
     def push_bubble_text(self, text: str) -> None:
         self.app.push_bubble_text(text)
 
+    def send_message_stream(self, message: str) -> None:
+        self.app.send_message_stream(message)
+
     def open_composer(self) -> None:
         self.app.open_composer()
 
@@ -164,7 +169,7 @@ class PopupApp:
         self.server = None
         self.api = WindowApi(self)
         self.backend_url = POPUP_BACKEND_URL.rstrip("/")
-        self.static_index = Path(__file__).parent.parent / "static" / "index.html"
+        self.static_index = Path(__file__).parent / "static" / "index.html"
         self.windows: dict[str, object] = {}
         self._shutting_down = False
         self._bubble_visible = False
@@ -172,6 +177,96 @@ class PopupApp:
         self._composer_visible = False
         self._memory_visible = False
         self._ensure_server()
+
+    def _emit_stream_event(self, payload: dict) -> None:
+        window = self.windows.get("companion")
+        if window is None:
+            return
+        try:
+            json_line = json.dumps(payload, ensure_ascii=False)
+            safe_text = json.dumps(json_line)
+            window.evaluate_js(
+                "window.__akaneStreamEvent && "
+                f"window.__akaneStreamEvent({safe_text});"
+            )
+        except Exception:
+            return
+
+    def _run_message_stream(self, message: str) -> None:
+        message = str(message or "").strip()
+        if not message:
+            self._emit_stream_event({"type": "error", "error": "Message is empty."})
+            return
+        session_id = DEFAULT_SESSION_ID
+        try:
+            stream_lines = (
+                self._local_stream_lines(message, session_id)
+                if popup_backend_is_local()
+                else self._remote_stream_lines(message, session_id)
+            )
+            for line in stream_lines:
+                self._emit_stream_line(line)
+        except Exception as exc:
+            self._emit_stream_event({"type": "error", "error": str(exc)})
+
+    def _emit_stream_line(self, line: str | bytes) -> None:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="replace")
+        line = str(line or "").strip()
+        if not line:
+            return
+        self._emit_stream_event(json.loads(line))
+
+    def _local_stream_lines(self, message: str, session_id: str):
+        from app.server import _session_state, _stream_chat_events
+
+        for line in _stream_chat_events(message, session_id=session_id):
+            event = json.loads(str(line or "").strip())
+            if event.get("type") == "done" and "version" not in event:
+                event["version"] = _session_state(session_id).version
+            yield json.dumps(event, ensure_ascii=False)
+
+    def _remote_stream_lines(self, message: str, session_id: str):
+        payload = json.dumps(
+            {"message": message, "session_id": session_id},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            urljoin(f"{self.backend_url}/", "api/chat/stream"),
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/x-ndjson",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=600) as response:
+                while True:
+                    line = response.readline()
+                    if not line:
+                        break
+                    yield line
+        except HTTPError as exc:
+            detail = exc.reason
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+                payload = json.loads(body)
+                detail = payload.get("error") or payload.get("detail") or body
+            except Exception:
+                pass
+            raise RuntimeError(f"Remote backend returned HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Could not reach remote backend at {self.backend_url}: {exc.reason}") from exc
+
+    def send_message_stream(self, message: str) -> None:
+        thread = threading.Thread(
+            target=self._run_message_stream,
+            args=(message,),
+            daemon=True,
+            name="AkanePopupStream",
+        )
+        thread.start()
 
     @staticmethod
     def _window_call(window, method: str, *args) -> None:
@@ -184,10 +279,10 @@ class PopupApp:
         if not popup_backend_is_local():
             return
         try:
-            import urllib.request
-
             urllib.request.urlopen(urljoin(f"{self.backend_url}/", "api/state"), timeout=1)
         except Exception:
+            from app.server import serve_in_thread
+
             self.server, _ = serve_in_thread()
 
     def _build_start_url(self, role: str) -> str:

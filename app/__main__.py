@@ -10,7 +10,7 @@ from app.core.config import APP_MODE, SERVER_HOST, SERVER_PORT
 def main() -> None:
     mode = str(sys.argv[1]).strip().lower() if len(sys.argv) > 1 else APP_MODE
     if mode == "server":
-        from app.ui.server import serve
+        from app.server import serve
         serve(host=SERVER_HOST, port=SERVER_PORT)
         return
     if mode == "popup":

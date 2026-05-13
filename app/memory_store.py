@@ -11,7 +11,7 @@ from typing import Callable
 
 import orjson
 
-from app.config import MEMORY_FLUSH_INTERVAL
+from app.core.config import MEMORY_FLUSH_INTERVAL
 
 MEMORY_PATH = Path(__file__).parent / "memory.json"
 

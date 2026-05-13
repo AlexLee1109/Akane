@@ -11,7 +11,7 @@ import json
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from app.config import (
+from app.core.config import (
     DISCORD_ALLOWED_CHANNEL_IDS,
     DISCORD_BOT_TOKEN,
     DISCORD_PREFIX,

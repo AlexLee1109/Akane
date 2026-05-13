@@ -15,11 +15,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from app.codebase_search import CodebaseSearch
-from app.config import ADVISOR_ONLY, CHAT_HISTORY_CONTEXT_TOKENS, LLAMA_CONTEXT_WINDOW, MAX_TOKENS, REPETITION_PENALTY, SERVER_HOST, SERVER_PORT, TEMPERATURE, TOP_K, TOP_P
-from app.coding_agent import run_coder_specialist
-from app.editor_bridge import get_editor_bridge
-from app.generation import (
+from app.agents.codebase_search import CodebaseSearch
+from app.core.config import ADVISOR_ONLY, CHAT_HISTORY_CONTEXT_TOKENS, LLAMA_CONTEXT_WINDOW, MAX_TOKENS, REPETITION_PENALTY, SERVER_HOST, SERVER_PORT, TEMPERATURE, TOP_K, TOP_P
+from app.agents.coding_agent import run_coder_specialist
+from app.integrations.editor_bridge import get_editor_bridge
+from app.core.generation import (
     HiddenTagStreamFilter,
     _cached_system_prompt,
     _generation_lock,
@@ -34,20 +34,20 @@ from app.generation import (
     truncate_messages,
 )
 from app.memory_store import MEMORY_PATH, format_for_prompt, get_all, record_interaction, reload_from_disk
-from app.model_loader import LLM, ModelManager
-from app.reply_pipeline import (
+from app.core.model_loader import LLM, ModelManager
+from app.core.reply_pipeline import (
     clean_reply_text,
     ensure_complete_visible_reply,
     finalize_reply,
     normalize_final_reply,
     postprocess_reply,
 )
-from app.request_analysis import RequestAnalyzer, RequestSnapshot
-from app.ui_assets import resolve_ui_asset
-from app.vscode_launcher import launch_vscode
+from app.core.request_analysis import RequestAnalyzer, RequestSnapshot
+from app.ui.assets import resolve_ui_asset
+from app.integrations.vscode_launcher import launch_vscode
 
 STATIC_DIR = Path(__file__).parent / "static"
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 _state_lock = threading.Lock()
 _EDITOR_LAUNCH_COMMANDS = {"open_vscode", "open_project", "open_workspace"}
@@ -934,7 +934,7 @@ def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id
     # Inject datetime immediately before the user turn so the model sees it
     # right before generating. Local models lose system-prompt content that
     # appears early in a long prompt, so this repetition is intentional.
-    from app.generation import _current_datetime_context
+    from app.core.generation import _current_datetime_context
     chat_messages = [
         *chat_messages[:-1],
         {"role": "system", "content": _current_datetime_context()},

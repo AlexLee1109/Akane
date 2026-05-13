@@ -4,7 +4,6 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IMAGES_DIR = PROJECT_ROOT / "images"
-
 UI_ASSET_PATHS = {
     "/images/Vtuber_model.png": IMAGES_DIR / "Vtuber_model.png",
     "/images/Text Bubble.png": IMAGES_DIR / "Text Bubble.png",

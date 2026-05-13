@@ -7,7 +7,7 @@ except ImportError:  # pragma: no cover - optional for API-only usage
     torch = None
 
 try:
-    from app import local_secrets as _local_secrets  # type: ignore
+    from app.secrets import local_secrets as _local_secrets  # type: ignore
 except ImportError:  # pragma: no cover - optional local config
     _local_secrets = None
 

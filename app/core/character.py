@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from app.config import ADVISOR_ONLY
+from app.core.config import ADVISOR_ONLY
 
 CHARACTER = {
     "name": "Akane",
@@ -10,7 +10,7 @@ CHARACTER = {
     "identity": "an AI VTuber who stays close to the user",
 }
 
-SOUL_PATH = Path(__file__).with_name("soul.md")
+SOUL_PATH = Path(__file__).resolve().parent.parent / "soul.md"
 
 
 def load_soul() -> str:

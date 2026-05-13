@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from app.generation import clean_model_text, collapse_hidden_tag_gaps, finalize_model_response
-from app.request_analysis import RequestAnalysis
+from app.core.generation import clean_model_text, collapse_hidden_tag_gaps, finalize_model_response
+from app.core.request_analysis import RequestAnalysis
 
 _EMPTY_REPLY_SENTINEL = "__AKANE_EMPTY_REPLY__"
 _TRAILING_CONTINUATIONS = {

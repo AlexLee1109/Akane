@@ -161,7 +161,7 @@ class ModelManager:
     _lock = threading.Lock()
 
     def __init__(self):
-        from app.config import (
+        from app.core.config import (
             DEVICE,
             LLAMA_BATCH_SIZE,
             LLAMA_CONTEXT_WINDOW,

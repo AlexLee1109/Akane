@@ -1,11 +1,11 @@
 import re
 import threading
 
-from app.config import ADVISOR_ONLY, CHAT_HISTORY_CONTEXT_TOKENS
-from app.character import build_system_prompt
-from app.editor_bridge import get_editor_bridge
+from app.core.config import ADVISOR_ONLY, CHAT_HISTORY_CONTEXT_TOKENS
+from app.core.character import build_system_prompt
+from app.integrations.editor_bridge import get_editor_bridge
 from app.memory_store import apply_tag_operations, format_for_prompt, get_store, remember_user_message
-from app.vscode_launcher import launch_vscode
+from app.integrations.vscode_launcher import launch_vscode
 
 _generation_lock = threading.Lock()
 

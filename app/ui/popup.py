@@ -6,10 +6,10 @@ import threading
 
 import webview
 
-from app.config import POPUP_BACKEND_URL, popup_backend_is_local
-from app.editor_bridge import get_editor_bridge
-from app.server import serve_in_thread
-from app.ui_assets import IMAGES_DIR
+from app.core.config import POPUP_BACKEND_URL, popup_backend_is_local
+from app.integrations.editor_bridge import get_editor_bridge
+from app.ui.server import serve_in_thread
+from app.ui.assets import IMAGES_DIR
 
 try:
     import AppKit
@@ -164,7 +164,7 @@ class PopupApp:
         self.server = None
         self.api = WindowApi(self)
         self.backend_url = POPUP_BACKEND_URL.rstrip("/")
-        self.static_index = Path(__file__).parent / "static" / "index.html"
+        self.static_index = Path(__file__).parent.parent / "static" / "index.html"
         self.windows: dict[str, object] = {}
         self._shutting_down = False
         self._bubble_visible = False

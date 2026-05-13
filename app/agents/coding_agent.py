@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from app.config import (
+from app.core.config import (
     CODER_INITIAL_CHUNKS_PER_FILE,
     CODER_MAX_INITIAL_TARGETS,
     CODER_MAX_READ_CHUNKS_PER_FILE,
@@ -17,9 +17,9 @@ from app.config import (
     TOP_K,
     TOP_P,
 )
-from app.editor_bridge import get_editor_bridge
-from app.generation import clean_model_text, collapse_hidden_tag_gaps, execute_read_requests
-from app.model_loader import ModelManager
+from app.integrations.editor_bridge import get_editor_bridge
+from app.core.generation import clean_model_text, collapse_hidden_tag_gaps, execute_read_requests
+from app.core.model_loader import ModelManager
 
 # ------------------------------------------------------------------ #
 # Constants                                                            #

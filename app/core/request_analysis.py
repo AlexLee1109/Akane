@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 
-from app.codebase_search import CodebaseSearch
+from app.agents.codebase_search import CodebaseSearch
 
 _FILE_SUFFIXES = {
     ".py", ".js", ".ts", ".json", ".md", ".tsx", ".jsx", ".toml", ".yaml", ".yml",

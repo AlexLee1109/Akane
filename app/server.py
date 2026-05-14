@@ -2,6 +2,8 @@
 
 import json
 import os
+import shlex
+import subprocess
 import threading
 import time
 from collections import deque
@@ -47,6 +49,8 @@ from app.integrations.vscode_launcher import launch_vscode
 
 STATIC_DIR = Path(__file__).parent / "ui" / "static"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+SERVICE_ROOT = Path(__file__).resolve().parents[1]
+RESTART_LOG_PATH = Path("/tmp/akane_restart.log")
 
 _state_lock = threading.Lock()
 _EDITOR_LAUNCH_COMMANDS = {"open_vscode", "open_project", "open_workspace"}
@@ -490,8 +494,71 @@ def _clear_messages(session_id: str | None = None) -> None:
         state.version += 1
 
 
+def _service_script_path(name: str) -> Path | None:
+    for filename in (name, f"{name}.sh"):
+        path = SERVICE_ROOT / filename
+        if path.exists():
+            return path
+    return None
+
+
+def _queue_service_restart() -> str:
+    stop_script = _service_script_path("stop_akane_services")
+    start_script = _service_script_path("start_akane_services")
+    if stop_script is None or start_script is None:
+        missing = []
+        if stop_script is None:
+            missing.append("stop_akane_services")
+        if start_script is None:
+            missing.append("start_akane_services")
+        raise FileNotFoundError(f"Missing restart script(s): {', '.join(missing)}")
+
+    job_name = f"akane-restart-{int(time.time())}"
+    command = (
+        f"cd {shlex.quote(str(SERVICE_ROOT))}; "
+        f"echo '[Akane restart] queued at $(date -Is)' >> {shlex.quote(str(RESTART_LOG_PATH))}; "
+        "sleep 3; "
+        f"{shlex.quote(str(stop_script))} >> {shlex.quote(str(RESTART_LOG_PATH))} 2>&1; "
+        "sleep 1; "
+        f"{shlex.quote(str(start_script))} >> {shlex.quote(str(RESTART_LOG_PATH))} 2>&1"
+    )
+    try:
+        subprocess.run(
+            [
+                "sudo",
+                "-n",
+                "systemd-run",
+                f"--unit={job_name}",
+                "--collect",
+                "/bin/bash",
+                "-lc",
+                command,
+            ],
+            cwd=str(SERVICE_ROOT),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("systemd-run is required to restart Akane from inside akane-server.service") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(f"Could not schedule systemd restart job: {detail}") from exc
+    return f"Restart queued as {job_name}. Akane services will stop and start again in a moment. Log: {RESTART_LOG_PATH}"
+
+
 def _handle_command(text: str, session_id: str | None = None) -> dict | None:
     bridge = get_editor_bridge()
+    if text == "/restart":
+        msgs = list(_session_state(session_id).messages)
+        try:
+            notice = _queue_service_restart()
+        except Exception as exc:
+            notice = f"Could not queue restart: {exc}"
+        return {"reply": notice, "messages": msgs, "notice": notice, "ephemeral": True}
+
     if text == "/vscode":
         notice = launch_vscode()
         return {"reply": "", "messages": list(_session_state(session_id).messages), "notice": notice, "ephemeral": True}
@@ -1772,6 +1839,10 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
                     append_visible(cleaned_delta)
                     visible_len += len(cleaned_delta)
                     if not suppress_intermediate_text:
+                        if is_popup_session and "[" not in cleaned_delta:
+                            yield json_line({"type": "delta", "content": cleaned_delta, "append": True})
+                            emitted_len = visible_len
+                            continue
                         if not is_popup_session and (visible_len - emitted_len) < emit_threshold and "\n" not in cleaned_delta:
                             continue
                         output_text = "".join(visible_parts)
@@ -1793,7 +1864,7 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
                 if flushed_tail:
                     append_visible(flushed_tail)
                     visible_len += len(flushed_tail)
-                if visible_parts and not suppress_intermediate_text:
+                if visible_parts and not suppress_intermediate_text and not is_popup_session:
                     output_text = "".join(visible_parts)
                     if strip_popup and "[" in output_text:
                         output_text = strip_popup(output_text)

@@ -543,6 +543,7 @@ _system_prompt_cache = None
 _system_prompt_gen = -1
 _runtime_context_cache = ""
 _include_memory_cache: bool | None = None
+_datetime_context_cache: tuple[str, str] | None = None
 
 
 def _nth_weekday(year: int, month: int, weekday: int, n: int):
@@ -567,8 +568,13 @@ def _nth_weekday(year: int, month: int, weekday: int, n: int):
 
 def _current_datetime_context() -> str:
     """Return current date/time plus yesterday/today/tomorrow holiday facts."""
+    global _datetime_context_cache
     from datetime import datetime as _datetime, timedelta
     now = _datetime.now()
+    cache_key = now.strftime("%Y-%m-%d %H:%M")
+    if _datetime_context_cache and _datetime_context_cache[0] == cache_key:
+        return _datetime_context_cache[1]
+
     today = now.date()
     weekday = now.strftime("%A")
     month = now.strftime("%B")
@@ -587,7 +593,9 @@ def _current_datetime_context() -> str:
         "Use this to answer any date, day-of-week, or holiday questions. "
         "Never invent or guess the date."
     )
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    _datetime_context_cache = (cache_key, result)
+    return result
 
 def build_runtime_context(*, include_memory: bool = True, include_editor: bool = True) -> str:
     memory_context = format_for_prompt() if include_memory else ""

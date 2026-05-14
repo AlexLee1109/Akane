@@ -2,11 +2,6 @@ import os
 from urllib.parse import urlsplit
 
 try:
-    import torch
-except ImportError:  # pragma: no cover - optional for API-only usage
-    torch = None
-
-try:
     from app.secrets import local_secrets as _local_secrets  # type: ignore
 except ImportError:  # pragma: no cover - optional local config
     _local_secrets = None
@@ -36,8 +31,6 @@ def _csv_ints(name: str, default: str = "") -> tuple[int, ...]:
             continue
     return tuple(values)
 
-DEVICE = "mps" if torch and torch.backends.mps.is_available() else "cpu"
-
 APP_MODE = (_secret_or_env("APP_MODE", "popup") or "popup").lower()
 SERVER_HOST = _secret_or_env("SERVER_HOST", "127.0.0.1") or "127.0.0.1"
 SERVER_PORT = int((_secret_or_env("SERVER_PORT", "8000") or "8000"))
@@ -62,6 +55,22 @@ def popup_backend_host() -> str:
 
 def popup_backend_is_local() -> bool:
     return popup_backend_host() in {"", "127.0.0.1", "localhost", "0.0.0.0", "::1"}
+
+
+def _detect_device() -> str:
+    explicit = _secret_or_env("DEVICE", "")
+    if explicit:
+        return explicit
+    if APP_MODE == "popup" and not popup_backend_is_local():
+        return "cpu"
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - optional for API-only usage
+        return "cpu"
+    return "mps" if torch.backends.mps.is_available() else "cpu"
+
+
+DEVICE = _detect_device()
 
 MODEL_PATH = os.environ.get(
     "AKANE_MODEL_PATH",

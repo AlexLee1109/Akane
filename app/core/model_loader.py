@@ -101,6 +101,8 @@ class OpenRouterBackend:
         top_p=None,
         repeat_penalty=None,
         stream=False,
+        response_format=None,
+        timeout: float | None = None,
     ):
         payload = {
             "model": model or self.model,
@@ -111,8 +113,10 @@ class OpenRouterBackend:
         }
         if top_p is not None:
             payload["top_p"] = top_p
+        if response_format is not None:
+            payload["response_format"] = response_format
 
-        response = self._request(payload)
+        response = self._request(payload) if timeout is None else self._request_with_timeout(payload, timeout)
         if not stream:
             with response as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -152,6 +156,25 @@ class OpenRouterBackend:
                     yield {"choices": [{"delta": {"content": delta.get("content", "")}}]}
 
         return event_stream()
+
+    def _request_with_timeout(self, payload: dict, timeout: float):
+        req = urlrequest.Request(
+            url=f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            return urlrequest.urlopen(req, timeout=timeout, context=self._ssl_context())
+        except urlerror.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenRouter request failed: {exc.code} {body}") from exc
+        except urlerror.URLError as exc:
+            reason = exc.reason
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                hint = " Try OPENROUTER_CA_BUNDLE first, or as a last resort OPENROUTER_SKIP_SSL_VERIFY=1."
+                raise RuntimeError(f"OpenRouter SSL verification failed: {reason}.{hint}") from exc
+            raise RuntimeError(f"OpenRouter request failed: {reason}") from exc
 
 
 class ModelManager:
@@ -405,6 +428,8 @@ class ModelManager:
         repeat_penalty=None,
         stream=False,
         role: str = "main",
+        response_format=None,
+        timeout: float | None = None,
     ):
         model_name = self.model_name_for_role(role)
         if role == "coder" and self.OPENROUTER_CODER_MODEL:
@@ -418,6 +443,8 @@ class ModelManager:
                 top_p=top_p,
                 repeat_penalty=repeat_penalty,
                 stream=stream,
+                response_format=response_format,
+                timeout=timeout,
             )
         if self._load_error:
             raise RuntimeError(f"Model failed to load: {self._load_error}") from self._load_error

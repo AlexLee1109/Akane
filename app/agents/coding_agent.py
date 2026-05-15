@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 
 from app.core.config import (
@@ -12,8 +13,9 @@ from app.core.config import (
     CODER_MAX_TOKENS,
     CODER_MAX_TURNS,
     CODER_READ_CHUNK_LINES,
+    CODER_TEMPERATURE,
+    CODER_TIMEOUT_SECONDS,
     REPETITION_PENALTY,
-    TEMPERATURE,
     TOP_K,
     TOP_P,
 )
@@ -57,6 +59,8 @@ class CoderOutcome:
     tool_used: bool
     approval_required: bool = False
     proposed_actions: list[dict] | None = None
+    timed_out: bool = False
+    error: str = ""
 
 
 # ------------------------------------------------------------------ #
@@ -83,17 +87,42 @@ def _extract_message_text(result: dict) -> str:
     return str(content).strip()
 
 
-def _request_coder_completion(messages: list[dict]) -> dict:
+def _remaining_seconds(deadline: float | None) -> float:
+    if deadline is None:
+        return CODER_TIMEOUT_SECONDS
+    return max(0.0, deadline - time.monotonic())
+
+
+def _budget_exhausted(deadline: float | None, *, reserve: float = 0.0) -> bool:
+    return _remaining_seconds(deadline) <= reserve
+
+
+def _request_coder_completion(messages: list[dict], *, deadline: float | None = None, json_mode: bool = True) -> dict:
+    timeout = max(4.0, min(30.0, _remaining_seconds(deadline) - 1.0))
+    if timeout <= 4.0 and _budget_exhausted(deadline, reserve=4.5):
+        raise TimeoutError("Coder model budget exhausted before request.")
     return ModelManager.get_instance().create_chat_completion(
         messages=messages,
         max_tokens=CODER_MAX_TOKENS,
-        temperature=TEMPERATURE,
+        temperature=CODER_TEMPERATURE,
         top_k=TOP_K,
         top_p=TOP_P,
         repeat_penalty=REPETITION_PENALTY,
         stream=False,
         role="coder",
+        response_format={"type": "json_object"} if json_mode else None,
+        timeout=timeout,
     )
+
+
+def _request_coder_completion_with_json_retry(messages: list[dict], *, deadline: float | None = None) -> dict:
+    try:
+        return _request_coder_completion(messages, deadline=deadline, json_mode=True)
+    except Exception as exc:
+        message = str(exc).lower()
+        if "response_format" not in message and "json" not in message:
+            raise
+        return _request_coder_completion(messages, deadline=deadline, json_mode=False)
 
 
 def _extract_json_payload(raw: str) -> dict:
@@ -124,15 +153,30 @@ def _extract_json_payload(raw: str) -> dict:
 
 
 def _request_payload_with_repair(
-    messages: list[dict], *, progress_callback=None
+    messages: list[dict], *, progress_callback=None, deadline: float | None = None
 ) -> tuple[str, dict]:
     """Call the coder LLM and attempt one JSON-repair pass on failure."""
     if progress_callback:
         progress_callback("Using coding model...")
-    raw = _extract_message_text(_request_coder_completion(messages))
+    try:
+        raw = _extract_message_text(_request_coder_completion_with_json_retry(messages, deadline=deadline))
+    except Exception as exc:
+        return "", {
+            "summary": "",
+            "done": True,
+            "reason": f"Coder model request failed: {exc}",
+            "_error": str(exc),
+        }
     payload = _extract_json_payload(raw)
     if payload:
         return raw, payload
+    if _budget_exhausted(deadline, reserve=8.0):
+        return raw, {
+            "summary": "",
+            "done": True,
+            "reason": "Coder model did not return valid JSON before the time budget expired.",
+            "_error": "invalid_json",
+        }
 
     repair_instruction = (
         "Your reply was empty. Reply with a complete JSON object using the required schema."
@@ -141,13 +185,21 @@ def _request_payload_with_repair(
     )
     if progress_callback:
         progress_callback("Using coding model...")
-    repair_raw = _extract_message_text(
-        _request_coder_completion([
-            *messages,
-            {"role": "assistant", "content": raw or "{}"},
-            {"role": "system",    "content": repair_instruction},
-        ])
-    )
+    try:
+        repair_raw = _extract_message_text(
+            _request_coder_completion_with_json_retry([
+                *messages,
+                {"role": "assistant", "content": raw or "{}"},
+                {"role": "system",    "content": repair_instruction},
+            ], deadline=deadline)
+        )
+    except Exception as exc:
+        return raw, {
+            "summary": "",
+            "done": True,
+            "reason": f"Coder JSON repair failed: {exc}",
+            "_error": str(exc),
+        }
     return repair_raw, _extract_json_payload(repair_raw)
 
 
@@ -252,12 +304,15 @@ def _parse_read_result_header(text: str) -> tuple[str, int | None, int | None, i
     return path, start_line, end_line, total_lines
 
 
-def _run_single_read(command: str, argument: str, *, logical_path: str) -> str:
+def _run_single_read(command: str, argument: str, *, logical_path: str, deadline: float | None = None) -> str:
+    timeout = min(_ACTION_WAIT_SECONDS, max(0.0, _remaining_seconds(deadline) - 1.0))
+    if timeout <= 0:
+        return ""
     bridge = get_editor_bridge()
     start_id = bridge.next_action_id()
     bridge.queue_action(command, argument)
     for item in bridge.wait_for_action_results_after(
-        after_id=start_id - 1, expected_count=1, timeout=_ACTION_WAIT_SECONDS
+        after_id=start_id - 1, expected_count=1, timeout=timeout
     ):
         if item.get("command") != command or not item.get("ok"):
             continue
@@ -272,11 +327,13 @@ def _run_single_read(command: str, argument: str, *, logical_path: str) -> str:
 
 
 def _read_file_via_bridge(
-    path: str, *, use_current: bool, max_chunks: int, progress_callback=None
+    path: str, *, use_current: bool, max_chunks: int, progress_callback=None, deadline: float | None = None
 ) -> list[str]:
     results: list[str] = []
     start_line = 1
     for _ in range(max_chunks):
+        if _budget_exhausted(deadline, reserve=2.0):
+            break
         end_line = start_line + CODER_READ_CHUNK_LINES - 1
         if use_current:
             cmd, arg = "read_current_file_chunk", f"{start_line}:{end_line}"
@@ -284,7 +341,7 @@ def _read_file_via_bridge(
             cmd, arg = "read_file_chunk", f"{path}:{start_line}:{end_line}"
         if progress_callback:
             progress_callback("Reading files...")
-        text = _run_single_read(cmd, arg, logical_path=path)
+        text = _run_single_read(cmd, arg, logical_path=path, deadline=deadline)
         if not text:
             break
         results.append(text)
@@ -303,6 +360,7 @@ def _fresh_reads(
     *,
     progress_callback=None,
     max_chunks: int = CODER_MAX_READ_CHUNKS_PER_FILE,
+    deadline: float | None = None,
 ) -> tuple[list[str], list[str]]:
     """Read files, preferring the editor bridge when connected.
 
@@ -324,6 +382,8 @@ def _fresh_reads(
     normalized = normalized[:CODER_MAX_INITIAL_TARGETS]
 
     if not connected:
+        if _budget_exhausted(deadline, reserve=1.0):
+            return [], normalized or []
         results = execute_read_requests(normalized)
         return results, normalized or []
 
@@ -336,7 +396,7 @@ def _fresh_reads(
     if read_active:
         chunks = _read_file_via_bridge(
             active_file, use_current=True,
-            max_chunks=max_chunks, progress_callback=progress_callback,
+            max_chunks=max_chunks, progress_callback=progress_callback, deadline=deadline,
         )
         if chunks:
             results.extend(chunks)
@@ -349,7 +409,7 @@ def _fresh_reads(
             continue
         chunks = _read_file_via_bridge(
             path, use_current=False,
-            max_chunks=max_chunks, progress_callback=progress_callback,
+            max_chunks=max_chunks, progress_callback=progress_callback, deadline=deadline,
         )
         if chunks:
             results.extend(chunks)
@@ -359,6 +419,8 @@ def _fresh_reads(
     # Filesystem fallback for anything the bridge did not serve
     missing = [p for p in normalized if p not in done]
     if missing:
+        if _budget_exhausted(deadline, reserve=1.0):
+            return results, consulted or normalized
         results.extend(execute_read_requests(missing))
         consulted.extend(missing)
 
@@ -406,9 +468,20 @@ def _prepare_editor_actions(actions: list[dict], active_file: str) -> list[dict]
     return queued
 
 
-def _queue_editor_actions(actions: list[dict], *, progress_callback=None) -> list[dict]:
+def _queue_editor_actions(actions: list[dict], *, progress_callback=None, deadline: float | None = None) -> list[dict]:
     if not actions:
         return []
+    if _budget_exhausted(deadline, reserve=2.0):
+        return [
+            {
+                "command": str(action.get("command") or ""),
+                "argument": str(action.get("argument") or ""),
+                "ok": False,
+                "result": "",
+                "error": "Coder time budget expired before editor action could run.",
+            }
+            for action in actions
+        ]
     bridge = get_editor_bridge()
     snapshot = bridge.snapshot().get("context", {})
     active_file = str(snapshot.get("active_file") or "").strip()
@@ -437,7 +510,9 @@ def _queue_editor_actions(actions: list[dict], *, progress_callback=None) -> lis
             oid = bridge.next_action_id()
             bridge.queue_action("open_file", target)
             bridge.wait_for_action_results_after(
-                after_id=oid - 1, expected_count=1, timeout=_ACTION_WAIT_SECONDS
+                after_id=oid - 1,
+                expected_count=1,
+                timeout=min(_ACTION_WAIT_SECONDS, max(0.1, _remaining_seconds(deadline) - 1.0)),
             )
         return [
             {**a, "ok": False, "result": "", "error": "Awaiting user approval."}
@@ -449,7 +524,7 @@ def _queue_editor_actions(actions: list[dict], *, progress_callback=None) -> lis
     return bridge.wait_for_action_results_after(
         after_id=start_id - 1,
         expected_count=len(queued),
-        timeout=_ACTION_WAIT_SECONDS,
+        timeout=min(_ACTION_WAIT_SECONDS, max(0.1, _remaining_seconds(deadline) - 1.0)),
     )
 
 
@@ -476,10 +551,14 @@ def _build_system_prompt(*, apply_now: bool) -> str:
         '  "reason": "optional blocker"\n'
         "}\n\n"
         "Rules:\n"
+        "- Prefer a final grounded summary over asking for more reads when the provided context is enough.\n"
+        "- If you cannot find the requested symbol/file, set done=true and explain exactly what you checked in reason.\n"
         "- Use read_requests before answering about code you have not seen.\n"
+        "- Keep read_requests focused: request at most 2 likely files at a time.\n"
         "- Set done=true only when summary contains a complete, grounded answer.\n"
         "- Use replace_file_range only when you have exact line numbers from fresh reads.\n"
         "- Use write_file only when replacing an entire small file with complete content.\n"
+        "- For debugging, name the likely bug and the smallest fix; do not punt to another model.\n"
         "- Never claim a change succeeded unless editor actions ran and were confirmed.\n"
         "- summary must be a short, natural sentence in Akane's voice — direct, calm, not robotic.\n"
         "- Never start with a heading, label, or self-description.\n"
@@ -499,6 +578,7 @@ def run_coder_specialist(
     apply_now: bool = False,
     progress_callback=None,
 ) -> CoderOutcome:
+    deadline = time.monotonic() + max(8.0, CODER_TIMEOUT_SECONDS)
     bridge = get_editor_bridge()
     initial_targets = [
         str(p or "").strip() for p in (preload_paths or []) if str(p or "").strip()
@@ -509,6 +589,7 @@ def run_coder_specialist(
         initial_targets,
         progress_callback=progress_callback,
         max_chunks=CODER_INITIAL_CHUNKS_PER_FILE,
+        deadline=deadline,
     )
     print(
         f"[Akane][coder] start apply_now={apply_now} targets={initial_targets} reads={len(fresh_reads)}",
@@ -544,14 +625,23 @@ def run_coder_specialist(
     used_action_sigs: set[tuple[tuple[str, str], ...]] = set()
     last_summary = ""
     last_reason = ""
+    last_error = ""
 
     for turn in range(CODER_MAX_TURNS):
-        raw, payload = _request_payload_with_repair(messages, progress_callback=progress_callback)
+        if _budget_exhausted(deadline, reserve=4.0):
+            last_reason = last_reason or "The coding model reached its time budget before finishing."
+            break
+        raw, payload = _request_payload_with_repair(
+            messages,
+            progress_callback=progress_callback,
+            deadline=deadline,
+        )
         summary      = clean_model_text(str(payload.get("summary") or "")).strip()
         reason       = clean_model_text(str(payload.get("reason")  or "")).strip()
         done         = bool(payload.get("done"))
         read_requests = _sanitize_read_requests(payload)
         actions       = _sanitize_actions(payload)
+        last_error = str(payload.get("_error") or last_error or "").strip()
 
         print(
             f"[Akane][coder] turn={turn} summary={len(summary)} "
@@ -577,8 +667,19 @@ def run_coder_specialist(
                 read_requests,
                 progress_callback=progress_callback,
                 max_chunks=CODER_MAX_READ_CHUNKS_PER_FILE,
+                deadline=deadline,
             )
             tool_used = tool_used or bool(results)
+            if not results:
+                messages.extend([
+                    {"role": "assistant", "content": raw or "{}"},
+                    {"role": "system", "content": (
+                        "Those read requests returned no content or timed out. "
+                        "Do not repeat the same reads. Use the existing context to give the best grounded answer, "
+                        "or set done=true with a precise reason describing what could not be found."
+                    )},
+                ])
+                continue
             messages.extend([
                 {"role": "assistant", "content": raw or "{}"},
                 {"role": "system",    "content": (
@@ -598,7 +699,7 @@ def run_coder_specialist(
                 continue
             used_action_sigs.add(sig)
 
-            results = _queue_editor_actions(actions, progress_callback=progress_callback)
+            results = _queue_editor_actions(actions, progress_callback=progress_callback, deadline=deadline)
             all_action_results.extend(results)
             tool_used = True
 
@@ -622,6 +723,7 @@ def run_coder_specialist(
                 touched[:CODER_MAX_INITIAL_TARGETS],
                 progress_callback=progress_callback,
                 max_chunks=CODER_INITIAL_CHUNKS_PER_FILE,
+                deadline=deadline,
             )
             messages.extend([
                 {"role": "assistant", "content": raw or "{}"},
@@ -679,6 +781,15 @@ def run_coder_specialist(
             "Applied the requested code changes."
         )
 
+    timed_out = _budget_exhausted(deadline)
+    if not final_summary:
+        if consulted:
+            final_summary = "I checked the likely code context, but the coding model did not find a reliable result before its budget ended."
+        elif last_error:
+            final_summary = f"The coding model could not complete reliably: {last_error}"
+        else:
+            final_summary = "The coding model could not produce a reliable result for this request."
+
     print(
         f"[Akane][coder] done summary={len(final_summary)} "
         f"applied={actions_applied} tool_used={tool_used}",
@@ -689,4 +800,6 @@ def run_coder_specialist(
         action_results=all_action_results,
         actions_applied=actions_applied,
         tool_used=tool_used,
+        timed_out=timed_out,
+        error=last_error,
     )

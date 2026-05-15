@@ -296,6 +296,17 @@ class EditorBridge:
         with self._lock:
             return self._snapshot_unlocked()
 
+    def context_snapshot(self) -> dict:
+        with self._lock:
+            return {
+                **self._context,
+                "file_excerpt": dict(self._context["file_excerpt"]),
+                "selection": dict(self._context["selection"]),
+                "open_tabs": list(self._context["open_tabs"]),
+                "workspace_folders": list(self._context["workspace_folders"]),
+                "diagnostics": list(self._context["diagnostics"]),
+            }
+
     def queue_action(self, command: str, argument: str = "", meta: dict | None = None) -> dict:
         with self._lock:
             status = "pending_approval" if command in _APPROVAL_REQUIRED_ACTIONS else "pending"

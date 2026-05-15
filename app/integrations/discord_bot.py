@@ -85,36 +85,6 @@ def _should_handle_message(message, bot_user_id: int, prefix: str) -> bool:
     return _leading_mention_user_id(content) == bot_user_id
 
 
-def _post_chat_request(prompt: str, session_id: str) -> dict:
-    payload = json.dumps({"message": prompt, "skip_memory": True, "session_id": session_id}).encode("utf-8")
-    req = urlrequest.Request(
-        url=f"{DISCORD_SERVER_URL}/api/chat",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlrequest.urlopen(req, timeout=_CHAT_TIMEOUT_SECONDS) as resp:
-            body = resp.read().decode("utf-8")
-    except urlerror.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError:
-            payload = {}
-        message = str(payload.get("detail") or payload.get("error") or body or exc).strip()
-        return {"error": message or f"HTTP {exc.code}"}
-    except urlerror.URLError as exc:
-        return {"error": f"Could not reach Akane server at {DISCORD_SERVER_URL}: {exc.reason}"}
-    except TimeoutError:
-        return {"error": "Akane server timed out while generating a reply."}
-
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError:
-        return {"error": "Akane server returned invalid JSON."}
-
-
 def _stream_chat_request(prompt: str, session_id: str) -> dict:
     payload = json.dumps({"message": prompt, "skip_memory": True, "session_id": session_id}).encode("utf-8")
     req = urlrequest.Request(

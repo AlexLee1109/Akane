@@ -2,6 +2,7 @@
 
 import json
 import os
+import random
 import shlex
 import subprocess
 import threading
@@ -19,7 +20,6 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.agents.codebase_search import CodebaseSearch
 from app.core.config import ADVISOR_ONLY, CHAT_HISTORY_CONTEXT_TOKENS, LLAMA_CONTEXT_WINDOW, MAX_TOKENS, REPETITION_PENALTY, SERVER_HOST, SERVER_PORT, TEMPERATURE, TOP_K, TOP_P
-from app.agents.coding_agent import run_coder_specialist
 from app.integrations.editor_bridge import get_editor_bridge
 from app.core.generation import (
     HiddenTagStreamFilter,
@@ -34,8 +34,8 @@ from app.core.generation import (
     extract_read_requests,
     truncate_messages,
 )
-from app.memory_store import MEMORY_PATH, format_for_prompt, get_all, record_interaction, reload_from_disk
-from app.core.model_loader import LLM, ModelManager
+from app.memory_store import MEMORY_PATH, format_for_prompt, get_all, reload_from_disk
+from app.core.model_loader import ModelManager
 from app.core.reply_pipeline import (
     clean_reply_text,
     ensure_complete_visible_reply,
@@ -48,7 +48,7 @@ from app.ui.assets import resolve_ui_asset
 from app.integrations.vscode_launcher import launch_vscode
 
 STATIC_DIR = Path(__file__).parent / "ui" / "static"
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 RESTART_LOG_PATH = Path("/tmp/akane_restart.log")
 
@@ -65,11 +65,20 @@ _FACTUAL_CHAT_MAX_TOKENS = min(MAX_TOKENS, 64)
 _INFRA_PATH_PREFIXES = (
     "integrations/",
     "extensions/",
+    ".vscode-server/",
     ".vscode/",
     ".idea/",
     ".zed/",
     ".github/",
     ".gitlab/",
+)
+_NON_SOURCE_FILE_SUFFIXES = {
+    ".node", ".so", ".dylib", ".dll", ".exe", ".bin", ".o", ".a", ".obj",
+    ".class", ".jar", ".war", ".pyd", ".whl", ".zip", ".tar", ".gz", ".7z",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf",
+}
+_FILE_REF_SUFFIXES = (
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md", ".txt", ".css", ".html", ".sh",
 )
 DEFAULT_SESSION_ID = "popup"
 # Compile this once at the module level
@@ -131,6 +140,25 @@ _CODEBASE_TARGET_HINTS = (
 _TECHNICAL_FOCUS_RULES = "Focus only on the code and the user's engineering question."
 
 _COMPACT_COMPANION_INSTRUCTION = "For this turn, reply like a compact companion. Respond in 1-3 short declarative sentences; start with the answer."
+_IDENTITY_REPLY_STYLES = (
+    "plain and casual",
+    "lightly teasing",
+    "soft and simple",
+    "a little wry",
+)
+_COMPANION_REPLY_STYLES = (
+    "soft and close, like a quick aside from a friend",
+    "casual and lightly teasing, but still warm",
+    "quiet and direct, with one human little edge",
+    "a little wry, relaxed, and unforced",
+    "gentle and familiar, without sounding scripted",
+)
+_TECHNICAL_REPLY_STYLES = (
+    "direct and calm, with no service language",
+    "crisp and slightly wry, focused on the fix",
+    "plain and practical, like a friend looking over the file",
+    "short and grounded, with only the useful detail",
+)
 
 
 def _technical_answer_instruction(*, single_suggestion: bool = False) -> str:
@@ -345,12 +373,16 @@ def _strip_popup_tags(text: str) -> str:
     return "\n".join(line for line in cleaned.splitlines() if line.strip())
 
 
+def _might_contain_file_ref(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return "/" in lowered or any(suffix in lowered for suffix in _FILE_REF_SUFFIXES)
+
+
 def _explicit_paths_in_text(text: str) -> list[str]:
+    if not _might_contain_file_ref(text):
+        return []
     seen: set[str] = set()
     matches: list[str] = []
-    fallback_suffixes = (
-        ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md", ".txt", ".css", ".html", ".sh",
-    )
     
     for raw_value in _REQUEST_ANALYZER.extract_file_refs(text):
         raw = str(raw_value or "").strip("`'\".,:;()[]{}")
@@ -369,7 +401,7 @@ def _explicit_paths_in_text(text: str) -> list[str]:
                 continue
                 
             if not Path(raw).suffix:
-                for suffix in fallback_suffixes:
+                for suffix in _FILE_REF_SUFFIXES:
                     candidate_with_suffix = PROJECT_ROOT / f"{raw}{suffix}"
                     # OPTIMIZATION: Check .is_file() first here too
                     if candidate_with_suffix.is_file():
@@ -403,18 +435,6 @@ def _remember_codebase_targets(paths: list[str], session_id: str | None = None) 
         state.version += 1
 
 
-def _recent_codebase_targets(session_id: str | None = None) -> list[str]:
-    state = _session_state(session_id)
-    with state.lock:
-        return list(state.recent_code_targets)
-
-
-def _last_assistant_message(session_id: str | None = None) -> str:
-    state = _session_state(session_id)
-    _refresh_session_history_cache(state)
-    return state.cached_last_assistant
-
-
 def _recent_exchange_context(session_id: str | None = None) -> str:
     state = _session_state(session_id)
     _refresh_session_history_cache(state)
@@ -431,7 +451,7 @@ def _recent_exchange_pair(session_id: str | None = None) -> tuple[str, str]:
 def _request_snapshot(*, session_id: str | None = None, last_assistant_override: str | None = None) -> RequestSnapshot:
     state = _session_state(session_id)
     _refresh_session_history_cache(state)
-    context = _editor_snapshot()
+    context = _editor_context()
     recent_targets = tuple(state.recent_code_targets[:5])
     open_tabs_raw = context.get("open_tabs") or []
     open_tabs = tuple(
@@ -480,7 +500,8 @@ def _append_message(role: str, content: str, session_id: str | None = None) -> N
         if role == "assistant":
             state.streaming_reply_preview = ""
     if role == "assistant":
-        _remember_codebase_targets(_explicit_paths_in_text(content), session_id)
+        if _might_contain_file_ref(content):
+            _remember_codebase_targets(_explicit_paths_in_text(content), session_id)
 
 
 def _clear_messages(session_id: str | None = None) -> None:
@@ -603,6 +624,10 @@ def _editor_snapshot() -> dict:
     return get_editor_bridge().snapshot().get("context", {})
 
 
+def _editor_context() -> dict:
+    return get_editor_bridge().context_snapshot()
+
+
 def _pending_action_target_path(action: dict) -> str:
     command = str(action.get("command", "") or "").strip().lower()
     argument = str(action.get("argument", "") or "")
@@ -694,6 +719,9 @@ def _filter_coder_preload_paths(paths: list[str], user_input: str) -> list[str]:
         if not rel or rel in seen:
             continue
         lowered = rel.lower()
+        suffix = Path(lowered).suffix
+        if suffix in _NON_SOURCE_FILE_SUFFIXES:
+            continue
         if not allow_infra and _is_infra_path(lowered):
             continue
         seen.add(rel)
@@ -708,7 +736,7 @@ def _should_preload_coder_paths(task_text: str, analysis) -> bool:
     lowered = collapse_hidden_tag_gaps(str(task_text or "")).strip().lower()
     if any(hint in lowered for hint in _CODEBASE_TARGET_HINTS):
         return True
-    return bool(analysis.explicit_file_reference)
+    return bool(analysis.explicit_file_reference or analysis.codebase_context or analysis.coding)
 
 
 def _enforce_vscode_for_coding(chat_messages: list[dict]) -> list[dict]:
@@ -873,13 +901,53 @@ def _is_referential_question(user_input: str) -> bool:
     return False
 
 
+def _is_identity_question(user_input: str) -> bool:
+    tokens = {
+        token.strip(".,!?;:").lower()
+        for token in str(user_input or "").split()
+        if token.strip(".,!?;:")
+    }
+    if not tokens:
+        return False
+    return bool(
+        {"you", "your"} & tokens
+        and (
+            {"what", "who"} & tokens
+            or {"name", "called", "made", "creator"} & tokens
+        )
+    )
+
+
+def _reply_style_instruction(analysis) -> str:
+    if analysis.coding_like or analysis.wants_execution:
+        style = random.choice(_TECHNICAL_REPLY_STYLES)
+    else:
+        style = random.choice(_COMPANION_REPLY_STYLES)
+    return (
+        "For this reply only, vary your wording and rhythm. "
+        f"Use this feel: {style}. "
+        "Do not reuse a stock phrase or copy examples from the soul file. "
+        "If the user repeats a question, keep the meaning consistent but phrase it differently."
+    )
+
+
 def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> tuple[list[dict], object]:
-    last_assistant = _last_assistant_message(session_id)
-    analysis = _analyze_request(user_input, session_id=session_id, last_assistant_override=last_assistant)
+    state = _session_state(session_id)
+    _refresh_session_history_cache(state)
+    editor_context = _editor_context()
+    open_tabs_raw = editor_context.get("open_tabs") or []
+    snapshot = RequestSnapshot(
+        last_user=state.cached_last_user,
+        last_assistant=state.cached_last_assistant,
+        recent_code_targets=tuple(state.recent_code_targets[:5]),
+        active_file=str(editor_context.get("active_file", "") or "").strip(),
+        open_tabs=tuple(path for raw in open_tabs_raw if (path := str(raw or "").strip())),
+        recent_text=state.cached_recent_text,
+        editor_connected=bool(editor_context.get("connected")),
+    )
+    analysis = _REQUEST_ANALYZER.analyze(user_input, snapshot)
     if not skip_memory:
         capture_explicit_user_memories(user_input)
-    ModelManager.get_instance().ensure_loaded()
-    state = _session_state(session_id)
     with state.lock:
         messages = list(state.messages)
     light_chat_turn = _is_light_chat_turn(analysis)
@@ -922,6 +990,29 @@ def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id
             },
             chat_messages[-1],
         ]
+    chat_messages = [
+        *chat_messages[:-1],
+        {
+            "role": "system",
+            "content": _reply_style_instruction(analysis),
+        },
+        chat_messages[-1],
+    ]
+    if _is_identity_question(user_input):
+        style = random.choice(_IDENTITY_REPLY_STYLES)
+        chat_messages = [
+            *chat_messages[:-1],
+            {
+                "role": "system",
+                "content": (
+                    "The user is asking what/who you are. Answer in one natural sentence, "
+                    f"with this feel: {style}. Vary the wording from previous identity answers. "
+                    "Do not say you exist to be near them, would stay, or share things that interest you. "
+                    "Do not sound like a bio, service bot, or character sheet."
+                ),
+            },
+            chat_messages[-1],
+        ]
     if analysis.codebase_followup and analysis.assistant_invited_continuation:
         exchange = _recent_exchange_context()
         chat_messages = [
@@ -954,7 +1045,7 @@ def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id
                 },
                 chat_messages[-1],
             ]
-    recent_targets = _recent_codebase_targets(session_id)
+    recent_targets = list(snapshot.recent_code_targets)
     if recent_targets and analysis.coding and not analysis.explicit_file_reference:
         chat_messages = [
             *chat_messages[:-1],
@@ -968,7 +1059,7 @@ def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id
                 },
                 chat_messages[-1],
             ]
-    if bool(_editor_snapshot().get("connected")) and analysis.wants_execution and not ADVISOR_ONLY:
+    if snapshot.editor_connected and analysis.wants_execution and not ADVISOR_ONLY:
         chat_messages = [
             *chat_messages[:-1],
             {
@@ -1019,7 +1110,6 @@ def _route_coder_generation(
     analysis=None,
     progress_callback=None,
 ) -> CoderRouteResult:
-    is_popup_session = _normalize_session_id(session_id) == DEFAULT_SESSION_ID
     analysis = analysis or _analyze_request(user_input, session_id=session_id)
     should_route = bool(
         not ADVISOR_ONLY
@@ -1031,37 +1121,6 @@ def _route_coder_generation(
     )
     if not should_route:
         return CoderRouteResult(text="", used_coder=False)
-
-    def _complete_visible(base_text: str, fallback_hint: str = "", *, finish_reason: str = "") -> str:
-        return ensure_complete_visible_reply(
-            chat_messages,
-            finalize_reply(base_text, fallback_hint),
-            finish_reason=finish_reason,
-            request_completion=lambda messages: _request_completion(messages, stream=False),
-            extract_message_text=_extract_message_text,
-            extract_finish_reason=_extract_finish_reason,
-        )
-
-    def _fallback_from_coder(fallback_hint: str = "") -> str:
-        fallback_messages = _build_codebase_fallback_messages(
-            chat_messages,
-            user_input,
-            coder_failed=True,
-            analysis=analysis,
-        )
-        if not fallback_messages:
-            return _complete_visible(raw_candidate, fallback_hint)
-        fallback_response = _request_completion(fallback_messages, stream=False, role="main")
-        fallback_raw = _extract_message_text(fallback_response)
-        fallback_finish_reason = _extract_finish_reason(fallback_response)
-        return ensure_complete_visible_reply(
-            fallback_messages,
-            finalize_reply(fallback_raw, fallback_hint),
-            finish_reason=fallback_finish_reason,
-            request_completion=lambda messages: _request_completion(messages, stream=False),
-            extract_message_text=_extract_message_text,
-            extract_finish_reason=_extract_finish_reason,
-        )
 
     if progress_callback:
         progress_callback("Using coding model...")
@@ -1075,7 +1134,7 @@ def _route_coder_generation(
 
     preload_query = task if task and task != user_input else user_input
     if _should_preload_coder_paths(preload_query, analysis):
-        explicit_paths = _explicit_paths_in_text(preload_query)
+        explicit_paths = _explicit_paths_in_text(user_input) or _explicit_paths_in_text(preload_query)
         if explicit_paths:
             preload_paths = explicit_paths[:3]
         else:
@@ -1087,6 +1146,8 @@ def _route_coder_generation(
         preload_paths = []
 
     try:
+        from app.agents.coding_agent import run_coder_specialist
+
         coder_outcome = run_coder_specialist(
             task,
             preload_paths=preload_paths,
@@ -1095,7 +1156,10 @@ def _route_coder_generation(
         )
     except Exception as exc:
         print(f"[Akane] Coding model handoff failed: {exc}", flush=True)
-        return CoderRouteResult(text=_fallback_from_coder(clean_reply_text(raw_candidate)), used_coder=True)
+        return CoderRouteResult(
+            text="The coding model hit an error before it could produce a reliable result.",
+            used_coder=True,
+        )
 
     if coder_outcome.approval_required:
         _open_vscode_for_pending_actions(coder_outcome.proposed_actions or [])
@@ -1107,19 +1171,10 @@ def _route_coder_generation(
 
     summary = collapse_hidden_tag_gaps(str(coder_outcome.summary or "").strip()).strip()
     if not summary:
-        print("[Akane] Coding model returned no usable result. Falling back to direct main-model answer.", flush=True)
-        return CoderRouteResult(text=_fallback_from_coder(clean_reply_text(raw_candidate)), used_coder=True)
+        print("[Akane] Coding model returned no usable result.", flush=True)
+        summary = "The coding model could not produce a reliable result for this request."
 
-    cleaned = _complete_visible(summary, clean_reply_text(raw_candidate))
-    cleaned = postprocess_reply(
-        cleaned,
-        analysis=analysis,
-        compact_mode=is_popup_session,
-        working_messages=chat_messages,
-        request_completion=lambda messages: _request_completion(messages, stream=False),
-        extract_message_text=_extract_message_text,
-        extract_finish_reason=_extract_finish_reason,
-    )
+    cleaned = normalize_final_reply(clean_reply_text(summary))
     return CoderRouteResult(text=cleaned, used_coder=True)
 
 
@@ -1543,7 +1598,7 @@ def _request_completion(
 ):
     if role == "main":
         messages = _fit_messages_to_context(messages)
-    return LLM.create_chat_completion(
+    return ModelManager.get_instance().create_chat_completion(
         messages=messages,
         max_tokens=max_tokens_override or MAX_TOKENS,
         temperature=temperature_override if temperature_override is not None else TEMPERATURE,
@@ -1747,8 +1802,6 @@ def _generate_reply(user_input: str, *, skip_memory: bool = False, session_id: s
         cleaned = _strip_popup_tags(cleaned)
     cleaned = normalize_final_reply(cleaned)
     _append_message("assistant", cleaned, session_id)
-    if not skip_memory:
-        record_interaction()
     return cleaned
 
 
@@ -1897,8 +1950,6 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
                     yield _json_line({"type": "delta", "content": cleaned})
                 
             _append_message("assistant", cleaned, session_id)
-            if not skip_memory:
-                record_interaction()
             _log_terminal_stream("done", cleaned)
             yield _json_line({"type": "done", "reply": cleaned, "messages": list(_session_state(session_id).messages)})
     except Exception as exc:  # pragma: no cover - surfaced in browser

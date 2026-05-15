@@ -1,8 +1,9 @@
 import re
 import threading
+from datetime import datetime as _datetime, timedelta
 
 from app.core.config import ADVISOR_ONLY, CHAT_HISTORY_CONTEXT_TOKENS
-from app.core.character import build_system_prompt
+from app.core.character import build_system_prompt, soul_cache_key
 from app.integrations.editor_bridge import get_editor_bridge
 from app.memory_store import apply_tag_operations, format_for_prompt, get_store, remember_user_message
 from app.integrations.vscode_launcher import launch_vscode
@@ -43,11 +44,6 @@ _STREAM_OPENERS = tuple(
     )
 )
 
-_HIDDEN_SQUARE_TAG_NAMES = (
-    "MEM", "FORGET", "PROJECT", "EDITOR", "ASK_CODER", "CODE", "READ", "WRITE", "SHELL", "READ_RESULT", "THINK",
-)
-_HIDDEN_XML_SIMPLE_TAG_NAMES = ("READ", "WRITE", "SHELL", "CODE", "READ_RESULT", "THINK")
-
 # ── Pre-compiled regex patterns (compiled once at import time) ──────────────
 _SQ_NAMES = "MEM|FORGET|PROJECT|EDITOR|ASK_CODER|CODE|READ|WRITE|SHELL|READ_RESULT|THINK"
 _XML_NAMES = "think|thinking|tool_call|READ|WRITE|SHELL|CODE|READ_RESULT|THINK"
@@ -71,45 +67,56 @@ _MULTI_BLANK_LINE_RE = re.compile(r"[ \t]*\n([ \t]*\n)+")
 # Inline backtick pairs (no newlines inside)
 _INLINE_BACKTICK_RE = re.compile(r"`([^`\n]*)`")
 
-
-from functools import lru_cache as _lru_cache
-
-
-@_lru_cache(maxsize=64)
-def _make_section_re(opener: str, closer: str, case_insensitive: bool) -> re.Pattern:
-    flags = re.DOTALL | (re.IGNORECASE if case_insensitive else 0)
-    return re.compile(re.escape(opener) + r"(.*?)" + re.escape(closer), flags)
-
-
-def _extract_wrapped_sections(text: str, opener: str, closer: str, *, case_insensitive: bool = False) -> list[str]:
+def _extract_tag_contents(text: str, opener: str, closer: str, *, case_insensitive: bool = False) -> list[str]:
     source = str(text or "")
-    if not source:
+    if not source or opener not in source and not case_insensitive:
         return []
-    return [m.group(1).strip() for m in _make_section_re(opener, closer, case_insensitive).finditer(source)]
+    haystack = source.lower() if case_insensitive else source
+    open_tag = opener.lower() if case_insensitive else opener
+    close_tag = closer.lower() if case_insensitive else closer
+    parts: list[str] = []
+    start = 0
+    while True:
+        open_idx = haystack.find(open_tag, start)
+        if open_idx == -1:
+            return parts
+        content_idx = open_idx + len(open_tag)
+        close_idx = haystack.find(close_tag, content_idx)
+        if close_idx == -1:
+            return parts
+        parts.append(source[content_idx:close_idx].strip())
+        start = close_idx + len(close_tag)
 
 def _extract_named_xml_sections(text: str, tag_name: str) -> list[str]:
-    return _extract_wrapped_sections(
+    return _extract_tag_contents(
         text,
         f"<{tag_name}>",
         f"</{tag_name}>",
         case_insensitive=True,
     )
 
-
-@_lru_cache(maxsize=32)
-def _make_assignment_re(prefix: str, closing_tag: str) -> re.Pattern:
-    # Matches e.g. <function=name>content</function>
-    return re.compile(
-        re.escape(prefix) + r"([^>]*?)>" + r"(.*?)" + re.escape(closing_tag),
-        re.DOTALL | re.IGNORECASE,
-    )
-
-
 def _extract_assignment_blocks(text: str, prefix: str, closing_tag: str) -> list[tuple[str, str]]:
     source = str(text or "")
     if not source:
         return []
-    return [(m.group(1).strip(), m.group(2).strip()) for m in _make_assignment_re(prefix, closing_tag).finditer(source)]
+    lowered = source.lower()
+    open_prefix = prefix.lower()
+    close_tag = closing_tag.lower()
+    blocks: list[tuple[str, str]] = []
+    start = 0
+    while True:
+        open_idx = lowered.find(open_prefix, start)
+        if open_idx == -1:
+            return blocks
+        attr_start = open_idx + len(prefix)
+        attr_end = source.find(">", attr_start)
+        if attr_end == -1:
+            return blocks
+        close_idx = lowered.find(close_tag, attr_end + 1)
+        if close_idx == -1:
+            return blocks
+        blocks.append((source[attr_start:attr_end].strip(), source[attr_end + 1:close_idx].strip()))
+        start = close_idx + len(closing_tag)
 
 
 # Pre-compiled for _extract_simple_xml_pairs — matches <tagname>content</tagname>
@@ -183,8 +190,6 @@ def collapse_hidden_tag_gaps(text: str) -> str:
 
 
 # ── Fast lookup tables for HiddenTagStreamFilter ────────────────────────────
-# Dict: full opener string → closer string (O(1) full-match lookup)
-_OPENER_DICT: dict[str, str] = {op: cl for op, cl in _STREAM_OPENERS}
 # Group openers by their first two characters (usually narrows candidates to 1-2)
 _OPENERS_BY_PREFIX2: dict[str, list[tuple[str, str]]] = {}
 for _op, _cl in _STREAM_OPENERS:
@@ -221,6 +226,12 @@ class HiddenTagStreamFilter:
         return stable
 
     def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        if not self._in_tag and "[" not in text and "<" not in text and not self._visible_buffer:
+            self._pending_visible += text
+            return self._drain_pending()
+
         self._visible_buffer += text
 
         while self._visible_buffer:
@@ -296,7 +307,7 @@ def _collect_memory_and_tool_ops(text: str) -> tuple[
     editor_ops = extract_editor_commands(text)
 
     if "[MEM]" in text:
-        for raw in _extract_wrapped_sections(text, "[MEM]", "[/MEM]"):
+        for raw in _extract_tag_contents(text, "[MEM]", "[/MEM]"):
             if ":" in raw:
                 cat, content = raw.split(":", 1)
                 cat = cat.strip().lower()
@@ -306,12 +317,12 @@ def _collect_memory_and_tool_ops(text: str) -> tuple[
                     mem_ops.append((mem_cat, content))
 
     if "[FORGET]" in text:
-        for query in _extract_wrapped_sections(text, "[FORGET]", "[/FORGET]"):
+        for query in _extract_tag_contents(text, "[FORGET]", "[/FORGET]"):
             if query:
                 forget_queries.append(query)
 
     if "[PROJECT]" in text:
-        for raw in _extract_wrapped_sections(text, "[PROJECT]", "[/PROJECT]"):
+        for raw in _extract_tag_contents(text, "[PROJECT]", "[/PROJECT]"):
             if ":" in raw:
                 name, detail = raw.split(":", 1)
                 name = name.strip().lower()
@@ -364,10 +375,8 @@ def clean_model_text(text: str) -> str:
 
 
 def extract_coder_requests(text: str) -> list[str]:
-    if "[ASK_CODER]" not in str(text or ""):
-        return []
     requests: list[str] = []
-    for content in _extract_wrapped_sections(text, "[ASK_CODER]", "[/ASK_CODER]"):
+    for content in _extract_tag_contents(text, "[ASK_CODER]", "[/ASK_CODER]"):
         if content:
             requests.append(content)
     return requests
@@ -395,7 +404,7 @@ def extract_editor_commands(text: str) -> list[str]:
         return []
     editor_ops: list[str] = []
 
-    for raw in _extract_wrapped_sections(source, "[EDITOR]", "[/EDITOR]"):
+    for raw in _extract_tag_contents(source, "[EDITOR]", "[/EDITOR]"):
         if raw:
             editor_ops.append(raw)
 
@@ -413,7 +422,7 @@ def extract_read_requests(text: str) -> list[str]:
     read_requests: list[str] = []
     seen: set[str] = set()
 
-    for filepath in _extract_wrapped_sections(source, "[READ]", "[/READ]"):
+    for filepath in _extract_tag_contents(source, "[READ]", "[/READ]"):
         if filepath and filepath not in seen:
             seen.add(filepath)
             read_requests.append(filepath)
@@ -540,36 +549,14 @@ def _extract_editor_commands_from_tool_block(block: str) -> list[str]:
 
 # Cache for system prompt to avoid repeated formatting
 _system_prompt_cache = None
-_system_prompt_gen = -1
+_system_prompt_gen: tuple[int, int] | None = None
 _runtime_context_cache = ""
 _include_memory_cache: bool | None = None
 _datetime_context_cache: tuple[str, str] | None = None
 
-
-def _nth_weekday(year: int, month: int, weekday: int, n: int):
-    """nth occurrence of weekday (0=Mon,6=Sun) in month. n=-1 = last."""
-    from datetime import date, timedelta
-    if n > 0:
-        d = date(year, month, 1)
-        count = 0
-        while True:
-            if d.weekday() == weekday:
-                count += 1
-                if count == n:
-                    return d
-            d += timedelta(days=1)
-    else:
-        nxt = date(year, month + 1, 1) if month < 12 else date(year + 1, 1, 1)
-        d = nxt - timedelta(days=1)
-        while d.weekday() != weekday:
-            d -= timedelta(days=1)
-        return d
-
-
 def _current_datetime_context() -> str:
     """Return current date/time plus yesterday/today/tomorrow holiday facts."""
     global _datetime_context_cache
-    from datetime import datetime as _datetime, timedelta
     now = _datetime.now()
     cache_key = now.strftime("%Y-%m-%d %H:%M")
     if _datetime_context_cache and _datetime_context_cache[0] == cache_key:
@@ -612,7 +599,7 @@ def _cached_system_prompt(runtime_context: str, *, include_memory: bool = True) 
     global _system_prompt_cache, _system_prompt_gen, _runtime_context_cache, _include_memory_cache
 
     store = get_store()
-    current_gen = store._prompt_cache_gen
+    current_gen = (store._prompt_cache_gen, soul_cache_key())
     if (
         _system_prompt_cache is not None
         and _system_prompt_gen == current_gen

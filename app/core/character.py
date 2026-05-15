@@ -11,11 +11,25 @@ CHARACTER = {
 }
 
 SOUL_PATH = Path(__file__).resolve().parent.parent / "soul.md"
+_SOUL_CACHE: tuple[int, str] | None = None
 
 
 def load_soul() -> str:
     """Load the soul.md file."""
-    return SOUL_PATH.read_text(encoding="utf-8").strip()
+    global _SOUL_CACHE
+    mtime_ns = soul_cache_key()
+    if _SOUL_CACHE is not None and _SOUL_CACHE[0] == mtime_ns:
+        return _SOUL_CACHE[1]
+    soul = SOUL_PATH.read_text(encoding="utf-8").strip()
+    _SOUL_CACHE = (mtime_ns, soul)
+    return soul
+
+
+def soul_cache_key() -> int:
+    try:
+        return SOUL_PATH.stat().st_mtime_ns
+    except OSError:
+        return -1
 
 
 def build_system_prompt(

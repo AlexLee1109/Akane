@@ -141,7 +141,13 @@ CODER_INITIAL_CHUNKS_PER_FILE = int(
 CODER_MAX_READ_CHUNKS_PER_FILE = int(
     os.environ.get(
         "AKANE_CODER_MAX_READ_CHUNKS_PER_FILE",
-        str(_local_secret("CODER_MAX_READ_CHUNKS_PER_FILE", 8)),
+        str(_local_secret("CODER_MAX_READ_CHUNKS_PER_FILE", 4)),
+    ).strip()
+)
+CODER_TIMEOUT_SECONDS = float(
+    os.environ.get(
+        "AKANE_CODER_TIMEOUT_SECONDS",
+        str(_local_secret("CODER_TIMEOUT_SECONDS", 38)),
     ).strip()
 )
 STATIC_DIR = "static"
@@ -180,12 +186,15 @@ CODER_MAX_TOKENS = int(
         str(_local_secret("CODER_MAX_TOKENS", 1024)),
     ).strip()
 )  # Higher limit for coding suggestions
+CODER_TEMPERATURE = float(
+    os.environ.get(
+        "AKANE_CODER_TEMPERATURE",
+        str(_local_secret("CODER_TEMPERATURE", 0.1)),
+    ).strip()
+)
 TEMPERATURE = 0.9
 TOP_K = 40
 TOP_P = 0.95
 REPETITION_PENALTY = 1.1
 
 # System prompt is now in app/character.py — edit that file to change personality.
-
-# Memory flush cadence (seconds) for background writes.
-MEMORY_FLUSH_INTERVAL = float(os.environ.get("AKANE_MEMORY_FLUSH_INTERVAL", "15.0"))

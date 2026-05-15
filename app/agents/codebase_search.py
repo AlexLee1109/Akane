@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -22,13 +23,22 @@ _CODE_FILE_SUFFIXES = {
     ".go", ".java",
 }
 _SECONDARY_TEXT_SUFFIXES = {".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".css", ".html"}
+_BINARY_FILE_SUFFIXES = {
+    ".node", ".so", ".dylib", ".dll", ".exe", ".bin", ".o", ".a", ".obj",
+    ".class", ".jar", ".war", ".pyd", ".whl", ".zip", ".tar", ".gz", ".7z",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf",
+}
 _DEPRIORITIZED_ROOT_PREFIXES = (
-    "integrations/", "extensions/", ".vscode/", ".idea/", ".zed/",
+    "integrations/", "extensions/", ".vscode-server/", ".vscode/", ".idea/", ".zed/",
     ".github/", ".gitlab/", "dist/", "build/", "coverage/", "storybook-static/",
 )
 _REFERENCE_TRAILING_PUNCT = " \t\r\n`'\".,:;()[]{}"
 _FILE_CACHE_TTL_SECONDS = 5.0
-_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
+_SKIP_DIRS = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build",
+    ".vscode-server", ".mypy_cache", ".pytest_cache", ".cache", "target", "out",
+}
+_PROJECT_PRIORITY_PREFIXES = ("app/", "src/", "lib/", "core/", "server/", "api/", "ui/", "web/")
 
 
 def _iter_word_tokens(text: str):
@@ -80,12 +90,16 @@ class CodebaseSearch:
             return self._inventory
         inventory: list[_IndexedFile] = []
         index: dict[str, list[str]] = {}
-        for path in self.project_root.rglob("*"):
-            if not path.is_file() or any(part in _SKIP_DIRS for part in path.parts):
-                continue
-            entry = _IndexedFile(path, self.project_root)
-            inventory.append(entry)
-            index.setdefault(path.name.lower(), []).append(entry.rel)
+        for root, dirs, files in os.walk(self.project_root):
+            dirs[:] = [name for name in dirs if name not in _SKIP_DIRS]
+            root_path = Path(root)
+            for filename in files:
+                path = root_path / filename
+                if self._skip_file(path):
+                    continue
+                entry = _IndexedFile(path, self.project_root)
+                inventory.append(entry)
+                index.setdefault(filename.lower(), []).append(entry.rel)
         self._inventory = inventory
         self._file_index = index
         self._inventory_built_at = now
@@ -133,19 +147,33 @@ class CodebaseSearch:
     def extract_query_tokens(self, user_input: str) -> list[str]:
         return list(self._cached_query_tokens(str(user_input or "")))
 
-    def has_recent_topic_overlap(self, user_input: str, recent_text: str) -> bool:
-        current = set(self.extract_query_tokens(user_input))
-        recent = set(self.extract_query_tokens(recent_text))
-        return bool(current and recent and current & recent)
+    @staticmethod
+    def _skip_file(path: Path) -> bool:
+        suffix = path.suffix.lower()
+        if suffix in _BINARY_FILE_SUFFIXES:
+            return True
+        try:
+            return path.stat().st_size > _TEXT_SEARCH_FILE_LIMIT and suffix not in _CODE_FILE_SUFFIXES
+        except OSError:
+            return True
 
-    def looks_like_text_file(self, path: Path) -> bool:
-        return path.suffix.lower() in _TEXT_FILE_SUFFIXES
+    def is_source_candidate(self, rel: str) -> bool:
+        lowered = str(rel or "").strip().lower()
+        if not lowered:
+            return False
+        suffix = Path(lowered).suffix
+        if suffix in _BINARY_FILE_SUFFIXES:
+            return False
+        return not any(lowered.startswith(prefix) for prefix in _DEPRIORITIZED_ROOT_PREFIXES)
 
     # ------------------------------------------------------------------ #
     # Scoring                                                              #
     # ------------------------------------------------------------------ #
 
     def _path_score(self, entry: _IndexedFile, query_tokens: list[str]) -> int:
+        suffix = entry.path.suffix.lower()
+        if suffix in _BINARY_FILE_SUFFIXES:
+            return 0
         score = 0
         exact_hits = 0
         path_parts = entry.lowered.split("/")
@@ -164,13 +192,12 @@ class CodebaseSearch:
                 score += 2
         if exact_hits >= 2:
             score += 4
-        if entry.lowered.startswith(("app/", "src/", "lib/")):
-            score += 1
+        if entry.lowered.startswith(_PROJECT_PRIORITY_PREFIXES):
+            score += 2
         if any(entry.lowered.startswith(p) for p in _DEPRIORITIZED_ROOT_PREFIXES):
-            score -= 2
-        suffix = entry.path.suffix.lower()
+            score -= 6
         if suffix in _CODE_FILE_SUFFIXES:
-            score += 1
+            score += 2
         elif suffix in _SECONDARY_TEXT_SUFFIXES:
             score -= 1
         return score
@@ -233,16 +260,9 @@ class CodebaseSearch:
         scored.sort(key=lambda x: (-x[0], x[1]))
         return [r for _, r in scored[:limit]]
 
-    def search_paths(self, user_input: str, limit: int = 3) -> list[str]:
-        return [r for _, r in self._score_all(user_input, limit=limit)]
-
     # ------------------------------------------------------------------ #
     # Reference resolution                                                 #
     # ------------------------------------------------------------------ #
-
-    def _is_deprioritized(self, rel: str) -> bool:
-        lower = rel.lower()
-        return any(lower.startswith(p) for p in _DEPRIORITIZED_ROOT_PREFIXES)
 
     def _resolve_ref(self, raw_ref: str) -> list[str]:
         """Resolve a file-reference token to zero or more repo-relative paths."""
@@ -319,33 +339,35 @@ class CodebaseSearch:
         ):
             _add(active_file)
 
-        # 3. Score-based path search on the current query
-        for _score, rel in self._score_all(user_input, limit=max(10, limit * 3)):
-            if not self._is_deprioritized(rel) or explicit_file_reference:
-                _add(rel)
-
-        # 4. Content search if still short
-        if len(candidates) < limit:
-            for rel in self.search_contents(user_input, limit=limit):
-                if not self._is_deprioritized(rel):
-                    _add(rel)
-
-        # 5. Carry recent targets for followup turns
+        # 3. Carry recent confirmed targets for followups before fuzzy search.
         if reuse_recent_targets or followup_reference:
             for rel in recent_targets:
+                if self.is_source_candidate(rel):
+                    _add(rel)
+
+        # 4. Score-based path search on the current query
+        for _score, rel in self._score_all(user_input, limit=max(10, limit * 3)):
+            if self.is_source_candidate(rel) or explicit_file_reference:
                 _add(rel)
+
+        # 5. Content search if still short
+        if len(candidates) < limit:
+            for rel in self.search_contents(user_input, limit=limit):
+                if self.is_source_candidate(rel):
+                    _add(rel)
 
         # 6. Score recent context text for additional signal
         if len(candidates) < limit and recent_texts:
             combined = " ".join(recent_texts[:3])
             for _score, rel in self._score_all(combined, limit=limit):
-                if not self._is_deprioritized(rel):
+                if self.is_source_candidate(rel):
                     _add(rel)
 
         # 7. Open tabs as last resort
         for rel in open_tabs[:5]:
             if len(candidates) >= limit:
                 break
-            _add(rel)
+            if self.is_source_candidate(rel):
+                _add(rel)
 
         return candidates[:limit]

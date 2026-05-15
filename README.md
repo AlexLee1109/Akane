@@ -1,171 +1,140 @@
-# Akane: Custom GPT-style Transformer
+# Akane
 
-Akane is a PyTorch-based GPT-style transformer model, currently in the **pre-training phase** on 20B tokens from FineWeb. The project focuses on clean, performant implementation with modern transformer techniques. After pre-training completes, instruction fine-tuning will enable Akane to become a local AI VTuber companion.
+Akane is a local-first AI companion app with a FastAPI backend, a built-in web UI, an optional desktop popup, and optional integrations (VS Code editor bridge + Discord bot).
 
-## Key Features
+The main entrypoint is:
 
-- **Grouped Query Attention (GQA)** with QK normalization for training stability
-- **Shared Rotary Positional Embeddings (RoPE)** across all layers
-- **SwiGLU MLP** with zero-initialized output projections
-- **Pre-allocated KV cache** for efficient autoregressive inference
-- **Distributed training** support via PyTorch DDP
-- **LoRA fine-tuning** infrastructure ready for instruction tuning
-
-## Quick Start
-
-### Pre-training
-
-1. **Download FineWeb data** (20B tokens):
 ```bash
-# Requires `datasets` library
-python data/downloaders/fineweb.py
+python -m app [server|popup|discord]
 ```
-This creates shards in `data/processed/fineweb20B/` (~100M tokens each).
 
-2. **Start pre-training**:
+## Quick start
+
+### 1) Install dependencies
+
+Python 3.10+ is recommended.
+
 ```bash
-# Single GPU
-torchrun train/pretrain.py
+python -m venv .venv
+source .venv/bin/activate
 
-# Multi-GPU
-torchrun --nproc_per_node=N train/pretrain.py
+pip install -U pip
+
+# Core runtime
+pip install fastapi uvicorn llama-cpp-python
+
+# Popup (optional)
+pip install pywebview pillow
+
+# Discord (optional)
+pip install discord.py aiohttp
 ```
 
-Checkpoints are saved to `logs/` (ignored by git). See `train/pretrain.py` to adjust:
-- Model configuration (layers, heads, embedding dim)
-- Batch size, learning rate, max steps
-- Data directory path if needed
+Notes:
 
-### Inference & Testing
+- The local model backend uses `llama-cpp-python` and expects a GGUF model file.
+- On macOS, Akane will use MPS automatically when available.
 
-After pre-training produces a checkpoint, convert it for inference:
+### 2) Point Akane at a model
+
+By default Akane looks for a GGUF at:
+
+```text
+models/Meta-Llama-3.1-8B-Instruct-Q5_K_S.gguf
+```
+
+Override with either:
+
+- Environment variable: `AKANE_MODEL_PATH=/absolute/or/relative/path/to/model.gguf`
+- Local secrets file: copy `app/secrets/local_secrets.py.example` to `app/secrets/local_secrets.py` and set `MODEL_PATH = "..."`
+
+### 3) Run
+
+Backend server + web UI:
+
 ```bash
-python utils/convert_checkpoint.py
-# Output: models/akane2.pt (or your chosen name)
+python -m app server
 ```
 
-Then test with interactive chat:
+Then open:
+
+- `http://127.0.0.1:8000`
+- API docs: `http://127.0.0.1:8000/docs`
+
+Desktop popup (macOS-focused; uses the server locally by default):
+
 ```bash
-python -m cli.chat
+python -m app popup
 ```
-Or run the web server:
+
+Discord bot (forwards messages to a running server over HTTP):
+
 ```bash
-python -m cli.server
-```
-(Note: `cli/` and `utils/` are local development directories not tracked by git)
-
-## Repository Structure
-
-Only core library and training scripts are version-controlled:
-
-```
-Akane/
-├── akane/                    # Core model implementation
-│   ├── gpt.py               # GPT model with GQA, RoPE, SwiGLU
-│   ├── kv_cache.py          # Pre-allocated KV cache for generation
-│   └── __init__.py
-├── train/                   # Training scripts
-│   ├── pretrain.py          # Main pre-training loop (DDP)
-│   ├── finetune.py          # LoRA fine-tuning (for later phase)
-│   └── dataloaders/
-│       ├── fineweb.py       # FineWeb shard loader
-│       ├── ultrachat.py     # UltraChat instruction data loader
-│       └── __init__.py
-├── README.md
-└── LICENSE
+python -m app discord
 ```
 
-**Local development files** (ignored by git, not tracked):
-- `cli/` - Chat CLI and HTTP server
-- `utils/` - Checkpoint conversion, plotting, data utilities
-- `data/` - Raw data, processed shards, downloaders
-- `models/` - Saved checkpoints
-- `logs/` - Training logs
-- `static/` - Web UI assets
+## Configuration
 
-## Model Architecture
+Most settings can be provided either via:
 
-### Components
+- Environment variables prefixed with `AKANE_` (for example: `AKANE_SERVER_PORT=8000`)
+- `app/secrets/local_secrets.py` (see `app/secrets/local_secrets.py.example`)
 
-1. **Token Embeddings**: GPT-2 vocabulary (50,304 tokens) with RMSNorm
-2. **Transformer Blocks** (configurable count):
-   - Causal self-attention with GQA (Grouped Query Attention)
-   - Q/K normalization via RMSNorm
-   - SwiGLU feed-forward network (≈2.67× expansion)
-   - Pre-norm architecture (RMSNorm before each sub-layer)
-3. **Output Head**: Linear projection to vocabulary logits
+Common settings:
 
-### Configuration
+- `AKANE_APP_MODE`: `popup` (default), `server`, or `discord`
+- `AKANE_SERVER_HOST`: default `127.0.0.1`
+- `AKANE_SERVER_PORT`: default `8000`
+- `AKANE_POPUP_BACKEND_URL`: server URL used by the popup when not local
+- `AKANE_DISCORD_BOT_TOKEN`: Discord bot token
 
-Edit `GPTConfig` in `akane/gpt.py` or pass parameters directly:
+Local model settings:
 
-```python
-config = GPTConfig(
-    n_layer=36,      # Number of transformer blocks
-    n_head=16,       # Number of query heads
-    n_kv_head=4,     # Number of key/value heads (GQA)
-    n_embd=1536,     # Embedding dimension
-    block_size=1024, # Max sequence length
-)
-```
+- `AKANE_MODEL_PATH`: path to your `.gguf`
+- `AKANE_LLAMA_CONTEXT_WINDOW`, `AKANE_LLAMA_BATCH_SIZE`, `AKANE_LLAMA_GPU_LAYERS`: llama.cpp tuning knobs
 
-### KV Cache
+Optional “coder” backend via OpenRouter:
 
-During generation, a pre-allocated `KVCache` stores keys and values for all layers in a single contiguous tensor. This eliminates per-token allocation and enables fast, memory-efficient autoregressive decoding.
+- `OPENROUTER_API_KEY`
+- `OPENROUTER_CODER_MODEL`
 
-## Data Preparation
+## VS Code integration
 
-### FineWeb (Pre-training)
+There is a VS Code extension in `integrations/akane-vscode-extension` that:
 
-The `data/downloaders/fineweb.py` script streams the FineWeb dataset from HuggingFace and writes tokenized shards:
+- Sends Akane editor context (active file, selection, diagnostics)
+- Polls Akane for queued editor actions
 
-- Shard size: 100M tokens
-- Output: `data/processed/fineweb20B/fineweb_train_*.npy` and `fineweb_val_000000.npy`
-- Multiprocessing for fast tokenization
-- Target: ~20B training tokens (199 shards)
+Install into your normal VS Code:
 
-The `train/dataloaders/fineweb.py` module loads these shards during training.
-
-### UltraChat (Fine-tuning)
-
-UltraChat 200k is loaded directly from HuggingFace by `train/dataloaders/ultrachat.py`. It uses ChatML formatting with special tokens `` and ` to mask non-assistant responses during training.
-
-## Training Details
-
-### Pre-training (`train/pretrain.py`)
-
-- **Optimizer**: AdamW (fused, betas=(0.9, 0.95), weight decay=0.1)
-- **Learning rate**: Cosine decay with warmup (adjustable)
-- **Gradient accumulation**: Achieves effective batch size of 524,288 tokens
-- **Mixed precision**: FP16 via autocast
-- **Gradient clipping**: Norm 1.0
-- **Checkpointing**: Every 250 steps (configurable), includes optimizer/scheduler state for resume
-- **Validation**: Every 250 steps (250 batches)
-
-### Fine-tuning (`train/finetune.py`)
-
-- **Method**: LoRA (rank 32, alpha 64) on attention and MLP projections
-- **Base model**: Load from pre-training checkpoint
-- **Loss**: Cross-entropy with `IGNORE_INDEX` masking for non-assistant tokens
-- **Merging**: LoRA weights merged into base model at end
-
-## Requirements
-
-- Python 3.10+
-- PyTorch 2.0+
-- Additional libraries: `tiktoken`, `rich`, `datasets`, `tqdm`, `peft`
-
-Install:
 ```bash
-pip install torch tiktoken rich datasets tqdm peft
+python3 integrations/akane-vscode-extension/install_local.py
 ```
 
-## Notes
+Then set the extension’s `akane.serverUrl` setting to your server (for local dev: `http://127.0.0.1:8000`).
 
-- The repository intentionally tracks only core model and training code.
-- Data, checkpoints, logs, and development utilities are excluded via `.gitignore` to keep the repo lightweight.
-- When cloning, you'll need to recreate the local `cli/`, `utils/`, and `data/downloaders/` directories if you want to use them (they are not tracked).
-- Adjust paths in config files if your data directories differ from defaults.
+## Linux service scripts (optional)
+
+`start_akane_services.sh` and `stop_akane_services.sh` are convenience wrappers for systemd units named:
+
+- `akane-server`
+- `akane-discord`
+
+They are intended for Linux deployment (they run `systemctl ...`).
+
+## Repository structure
+
+Key folders:
+
+```text
+app/                     # Current runtime (server, popup UI, integrations)
+    core/                  # Prompt + generation pipeline, model manager
+    integrations/          # Discord bot, editor bridge, VS Code launcher
+    ui/                    # Popup window + embedded static UI
+akane/                   # Older/experimental transformer code
+train/                   # Training scripts/dataloaders (optional/experimental)
+integrations/            # VS Code extension project
+```
 
 ## License
 

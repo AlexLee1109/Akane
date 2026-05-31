@@ -1,14 +1,16 @@
+"""Lean text, tag, and local-read helpers."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from pathlib import Path
 import re
-import threading
-from datetime import datetime as _datetime, timedelta
 
 from app.core.config import ADVISOR_ONLY, CHAT_HISTORY_CONTEXT_TOKENS
-from app.core.character import build_system_prompt, soul_cache_key
+from app.core.character import build_system_prompt, prompt_revision
 from app.integrations.editor_bridge import get_editor_bridge
-from app.memory_store import apply_tag_operations, format_for_prompt, get_store, remember_user_message
 from app.integrations.vscode_launcher import launch_vscode
-
-_generation_lock = threading.Lock()
+from app.memory_store import apply_tag_operations, format_for_prompt, remember_user_message
 
 STREAM_HIDDEN_TAGS = {
     "MEM": "[/MEM]",
@@ -26,656 +28,391 @@ STREAM_HIDDEN_TAGS = {
 STREAM_HIDDEN_XML_TAGS = {
     "think": "</think>",
     "thinking": "</thinking>",
-    "tool_call": "/tool",
-    "READ": "</READ>",
-    "WRITE": "</WRITE>",
-    "SHELL": "</SHELL>",
-    "CODE": "</CODE>",
-    "READ_RESULT": "</READ_RESULT>",
+    "tool_call": "</tool_call>",
+    "read": "</read>",
+    "write": "</write>",
+    "shell": "</shell>",
+    "code": "</code>",
+    "read_result": "</read_result>",
 }
-_STREAM_OPENERS = tuple(
+_OPENERS = tuple(
     sorted(
-        [
-            *((f"[{name}]", closer) for name, closer in STREAM_HIDDEN_TAGS.items()),
-            *((f"<{name}>", closer) for name, closer in STREAM_HIDDEN_XML_TAGS.items()),
-        ],
-        key=lambda item: len(item[0]),
+        [(f"[{name}]", close) for name, close in STREAM_HIDDEN_TAGS.items()]
+        + [(f"<{name}>", close) for name, close in STREAM_HIDDEN_XML_TAGS.items()],
+        key=lambda pair: len(pair[0]),
         reverse=True,
     )
 )
+_OPENER_PREFIXES = frozenset(opener[:i].lower() for opener, _ in _OPENERS for i in range(1, len(opener) + 1))
+_TAG_NAMES = "MEM|FORGET|PROJECT|EDITOR|ASK_CODER|CODE|READ|WRITE|SHELL|READ_RESULT|THINK"
+_XML_NAMES = "think|thinking|tool_call|read|write|shell|code|read_result"
+_SQUARE_TAG_RE = re.compile(rf"\[({_TAG_NAMES})\].*?(?:\[/\1\]|$)", re.DOTALL | re.IGNORECASE)
+_XML_TAG_RE = re.compile(rf"<({_XML_NAMES})>.*?(?:</\1>|$)", re.DOTALL | re.IGNORECASE)
+_MULTI_BLANK_RE = re.compile(r"[ \t]*\n([ \t]*\n)+")
+_FUNCTION_RE = re.compile(r"<function\s*=\s*['\"]?([^'\">]+)['\"]?>(.*?)</function>", re.DOTALL | re.IGNORECASE)
+_PARAM_RE = re.compile(r"<parameter\s*=\s*['\"]?([^'\">]+)['\"]?>(.*?)</parameter>", re.DOTALL | re.IGNORECASE)
+_PAIR_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_]*)>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
+_READ_MAX_LINES_PER_FILE = 420
+_READ_MAX_CHARS_PER_FILE = 16_000
 
-# ── Pre-compiled regex patterns (compiled once at import time) ──────────────
-_SQ_NAMES = "MEM|FORGET|PROJECT|EDITOR|ASK_CODER|CODE|READ|WRITE|SHELL|READ_RESULT|THINK"
-_XML_NAMES = "think|thinking|tool_call|READ|WRITE|SHELL|CODE|READ_RESULT|THINK"
-
-# Complete tag pairs (non-greedy)
-_HIDDEN_SQUARE_TAG_RE = re.compile(
-    rf"\[({_SQ_NAMES})\].*?\[/\1\]", re.DOTALL | re.IGNORECASE
-)
-_HIDDEN_XML_TAG_RE = re.compile(
-    rf"<({_XML_NAMES})>.*?</\1>", re.DOTALL | re.IGNORECASE
-)
-# Unclosed tags — consume to end of string (mirrors original _consume_hidden_tag behaviour)
-_UNCLOSED_SQUARE_TAG_RE = re.compile(
-    rf"\[({_SQ_NAMES})\].*", re.DOTALL | re.IGNORECASE
-)
-_UNCLOSED_XML_TAG_RE = re.compile(
-    rf"<({_XML_NAMES})>.*", re.DOTALL | re.IGNORECASE
-)
-# Consecutive blank lines (2+ blank lines → 1 blank line)
-_MULTI_BLANK_LINE_RE = re.compile(r"[ \t]*\n([ \t]*\n)+")
-# Inline backtick pairs (no newlines inside)
-_INLINE_BACKTICK_RE = re.compile(r"`([^`\n]*)`")
 
 def _extract_tag_contents(text: str, opener: str, closer: str, *, case_insensitive: bool = False) -> list[str]:
     source = str(text or "")
-    if not source or opener not in source and not case_insensitive:
+    if not source:
         return []
     haystack = source.lower() if case_insensitive else source
     open_tag = opener.lower() if case_insensitive else opener
     close_tag = closer.lower() if case_insensitive else closer
-    parts: list[str] = []
+    out: list[str] = []
     start = 0
     while True:
-        open_idx = haystack.find(open_tag, start)
-        if open_idx == -1:
-            return parts
-        content_idx = open_idx + len(open_tag)
-        close_idx = haystack.find(close_tag, content_idx)
-        if close_idx == -1:
-            return parts
-        parts.append(source[content_idx:close_idx].strip())
-        start = close_idx + len(close_tag)
+        i = haystack.find(open_tag, start)
+        if i == -1:
+            return out
+        j = haystack.find(close_tag, i + len(open_tag))
+        if j == -1:
+            return out
+        content = source[i + len(open_tag):j].strip()
+        if content:
+            out.append(content)
+        start = j + len(close_tag)
+
 
 def _extract_named_xml_sections(text: str, tag_name: str) -> list[str]:
-    return _extract_tag_contents(
-        text,
-        f"<{tag_name}>",
-        f"</{tag_name}>",
-        case_insensitive=True,
-    )
+    return _extract_tag_contents(text, f"<{tag_name}>", f"</{tag_name}>", case_insensitive=True)
+
 
 def _extract_assignment_blocks(text: str, prefix: str, closing_tag: str) -> list[tuple[str, str]]:
-    source = str(text or "")
-    if not source:
-        return []
-    lowered = source.lower()
-    open_prefix = prefix.lower()
-    close_tag = closing_tag.lower()
-    blocks: list[tuple[str, str]] = []
-    start = 0
-    while True:
-        open_idx = lowered.find(open_prefix, start)
-        if open_idx == -1:
-            return blocks
-        attr_start = open_idx + len(prefix)
-        attr_end = source.find(">", attr_start)
-        if attr_end == -1:
-            return blocks
-        close_idx = lowered.find(close_tag, attr_end + 1)
-        if close_idx == -1:
-            return blocks
-        blocks.append((source[attr_start:attr_end].strip(), source[attr_end + 1:close_idx].strip()))
-        start = close_idx + len(closing_tag)
-
-
-# Pre-compiled for _extract_simple_xml_pairs — matches <tagname>content</tagname>
-_SIMPLE_XML_PAIR_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_]*)>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
+    attr_name = prefix.lstrip("<").rstrip("=").lower()
+    pattern = re.compile(
+        rf"<{re.escape(attr_name)}\s*=\s*['\"]?([^'\">]+)['\"]?>(.*?)</{re.escape(attr_name)}>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    return [(m.group(1).strip(), m.group(2).strip()) for m in pattern.finditer(str(text or ""))]
 
 
 def _extract_simple_xml_pairs(text: str) -> list[tuple[str, str]]:
-    source = str(text or "")
-    if not source:
-        return []
-    return [(m.group(1), m.group(2).strip()) for m in _SIMPLE_XML_PAIR_RE.finditer(source)]
-
-
-def _strip_hidden_markup(text: str) -> str:
-    source = str(text or "")
-    if not source:
-        return ""
-    if "[" not in source and "<" not in source:
-        return collapse_hidden_tag_gaps(source).strip()
-    # Remove complete tag pairs first (non-greedy match)
-    source = _HIDDEN_SQUARE_TAG_RE.sub("", source)
-    source = _HIDDEN_XML_TAG_RE.sub("", source)
-    # Remove unclosed tags — consume everything from the opener to end of string,
-    # matching the original _consume_hidden_tag behaviour for truncated model output.
-    source = _UNCLOSED_SQUARE_TAG_RE.sub("", source)
-    source = _UNCLOSED_XML_TAG_RE.sub("", source)
-    return collapse_hidden_tag_gaps(source).strip()
-
-
-def _strip_inline_markdown_code(text: str) -> str:
-    if "`" not in text:
-        return text
-    # Strip paired inline backticks (no newlines inside)
-    result = _INLINE_BACKTICK_RE.sub(r"\1", text)
-    # Remove any remaining unpaired backticks
-    return result.replace("`", "") if "`" in result else result
-
-CATEGORY_MAP = {
-    "name": "user",
-    "fact": "facts",
-    "facts": "facts",
-    "preference": "preferences",
-    "preferences": "preferences",
-    "user": "user",
-}
-
-
-def _looks_like_name(value: str) -> bool:
-    candidate = value.strip()
-    if not candidate or len(candidate) > 40:
-        return False
-    parts = candidate.replace("-", " ").split()
-    if not 1 <= len(parts) <= 3:
-        return False
-    return all(part.isalpha() for part in parts)
-
-
-def capture_explicit_user_memories(user_text: str) -> bool:
-    """Store important explicit user details directly from the raw user message."""
-    return remember_user_message(user_text)
+    return [(m.group(1), m.group(2).strip()) for m in _PAIR_RE.finditer(str(text or ""))]
 
 
 def collapse_hidden_tag_gaps(text: str) -> str:
-    """Remove blank-line artifacts left behind when inline tags are hidden."""
     if not text:
         return text or ""
-    if "\n" not in text and "\t" not in text and "\r" not in text:
-        return text
-    text = text.replace("\r\n", "\n").replace("\t", " ")
-    return _MULTI_BLANK_LINE_RE.sub("\n\n", text)
-
-
-# ── Fast lookup tables for HiddenTagStreamFilter ────────────────────────────
-# Group openers by their first two characters (usually narrows candidates to 1-2)
-_OPENERS_BY_PREFIX2: dict[str, list[tuple[str, str]]] = {}
-for _op, _cl in _STREAM_OPENERS:
-    _OPENERS_BY_PREFIX2.setdefault(_op[:2], []).append((_op, _cl))
-# All possible prefixes of all openers — used for O(1) partial-match detection
-_OPENER_PREFIXES: frozenset[str] = frozenset(
-    _op[:i] for _op, _ in _STREAM_OPENERS for i in range(1, len(_op) + 1)
-)
+    value = str(text).replace("\r\n", "\n").replace("\t", " ")
+    return _MULTI_BLANK_RE.sub("\n\n", value)
 
 
 class HiddenTagStreamFilter:
-    """Hide inline tags during streaming while preserving surrounding text."""
+    """Remove hidden/tool tags from token streams."""
 
-    def __init__(self):
-        self._visible_buffer = ""
-        self._pending_visible = ""
-        self._in_tag = False
-        self._closing = ""
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._hidden_close = ""
 
-    def _drain_pending(self, *, flush: bool = False) -> str:
-        """Emit only stable visible text while holding ambiguous trailing whitespace."""
-        if not self._pending_visible:
-            return ""
-
-        pv = self._pending_visible
-        normalized = collapse_hidden_tag_gaps(pv) if ("\n" in pv or "\t" in pv or "\r" in pv) else pv
-        if flush:
-            self._pending_visible = ""
-            return normalized
-
-        stable = normalized.rstrip(" \t\n")
-        trailing = normalized[len(stable):]
-        self._pending_visible = trailing
-        return stable
+    @staticmethod
+    def _hold_prefix(buffer: str) -> int:
+        lower = buffer.lower()
+        best = 0
+        for i in range(1, min(len(lower), 24) + 1):
+            if lower[-i:] in _OPENER_PREFIXES:
+                best = i
+        return best
 
     def feed(self, text: str) -> str:
         if not text:
             return ""
-        if not self._in_tag and "[" not in text and "<" not in text and not self._visible_buffer:
-            self._pending_visible += text
-            return self._drain_pending()
+        self._buffer += str(text)
+        out: list[str] = []
 
-        self._visible_buffer += text
-
-        while self._visible_buffer:
-            if self._in_tag:
-                close_idx = self._visible_buffer.find(self._closing)
-                if close_idx == -1:
-                    keep = max(len(self._closing) - 1, 0)
-                    self._visible_buffer = self._visible_buffer[-keep:] if keep else ""
-                    break
-                self._visible_buffer = self._visible_buffer[close_idx + len(self._closing):]
-                self._in_tag = False
-                self._closing = ""
+        while self._buffer:
+            lower = self._buffer.lower()
+            if self._hidden_close:
+                close = self._hidden_close.lower()
+                idx = lower.find(close)
+                if idx == -1:
+                    keep = max(len(close) - 1, 0)
+                    self._buffer = self._buffer[-keep:] if keep else ""
+                    return "".join(out)
+                self._buffer = self._buffer[idx + len(self._hidden_close):]
+                self._hidden_close = ""
                 continue
 
-            bracket_idx = self._visible_buffer.find("[")
-            angle_idx = self._visible_buffer.find("<")
-            if bracket_idx == -1 and angle_idx == -1:
-                self._pending_visible += self._visible_buffer
-                self._visible_buffer = ""
+            match = min(
+                ((lower.find(op.lower()), op, close) for op, close in _OPENERS if lower.find(op.lower()) != -1),
+                default=None,
+                key=lambda item: item[0],
+            )
+            if match is None:
+                hold = self._hold_prefix(self._buffer)
+                if hold:
+                    out.append(self._buffer[:-hold])
+                    self._buffer = self._buffer[-hold:]
+                else:
+                    out.append(self._buffer)
+                    self._buffer = ""
                 break
-            elif bracket_idx == -1:
-                tag_idx = angle_idx
-            elif angle_idx == -1:
-                tag_idx = bracket_idx
-            else:
-                tag_idx = min(bracket_idx, angle_idx)
 
-            if tag_idx > 0:
-                self._pending_visible += self._visible_buffer[:tag_idx]
-                self._visible_buffer = self._visible_buffer[tag_idx:]
+            idx, opener, close = match
+            if idx:
+                out.append(self._buffer[:idx])
+            self._buffer = self._buffer[idx + len(opener):]
+            self._hidden_close = close
 
-            buf = self._visible_buffer
-            # Fast path: group by first two chars to narrow candidates, then startswith check
-            matched = False
-            for opener, closer in _OPENERS_BY_PREFIX2.get(buf[:2], ()):
-                if buf.startswith(opener):
-                    self._visible_buffer = buf[len(opener):]
-                    self._in_tag = True
-                    self._closing = closer
-                    matched = True
-                    break
-
-            if matched:
-                continue
-
-            # O(1) partial-match check: is buf a possible prefix of any opener?
-            if buf in _OPENER_PREFIXES:
-                break  # wait for more data to arrive
-
-            # Not an opener — emit the bracket character and advance
-            self._pending_visible += buf[0]
-            self._visible_buffer = buf[1:]
-
-        return self._drain_pending()
+        return collapse_hidden_tag_gaps("".join(out))
 
     def flush(self) -> str:
-        if self._in_tag:
+        if self._hidden_close:
+            self._buffer = ""
+            self._hidden_close = ""
             return ""
-        self._pending_visible += self._visible_buffer
-        self._visible_buffer = ""
-        return self._drain_pending(flush=True)
+        out = self._buffer
+        self._buffer = ""
+        return collapse_hidden_tag_gaps(out)
 
 
-def _collect_memory_and_tool_ops(text: str) -> tuple[
-    list[tuple[str, str]],
-    list[str],
-    list[tuple[str, str]],
-    list[str],
-]:
-    mem_ops: list[tuple[str, str]] = []
-    forget_queries: list[str] = []
-    project_ops: list[tuple[str, str]] = []
-    editor_ops = extract_editor_commands(text)
-
-    if "[MEM]" in text:
-        for raw in _extract_tag_contents(text, "[MEM]", "[/MEM]"):
-            if ":" in raw:
-                cat, content = raw.split(":", 1)
-                cat = cat.strip().lower()
-                content = content.strip()
-                mem_cat = CATEGORY_MAP.get(cat)
-                if mem_cat and content:
-                    mem_ops.append((mem_cat, content))
-
-    if "[FORGET]" in text:
-        for query in _extract_tag_contents(text, "[FORGET]", "[/FORGET]"):
-            if query:
-                forget_queries.append(query)
-
-    if "[PROJECT]" in text:
-        for raw in _extract_tag_contents(text, "[PROJECT]", "[/PROJECT]"):
-            if ":" in raw:
-                name, detail = raw.split(":", 1)
-                name = name.strip().lower()
-                detail = detail.strip().lower()
-                project_ops.append((name, detail))
-            elif raw:
-                project_ops.append((raw.strip().lower(), ""))
-
-    return mem_ops, forget_queries, project_ops, editor_ops
-
-
-def apply_response_side_effects(text: str) -> None:
-    """Apply memory and editor side effects without mutating visible text."""
-    mem_ops, forget_queries, project_ops, editor_ops = _collect_memory_and_tool_ops(text)
-
-    filtered_mem_ops = []
-    for mem_cat, content in mem_ops:
-        if mem_cat != "user":
-            filtered_mem_ops.append((mem_cat, content))
-            continue
-        if ":" in content:
-            filtered_mem_ops.append((mem_cat, content))
-        elif _looks_like_name(content):
-            filtered_mem_ops.append((mem_cat, f"name: {content.strip()}"))
-
-    if filtered_mem_ops or forget_queries or project_ops:
-        apply_tag_operations(
-            mem_ops=filtered_mem_ops,
-            forget_queries=forget_queries,
-            project_ops=project_ops,
-        )
-
-    if editor_ops and not ADVISOR_ONLY:
-        bridge = get_editor_bridge()
-        for raw in editor_ops:
-            command, argument = _parse_editor_tool(raw)
-            if command:
-                if command in {"open_vscode", "open_project", "open_workspace"}:
-                    try:
-                        launch_vscode()
-                    except RuntimeError:
-                        pass
-                else:
-                    bridge.queue_action(command, argument)
+def capture_explicit_user_memories(user_text: str) -> bool:
+    return remember_user_message(user_text)
 
 
 def clean_model_text(text: str) -> str:
-    """Return only the visible conversational text from a model reply."""
-    return _strip_inline_markdown_code(_strip_hidden_markup(text))
+    source = str(text or "")
+    if not source:
+        return ""
+    source = _SQUARE_TAG_RE.sub("", source)
+    source = _XML_TAG_RE.sub("", source)
+    return collapse_hidden_tag_gaps(source).replace("`", "").strip()
 
 
-def extract_coder_requests(text: str) -> list[str]:
-    requests: list[str] = []
-    for content in _extract_tag_contents(text, "[ASK_CODER]", "[/ASK_CODER]"):
-        if content:
-            requests.append(content)
-    return requests
+def _parse_mem(raw: str) -> tuple[str, str] | None:
+    if ":" not in raw:
+        return None
+    category, content = raw.split(":", 1)
+    key = category.strip().lower()
+    if key in {"fact", "facts"}:
+        return "facts", content.strip()
+    if key in {"preference", "preferences"}:
+        return "preferences", content.strip()
+    if key in {"user", "name"}:
+        return "user", content.strip() if key == "user" else f"name: {content.strip()}"
+    return None
+
+
+def apply_response_side_effects(text: str) -> None:
+    source = str(text or "")
+    if not source:
+        return
+    lowered = source.lower()
+    mem_ops = [op for raw in _extract_tag_contents(source, "[MEM]", "[/MEM]", case_insensitive=True) if (op := _parse_mem(raw))]
+    forget_queries = _extract_tag_contents(source, "[FORGET]", "[/FORGET]", case_insensitive=True)
+    project_ops: list[tuple[str, str]] = []
+    for raw in _extract_tag_contents(source, "[PROJECT]", "[/PROJECT]", case_insensitive=True):
+        name, _, detail = raw.partition(":")
+        if name.strip():
+            project_ops.append((name.strip().lower(), detail.strip().lower()))
+    if mem_ops or forget_queries or project_ops:
+        apply_tag_operations(mem_ops=mem_ops, forget_queries=forget_queries, project_ops=project_ops)
+
+    if ADVISOR_ONLY or ("[editor]" not in lowered and "<tool_call>" not in lowered):
+        return
+    bridge = get_editor_bridge()
+    for raw in extract_editor_commands(source):
+        command, argument = _parse_editor_tool(raw)
+        if not command:
+            continue
+        if command in {"open_vscode", "open_project", "open_workspace"}:
+            try:
+                launch_vscode()
+            except RuntimeError:
+                pass
+        else:
+            bridge.queue_action(command, argument)
 
 
 def finalize_model_response(text: str) -> str:
-    """Apply response side effects, then return the visible text."""
     apply_response_side_effects(text)
     return clean_model_text(text)
 
 
-def _parse_editor_tool(raw: str) -> tuple[str, str]:
-    raw = raw.strip()
-    if not raw:
-        return "", ""
-    if ":" not in raw:
-        return raw.strip().lower(), ""
-    command, argument = raw.split(":", 1)
-    return command.strip().lower(), argument.strip()
+def extract_coder_requests(text: str) -> list[str]:
+    return _extract_tag_contents(text, "[ASK_CODER]", "[/ASK_CODER]", case_insensitive=True)
 
 
-def extract_editor_commands(text: str) -> list[str]:
-    source = str(text or "")
-    if "[EDITOR]" not in source and "<tool_call>" not in source.lower():
-        return []
-    editor_ops: list[str] = []
+def _function_blocks(text: str) -> list[tuple[str, str]]:
+    return [(m.group(1).strip().strip("'\"").lower(), m.group(2).strip()) for m in _FUNCTION_RE.finditer(str(text or ""))]
 
-    for raw in _extract_tag_contents(source, "[EDITOR]", "[/EDITOR]"):
-        if raw:
-            editor_ops.append(raw)
 
-    for block in _extract_tool_call_blocks(source):
-        editor_ops.extend(_extract_editor_commands_from_tool_block(block))
+def _parameters(block: str) -> dict[str, str]:
+    return {m.group(1).strip().strip("'\"").lower(): m.group(2).strip() for m in _PARAM_RE.finditer(block)}
 
-    return editor_ops
+
+def _first(parameters: dict[str, str], *names: str) -> str:
+    for name in names:
+        if parameters.get(name):
+            return parameters[name]
+    return ""
 
 
 def extract_read_requests(text: str) -> list[str]:
     source = str(text or "")
-    source_lower = source.lower()
-    if "[READ]" not in source and "<tool_call>" not in source_lower and "<read>" not in source_lower:
-        return []
-    read_requests: list[str] = []
+    out: list[str] = []
     seen: set[str] = set()
+    for value in _extract_tag_contents(source, "[READ]", "[/READ]", case_insensitive=True):
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    for value in _extract_named_xml_sections(source, "read") + _extract_named_xml_sections(source, "READ"):
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    for block in _extract_named_xml_sections(source, "tool_call"):
+        for name, inner in _function_blocks(block):
+            if name != "read":
+                continue
+            path = _first(_parameters(inner), "path", "file", "value", "argument")
+            if path and path not in seen:
+                seen.add(path)
+                out.append(path)
+    return out
 
-    for filepath in _extract_tag_contents(source, "[READ]", "[/READ]"):
-        if filepath and filepath not in seen:
-            seen.add(filepath)
-            read_requests.append(filepath)
 
-    for block in _extract_tool_call_blocks(source):
-        function_name, inner = _extract_function_tool_block(block)
-        if function_name != "read":
-            continue
-        parameters = _extract_tool_parameters(inner)
-        filepath = _first_parameter(parameters, "file", "path", "value", "argument")
-        if filepath and filepath not in seen:
-            seen.add(filepath)
-            read_requests.append(filepath)
+def _parse_editor_tool(raw: str) -> tuple[str, str]:
+    command, sep, argument = str(raw or "").strip().partition(":")
+    return command.strip().lower(), argument.strip() if sep else ""
 
-    for filepath in _extract_named_xml_sections(source, "READ"):
-        if filepath and filepath not in seen:
-            seen.add(filepath)
-            read_requests.append(filepath)
 
-    return read_requests
+def extract_editor_commands(text: str) -> list[str]:
+    source = str(text or "")
+    out = _extract_tag_contents(source, "[EDITOR]", "[/EDITOR]", case_insensitive=True)
+    for block in _extract_named_xml_sections(source, "tool_call"):
+        for name, inner in _function_blocks(block):
+            if name == "editor":
+                params = _parameters(inner)
+                command = _first(params, "command", "action", "name")
+                argument = _first(params, "argument", "value", "path", "file", "text")
+                if command:
+                    out.append(command if not argument else f"{command}: {argument}")
+            elif name in {"open_vscode", "open_project", "open_workspace"}:
+                out.append(name)
+    return [item for item in out if item.strip()]
+
+
+def _normalize_read_path(raw_path: str) -> str:
+    path = str(raw_path or "").strip().strip("`'\".,;()[]{}").replace("\\", "/")
+    if path.startswith("./"):
+        path = path[2:]
+    if ":" in path:
+        head, _, suffix = path.partition(":")
+        if suffix.strip()[:1].isdigit() or suffix.strip().lower().startswith("l"):
+            path = head.strip()
+    return path
+
+
+def _read_numbered_preview(path: Path) -> str:
+    lines: list[str] = []
+    chars = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for number, raw in enumerate(handle, start=1):
+            if number > _READ_MAX_LINES_PER_FILE or chars >= _READ_MAX_CHARS_PER_FILE:
+                lines.append("...[trimmed]")
+                break
+            line = raw.rstrip("\n")
+            lines.append(f"{number:>4}| {line}")
+            chars += len(line) + 1
+    return "\n".join(lines)
 
 
 def execute_read_requests(filepaths: list[str]) -> list[str]:
-    from pathlib import Path
-
-    read_results: list[str] = []
-    project_root = Path.cwd().resolve()
+    root = Path.cwd().resolve()
     seen: set[str] = set()
-
-    def format_with_line_numbers(text: str) -> str:
-        lines = text.splitlines()
-        if not lines:
-            return ""
-        width = max(3, len(str(len(lines))))
-        return "\n".join(
-            f"{idx:>{width}}| {line}"
-            for idx, line in enumerate(lines, start=1)
-        )
-
-    for raw_path in filepaths:
-        filepath = str(raw_path or "").strip()
+    out: list[str] = []
+    for raw in filepaths:
+        filepath = _normalize_read_path(raw)
         if not filepath or filepath in seen:
             continue
         seen.add(filepath)
-        resolved = (project_root / filepath).resolve()
-        if not str(resolved).startswith(str(project_root)):
-            read_results.append(f"[READ_RESULT]Access denied: {filepath} is outside project directory[/READ_RESULT]")
+        resolved = (root / filepath).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            out.append(f"[READ_RESULT]Access denied: {filepath} is outside project directory[/READ_RESULT]")
             continue
         if not resolved.exists():
-            read_results.append(f"[READ_RESULT]Error reading {filepath}: file not found[/READ_RESULT]")
+            out.append(f"[READ_RESULT]Error reading {filepath}: file not found[/READ_RESULT]")
+            continue
+        if not resolved.is_file():
+            out.append(f"[READ_RESULT]Error reading {filepath}: not a file[/READ_RESULT]")
             continue
         try:
-            with open(resolved, "r", encoding="utf-8") as f:
-                content = f.read()
-            numbered = format_with_line_numbers(content)
-            read_results.append(
-                f"[READ_RESULT]{filepath} (line-numbered):\n{numbered}[/READ_RESULT]"
-            )
-        except Exception as e:
-            read_results.append(f"[READ_RESULT]Error reading {filepath}: {e}[/READ_RESULT]")
-
-    return read_results
+            out.append(f"[READ_RESULT]{filepath} (line-numbered):\n{_read_numbered_preview(resolved)}[/READ_RESULT]")
+        except OSError as exc:
+            out.append(f"[READ_RESULT]Error reading {filepath}: {exc}[/READ_RESULT]")
+    return out
 
 
-def _extract_tool_call_blocks(text: str) -> list[str]:
-    return _extract_named_xml_sections(text, "tool_call")
-
-
-def _extract_function_tool_block(block: str) -> tuple[str, str]:
-    matches = _extract_assignment_blocks(block, "<function=", "</function>")
-    if not matches:
-        return "", ""
-    name, content = matches[0]
-    return name.strip().lower(), content
-
-
-def _extract_tool_parameters(block: str) -> dict[str, str]:
-    return {
-        name.strip().lower(): content.strip()
-        for name, content in _extract_assignment_blocks(block, "<parameter=", "</parameter>")
-        if name.strip()
-    }
-
-
-def _first_parameter(parameters: dict[str, str], *names: str) -> str:
-    for name in names:
-        value = parameters.get(name, "")
-        if value:
-            return value
-    return ""
-
-
-def _editor_ops_from_parameter_block(inner: str) -> list[str]:
-    parameters = _extract_tool_parameters(inner)
-    command = _first_parameter(parameters, "action", "command", "name")
-    argument = _first_parameter(parameters, "value", "argument", "file", "path", "text")
-    if command:
-        lowered = command.lower()
-        return [lowered if not argument else f"{lowered}: {argument}"]
-    return [
-        command if not argument else f"{command}: {argument}"
-        for command, argument in (
-            (name.strip().lower(), content.strip())
-            for name, content in _extract_simple_xml_pairs(inner)
-        )
-        if command
-    ]
-
-
-def _extract_editor_commands_from_tool_block(block: str) -> list[str]:
-    editor_blocks = _extract_named_xml_sections(block, "editor")
-    if editor_blocks:
-        inner = editor_blocks[0]
-        return _editor_ops_from_parameter_block(inner)
-
-    function_name, inner = _extract_function_tool_block(block)
-    if function_name == "editor":
-        return _editor_ops_from_parameter_block(inner)
-
-    if function_name in {"open_vscode", "open_project", "open_workspace"}:
-        return [function_name]
-    return []
-
-
-# Cache for system prompt to avoid repeated formatting
-_system_prompt_cache = None
-_system_prompt_gen: tuple[int, int] | None = None
-_runtime_context_cache = ""
-_include_memory_cache: bool | None = None
+_system_prompt_cache: tuple[tuple[str, bool, tuple[int, int, int]], str] | None = None
+_runtime_context_cache: tuple[tuple[bool, bool, str, str], str] | None = None
 _datetime_context_cache: tuple[str, str] | None = None
 
+
+def _estimate_text_tokens(text: str) -> int:
+    return max(1, len(str(text or "")) // 4) if text else 0
+
+
 def _current_datetime_context() -> str:
-    """Return current date/time plus yesterday/today/tomorrow holiday facts."""
     global _datetime_context_cache
-    now = _datetime.now()
-    cache_key = now.strftime("%Y-%m-%d %H:%M")
-    if _datetime_context_cache and _datetime_context_cache[0] == cache_key:
+    now = datetime.now()
+    key = now.strftime("%Y-%m-%d %H:%M")
+    if _datetime_context_cache and _datetime_context_cache[0] == key:
         return _datetime_context_cache[1]
-
     today = now.date()
-    weekday = now.strftime("%A")
-    month = now.strftime("%B")
-    year = now.year
-    hour = now.hour % 12 or 12
-    minute = now.strftime("%M")
-    am_pm = "AM" if now.hour < 12 else "PM"
-    date_str = f"{weekday}, {month} {today.day}, {year} at {hour}:{minute} {am_pm}"
-
-    lines: list[str] = [f"CURRENT DATE AND TIME: {date_str}"]
+    lines = [f"Current date/time: {now.strftime('%A, %B %-d, %Y at %-I:%M %p')}"]
     for offset, label in ((-1, "Yesterday"), (0, "Today"), (1, "Tomorrow")):
-        d = today + timedelta(days=offset)
-        day_str = d.strftime("%A, %B ") + str(d.day)
-        lines.append(f"{label}: {day_str}")
-    lines.append(
-        "Use this to answer any date, day-of-week, or holiday questions. "
-        "Never invent or guess the date."
-    )
+        day = today + timedelta(days=offset)
+        lines.append(f"{label}: {day.strftime('%A, %B ')}{day.day}")
     result = "\n".join(lines)
-    _datetime_context_cache = (cache_key, result)
+    _datetime_context_cache = (key, result)
     return result
 
+
 def build_runtime_context(*, include_memory: bool = True, include_editor: bool = True) -> str:
-    memory_context = format_for_prompt() if include_memory else ""
-    editor_context = get_editor_bridge().format_for_prompt() if include_editor else ""
-    parts = [_current_datetime_context()]
-    if memory_context:
-        parts.append(memory_context)
-    if editor_context:
-        parts.append(editor_context)
-    return "\n\n".join(parts)
+    global _runtime_context_cache
+    memory = format_for_prompt() if include_memory else ""
+    editor = get_editor_bridge().format_for_prompt() if include_editor else ""
+    key = (include_memory, include_editor, memory, editor)
+    if _runtime_context_cache and _runtime_context_cache[0] == key:
+        return _runtime_context_cache[1]
+    result = "\n\n".join(part for part in (memory, editor) if part)
+    _runtime_context_cache = (key, result)
+    return result
 
 
 def _cached_system_prompt(runtime_context: str, *, include_memory: bool = True) -> str:
-    global _system_prompt_cache, _system_prompt_gen, _runtime_context_cache, _include_memory_cache
-
-    store = get_store()
-    current_gen = (store._prompt_cache_gen, soul_cache_key())
-    if (
-        _system_prompt_cache is not None
-        and _system_prompt_gen == current_gen
-        and _runtime_context_cache == runtime_context
-        and _include_memory_cache == include_memory
-    ):
-        return _system_prompt_cache
-
-    system_prompt = build_system_prompt(runtime_context, include_memory=include_memory)
-    _system_prompt_cache = system_prompt
-    _system_prompt_gen = current_gen
-    _runtime_context_cache = runtime_context
-    _include_memory_cache = include_memory
-    return system_prompt
+    global _system_prompt_cache
+    key = (runtime_context, include_memory, prompt_revision())
+    if _system_prompt_cache and _system_prompt_cache[0] == key:
+        return _system_prompt_cache[1]
+    result = build_system_prompt(runtime_context, include_memory=include_memory)
+    _system_prompt_cache = (key, result)
+    return result
 
 
-def truncate_messages(messages: list[dict], system_prompt: str, user_message: str, max_context_tokens: int = CHAT_HISTORY_CONTEXT_TOKENS) -> list[dict]:
-    """
-    Truncate message history to fit within context window.
-
-    Uses rough token estimation: ~4 chars per token for English.
-    Prioritizes keeping recent messages and the most recent complete exchanges.
-    """
-    # Estimate tokens (rough: 4 chars = 1 token)
-    system_tokens = len(system_prompt) // 4
-    user_msg_tokens = len(user_message) // 4
-    available_for_history = max_context_tokens - system_tokens - user_msg_tokens - 100  # safety buffer
-
-    if available_for_history <= 0:
-        # System prompt itself is too large - this is a configuration error
-        # Return just the system prompt and user message, drop all history
-        return [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
-
-    # Convert deque to list if needed
-    messages_list = list(messages)
-    if not messages_list:
-        return [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
-
-    # Calculate current history tokens
-    history_tokens = sum(len(m.get("content", "")) // 4 for m in messages_list)
-
-    if history_tokens <= available_for_history:
-        chat_messages = [{"role": "system", "content": system_prompt}]
-        chat_messages.extend(messages_list)
-        chat_messages.append({"role": "user", "content": user_message})
-        return chat_messages
-
-    # Need to truncate: keep the most recent conversation first, while trying
-    # to preserve complete recent exchanges instead of a random cutoff.
-    trimmed: list[dict] = []
-    current_tokens = 0
-    min_recent_messages = min(len(messages_list), 6)
-
-    for index in range(len(messages_list) - 1, -1, -1):
-        msg = messages_list[index]
-        msg_tokens = len(msg.get("content", "")) // 4
-        if current_tokens + msg_tokens <= available_for_history:
-            trimmed.append(msg)
-            current_tokens += msg_tokens
-            continue
-        if len(trimmed) < min_recent_messages:
-            trimmed.append(msg)
-            current_tokens += msg_tokens
-            continue
-        break
-    trimmed.reverse()
-
-    # Build final message list
-    chat_messages = [{"role": "system", "content": system_prompt}]
-    chat_messages.extend(trimmed)
-    chat_messages.append({"role": "user", "content": user_message})
-
-    return chat_messages
+def truncate_messages(
+    messages: list[dict],
+    system_prompt: str,
+    user_message: str,
+    max_context_tokens: int = CHAT_HISTORY_CONTEXT_TOKENS,
+) -> list[dict]:
+    budget = max(0, max_context_tokens - _estimate_text_tokens(system_prompt) - _estimate_text_tokens(user_message) - 64)
+    kept: list[dict] = []
+    used = 0
+    for message in reversed(list(messages or [])):
+        content = str(message.get("content", "") or "")
+        cost = _estimate_text_tokens(content)
+        if kept and used + cost > budget:
+            break
+        if cost > budget and not kept:
+            content = content[-max(0, budget * 4):].lstrip()
+        kept.append({**message, "content": content})
+        used += min(cost, budget)
+    kept.reverse()
+    return [{"role": "system", "content": system_prompt}, *kept, {"role": "user", "content": user_message}]

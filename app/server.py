@@ -1,104 +1,125 @@
-"""Browser-based chat interface for Akane."""
+"""Lean local chat server for Akane."""
+
+from __future__ import annotations
 
 import json
+import logging
 import os
-import random
-import shlex
-import subprocess
+import re
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import unquote
-import re
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from app.agents.codebase_search import CodebaseSearch
-from app.core.config import ADVISOR_ONLY, CHAT_HISTORY_CONTEXT_TOKENS, LLAMA_CONTEXT_WINDOW, MAX_TOKENS, REPETITION_PENALTY, SERVER_HOST, SERVER_PORT, TEMPERATURE, TOP_K, TOP_P
+from app.core.config import (
+    CHAT_HISTORY_CONTEXT_TOKENS,
+    MAX_TOKENS,
+    REPETITION_PENALTY,
+    SERVER_HOST,
+    SERVER_PORT,
+    TEMPERATURE,
+    TOP_K,
+    TOP_P,
+    _coerce_bool,
+    _coerce_int,
+)
+from app.core.character import build_system_prompt
+from app.core.generation import HiddenTagStreamFilter, collapse_hidden_tag_gaps
+from app.core.model_loader import ModelManager, content_to_text
 from app.integrations.editor_bridge import get_editor_bridge
-from app.core.generation import (
-    HiddenTagStreamFilter,
-    _cached_system_prompt,
-    _generation_lock,
-    build_runtime_context,
-    capture_explicit_user_memories,
-    collapse_hidden_tag_gaps,
-    execute_read_requests,
-    extract_coder_requests,
-    extract_editor_commands,
-    extract_read_requests,
-    truncate_messages,
-)
-from app.memory_store import MEMORY_PATH, format_for_prompt, get_all, reload_from_disk
-from app.core.model_loader import ModelManager
-from app.core.reply_pipeline import (
-    clean_reply_text,
-    ensure_complete_visible_reply,
-    finalize_reply,
-    normalize_final_reply,
-    postprocess_reply,
-)
-from app.core.request_analysis import RequestAnalyzer, RequestSnapshot
-from app.ui.assets import resolve_ui_asset
 from app.integrations.vscode_launcher import launch_vscode
+from app.memory_store import MEMORY_PATH, format_for_prompt, get_all, reload_from_disk, remember_user_message
+from app.ui.assets import resolve_ui_asset
 
-STATIC_DIR = Path(__file__).parent / "ui" / "static"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SERVICE_ROOT = Path(__file__).resolve().parents[1]
-RESTART_LOG_PATH = Path("/tmp/akane_restart.log")
+STATIC_DIR = Path(__file__).parent / "ui" / "static"
+DEFAULT_SESSION_ID = "popup"
 
+_MAX_HISTORY_MESSAGES = 8
+_MAX_HISTORY_CHARS = max(600, min(CHAT_HISTORY_CONTEXT_TOKENS * 4, 1800))
+_MAX_MEMORY_CHARS = _coerce_int(os.environ.get("AKANE_MAX_MEMORY_CHARS", 1800), 1800)
+_MAX_EDITOR_CHARS = _coerce_int(os.environ.get("AKANE_MAX_EDITOR_CHARS", 1600), 1600)
+_FAST_MAX_TOKENS = min(MAX_TOKENS, 160)
+_generation_lock = threading.Lock()
 _state_lock = threading.Lock()
-_EDITOR_LAUNCH_COMMANDS = {"open_vscode", "open_project", "open_workspace"}
-_EDITOR_AUTONOMY_MAX_TURNS = 2
-_EDITOR_ACTION_WAIT_SECONDS = 4.5
-_LLAMA_CONTEXT_SAFETY_TOKENS = 512
-_MAX_INLINE_READ_RESULT_CHARS = 1800
-_MAX_TOTAL_READ_RESULT_CHARS = 5200
-_MAX_EXTRA_SYSTEM_CHARS = 3200
-_FAST_CHAT_MAX_TOKENS = min(MAX_TOKENS, 128)
-_FACTUAL_CHAT_MAX_TOKENS = min(MAX_TOKENS, 64)
-_INFRA_PATH_PREFIXES = (
-    "integrations/",
-    "extensions/",
-    ".vscode-server/",
-    ".vscode/",
-    ".idea/",
-    ".zed/",
-    ".github/",
-    ".gitlab/",
+_SESSIONS: dict[str, "SessionState"] = {}
+_LOG_PROMPTS = _coerce_bool(os.environ.get("AKANE_LOG_PROMPTS", "1"), True)
+_LOG_PATH = Path(os.environ.get("AKANE_LOG_PATH", "/tmp/akane_server.log"))
+_LOG_MAX_CHARS = _coerce_int(os.environ.get("AKANE_LOG_MAX_CHARS", 120_000), 120_000)
+
+_STATIC_ROUTES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+}
+_HIDDEN_TAGS = "MEM|FORGET|PROJECT|EDITOR|ASK_CODER|CODE|READ|WRITE|SHELL|READ_RESULT|THINK"
+_POPUP_STRIP_REGEX = re.compile(rf"\[({_HIDDEN_TAGS})\].*?(?:\[/\1\]|$)", re.DOTALL | re.IGNORECASE)
+_XML_STRIP_REGEX = re.compile(
+    r"<(think|thinking|tool_call|read|write|shell|code|read_result)>.*?(?:</\1>|$)",
+    re.DOTALL | re.IGNORECASE,
 )
+_PATH_RE = re.compile(
+    r"(?P<path>(?:\.{0,2}/)?[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)+|[A-Za-z0-9_.@+-]+\.[A-Za-z0-9_+-]+)"
+    r"(?::\d+(?::\d+)?)?"
+)
+_FILE_REF_SUFFIXES = (".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md", ".txt", ".css", ".html", ".sh")
 _NON_SOURCE_FILE_SUFFIXES = {
     ".node", ".so", ".dylib", ".dll", ".exe", ".bin", ".o", ".a", ".obj",
     ".class", ".jar", ".war", ".pyd", ".whl", ".zip", ".tar", ".gz", ".7z",
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf",
 }
-_FILE_REF_SUFFIXES = (
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md", ".txt", ".css", ".html", ".sh",
+_INFRA_PATH_PREFIXES = ("integrations/", "extensions/", ".vscode-server/", ".vscode/", ".idea/", ".zed/", ".github/")
+_CODE_HINTS = (
+    "code", "file", "bug", "error", "traceback", "stack", "function", "class", "server",
+    "python", "javascript", "typescript", "css", "html", ".py", ".js", ".ts", ".tsx", ".json",
 )
-DEFAULT_SESSION_ID = "popup"
-# Compile this once at the module level
-_POPUP_STRIP_REGEX = re.compile(
-    r"\[(MEM|FORGET|PROJECT|NEXT)\].*?(?:\[/\1\]|$)",
-    re.DOTALL | re.IGNORECASE
-)
+
+
+def _build_logger() -> logging.Logger:
+    logger = logging.getLogger("akane.server")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            _LOG_PATH,
+            maxBytes=2_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError as exc:
+        print(f"[Akane:log] Could not open log file {_LOG_PATH}: {exc}", flush=True)
+
+    return logger
+
+
+_LOGGER = _build_logger()
+
+
+def _log_terminal_stream(label: str, text: str = "") -> None:
+    suffix = f" {text}" if text else ""
+    print(f"[Akane:{label}]{suffix}", flush=True)
+
 
 @dataclass
 class SessionState:
-    messages: deque = field(default_factory=lambda: deque(maxlen=40))
+    messages: deque = field(default_factory=lambda: deque(maxlen=_MAX_HISTORY_MESSAGES))
     streaming_reply_preview: str = ""
-    recent_code_targets: list[str] = field(default_factory=list)
     version: int = 0
-    history_cache_version: int = -1
-    cached_last_user: str = ""
-    cached_last_assistant: str = ""
-    cached_recent_text: str = ""
-    cached_recent_exchange_context: str = ""
-    cached_recent_exchange_note: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -109,140 +130,43 @@ class ChatRequestData:
     session_id: str = DEFAULT_SESSION_ID
 
 
-@dataclass(frozen=True)
-class CoderRouteResult:
-    text: str
-    used_coder: bool
-    approval_required: bool = False
-_ACTIVE_EDITOR_COMMANDS = {"replace_selection", "insert_text", "format_document", "save_file"}
-_CODEBASE_SEARCH = CodebaseSearch(PROJECT_ROOT)
-_REQUEST_ANALYZER = RequestAnalyzer(_CODEBASE_SEARCH)
-_SESSIONS: dict[str, SessionState] = {}
-_IMPLEMENTATION_WALKTHROUGH_PHRASES = ("show me how", "how to implement", "walk me through")
-_INFRA_CONTEXT_KEYWORDS = ("vscode", "extension", "integration")
-_DEFERRED_ACTION_OPENERS = ("i'll", "i will", "let me")
-_DEFERRED_ACTION_VERBS = ("check", "inspect", "review", "fix", "update")
-_CODEBASE_TARGET_HINTS = (
-    "this project",
-    "this codebase",
-    "in this repo",
-    "in the repo",
-    "in this file",
-    "current file",
-    "existing file",
-    "update ",
-    "edit ",
-    "refactor ",
-    "debug ",
-    "fix ",
-)
-
-_TECHNICAL_FOCUS_RULES = "Focus only on the code and the user's engineering question."
-
-_COMPACT_COMPANION_INSTRUCTION = "For this turn, reply like a compact companion. Respond in 1-3 short declarative sentences; start with the answer."
-_IDENTITY_REPLY_STYLES = (
-    "plain and casual",
-    "lightly teasing",
-    "soft and simple",
-    "a little wry",
-)
-_COMPANION_REPLY_STYLES = (
-    "soft and close, like a quick aside from a friend",
-    "casual and lightly teasing, but still warm",
-    "quiet and direct, with one human little edge",
-    "a little wry, relaxed, and unforced",
-    "gentle and familiar, without sounding scripted",
-)
-_TECHNICAL_REPLY_STYLES = (
-    "direct and calm, with no service language",
-    "crisp and slightly wry, focused on the fix",
-    "plain and practical, like a friend looking over the file",
-    "short and grounded, with only the useful detail",
-)
-
-
-def _technical_answer_instruction(*, single_suggestion: bool = False) -> str:
-    if single_suggestion:
-        return f"Answer in 1 short technical sentence. {_TECHNICAL_FOCUS_RULES}"
-    return f"Answer in 1-3 short technical sentences. {_TECHNICAL_FOCUS_RULES}"
-
-
 class _StreamVisibleCleaner:
-    """Incrementally normalize visible streaming text.
-
-    - Removes inline backticks.
-    - Collapses blank-line artifacts across chunk boundaries.
-    - Normalizes tabs to spaces per line.
-    """
-
     def __init__(self) -> None:
         self._buffer = ""
         self._previous_blank = False
 
     def _consume_lines(self, text: str, *, flush: bool = False) -> str:
-        if not text:
+        if not text and not (flush and self._buffer):
             return ""
-
         working = self._buffer + text
-        # Fast path to avoid redundant checks
         if "\n" not in working and not flush:
             self._buffer = working
             return ""
 
         parts = working.split("\n")
         self._buffer = "" if flush else parts.pop()
-
-        normalized = []
-        for raw_line in parts:
-            line = raw_line.replace("\t", " ")
+        lines: list[str] = []
+        for raw in parts:
+            line = raw.replace("\t", " ")
             if not line:
                 if not self._previous_blank:
-                    normalized.append("")
+                    lines.append("")
                     self._previous_blank = True
                 continue
-            normalized.append(line)
+            lines.append(line)
             self._previous_blank = False
-            
-        return "\n".join(normalized) + ("\n" if normalized else "")
+        return "\n".join(lines) + ("\n" if lines and (working.endswith("\n") or not flush) else "")
 
     def feed(self, text: str) -> str:
-        if not text:
-            return ""
-        cleaned = text.replace("\r\n", "\n").replace("`", "")
-        return self._consume_lines(cleaned, flush=False)
+        return self._consume_lines(str(text or "").replace("\r\n", "\n").replace("`", ""), flush=False)
 
     def flush(self) -> str:
-        if not self._buffer:
-            return ""
         return self._consume_lines("", flush=True)
 
 
-_STATIC_ROUTES: dict[str, tuple[str, str]] = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/app.js": ("app.js", "application/javascript; charset=utf-8"),
-    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
-}
-
-
-def _static_response_path(route: str) -> tuple[Path, str] | None:
-    if entry := _STATIC_ROUTES.get(route):
-        filename, content_type = entry
-        return STATIC_DIR / filename, content_type
-
-    asset_path = resolve_ui_asset(route)
-    if asset_path is not None:
-        return asset_path, "image/png"
-
-    return None
-
-
 def _normalize_session_id(session_id: str | None) -> str:
-    if session_id is None:
-        return DEFAULT_SESSION_ID
-    cleaned = str(session_id).strip()
-    if not cleaned:
-        return DEFAULT_SESSION_ID
-    return cleaned[:120]
+    value = str(session_id or "").strip()
+    return (value or DEFAULT_SESSION_ID)[:120]
 
 
 def _session_state(session_id: str | None = None) -> SessionState:
@@ -256,9 +180,10 @@ def _session_state(session_id: str | None = None) -> SessionState:
 
 
 async def _request_payload(request: Request) -> dict:
-    if not request.headers.get("content-length"):
+    try:
+        payload = await request.json()
+    except Exception:
         return {}
-    payload = await request.json()
     return payload if isinstance(payload, dict) else {}
 
 
@@ -270,1699 +195,360 @@ def _parse_chat_request(payload: dict) -> ChatRequestData:
     )
 
 
-def _start_model_loading() -> None:
-    manager = ModelManager.get_instance()
-    status = manager.status()
-    if status["loading"] or status["loaded"]:
+def _json_line(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def _log_text(label: str, text: str, *, session_id: str | None = None) -> None:
+    if not _LOG_PROMPTS:
         return
-
-    def loader() -> None:
-        try:
-            manager.ensure_loaded()
-        except Exception:
-            pass
-
-    threading.Thread(target=loader, daemon=True, name="AkaneModelLoader").start()
+    value = str(text or "")
+    if len(value) > _LOG_MAX_CHARS:
+        value = value[:_LOG_MAX_CHARS].rstrip() + "\n[log trimmed]"
+    session = _normalize_session_id(session_id)
+    _LOGGER.info("\n===== %s session=%s =====\n%s\n===== end %s =====", label, session, value, label)
 
 
-def _warm_model_now() -> None:
-    manager = ModelManager.get_instance()
-    status = manager.status()
-    if status["loading"] or status["loaded"]:
-        return
-    print("Loading model now...", flush=True)
-    manager.ensure_loaded()
-    print("Model warmup complete.", flush=True)
+def _log_prompt(messages: list[dict], *, session_id: str | None = None, stream: bool = False) -> None:
+    payload = json.dumps(messages, ensure_ascii=False, indent=2)
+    _log_text("prompt stream" if stream else "prompt", payload, session_id=session_id)
 
 
-def _refresh_session_history_cache(state: SessionState) -> None:
-    with state.lock:
-        if state.history_cache_version == state.version:
-            return
-        messages = list(state.messages)
-        last_user = ""
-        last_assistant = ""
-        recent_text_parts: list[str] = []
-        recent_exchange_parts: list[str] = []
-        # Single reverse pass: collect last_user/assistant AND recent text together.
-        for message in reversed(messages):
-            role = str(message.get("role", "") or "").strip()
-            content = collapse_hidden_tag_gaps(str(message.get("content", "") or "")).strip()
-            if not content:
-                continue
-            if role == "assistant" and not last_assistant:
-                last_assistant = content
-            elif role == "user" and not last_user:
-                last_user = content
-            label = "User" if role == "user" else "Akane" if role == "assistant" else role.title()
-            recent_text_parts.append(content)
-            recent_exchange_parts.append(f"{label}: {content}")
-            if last_user and last_assistant and len(recent_text_parts) >= 8:
-                break
-        recent_text_parts.reverse()
-        recent_exchange_parts.reverse()
-        note_parts: list[str] = []
-        if last_user:
-            note_parts.append(f"Previous user message: {last_user[:500]}")
-        if last_assistant:
-            note_parts.append(f"Previous Akane reply: {last_assistant[:700]}")
-        state.cached_last_user = last_user
-        state.cached_last_assistant = last_assistant
-        state.cached_recent_text = " ".join(recent_text_parts)
-        state.cached_recent_exchange_context = "\n".join(recent_exchange_parts)
-        state.cached_recent_exchange_note = "\n".join(note_parts)
-        state.history_cache_version = state.version
+def _log_reply(reply: str, *, session_id: str | None = None, raw: str = "") -> None:
+    _log_terminal_stream("done", reply)
+    if raw and raw != reply:
+        _log_text("raw reply", raw, session_id=session_id)
+    _log_text("reply", reply, session_id=session_id)
+
+
+def _clip(text: str, limit: int) -> str:
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n[trimmed]"
+
+
+def _static_response_path(route: str) -> tuple[Path, str] | None:
+    if route in _STATIC_ROUTES:
+        name, media_type = _STATIC_ROUTES[route]
+        return STATIC_DIR / name, media_type
+    asset = resolve_ui_asset(route)
+    return (asset, "image/png") if asset else None
 
 
 def _state_messages(session_id: str | None = None) -> list[dict]:
     state = _session_state(session_id)
     with state.lock:
         messages = list(state.messages)
-        preview = state.streaming_reply_preview.strip()
-        if preview:
-            messages.append({"role": "assistant", "content": preview})
+        if state.streaming_reply_preview.strip():
+            messages.append({"role": "assistant", "content": state.streaming_reply_preview})
         return messages
-
-
-def _set_streaming_reply_preview(text: str, session_id: str | None = None) -> None:
-    state = _session_state(session_id)
-    next_text = str(text or "")
-    with state.lock:
-        if state.streaming_reply_preview == next_text:
-            return
-        state.streaming_reply_preview = next_text
-        state.version += 1
-
-
-def _clear_streaming_reply_preview(session_id: str | None = None) -> None:
-    _set_streaming_reply_preview("", session_id)
-
-
-def _log_terminal_stream(label: str, text: str = "") -> None:
-    suffix = f" {text}" if text else ""
-    print(f"[Akane:{label}]{suffix}", flush=True)
-
-
-def _strip_popup_tags(text: str) -> str:
-    if not text:
-        return text
-    
-    # Let the C-optimized regex engine handle the replacements
-    cleaned = _POPUP_STRIP_REGEX.sub("", str(text))
-    
-    return "\n".join(line for line in cleaned.splitlines() if line.strip())
-
-
-def _might_contain_file_ref(text: str) -> bool:
-    lowered = str(text or "").lower()
-    return "/" in lowered or any(suffix in lowered for suffix in _FILE_REF_SUFFIXES)
-
-
-def _explicit_paths_in_text(text: str) -> list[str]:
-    if not _might_contain_file_ref(text):
-        return []
-    seen: set[str] = set()
-    matches: list[str] = []
-    
-    for raw_value in _REQUEST_ANALYZER.extract_file_refs(text):
-        raw = str(raw_value or "").strip("`'\".,:;()[]{}")
-        if not raw:
-            continue
-            
-        if "/" in raw:
-            candidate = PROJECT_ROOT / raw
-            if candidate.is_file():
-                resolved = candidate.resolve()
-                if str(resolved).startswith(str(PROJECT_ROOT)):
-                    rel = str(resolved.relative_to(PROJECT_ROOT))
-                    if rel not in seen:
-                        seen.add(rel)
-                        matches.append(rel)
-                continue
-                
-            if not Path(raw).suffix:
-                for suffix in _FILE_REF_SUFFIXES:
-                    candidate_with_suffix = PROJECT_ROOT / f"{raw}{suffix}"
-                    # OPTIMIZATION: Check .is_file() first here too
-                    if candidate_with_suffix.is_file():
-                        resolved = candidate_with_suffix.resolve()
-                        if str(resolved).startswith(str(PROJECT_ROOT)):
-                            rel = str(resolved.relative_to(PROJECT_ROOT))
-                            if rel not in seen:
-                                seen.add(rel)
-                                matches.append(rel)
-                            break
-            continue
-
-        for rel in _CODEBASE_SEARCH.get_project_file_index().get(raw.lower(), []):
-            if rel not in seen:
-                seen.add(rel)
-                matches.append(rel)
-                
-    return matches
-
-
-def _remember_codebase_targets(paths: list[str], session_id: str | None = None) -> None:
-    remembered = [p for raw in paths if (p := str(raw or "").strip()) and not _is_infra_path(p)]
-    if not remembered:
-        return
-    state = _session_state(session_id)
-    next_targets = remembered[:5]
-    with state.lock:
-        if state.recent_code_targets == next_targets:
-            return
-        state.recent_code_targets = next_targets
-        state.version += 1
-
-
-def _recent_exchange_context(session_id: str | None = None) -> str:
-    state = _session_state(session_id)
-    _refresh_session_history_cache(state)
-    return state.cached_recent_exchange_context
-
-
-def _recent_exchange_pair(session_id: str | None = None) -> tuple[str, str]:
-    """Return (context, note) with a single cache refresh."""
-    state = _session_state(session_id)
-    _refresh_session_history_cache(state)
-    return state.cached_recent_exchange_context, state.cached_recent_exchange_note
-
-
-def _request_snapshot(*, session_id: str | None = None, last_assistant_override: str | None = None) -> RequestSnapshot:
-    state = _session_state(session_id)
-    _refresh_session_history_cache(state)
-    context = _editor_context()
-    recent_targets = tuple(state.recent_code_targets[:5])
-    open_tabs_raw = context.get("open_tabs") or []
-    open_tabs = tuple(
-        path
-        for raw in open_tabs_raw
-        if (path := str(raw or "").strip())
-    )
-    return RequestSnapshot(
-        last_user=state.cached_last_user,
-        last_assistant=str(last_assistant_override if last_assistant_override is not None else state.cached_last_assistant),
-        recent_code_targets=recent_targets,
-        active_file=str(context.get("active_file", "") or "").strip(),
-        open_tabs=open_tabs,
-        recent_text=state.cached_recent_text,
-        editor_connected=bool(context.get("connected")),
-    )
-
-
-def _analyze_request(user_input: str, *, session_id: str | None = None, last_assistant_override: str | None = None):
-    return _REQUEST_ANALYZER.analyze(
-        user_input,
-        _request_snapshot(session_id=session_id, last_assistant_override=last_assistant_override),
-    )
-
-
-def _runtime_context_for_request(*, skip_memory: bool = False, include_editor: bool = True) -> str:
-    if not skip_memory:
-        return build_runtime_context(include_editor=include_editor)
-    try:
-        return build_runtime_context(include_memory=False, include_editor=include_editor)
-    except TypeError:
-        return get_editor_bridge().format_for_prompt() if include_editor else ""
-
-
-def _coerce_bool(value) -> bool:
-    if isinstance(value, (bool, int, float)):
-        return bool(value)
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _append_message(role: str, content: str, session_id: str | None = None) -> None:
     state = _session_state(session_id)
     with state.lock:
         state.messages.append({"role": role, "content": content})
+        state.streaming_reply_preview = ""
         state.version += 1
-        if role == "assistant":
-            state.streaming_reply_preview = ""
-    if role == "assistant":
-        if _might_contain_file_ref(content):
-            _remember_codebase_targets(_explicit_paths_in_text(content), session_id)
+
+
+def _set_streaming_reply_preview(text: str, session_id: str | None = None) -> None:
+    state = _session_state(session_id)
+    with state.lock:
+        state.streaming_reply_preview = str(text or "")
+        state.version += 1
 
 
 def _clear_messages(session_id: str | None = None) -> None:
     state = _session_state(session_id)
     with state.lock:
-        if not state.messages and not state.streaming_reply_preview and not state.recent_code_targets:
-            return
         state.messages.clear()
         state.streaming_reply_preview = ""
-        state.recent_code_targets.clear()
         state.version += 1
 
 
-def _service_script_path(name: str) -> Path | None:
-    for filename in (name, f"{name}.sh"):
-        path = SERVICE_ROOT / filename
-        if path.exists():
-            return path
-    return None
+def _clean_reference_path(raw_path: str) -> str:
+    path = str(raw_path or "").strip().strip("`'\".,:;()[]{}").replace("\\", "/")
+    if not path or "://" in path or path.startswith("~"):
+        return ""
+    if path.startswith("./"):
+        path = path[2:]
+    if ":" in path:
+        head, _, tail = path.partition(":")
+        if tail.strip()[:1].isdigit() or tail.strip().lower().startswith("l"):
+            path = head.strip()
+    return path
 
 
-def _queue_service_restart() -> str:
-    stop_script = _service_script_path("stop_akane_services")
-    start_script = _service_script_path("start_akane_services")
-    if stop_script is None or start_script is None:
-        missing = []
-        if stop_script is None:
-            missing.append("stop_akane_services")
-        if start_script is None:
-            missing.append("start_akane_services")
-        raise FileNotFoundError(f"Missing restart script(s): {', '.join(missing)}")
-
-    job_name = f"akane-restart-{int(time.time())}"
-    command = (
-        f"cd {shlex.quote(str(SERVICE_ROOT))}; "
-        f"echo '[Akane restart] queued at $(date -Is)' >> {shlex.quote(str(RESTART_LOG_PATH))}; "
-        "sleep 3; "
-        f"{shlex.quote(str(stop_script))} >> {shlex.quote(str(RESTART_LOG_PATH))} 2>&1; "
-        "sleep 1; "
-        f"{shlex.quote(str(start_script))} >> {shlex.quote(str(RESTART_LOG_PATH))} 2>&1"
-    )
+def _project_relative_path(raw_path: str, *, must_be_file: bool = False) -> str:
+    path = _clean_reference_path(raw_path)
+    if not path:
+        return ""
     try:
-        subprocess.run(
-            [
-                "sudo",
-                "-n",
-                "systemd-run",
-                f"--unit={job_name}",
-                "--collect",
-                "/bin/bash",
-                "-lc",
-                command,
-            ],
-            cwd=str(SERVICE_ROOT),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=True,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError("systemd-run is required to restart Akane from inside akane-server.service") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or str(exc)).strip()
-        raise RuntimeError(f"Could not schedule systemd restart job: {detail}") from exc
-    return f"Restart queued as {job_name}. Akane services will stop and start again in a moment. Log: {RESTART_LOG_PATH}"
+        candidate = Path(path)
+        resolved = candidate.resolve() if candidate.is_absolute() else (PROJECT_ROOT / candidate).resolve()
+        rel = resolved.relative_to(PROJECT_ROOT)
+    except (OSError, ValueError):
+        return ""
+    if must_be_file and not resolved.is_file():
+        return ""
+    return rel.as_posix()
 
 
-def _handle_command(text: str, session_id: str | None = None) -> dict | None:
-    bridge = get_editor_bridge()
-    if text == "/restart":
-        msgs = list(_session_state(session_id).messages)
-        try:
-            notice = _queue_service_restart()
-        except Exception as exc:
-            notice = f"Could not queue restart: {exc}"
-        return {"reply": notice, "messages": msgs, "notice": notice, "ephemeral": True}
-
-    if text == "/vscode":
-        notice = launch_vscode()
-        return {"reply": "", "messages": list(_session_state(session_id).messages), "notice": notice, "ephemeral": True}
-
-    if text in {"/approve", "/reject"}:
-        if text == "/approve":
-            actions = bridge.approve_all_pending_actions()
-            verb, noun = "Approved", "approve"
-        else:
-            actions = bridge.reject_all_pending_actions()
-            verb, noun = "Rejected", "reject"
-        msgs = list(_session_state(session_id).messages)
-        if not actions:
-            return {"reply": "", "messages": msgs, "notice": f"No pending code changes to {noun}.", "ephemeral": True}
-        return {"reply": "", "messages": msgs, "notice": f"{verb} {len(actions)} pending code change(s).", "ephemeral": True}
-
-    if text == "/memory":
-        reload_from_disk()
-        reply = format_for_prompt() or "No memories yet."
-        msgs = list(_session_state(session_id).messages)
-        preview_messages = msgs + [
-            {"role": "user", "content": text},
-            {"role": "assistant", "content": reply},
-        ]
-        return {"reply": reply, "messages": preview_messages, "ephemeral": True}
-
-    if text == "/clear":
-        _clear_messages(session_id)
-        return {"reply": "", "messages": [], "notice": "Context cleared."}
-
-    if text == "/reset":
-        _clear_messages(session_id)
-        if MEMORY_PATH.exists():
-            os.remove(MEMORY_PATH)
-        reload_from_disk()
-        return {"reply": "", "messages": [], "notice": "Memory wiped and context cleared."}
-
-    return None
-
-
-def _editor_snapshot() -> dict:
-    return get_editor_bridge().snapshot().get("context", {})
-
-
-def _editor_context() -> dict:
-    return get_editor_bridge().context_snapshot()
-
-
-def _pending_action_target_path(action: dict) -> str:
-    command = str(action.get("command", "") or "").strip().lower()
-    argument = str(action.get("argument", "") or "")
-    if command in {"open_file", "read_file"}:
-        return argument.split(":", 1)[0].strip()
-    if command in {"create_file", "save_file"}:
-        return argument.strip()
-    if command in {"write_file", "append_file"}:
-        return argument.split("\n", 1)[0].strip()
-    if command == "replace_file_range":
-        return argument.split("\n", 1)[0].split(":", 1)[0].strip()
-    return ""
-
-
-def _open_vscode_for_pending_actions(actions: list[dict]) -> None:
-    bridge = get_editor_bridge()
-    try:
-        launch_vscode()
-    except Exception:
-        pass
-    opened: set[str] = set()
-    for action in actions:
-        path = _pending_action_target_path(action)
-        if not path or path in opened:
-            continue
-        opened.add(path)
-        try:
-            bridge.queue_action("open_file", path)
-        except Exception:
-            pass
-
-
-def _format_pending_approval_reply(actions: list[dict]) -> str:
-    if not actions:
-        return "I staged a code change for approval. Use /approve to apply it or /reject to cancel it."
-    visible_actions = [
-        action
-        for action in actions
-        if str(action.get("command", "") or "").lower()
-        not in {"save_file", "format_document", "open_file"}
-    ] or list(actions)
-    targets: list[str] = []
+def _explicit_paths_in_text(text: str) -> list[str]:
     seen: set[str] = set()
-    for action in visible_actions:
-        path = _pending_action_target_path(action)
-        if not path or path in seen:
-            continue
-        seen.add(path)
-        targets.append(path)
-    lines = ["I staged code changes for approval and opened them in VS Code."]
-    if targets:
-        lines.append(f"Files: {', '.join(targets[:4])}")
-    lines.append("Use /approve to apply them or /reject to cancel them.")
-    return "\n".join(lines)
-
-def _looks_like_deferred_action_reply(reply: str) -> bool:
-    text = collapse_hidden_tag_gaps(str(reply or "")).strip()
-    if not text:
-        return False
-    if _response_uses_tool_calls(text):
-        return False
-    lowered = text.lower()
-    return any(opener in lowered for opener in _DEFERRED_ACTION_OPENERS) and any(
-        verb in lowered for verb in _DEFERRED_ACTION_VERBS
-    )
-
-
-def _candidate_codebase_paths(user_input: str, limit: int = 3, session_id: str | None = None) -> list[str]:
-    explicit = _explicit_paths_in_text(user_input)
-    if explicit:
-        return explicit[:limit]
-    return _REQUEST_ANALYZER.candidate_paths(user_input, _request_snapshot(session_id=session_id), limit=limit)
+    paths: list[str] = []
+    for match in _PATH_RE.finditer(str(text or "")):
+        raw = _clean_reference_path(match.group("path"))
+        candidates = [raw]
+        if raw and not Path(raw).suffix:
+            candidates.extend(f"{raw}{suffix}" for suffix in _FILE_REF_SUFFIXES)
+        for candidate in candidates:
+            rel = _project_relative_path(candidate, must_be_file=True)
+            if rel and rel not in seen:
+                seen.add(rel)
+                paths.append(rel)
+                break
+    return paths
 
 
 def _is_infra_path(path: str) -> bool:
     lowered = str(path or "").strip().lower()
-    if not lowered:
-        return False
-    return any(lowered.startswith(prefix) for prefix in _INFRA_PATH_PREFIXES)
+    return bool(lowered) and any(lowered.startswith(prefix) for prefix in _INFRA_PATH_PREFIXES)
 
 
 def _filter_coder_preload_paths(paths: list[str], user_input: str) -> list[str]:
-    cleaned: list[str] = []
+    allow_infra = any(token in str(user_input or "").lower() for token in ("vscode", "extension", "integration"))
     seen: set[str] = set()
-    lowered_input = str(user_input or "").lower()
-    allow_infra = any(token in lowered_input for token in _INFRA_CONTEXT_KEYWORDS)
+    out: list[str] = []
     for raw in paths:
-        rel = str(raw or "").strip()
+        rel = _project_relative_path(raw, must_be_file=True)
         if not rel or rel in seen:
             continue
-        lowered = rel.lower()
-        suffix = Path(lowered).suffix
-        if suffix in _NON_SOURCE_FILE_SUFFIXES:
-            continue
-        if not allow_infra and _is_infra_path(lowered):
+        suffix = Path(rel.lower()).suffix
+        if suffix in _NON_SOURCE_FILE_SUFFIXES or (_is_infra_path(rel) and not allow_infra):
             continue
         seen.add(rel)
-        cleaned.append(rel)
-    return cleaned
-
-
-def _should_preload_coder_paths(task_text: str, analysis) -> bool:
-    explicit_paths = _explicit_paths_in_text(task_text)
-    if explicit_paths:
-        return True
-    lowered = collapse_hidden_tag_gaps(str(task_text or "")).strip().lower()
-    if any(hint in lowered for hint in _CODEBASE_TARGET_HINTS):
-        return True
-    return bool(analysis.explicit_file_reference or analysis.codebase_context or analysis.coding)
-
-
-def _enforce_vscode_for_coding(chat_messages: list[dict]) -> list[dict]:
-    instruction = (
-        "Use VS Code editor actions for coding tasks. "
-        "If you need context, use [READ]file[/READ]. "
-        "Use only [EDITOR]...[/EDITOR] and [READ]...[/READ]; no XML tool tags. "
-        "Do the work now and summarize findings briefly."
-    )
-    return [*chat_messages[:-1], {"role": "system", "content": instruction}, chat_messages[-1]]
-
-
-def _should_force_vscode(user_input: str, analysis=None, *, session_id: str | None = None) -> bool:
-    if ADVISOR_ONLY:
-        return False
-    analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    return analysis.should_force_vscode
-
-
-def _should_use_coder_specialist(user_input: str, analysis=None, *, session_id: str | None = None) -> bool:
-    # Lightweight, conservative check: only use coder for explicit coding/execution turns
-    analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    if ADVISOR_ONLY or analysis.open_vscode or analysis.should_force_vscode:
-        return False
-    manager = ModelManager.get_instance()
-    status = manager.status()
-    if status.get("coder_backend") != "openrouter" or not status.get("openrouter_coder_model"):
-        return False
-    if not analysis.coding_like:
-        return False
-    if analysis.wants_execution or analysis.codebase_direct or analysis.explicit_file_reference:
-        return True
-    return False
-
-
-def _response_uses_editor_tools(raw: str) -> bool:
-    text = str(raw or "")
-    lowered = text.lower()
-    return "[EDITOR]" in text or "<tool_call>" in lowered
+        out.append(rel)
+    return out
 
 
 def _response_uses_tool_calls(raw: str) -> bool:
-    text = str(raw or "")
-    if not text:
-        return False
-    lowered = text.lower()
-    has_read = "[READ]" in text or "<read>" in lowered
-    has_editor = "[EDITOR]" in text or "<tool_call>" in lowered
-    has_coder = "[ASK_CODER]" in text
-    if ADVISOR_ONLY:
-        return has_read and bool(extract_read_requests(text))
-    if not (has_read or has_editor or has_coder):
-        return False
-    return (has_editor and _response_uses_editor_tools(text)) or (has_read and bool(extract_read_requests(text))) or (has_coder and bool(extract_coder_requests(text)))
+    text = str(raw or "").lower()
+    return bool(text and ("<tool_call>" in text or re.search(r"\[(read|editor|ask_coder)\]", text)))
 
 
 def _response_uses_disabled_coding_tools(raw: str) -> bool:
-    text = str(raw or "")
+    text = str(raw or "").lower()
+    return bool(text and ("<tool_call>" in text or re.search(r"\[(editor|ask_coder)\]", text)))
+
+
+def _strip_popup_tags(text: str) -> str:
     if not text:
-        return False
-    if "[ASK_CODER]" not in text and "[EDITOR]" not in text and "<tool_call>" not in text.lower():
-        return False
-    return bool(extract_coder_requests(text) or _response_uses_editor_tools(text))
-
-
-def _needs_editor_retry(user_input: str, raw: str) -> bool:
-    if not _should_force_vscode(user_input):
-        return False
-    if _response_uses_tool_calls(raw):
-        return False
-    if _looks_like_deferred_action_reply(raw):
-        return True
-    return True
-
-
-def _needs_codebase_action_retry(analysis, raw: str) -> bool:
-    if not (analysis.codebase_context or analysis.coding_like):
-        return False
-    if _response_uses_tool_calls(raw):
-        return False
-    return _looks_like_deferred_action_reply(raw)
-
-
-def _is_light_chat_turn(analysis) -> bool:
-    return (
-        not analysis.coding_like
-        and not analysis.wants_execution
-        and not analysis.open_vscode
-        and not analysis.explicit_file_reference
-        and not analysis.wants_detail
-    )
-
-
-def _is_simple_factual_turn(user_input: str, analysis) -> bool:
-    if not _is_light_chat_turn(analysis):
-        return False
-    if analysis.wants_single_suggestion or analysis.wants_brainstorm or analysis.should_carry_last_reply:
-        return False
-    text = collapse_hidden_tag_gaps(str(user_input or "")).strip()
-    if not text or "?" not in text:
-        return False
-    return len(analysis.query_tokens) <= 8
-
-
-def _completion_overrides_for_turn(user_input: str, analysis, *, session_id: str | None = None) -> dict[str, float | int]:
-    # Reduce token budget for simple factual/light turns to save compute
-    if _is_simple_factual_turn(user_input, analysis):
-        return {"max_tokens_override": _FACTUAL_CHAT_MAX_TOKENS, "temperature_override": min(TEMPERATURE, 0.45)}
-    if _is_light_chat_turn(analysis):
-        return {"max_tokens_override": _FAST_CHAT_MAX_TOKENS}
-    return {}
-
-
-def _should_attach_recent_exchange(analysis, user_input: str) -> bool:
-    if not analysis.should_carry_last_reply:
-        # Check for referential questions that should carry context even if analyzer didn't flag them
-        if _is_referential_question(user_input):
-            return True
-        return False
-    if analysis.coding_like or analysis.wants_execution or analysis.wants_detail:
-        return True
-
-    text = collapse_hidden_tag_gaps(str(user_input or "")).strip()
-    if not text:
-        return False
-
-    lowered = text.lower()
-    if len(lowered) <= 12:
-        return lowered not in {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "cool", "nice", "sure", "yep", "yes", "no"}
-    if len(lowered) <= 40 and " " not in lowered:
-        return False
-    return len(lowered.split()) >= 3
-
-
-def _is_referential_question(user_input: str) -> bool:
-    """Detect short questions that likely refer to the previous topic."""
-    if not user_input:
-        return False
-
-    text = collapse_hidden_tag_gaps(user_input).strip()
-    if not text or "?" not in text or len(text) > 50:
-        return False
-
-    lowered = text.lower()
-
-    # Pre-define sets
-    referential_pronouns = {"it", "this", "that", "they", "them", "he", "she", "his", "her", "its"}
-    follow_up_phrases = {
-        "what", "how", "why", "tell me", "explain", "more about", "details",
-        "elaborate", "go on", "continue", "what happened", "what is", "what are"
-    }
-    
-    # 1. Faster evaluation using set intersection
-    words = set(lowered.split())
-    if referential_pronouns & words:  
-        return True
-
-    # 2. Iterate follow_up_phrases efficiently
-    if any(phrase in lowered for phrase in follow_up_phrases):
-        return True
-
-    return False
-
-
-def _is_identity_question(user_input: str) -> bool:
-    tokens = {
-        token.strip(".,!?;:").lower()
-        for token in str(user_input or "").split()
-        if token.strip(".,!?;:")
-    }
-    if not tokens:
-        return False
-    return bool(
-        {"you", "your"} & tokens
-        and (
-            {"what", "who"} & tokens
-            or {"name", "called", "made", "creator"} & tokens
-        )
-    )
-
-
-def _reply_style_instruction(analysis) -> str:
-    if analysis.coding_like or analysis.wants_execution:
-        style = random.choice(_TECHNICAL_REPLY_STYLES)
-    else:
-        style = random.choice(_COMPANION_REPLY_STYLES)
-    return (
-        "For this reply only, vary your wording and rhythm. "
-        f"Use this feel: {style}. "
-        "Do not reuse a stock phrase or copy examples from the soul file. "
-        "If the user repeats a question, keep the meaning consistent but phrase it differently."
-    )
-
-
-def _prepare_chat_turn(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> tuple[list[dict], object]:
-    state = _session_state(session_id)
-    _refresh_session_history_cache(state)
-    editor_context = _editor_context()
-    open_tabs_raw = editor_context.get("open_tabs") or []
-    snapshot = RequestSnapshot(
-        last_user=state.cached_last_user,
-        last_assistant=state.cached_last_assistant,
-        recent_code_targets=tuple(state.recent_code_targets[:5]),
-        active_file=str(editor_context.get("active_file", "") or "").strip(),
-        open_tabs=tuple(path for raw in open_tabs_raw if (path := str(raw or "").strip())),
-        recent_text=state.cached_recent_text,
-        editor_connected=bool(editor_context.get("connected")),
-    )
-    analysis = _REQUEST_ANALYZER.analyze(user_input, snapshot)
-    if not skip_memory:
-        capture_explicit_user_memories(user_input)
-    with state.lock:
-        messages = list(state.messages)
-    light_chat_turn = _is_light_chat_turn(analysis)
-    include_memory = _normalize_session_id(session_id) == DEFAULT_SESSION_ID
-    runtime_context = _runtime_context_for_request(
-        skip_memory=skip_memory,
-        include_editor=not light_chat_turn,
-    )
-    system_prompt = _cached_system_prompt(runtime_context, include_memory=include_memory)
-    chat_messages = truncate_messages(messages, system_prompt, user_input, max_context_tokens=CHAT_HISTORY_CONTEXT_TOKENS)
-
-    if _should_attach_recent_exchange(analysis, user_input):
-        exchange, exchange_note = _recent_exchange_pair(session_id=session_id)
-        if exchange or exchange_note:
-            chat_messages = [
-                *chat_messages[:-1],
-                {
-                    "role": "system",
-                    "content": (
-                        "Treat the recent exchange as the default context for this turn unless the user clearly switches topics. "
-                        "Resolve short references like it/that/this/the first one against the previous exchange, not in isolation. "
-                        "If the user asks a short follow-up question, assume they mean the main subject, files, functions, parameters, or thresholds from the previous exchange. "
-                        "Only drop that context if the user explicitly introduces a different topic.\n\n"
-                        f"{exchange_note[:500]}\n\n"
-                        f"Recent exchange:\n{exchange[:500]}"
-                    ),
-                },
-                chat_messages[-1],
-            ]
-    if (
-        not analysis.wants_detail
-        and not analysis.coding_like
-        and not analysis.wants_execution
-    ):
-        chat_messages = [
-            *chat_messages[:-1],
-            {
-                "role": "system",
-                "content": _COMPACT_COMPANION_INSTRUCTION,
-            },
-            chat_messages[-1],
-        ]
-    chat_messages = [
-        *chat_messages[:-1],
-        {
-            "role": "system",
-            "content": _reply_style_instruction(analysis),
-        },
-        chat_messages[-1],
-    ]
-    if _is_identity_question(user_input):
-        style = random.choice(_IDENTITY_REPLY_STYLES)
-        chat_messages = [
-            *chat_messages[:-1],
-            {
-                "role": "system",
-                "content": (
-                    "The user is asking what/who you are. Answer in one natural sentence, "
-                    f"with this feel: {style}. Vary the wording from previous identity answers. "
-                    "Do not say you exist to be near them, would stay, or share things that interest you. "
-                    "Do not sound like a bio, service bot, or character sheet."
-                ),
-            },
-            chat_messages[-1],
-        ]
-    if analysis.codebase_followup and analysis.assistant_invited_continuation:
-        exchange = _recent_exchange_context()
-        chat_messages = [
-            *chat_messages[:-1],
-            {
-                "role": "system",
-                "content": (
-                    "The user is following up on your last question or offer. "
-                    "Continue the same topic and do the thing you just offered. "
-                    "Do not ask them to repeat or restate what they want. "
-                    "If your last message offered an example, rewrite, sketch, or implementation step, provide it now.\n\n"
-                    f"Recent exchange:\n{exchange[:700]}"
-                ),
-                },
-                chat_messages[-1],
-            ]
-    elif analysis.codebase_followup and analysis.referential_followup:
-        exchange = _recent_exchange_context(session_id=session_id)
-        if exchange:
-            chat_messages = [
-                *chat_messages[:-1],
-                {
-                    "role": "system",
-                    "content": (
-                        "The user is referring to the main subject of your last reply. "
-                        "Resolve pronouns like it/that/this using the recent exchange and continue the same topic. "
-                        "Do not ask what the referent is unless your previous answer truly discussed multiple competing things. "
-                        f"Recent exchange:\n{exchange[:700]}"
-                    ),
-                },
-                chat_messages[-1],
-            ]
-    recent_targets = list(snapshot.recent_code_targets)
-    if recent_targets and analysis.coding and not analysis.explicit_file_reference:
-        chat_messages = [
-            *chat_messages[:-1],
-            {
-                "role": "system",
-                "content": (
-                    "Recent code context: unless the user clearly switches topics, "
-                    f"their follow-up coding request likely refers to these files: {', '.join(recent_targets[:3])}. "
-                    "Prefer to keep working on those files before assuming a new code target."
-                ),
-                },
-                chat_messages[-1],
-            ]
-    if snapshot.editor_connected and analysis.wants_execution and not ADVISOR_ONLY:
-        chat_messages = [
-            *chat_messages[:-1],
-            {
-                "role": "system",
-                "content": (
-                    "The user wants you to apply the code change now, not just describe it. "
-                    "Use VS Code editor actions to make the change if you have enough context. "
-                    "Before editing, prefer reading the freshest editor state from VS Code for the target file."
-                ),
-                },
-                chat_messages[-1],
-            ]
-    if ADVISOR_ONLY and analysis.coding_like:
-        chat_messages = [
-            *chat_messages[:-1],
-            {
-                "role": "system",
-                "content": (
-                    "Advisor-only mode is enabled. "
-                    "Do not offer to apply edits, save files, patch code, or use hidden coding/tool execution. "
-                    "You may inspect code with [READ] tags when needed, then explain the best updates or improvements in plain language."
-                ),
-            },
-            chat_messages[-1],
-        ]
-    if _should_force_vscode(user_input, analysis, session_id=session_id):
-        chat_messages = _enforce_vscode_for_coding(chat_messages)
-
-    # Inject datetime immediately before the user turn so the model sees it
-    # right before generating. Local models lose system-prompt content that
-    # appears early in a long prompt, so this repetition is intentional.
-    from app.core.generation import _current_datetime_context
-    chat_messages = [
-        *chat_messages[:-1],
-        {"role": "system", "content": _current_datetime_context()},
-        chat_messages[-1],
-    ]
-
-    return chat_messages, analysis
-
-
-def _route_coder_generation(
-    user_input: str,
-    chat_messages: list[dict],
-    raw_candidate: str,
-    *,
-    session_id: str | None = None,
-    analysis=None,
-    progress_callback=None,
-) -> CoderRouteResult:
-    analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    should_route = bool(
-        not ADVISOR_ONLY
-        and analysis.coding_like
-        and (
-            extract_coder_requests(raw_candidate)
-            or _should_use_coder_specialist(user_input, analysis, session_id=session_id)
-        )
-    )
-    if not should_route:
-        return CoderRouteResult(text="", used_coder=False)
-
-    if progress_callback:
-        progress_callback("Using coding model...")
-    print("[Akane] Using coding model for coding specialist handoff.", flush=True)
-    requests = extract_coder_requests(raw_candidate)
-    task = "\n\n".join(requests).strip() or user_input
-    if analysis.should_carry_last_reply:
-        exchange = _recent_exchange_context(session_id=session_id)
-        if exchange:
-            task = f"Recent exchange context:\n{exchange[:1400]}\n\nCurrent user request:\n{task}"
-
-    preload_query = task if task and task != user_input else user_input
-    if _should_preload_coder_paths(preload_query, analysis):
-        explicit_paths = _explicit_paths_in_text(user_input) or _explicit_paths_in_text(preload_query)
-        if explicit_paths:
-            preload_paths = explicit_paths[:3]
-        else:
-            preload_paths = _filter_coder_preload_paths(
-                _candidate_codebase_paths(preload_query, limit=6, session_id=session_id),
-                preload_query,
-            )[:3]
-    else:
-        preload_paths = []
-
-    try:
-        from app.agents.coding_agent import run_coder_specialist
-
-        coder_outcome = run_coder_specialist(
-            task,
-            preload_paths=preload_paths,
-            apply_now=analysis.wants_execution,
-            progress_callback=progress_callback,
-        )
-    except Exception as exc:
-        print(f"[Akane] Coding model handoff failed: {exc}", flush=True)
-        return CoderRouteResult(
-            text="The coding model hit an error before it could produce a reliable result.",
-            used_coder=True,
-        )
-
-    if coder_outcome.approval_required:
-        _open_vscode_for_pending_actions(coder_outcome.proposed_actions or [])
-        return CoderRouteResult(
-            text=_format_pending_approval_reply(coder_outcome.proposed_actions or []),
-            used_coder=True,
-            approval_required=True,
-        )
-
-    summary = collapse_hidden_tag_gaps(str(coder_outcome.summary or "").strip()).strip()
-    if not summary:
-        print("[Akane] Coding model returned no usable result.", flush=True)
-        summary = "The coding model could not produce a reliable result for this request."
-
-    cleaned = normalize_final_reply(clean_reply_text(summary))
-    return CoderRouteResult(text=cleaned, used_coder=True)
-
-
-def _retry_messages_for_editor_actions(chat_messages: list[dict]) -> list[dict]:
-    retry_instruction = (
-        "Retry with VS Code editor actions now. "
-        "Use only [EDITOR]...[/EDITOR] or [READ]...[/READ], no XML tool tags. "
-        "Do not defer or reply with plain fenced code."
-    )
-    return [*chat_messages, {"role": "system", "content": retry_instruction}]
-
-
-def _retry_messages_for_codebase_action(
-    chat_messages: list[dict],
-    raw: str,
-    user_input: str,
-) -> list[dict]:
-    retry_instruction = (
-        "Do the codebase work now. "
-        "If context is missing, use [READ]path/to/file[/READ]. "
-        "If edits are needed and VS Code is connected, emit [EDITOR] actions now. "
-        "No plans or deferred intent."
-    )
-    return [
-        *chat_messages,
-        {"role": "assistant", "content": raw or user_input},
-        {"role": "system", "content": retry_instruction},
-    ]
-
-
-def _retry_messages_for_advisor_only_tools(chat_messages: list[dict], raw: str) -> list[dict]:
-    retry_instruction = (
-        "Advisor-only mode: do not use [ASK_CODER] or [EDITOR]. "
-        "Use [READ]path/to/file[/READ] only if needed; otherwise answer directly."
-    )
-    return [
-        *chat_messages,
-        {"role": "assistant", "content": raw},
-        {"role": "system", "content": retry_instruction},
-    ]
-
-
-def _wants_implementation_walkthrough(user_input: str, *, session_id: str | None = None, analysis=None) -> bool:
-    text = str(user_input or "").strip()
-    if not text:
-        return False
-    lowered = text.lower()
-    if any(phrase in lowered for phrase in _IMPLEMENTATION_WALKTHROUGH_PHRASES):
-        return True
-    if ("how do i" in lowered or "how would i" in lowered or "how can i" in lowered) and "implement" in lowered:
-        return True
-    analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    return analysis.coding_like and analysis.wants_detail
-
-
-def _parse_editor_command(raw: str) -> tuple[str, str]:
-    raw = str(raw or "").strip()
-    if not raw:
-        return "", ""
-    if ":" not in raw:
-        return raw.lower(), ""
-    command, argument = raw.split(":", 1)
-    return command.strip().lower(), argument.strip()
-
-
-def _editor_command_target_path(command: str, argument: str, active_file: str) -> str:
-    if command in {"read_file", "open_file"}:
-        return argument.split(":", 1)[0].strip()
-    if command == "create_file":
-        return argument.strip()
-    if command in {"write_file", "append_file"}:
-        return argument.split("\n", 1)[0].strip()
-    if command == "replace_file_range":
-        return argument.split("\n", 1)[0].split(":", 1)[0].strip()
-    if command == "save_file":
-        return argument.strip() or active_file
-    if command in {"replace_selection", "insert_text", "format_document"}:
-        return active_file
-    return ""
-
-
-def _prepare_editor_commands(actions: list[tuple[str, str]], active_file: str) -> list[tuple[str, str]]:
-    queued = list(actions)
-    needs_active_editor = any(command in _ACTIVE_EDITOR_COMMANDS for command, _ in queued)
-    preferred_path = ""
-    for command, argument in queued:
-        if command in {"replace_selection", "insert_text", "format_document"}:
-            continue
-        preferred_path = _editor_command_target_path(command, argument, "")
-        if preferred_path:
-            break
-    if not preferred_path:
-        preferred_path = active_file
-
-    if (
-        needs_active_editor
-        and preferred_path
-        and preferred_path != active_file
-        and not any(command == "open_file" and argument.split(":", 1)[0].strip() == preferred_path for command, argument in queued)
-    ):
-        queued = [("open_file", preferred_path), *queued]
-    return queued
-
-
-def _render_editor_results(results: list[dict]) -> str:
-    if not results:
-        return ""
-    lines = ["VS Code editor action results:"]
-    for item in results:
-        outcome = item.get("result") if item.get("ok") else item.get("error") or "failed"
-        lines.append(f"- {item.get('command', 'action')}: {outcome}")
-    return "\n".join(lines)
-
-
-def _render_read_results(results: list[str]) -> str:
-    if not results:
-        return ""
-    rendered: list[str] = ["Local file reads (private tool results, do not print verbatim):"]
-    total_chars = 0
-    for item in results:
-        text = str(item or "").strip()
-        if text.startswith("[READ_RESULT]"):
-            text = text[len("[READ_RESULT]") :]
-            if text.endswith("[/READ_RESULT]"):
-                text = text[: -len("[/READ_RESULT]")]
-            text = text.strip()
-        remaining = _MAX_TOTAL_READ_RESULT_CHARS - total_chars
-        if remaining <= 0:
-            rendered.append("[Additional file context trimmed for fit.]")
-            break
-        clipped = text[: min(_MAX_INLINE_READ_RESULT_CHARS, remaining)].strip()
-        if len(text) > len(clipped):
-            clipped = clipped.rstrip() + "\n...[trimmed]"
-        rendered.append(clipped)
-        total_chars += len(clipped)
-    return "\n\n".join(rendered)
-
-
-def _estimate_prompt_tokens(messages: list[dict]) -> int:
-    total = 0
-    for message in messages:
-        content = str(message.get("content", "") or "")
-        total += max(1, len(content) // 4)
-    return total
-
-
-def _fit_messages_to_context(messages: list[dict]) -> list[dict]:
-    if not messages:
-        return messages
-
-    budget = max(1024, LLAMA_CONTEXT_WINDOW - MAX_TOKENS - _LLAMA_CONTEXT_SAFETY_TOKENS)
-
-    if _estimate_prompt_tokens(messages) <= budget and not any(
-        len(str(m.get("content") or "")) > _MAX_EXTRA_SYSTEM_CHARS
-        for m in messages[1:-1] if m.get("role") == "system"
-    ):
-        return messages
-
-    fitted = [dict(message) for message in messages]
-
-    for index, message in enumerate(fitted[1:-1], start=1):
-        if message.get("role") != "system":
-            continue
-        content = str(message.get("content", "") or "")
-        if len(content) <= _MAX_EXTRA_SYSTEM_CHARS:
-            continue
-        fitted[index]["content"] = content[:_MAX_EXTRA_SYSTEM_CHARS].rstrip() + "\n\n[Context trimmed for fit.]"
-
-    while len(fitted) > 2 and _estimate_prompt_tokens(fitted) > budget:
-        removable_index = next(
-            (i for i, message in enumerate(fitted[1:-1], start=1) if message.get("role") != "system"),
-            None,
-        )
-        if removable_index is None:
-            removable_index = next(
-                (i for i, message in enumerate(fitted[1:-1], start=1) if message.get("role") == "system"),
-                None,
-            )
-        if removable_index is None:
-            break
-        del fitted[removable_index]
-
-    if _estimate_prompt_tokens(fitted) > budget and fitted:
-        system_content = str(fitted[0].get("content", "") or "")
-        max_system_chars = max(1200, budget * 4 // 2)
-        if len(system_content) > max_system_chars:
-            fitted[0]["content"] = system_content[:max_system_chars].rstrip() + "\n\n[System context trimmed for fit.]"
-
-    return fitted
-
-
-def _build_codebase_fallback_messages(
-    chat_messages: list[dict],
-    user_input: str,
-    *,
-    session_id: str | None = None,
-    analysis=None,
-    coder_failed: bool = False,
-) -> list[dict]:
-    targets = _candidate_codebase_paths(user_input, session_id=session_id)
-    if not targets:
-        active_file = str(_editor_snapshot().get("active_file", "") or "").strip()
-        if active_file:
-            targets = [active_file]
-    if not targets:
-        return []
-    _remember_codebase_targets(targets, session_id)
-
-    read_results = execute_read_requests(targets)
-    if not read_results:
-        return []
-
-    analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    if _wants_implementation_walkthrough(user_input, session_id=session_id, analysis=analysis):
-        answer_instruction = (
-            "Answer the implementation question using the fresh reads. "
-            "Explain which file/symbol to change and the step order. "
-            "No raw code or file dumps unless asked."
-        )
-    elif analysis.wants_single_suggestion:
-        answer_instruction = (
-            "Answer the code-review request using the inspected code. "
-            + _technical_answer_instruction(single_suggestion=True)
-        )
-    else:
-        answer_instruction = _technical_answer_instruction()
-    if coder_failed:
-        answer_instruction = (
-            "The hidden coding handoff did not produce a usable answer. "
-            "Answer the user directly now without mentioning the failed handoff. "
-            + answer_instruction
-        )
-
-    instruction = (
-        f"{_render_read_results(read_results)}\n\n"
-        "Use the freshly read files as source of truth. "
-        "Do not re-read unless truly necessary. "
-        "Avoid tool tags unless required. "
-        f"{answer_instruction}"
-    )
-    return [*chat_messages, {"role": "system", "content": instruction}]
-
-
-def _maybe_get_codebase_messages(
-    base_messages: list[dict],
-    working_messages: list[dict],
-    user_input: str,
-    *,
-    session_id: str | None = None,
-    analysis=None,
-) -> list[dict]:
-    if working_messages is not base_messages:
-        return working_messages
-    return _build_codebase_fallback_messages(
-        base_messages,
-        user_input,
-        session_id=session_id,
-        analysis=analysis,
-    )
-
-
-def _should_preload_codebase_context(user_input: str, analysis=None, *, session_id: str | None = None, use_coder_specialist: bool | None = None) -> bool:
-    analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    if analysis.open_vscode:
-        return False
-    if use_coder_specialist is None:
-        use_coder_specialist = _should_use_coder_specialist(user_input, analysis, session_id=session_id)
-    if use_coder_specialist:
-        return False
-    return analysis.codebase_context
-
-
-def _run_editor_followup_loop(
-    user_input: str,
-    chat_messages: list[dict],
-    initial_raw: str,
-    initial_finish_reason: str = "",
-    session_id: str | None = None,
-    progress_callback=None,
-) -> str:
-    bridge = get_editor_bridge()
-    loop_messages = list(chat_messages)
-    raw = initial_raw
-    seen_read_signatures: set[tuple[str, ...]] = set()
-    last_finish_reason = initial_finish_reason
-    last_cleaned = ""
-    saw_tool_work = False
-
-    for _ in range(_EDITOR_AUTONOMY_MAX_TURNS):
-        snapshot = bridge.snapshot().get("context", {})
-        active_file = str(snapshot.get("active_file") or "").strip()
-        editor_ops = extract_editor_commands(raw)
-        actionable: list[tuple[str, str]] = []
-        for op in editor_ops:
-            command, argument = _parse_editor_command(op)
-            if not command or command in _EDITOR_LAUNCH_COMMANDS:
-                continue
-            actionable.append((command, argument))
-        actionable = _prepare_editor_commands(actionable, active_file)
-        read_requests = extract_read_requests(raw)
-        read_signature = tuple(read_requests)
-        read_results: list[str] = []
-        if read_requests and read_signature not in seen_read_signatures:
-            if progress_callback:
-                progress_callback("Reading files...")
-            seen_read_signatures.add(read_signature)
-            _remember_codebase_targets(read_requests)
-            read_results = execute_read_requests(read_requests)
-        queued_actions: list[dict] = []
-        action_start_id = bridge.next_action_id()
-        for command, argument in actionable:
-            queued_actions.append(bridge.queue_action(command, argument))
-        cleaned = clean_reply_text(raw)
-        if cleaned:
-            last_cleaned = cleaned
-
-        if any(action.get("status") == "pending_approval" for action in queued_actions):
-            _open_vscode_for_pending_actions(queued_actions)
-            return _format_pending_approval_reply(queued_actions)
-
-        if not actionable and not read_results:
-            if _analyze_request(user_input, session_id=session_id).wants_execution and _looks_like_deferred_action_reply(cleaned):
-                forced_result = _request_completion(
-                    [
-                        *loop_messages,
-                        {"role": "assistant", "content": cleaned or "Applying the change."},
-                        {
-                            "role": "system",
-                            "content": (
-                                "The user wants the code changed now. "
-                                "Do not explain or promise future work. "
-                                "Emit only the [READ] and [EDITOR] tags needed to inspect the latest file and apply the edit. "
-                                "If you already have enough context, emit the exact [EDITOR] actions now."
-                            ),
-                        },
-                    ],
-                    stream=False,
-                )
-                raw = _extract_message_text(forced_result)
-                last_finish_reason = _extract_finish_reason(forced_result)
-                forced_cleaned = clean_reply_text(raw)
-                if forced_cleaned:
-                    last_cleaned = forced_cleaned
-                if _response_uses_tool_calls(raw):
-                    continue
-            break
-        saw_tool_work = True
-
-        results: list[dict] = []
-        if actionable:
-            if progress_callback:
-                progress_callback("Working in VS Code...")
-            results = bridge.wait_for_action_results_after(
-                after_id=action_start_id - 1,
-                expected_count=len(actionable),
-                timeout=_EDITOR_ACTION_WAIT_SECONDS,
-            )
-        if actionable and not results and not read_results:
-            break
-
-        tool_context_parts = [
-            part for part in (_render_editor_results(results), _render_read_results(read_results)) if part
-        ]
-        loop_messages = [
-            *loop_messages,
-            {"role": "assistant", "content": cleaned or "Let me check that in VS Code."},
-            {
-                "role": "system",
-                "content": (
-                    f"{'\n\n'.join(tool_context_parts)}\n\n"
-                    "Continue helping the user using those results. "
-                    "Do not print raw READ_RESULT blocks, raw file dumps, or verbatim tool output to the user. "
-                    "Use the file contents privately and summarize the important findings in your own words. "
-                    "If you already have enough information, answer briefly and concretely. "
-                    "If you still need another tool call, emit it now."
-                ),
-            },
-        ]
-        if progress_callback:
-            progress_callback("Thinking...")
-        response = _request_completion(loop_messages, stream=False)
-        raw = _extract_message_text(response)
-        last_finish_reason = _extract_finish_reason(response)
-        cleaned = clean_reply_text(raw)
-        if cleaned:
-            last_cleaned = cleaned
-
-    final_reply = last_cleaned or finalize_reply(raw)
-    if (saw_tool_work or _response_uses_tool_calls(initial_raw)) and last_finish_reason == "length":
-        repair_raw = _extract_message_text(
-            _request_completion(
-                [
-                    *loop_messages,
-                    {"role": "assistant", "content": final_reply},
-                    {
-                        "role": "system",
-                        "content": (
-                            "Your last visible reply was cut off or too partial. "
-                            "Reply again with only the final short summary for the user. "
-                            "Do not include the earlier 'reading' preamble. "
-                            "Do not emit tool tags unless you still truly need them."
-                        ),
-                    },
-                ],
-                stream=False,
-            )
-        )
-        repaired = clean_reply_text(repair_raw)
-        if repaired:
-            return repaired
-    return finalize_reply(raw, final_reply)
-
-
-def _request_completion(
-    messages: list[dict],
-    *,
-    stream: bool,
-    role: str = "main",
-    max_tokens_override: int | None = None,
-    temperature_override: float | None = None,
-):
-    if role == "main":
-        messages = _fit_messages_to_context(messages)
-    return ModelManager.get_instance().create_chat_completion(
-        messages=messages,
-        max_tokens=max_tokens_override or MAX_TOKENS,
-        temperature=temperature_override if temperature_override is not None else TEMPERATURE,
-        top_k=TOP_K,
-        top_p=TOP_P,
-        repeat_penalty=REPETITION_PENALTY,
-        stream=stream,
-        role=role,
-    )
+        return text
+    source = str(text)
+    cleaned = _POPUP_STRIP_REGEX.sub("", source)
+    cleaned = _XML_STRIP_REGEX.sub("", cleaned)
+    if cleaned == source:
+        return source
+    return "\n".join(line.rstrip() for line in cleaned.splitlines() if line.strip())
+
+
+def _clean_reply(text: str) -> str:
+    cleaned = _strip_popup_tags(text).replace("/no_think", "")
+    cleaned = collapse_hidden_tag_gaps(cleaned).replace("\r\n", "\n")
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip(" `\n\t")
 
 
 def _extract_message_text(result: dict) -> str:
     choices = result.get("choices") or []
     if not choices:
         return ""
-    message = choices[0].get("message", {}) or {}
-    content = message.get("content")
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text")
-                if text:
-                    parts.append(str(text))
-        return "".join(parts).strip()
-    return str(content).strip()
+    return content_to_text((choices[0].get("message") or {}).get("content")).strip()
 
 
-def _extract_finish_reason(result: dict) -> str:
-    choices = result.get("choices") or []
-    if not choices:
-        return ""
-    return str(choices[0].get("finish_reason", "") or "").strip().lower()
+def _looks_codey(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(hint in lowered for hint in _CODE_HINTS) or bool(_explicit_paths_in_text(text))
 
 
-def _complete_reply(
-    user_input: str,
-    base_messages: list[dict],
-    working_messages: list[dict],
-    raw: str,
-    *,
-    finish_reason: str = "",
-    visible_fallback: str = "",
-    session_id: str | None = None,
-    analysis=None,
-    use_coder_specialist: bool | None = None,
-    progress_callback=None,
-) -> str:
-    current_raw = raw
-    current_finish_reason = finish_reason
-    analysis = analysis or _analyze_request(user_input, session_id=session_id)
-    is_popup_session = _normalize_session_id(session_id) == DEFAULT_SESSION_ID
-    light_chat_turn = _is_light_chat_turn(analysis)
+def _system_prompt(user_text: str, *, skip_memory: bool) -> str:
+    sections: list[str] = []
+    if not skip_memory:
+        memory = format_for_prompt()
+        if memory:
+            sections.append("Memory:\n" + _clip(memory, _MAX_MEMORY_CHARS))
+    if _looks_codey(user_text):
+        editor = get_editor_bridge().format_for_prompt()
+        if editor:
+            sections.append(_clip(editor, _MAX_EDITOR_CHARS))
+    return build_system_prompt("\n\n".join(sections), include_memory=not skip_memory)
 
-    if light_chat_turn:
-        cleaned = finalize_reply(current_raw, visible_fallback)
-        return normalize_final_reply(cleaned)
 
-    if ADVISOR_ONLY and _response_uses_disabled_coding_tools(current_raw):
-        advisor_retry = _request_completion(
-            _retry_messages_for_advisor_only_tools(working_messages, current_raw),
-            stream=False,
-        )
-        current_raw = _extract_message_text(advisor_retry)
-        current_finish_reason = _extract_finish_reason(advisor_retry)
+def _history_messages(session_id: str | None) -> list[dict]:
+    state = _session_state(session_id)
+    with state.lock:
+        messages = list(state.messages)
 
-    if use_coder_specialist is None:
-        use_coder_specialist = _should_use_coder_specialist(user_input, analysis, session_id=session_id)
+    total = 0
+    kept: list[dict] = []
+    for message in reversed(messages[-_MAX_HISTORY_MESSAGES:]):
+        role = str(message.get("role", "") or "")
+        if role not in {"user", "assistant"}:
+            continue
+        content = _clip(_clean_reply(str(message.get("content", "") or "")), 700)
+        if not content:
+            continue
+        cost = len(content)
+        if kept and total + cost > _MAX_HISTORY_CHARS:
+            break
+        kept.append({"role": role, "content": content})
+        total += cost
+    kept.reverse()
+    return kept
 
-    coder_route = _route_coder_generation(
-        user_input,
-        working_messages,
-        current_raw,
-        session_id=session_id,
-        analysis=analysis,
-        progress_callback=progress_callback,
+
+def _chat_messages(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> list[dict]:
+    return [
+        {"role": "system", "content": _system_prompt(user_input, skip_memory=skip_memory)},
+        *_history_messages(session_id),
+        {"role": "user", "content": user_input},
+    ]
+
+
+def _request_completion(messages: list[dict], *, stream: bool):
+    return ModelManager.get_instance().create_chat_completion(
+        messages=messages,
+        max_tokens=_FAST_MAX_TOKENS,
+        temperature=TEMPERATURE,
+        top_k=TOP_K,
+        top_p=TOP_P,
+        repeat_penalty=REPETITION_PENALTY,
+        stream=stream,
     )
 
-    if coder_route.used_coder:
-        cleaned = coder_route.text
-    else:
-        if _needs_codebase_action_retry(analysis, current_raw):
-            retry_result = _request_completion(
-                _retry_messages_for_codebase_action(working_messages, current_raw, user_input),
-                stream=False,
-            )
-            current_raw = _extract_message_text(retry_result)
-            current_finish_reason = _extract_finish_reason(retry_result)
 
-        if _needs_editor_retry(user_input, current_raw):
-            retry_result = _request_completion(_retry_messages_for_editor_actions(working_messages), stream=False)
-            current_raw = _extract_message_text(retry_result)
-            current_finish_reason = _extract_finish_reason(retry_result)
+def _start_model_loading() -> None:
+    manager = ModelManager.get_instance()
+    status = manager.status()
+    if status["loading"] or status["loaded"]:
+        return
 
-        if _response_uses_tool_calls(current_raw):
-            cleaned = _run_editor_followup_loop(
-                user_input,
-                working_messages,
-                current_raw,
-                initial_finish_reason=current_finish_reason,
-                session_id=session_id,
-                progress_callback=progress_callback,
-            )
-        elif analysis.codebase_context:
-            codebase_messages = _maybe_get_codebase_messages(
-                base_messages,
-                working_messages,
-                user_input,
-                session_id=session_id,
-                analysis=analysis,
-            )
-            if codebase_messages is working_messages and working_messages is not base_messages:
-                cleaned = finalize_reply(current_raw, visible_fallback)
-            elif codebase_messages:
-                fallback_result = _request_completion(codebase_messages, stream=False)
-                fallback_raw = _extract_message_text(fallback_result)
-                current_finish_reason = _extract_finish_reason(fallback_result)
-                if _response_uses_tool_calls(fallback_raw):
-                    cleaned = _run_editor_followup_loop(
-                        user_input,
-                        codebase_messages,
-                        fallback_raw,
-                        initial_finish_reason=current_finish_reason,
-                        session_id=session_id,
-                        progress_callback=progress_callback,
-                    )
-                else:
-                    cleaned = finalize_reply(fallback_raw, visible_fallback)
-            else:
-                cleaned = finalize_reply(current_raw, visible_fallback)
-        else:
-            cleaned = finalize_reply(current_raw, visible_fallback)
+    def load() -> None:
+        try:
+            manager.ensure_loaded()
+        except Exception:
+            pass
 
-    cleaned = ensure_complete_visible_reply(
-        working_messages,
-        cleaned,
-        finish_reason=current_finish_reason,
-        request_completion=lambda msgs: _request_completion(msgs, stream=False),
-        extract_message_text=_extract_message_text,
-        extract_finish_reason=_extract_finish_reason,
-    )
-    cleaned = postprocess_reply(
-        cleaned,
-        analysis=analysis,
-        compact_mode=is_popup_session,
-        working_messages=working_messages,
-        request_completion=lambda msgs: _request_completion(msgs, stream=False),
-        extract_message_text=_extract_message_text,
-        extract_finish_reason=_extract_finish_reason,
-    )
-    return normalize_final_reply(cleaned)
+    threading.Thread(target=load, daemon=True, name="AkaneModelLoader").start()
 
 
 def _generate_reply(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> str:
     with _generation_lock:
-        chat_messages, analysis = _prepare_chat_turn(user_input, skip_memory=skip_memory, session_id=session_id)
+        _log_terminal_stream("user", user_input)
+        remember_user_message(user_input)
+        messages = _chat_messages(user_input, skip_memory=skip_memory, session_id=session_id)
+        _log_prompt(messages, session_id=session_id, stream=False)
         _append_message("user", user_input, session_id)
-        light_chat_turn = _is_light_chat_turn(analysis)
-        completion_overrides = _completion_overrides_for_turn(user_input, analysis, session_id=session_id)
-        use_coder_specialist = False if light_chat_turn else _should_use_coder_specialist(user_input, analysis, session_id=session_id)
-        coder_route = _route_coder_generation(
-            user_input,
-            chat_messages,
-            user_input,
-            session_id=session_id,
-            analysis=analysis,
-        )
-        if coder_route.used_coder:
-            cleaned = coder_route.text
-        else:
-            working_messages = chat_messages
-            if not light_chat_turn and _should_preload_codebase_context(user_input, analysis, session_id=session_id, use_coder_specialist=use_coder_specialist):
-                fallback_messages = _build_codebase_fallback_messages(
-                    chat_messages,
-                    user_input,
-                    session_id=session_id,
-                    analysis=analysis,
-                )
-                if fallback_messages:
-                    working_messages = fallback_messages
-
-            result = _request_completion(working_messages, stream=False, **completion_overrides)
-            cleaned = _complete_reply(
-                user_input,
-                chat_messages,
-                working_messages,
-                _extract_message_text(result),
-                finish_reason=_extract_finish_reason(result),
-                session_id=session_id,
-                analysis=analysis,
-                use_coder_specialist=use_coder_specialist,
-            )
-
-    if _normalize_session_id(session_id) == DEFAULT_SESSION_ID:
-        cleaned = _strip_popup_tags(cleaned)
-    cleaned = normalize_final_reply(cleaned)
-    _append_message("assistant", cleaned, session_id)
-    return cleaned
-
-
-def _json_line(payload: dict) -> str:
-    return json.dumps(payload, ensure_ascii=False) + "\n"
+        result = _request_completion(messages, stream=False)
+        raw = _extract_message_text(result)
+        remember_user_message(raw)
+        reply = _clean_reply(raw) or "I lost the thread for a second. Try that again."
+        _log_reply(reply, session_id=session_id, raw=raw)
+        _append_message("assistant", reply, session_id)
+        return reply
 
 
 def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str | None = None):
     try:
         with _generation_lock:
-            normalized_session = _normalize_session_id(session_id)
-            is_popup_session = normalized_session == DEFAULT_SESSION_ID
-            _clear_streaming_reply_preview(session_id)
             _log_terminal_stream("user", text)
-            chat_messages, analysis = _prepare_chat_turn(text, skip_memory=skip_memory, session_id=session_id)
+            _set_streaming_reply_preview("", session_id)
+            remember_user_message(text)
+            messages = _chat_messages(text, skip_memory=skip_memory, session_id=session_id)
+            _log_prompt(messages, session_id=session_id, stream=True)
             _append_message("user", text, session_id)
             yield _json_line({"type": "start", "messages": list(_session_state(session_id).messages)})
-            light_chat_turn = _is_light_chat_turn(analysis)
-            completion_overrides = _completion_overrides_for_turn(text, analysis, session_id=session_id)
-            if is_popup_session:
-                capped = min(completion_overrides.get("max_tokens_override", MAX_TOKENS), 128)
-                completion_overrides = {**completion_overrides, "max_tokens_override": capped}
-            use_coder_specialist = False if light_chat_turn else _should_use_coder_specialist(text, analysis, session_id=session_id)
-            coder_route = _route_coder_generation(
-                text,
-                chat_messages,
-                text,
-                session_id=session_id,
-                analysis=analysis,
-            )
-            if coder_route.used_coder:
-                cleaned = coder_route.text
-                yield _json_line({"type": "delta", "content": cleaned})
-                _set_streaming_reply_preview(cleaned, session_id)
-            else:
-                suppress_intermediate_text = False if light_chat_turn else (
-                    _should_force_vscode(text, analysis, session_id=session_id)
-                    or analysis.codebase_context
-                )
-                if is_popup_session:
-                    suppress_intermediate_text = False
-                working_messages = chat_messages
-                if not light_chat_turn and not is_popup_session and _should_preload_codebase_context(text, analysis, session_id=session_id, use_coder_specialist=use_coder_specialist):
-                    yield _json_line({"type": "status", "label": "Reading files..."})
-                    fallback_messages = _build_codebase_fallback_messages(
-                        chat_messages,
-                        text,
-                        session_id=session_id,
-                        analysis=analysis,
-                    )
-                    if fallback_messages:
-                        working_messages = fallback_messages
 
-                stream = _request_completion(working_messages, stream=True, **completion_overrides)
-                hidden_filter = HiddenTagStreamFilter()
-                visible_cleaner = _StreamVisibleCleaner()
-                full_response: list[str] = []
-                visible_parts: list[str] = []
-                visible_len = 0
-                emitted_len = 0
-                emit_threshold = 16 if is_popup_session else 32
-                stream_finish_reason = ""
-                append_visible = visible_parts.append
-                feed_hidden = hidden_filter.feed
-                feed_visible = visible_cleaner.feed
-                json_line = _json_line
-                set_preview = _set_streaming_reply_preview
-                strip_popup = _strip_popup_tags if is_popup_session else None
+            hidden_filter = HiddenTagStreamFilter()
+            raw_parts: list[str] = []
+            visible_parts: list[str] = []
+            stream = _request_completion(messages, stream=True)
 
-                for chunk in stream:
-                    choice = chunk["choices"][0]
-                    delta = choice.get("delta", {})
-                    token = delta.get("content")
-                    finish_reason = choice.get("finish_reason")
-                    if finish_reason:
-                        stream_finish_reason = str(finish_reason).strip().lower()
-                    if not token:
-                        continue
-                    full_response.append(token)
-                    visible = feed_hidden(token)
-                    if not visible:
-                        continue
-                    cleaned_delta = visible.replace("\r\n", "\n").replace("`", "") if is_popup_session else feed_visible(visible)
-                    if is_popup_session and not visible_parts:
-                        cleaned_delta = cleaned_delta.lstrip()
-                    if not cleaned_delta:
-                        continue
-                    append_visible(cleaned_delta)
-                    visible_len += len(cleaned_delta)
-                    if not suppress_intermediate_text:
-                        if is_popup_session and "[" not in cleaned_delta:
-                            yield json_line({"type": "delta", "content": cleaned_delta, "append": True})
-                            emitted_len = visible_len
-                            continue
-                        if not is_popup_session and (visible_len - emitted_len) < emit_threshold and "\n" not in cleaned_delta:
-                            continue
-                        output_text = "".join(visible_parts)
-                        if strip_popup and "[" in output_text:
-                            output_text = strip_popup(output_text)
-                        set_preview(output_text, session_id)
-                        yield json_line({"type": "delta", "content": output_text})
-                        emitted_len = len(output_text)
+            for chunk in stream:
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                token = content_to_text((choices[0].get("delta") or {}).get("content"))
+                if not token:
+                    continue
+                raw_parts.append(token)
+                visible = hidden_filter.feed(token)
+                if not visible:
+                    continue
+                visible_parts.append(visible)
+                preview = "".join(visible_parts)
+                _set_streaming_reply_preview(preview, session_id)
+                yield _json_line({"type": "delta", "content": visible, "append": True})
 
-                visible = hidden_filter.flush()
-                if visible:
-                    cleaned_delta = visible.replace("\r\n", "\n").replace("`", "") if is_popup_session else feed_visible(visible)
-                    if is_popup_session and not visible_parts:
-                        cleaned_delta = cleaned_delta.lstrip()
-                    if cleaned_delta:
-                        append_visible(cleaned_delta)
-                        visible_len += len(cleaned_delta)
-                flushed_tail = "" if is_popup_session else visible_cleaner.flush()
-                if flushed_tail:
-                    append_visible(flushed_tail)
-                    visible_len += len(flushed_tail)
-                if visible_parts and not suppress_intermediate_text and not is_popup_session:
-                    output_text = "".join(visible_parts)
-                    if strip_popup and "[" in output_text:
-                        output_text = strip_popup(output_text)
-                    set_preview(output_text, session_id)
-                    yield json_line({"type": "delta", "content": output_text})
-                    emitted_len = len(output_text)
+            tail = hidden_filter.flush()
+            if tail:
+                visible_parts.append(tail)
+                preview = "".join(visible_parts)
+                _set_streaming_reply_preview(preview, session_id)
+                yield _json_line({"type": "delta", "content": tail, "append": True})
 
-                raw = "".join(full_response).strip()
-                displayed_text = "".join(visible_parts)
-                streamed_visible = displayed_text.strip()
-                if not suppress_intermediate_text and streamed_visible:
-                    cleaned = streamed_visible
-                else:
-                    cleaned = _complete_reply(
-                        text,
-                        chat_messages,
-                        working_messages,
-                        raw,
-                        finish_reason=stream_finish_reason,
-                        visible_fallback=displayed_text,
-                        session_id=session_id,
-                        analysis=analysis,
-                        use_coder_specialist=use_coder_specialist,
-                    )
-                if is_popup_session and "[" in cleaned:
-                    cleaned = _strip_popup_tags(cleaned)
-                cleaned = normalize_final_reply(cleaned)
-                if suppress_intermediate_text or cleaned != displayed_text:
-                    _set_streaming_reply_preview(cleaned, session_id)
-                    yield _json_line({"type": "delta", "content": cleaned})
-                
-            _append_message("assistant", cleaned, session_id)
-            _log_terminal_stream("done", cleaned)
-            yield _json_line({"type": "done", "reply": cleaned, "messages": list(_session_state(session_id).messages)})
-    except Exception as exc:  # pragma: no cover - surfaced in browser
-        _clear_streaming_reply_preview(session_id)
+            raw = "".join(raw_parts)
+            remember_user_message(raw)
+            displayed = "".join(visible_parts)
+            reply = _clean_reply(raw) or _clean_reply(displayed) or "I lost the thread for a second. Try that again."
+            _log_reply(reply, session_id=session_id, raw=raw)
+            if reply != displayed.strip():
+                _set_streaming_reply_preview(reply, session_id)
+                yield _json_line({"type": "delta", "content": reply})
+
+            _append_message("assistant", reply, session_id)
+            yield _json_line({"type": "done", "reply": reply, "messages": list(_session_state(session_id).messages)})
+    except Exception as exc:
+        _set_streaming_reply_preview("", session_id)
         _log_terminal_stream("error", str(exc))
+        _LOGGER.exception("Chat generation failed for session=%s", _normalize_session_id(session_id))
         yield _json_line({"type": "error", "error": str(exc)})
+
+
+def _handle_command(text: str, session_id: str | None = None) -> dict | None:
+    if text == "/clear":
+        _clear_messages(session_id)
+        return {"reply": "", "messages": [], "notice": "Context cleared."}
+    if text == "/memory":
+        reload_from_disk()
+        reply = format_for_prompt() or "No memories yet."
+        return {"reply": reply, "messages": [*_state_messages(session_id), {"role": "assistant", "content": reply}], "ephemeral": True}
+    if text == "/reset":
+        _clear_messages(session_id)
+        if MEMORY_PATH.exists():
+            MEMORY_PATH.unlink()
+        reload_from_disk()
+        return {"reply": "", "messages": [], "notice": "Memory wiped and context cleared."}
+    if text == "/vscode":
+        return {"reply": "", "messages": _state_messages(session_id), "notice": launch_vscode(), "ephemeral": True}
+    if text in {"/approve", "/reject"}:
+        bridge = get_editor_bridge()
+        actions = bridge.approve_all_pending_actions() if text == "/approve" else bridge.reject_all_pending_actions()
+        verb = "Approved" if text == "/approve" else "Rejected"
+        notice = f"{verb} {len(actions)} pending code change(s)." if actions else "No pending code changes."
+        return {"reply": "", "messages": _state_messages(session_id), "notice": notice, "ephemeral": True}
+    return None
 
 
 def _app_state_payload(session_id: str | None = None, *, include_messages: bool = True) -> dict:
     state = _session_state(session_id)
     payload = {
         "model": ModelManager.get_instance().status(),
-        "editor": _editor_snapshot(),
+        "editor": get_editor_bridge().snapshot(),
         "version": state.version,
     }
     if include_messages:
@@ -1971,7 +557,7 @@ def _app_state_payload(session_id: str | None = None, *, include_messages: bool 
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Akane API", docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
+    app = FastAPI(title="Akane API", docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -1982,27 +568,18 @@ def create_app() -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     async def root():
-        static_response = _static_response_path("/")
-        if static_response is None:
+        path, media_type = _static_response_path("/") or (None, None)
+        if path is None:
             raise HTTPException(status_code=404)
-        path, content_type = static_response
-        return FileResponse(path, media_type=content_type)
+        return FileResponse(path, media_type=media_type)
 
     @app.get("/api/state")
     async def api_state(session_id: str = DEFAULT_SESSION_ID, include_messages: str = "1"):
-        return JSONResponse(
-            _app_state_payload(
-                session_id,
-                include_messages=_coerce_bool(include_messages),
-            )
-        )
+        return JSONResponse(_app_state_payload(session_id, include_messages=_coerce_bool(include_messages, True)))
 
     @app.get("/api/memory")
     async def api_memory():
-        try:
-            return JSONResponse(get_all())
-        except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse(get_all())
 
     @app.get("/api/editor/state")
     async def api_editor_state():
@@ -2014,19 +591,17 @@ def create_app() -> FastAPI:
 
     @app.post("/api/editor/context")
     async def api_editor_context(request: Request):
-        payload = await _request_payload(request)
-        snapshot = get_editor_bridge().update_context(payload)
-        return JSONResponse({"ok": True, "state": snapshot})
+        return JSONResponse({"ok": True, "state": get_editor_bridge().update_context(await _request_payload(request))})
 
     @app.post("/api/editor/action-result")
     async def api_editor_action_result(request: Request):
         payload = await _request_payload(request)
-        action_id = int(payload.get("id", 0) or 0)
+        action_id = _coerce_int(payload.get("id", 0), 0)
         if action_id <= 0:
             return JSONResponse({"error": "Missing action id."}, status_code=400)
         summary = get_editor_bridge().complete_action(
             action_id=action_id,
-            ok=bool(payload.get("ok", False)),
+            ok=_coerce_bool(payload.get("ok", False)),
             result=str(payload.get("result", "")),
             error=str(payload.get("error", "")),
         )
@@ -2037,14 +612,11 @@ def create_app() -> FastAPI:
     @app.post("/api/backend")
     async def api_backend(request: Request):
         payload = await _request_payload(request)
-        backend = str(payload.get("backend", "")).strip().lower()
-        model_name = payload.get("model_name")
-        local_model_path = payload.get("local_model_path")
         try:
             status = ModelManager.get_instance().switch_backend(
-                backend,
-                local_model_path=str(local_model_path) if local_model_path is not None else None,
-                openrouter_model=str(model_name) if model_name is not None else None,
+                str(payload.get("backend", "")).strip().lower(),
+                local_model_path=str(payload["local_model_path"]) if "local_model_path" in payload else None,
+                openrouter_model=str(payload["model_name"]) if "model_name" in payload else None,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -2052,85 +624,50 @@ def create_app() -> FastAPI:
 
     @app.post("/api/open-vscode")
     async def api_open_vscode():
-        try:
-            notice = launch_vscode()
-        except RuntimeError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
-        return JSONResponse({"ok": True, "notice": notice, "editor": _editor_snapshot()})
+        return JSONResponse({"ok": True, "notice": launch_vscode(), "editor": get_editor_bridge().snapshot()})
 
     @app.post("/api/quit")
     async def api_quit():
-        def _quit_soon() -> None:
-            time.sleep(0.15)
-            os._exit(0)
-
-        threading.Thread(target=_quit_soon, daemon=True, name="AkaneQuit").start()
+        threading.Thread(target=lambda: (time.sleep(0.15), os._exit(0)), daemon=True, name="AkaneQuit").start()
         return JSONResponse({"ok": True}, status_code=202)
 
     @app.post("/api/chat")
     async def api_chat(request: Request):
         _start_model_loading()
-        chat_request = _parse_chat_request(await _request_payload(request))
-        if not chat_request.text:
+        chat = _parse_chat_request(await _request_payload(request))
+        if not chat.text:
             return JSONResponse({"error": "Message is empty."}, status_code=400)
-
-        command_result = _handle_command(chat_request.text, chat_request.session_id)
-        if command_result is not None:
-            command_result.setdefault("messages", list(_session_state(chat_request.session_id).messages))
-            return JSONResponse(command_result)
-
-        model_status = ModelManager.get_instance().status()
-        if model_status["error"]:
-            return JSONResponse({"error": model_status["error"]}, status_code=500)
-
+        command = _handle_command(chat.text, chat.session_id)
+        if command is not None:
+            return JSONResponse(command)
         try:
-            reply = _generate_reply(
-                chat_request.text,
-                skip_memory=chat_request.skip_memory,
-                session_id=chat_request.session_id,
-            )
-        except Exception as exc:  # pragma: no cover - surfaced in browser
+            reply = _generate_reply(chat.text, skip_memory=chat.skip_memory, session_id=chat.session_id)
+        except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
-
-        return JSONResponse({"reply": reply, "messages": list(_session_state(chat_request.session_id).messages)})
+        return JSONResponse({"reply": reply, "messages": _state_messages(chat.session_id)})
 
     @app.post("/api/chat/stream")
     async def api_chat_stream(request: Request):
         _start_model_loading()
-        chat_request = _parse_chat_request(await _request_payload(request))
-        if not chat_request.text:
+        chat = _parse_chat_request(await _request_payload(request))
+        if not chat.text:
             return JSONResponse({"error": "Message is empty."}, status_code=400)
-
-        command_result = _handle_command(chat_request.text, chat_request.session_id)
-        if command_result is not None:
-            command_result.setdefault("messages", list(_session_state(chat_request.session_id).messages))
-            return JSONResponse(command_result)
-
-        model_status = ModelManager.get_instance().status()
-        if model_status["error"]:
-            return JSONResponse({"error": model_status["error"]}, status_code=500)
-
+        command = _handle_command(chat.text, chat.session_id)
+        if command is not None:
+            return JSONResponse(command)
         return StreamingResponse(
-            _stream_chat_events(
-                chat_request.text,
-                skip_memory=chat_request.skip_memory,
-                session_id=chat_request.session_id,
-            ),
+            _stream_chat_events(chat.text, skip_memory=chat.skip_memory, session_id=chat.session_id),
             media_type="application/x-ndjson; charset=utf-8",
-            headers={
-                "Cache-Control": "no-store, no-transform",
-                "X-Accel-Buffering": "no",
-            },
+            headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
         )
 
     @app.get("/{asset_path:path}", include_in_schema=False)
     async def static_assets(asset_path: str):
-        route = "/" + asset_path.lstrip("/")
-        static_response = _static_response_path(unquote(route))
-        if static_response is None:
+        static = _static_response_path(unquote("/" + asset_path.lstrip("/")))
+        if static is None:
             raise HTTPException(status_code=404)
-        path, content_type = static_response
-        return FileResponse(path, media_type=content_type)
+        path, media_type = static
+        return FileResponse(path, media_type=media_type)
 
     return app
 
@@ -2140,15 +677,7 @@ APP = create_app()
 
 class BackgroundUvicornServer:
     def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
-        self._config = uvicorn.Config(
-            APP,
-            host=host,
-            port=port,
-            log_level="warning",
-            access_log=False,
-        )
+        self._config = uvicorn.Config(APP, host=host, port=port, log_level="warning", access_log=False)
         self._server = uvicorn.Server(self._config)
         self._thread: threading.Thread | None = None
 
@@ -2163,10 +692,9 @@ class BackgroundUvicornServer:
 
 def serve(host: str = SERVER_HOST, port: int = SERVER_PORT) -> None:
     print(f"Akane web chat running at http://{host}:{port}", flush=True)
-    _warm_model_now()
-    server = BackgroundUvicornServer(host, port)
+    _start_model_loading()
     try:
-        server.run()
+        BackgroundUvicornServer(host, port).run()
     except KeyboardInterrupt:
         print("\nStopping Akane web chat...", flush=True)
 
@@ -2174,11 +702,7 @@ def serve(host: str = SERVER_HOST, port: int = SERVER_PORT) -> None:
 def serve_in_thread(host: str = SERVER_HOST, port: int = SERVER_PORT) -> tuple[BackgroundUvicornServer, threading.Thread]:
     _start_model_loading()
     server = BackgroundUvicornServer(host, port)
-    thread = threading.Thread(
-        target=server.run,
-        daemon=True,
-        name="AkaneAPIServer",
-    )
+    thread = threading.Thread(target=server.run, daemon=True, name="AkaneAPIServer")
     server._thread = thread
     thread.start()
     print(f"Akane background API running at http://{host}:{port}", flush=True)

@@ -12,6 +12,9 @@ IDENTITY_PATH = Path(__file__).resolve().parent.parent / "identity.md"
 _PromptFileCache = tuple[int, str]
 _SOUL_CACHE: _PromptFileCache | None = None
 _IDENTITY_CACHE: _PromptFileCache | None = None
+_BASE_PROMPT_CACHE: dict[tuple[tuple[int, int, int], bool], str] = {}
+_FULL_PROMPT_CACHE: dict[tuple[tuple[int, int, int], bool, str], str] = {}
+
 
 def _load_cached(path: Path, cache: _PromptFileCache | None) -> _PromptFileCache:
     try:
@@ -45,20 +48,13 @@ def prompt_revision() -> tuple[int, int, int]:
     )
 
 
-def build_system_prompt(runtime_context: str = "", *, include_memory: bool = True) -> str:
-    parts = [load_identity(), load_soul()]
-    parts.append(
-        "PRIORITY:\n"
-        "- soul.md defines behavior and overrides all other style instructions.\n"
-        "- identity.md defines who you are and how you show up.\n"
-        "- Use only facts that exist in the conversation, memory, or runtime context."
-    )
-    parts.append(
-        "CONVERSATION:\n"
-        "- Stay concise unless the user asks for detail.\n"
-        "- React to the user's actual message, not a generic assistant script.\n"
-        "- Do not use emojis."
-    )
+def _base_system_prompt(*, include_memory: bool) -> str:
+    key = (prompt_revision(), include_memory)
+    cached = _BASE_PROMPT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    parts = [load_soul(), load_identity()]
     if include_memory:
         parts.append(
             "MEMORY:\n"
@@ -73,6 +69,24 @@ def build_system_prompt(runtime_context: str = "", *, include_memory: bool = Tru
         )
     if ADVISOR_ONLY:
         parts.append("Advisor-only mode: do not claim to edit files.")
-    if runtime_context:
-        parts.append(runtime_context.strip())
-    return "\n\n".join(part for part in parts if part)
+    result = "\n\n".join(part for part in parts if part)
+    if len(_BASE_PROMPT_CACHE) > 8:
+        _BASE_PROMPT_CACHE.clear()
+    _BASE_PROMPT_CACHE[key] = result
+    return result
+
+
+def build_system_prompt(runtime_context: str = "", *, include_memory: bool = True) -> str:
+    context = str(runtime_context or "").strip()
+    key = (prompt_revision(), include_memory, context)
+    cached = _FULL_PROMPT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    parts = [_base_system_prompt(include_memory=include_memory)]
+    if context:
+        parts.append(context)
+    result = "\n\n".join(part for part in parts if part)
+    if len(_FULL_PROMPT_CACHE) > 16:
+        _FULL_PROMPT_CACHE.clear()
+    _FULL_PROMPT_CACHE[key] = result
+    return result

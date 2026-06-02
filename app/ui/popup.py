@@ -9,7 +9,6 @@ import threading
 import webview
 
 from app.core.config import POPUP_BACKEND_URL, popup_backend_is_local
-from app.integrations.editor_bridge import get_editor_bridge
 from app.ui.assets import IMAGES_DIR
 
 try:
@@ -154,15 +153,6 @@ class WindowApi:
     def toggle_memory(self) -> None:
         self.app.toggle_memory()
 
-    def show_code_approval(self) -> None:
-        self.app.show_code_approval()
-
-    def approve_approval(self) -> None:
-        self.app.approve_pending_changes()
-
-    def reject_approval(self) -> None:
-        self.app.reject_pending_changes()
-
 
 class PopupApp:
     def __init__(self):
@@ -199,12 +189,7 @@ class PopupApp:
             return
         session_id = DEFAULT_SESSION_ID
         try:
-            stream_lines = (
-                self._local_stream_lines(message, session_id)
-                if popup_backend_is_local()
-                else self._remote_stream_lines(message, session_id)
-            )
-            for line in stream_lines:
+            for line in self._remote_stream_lines(message, session_id):
                 self._emit_stream_line(line)
         except Exception as exc:
             self._emit_stream_event({"type": "error", "error": str(exc)})
@@ -217,18 +202,9 @@ class PopupApp:
             return
         self._emit_stream_event(json.loads(line))
 
-    def _local_stream_lines(self, message: str, session_id: str):
-        from app.server import _session_state, _stream_chat_events
-
-        for line in _stream_chat_events(message, session_id=session_id):
-            event = json.loads(str(line or "").strip())
-            if event.get("type") == "done" and "version" not in event:
-                event["version"] = _session_state(session_id).version
-            yield json.dumps(event, ensure_ascii=False)
-
     def _remote_stream_lines(self, message: str, session_id: str):
         payload = json.dumps(
-            {"message": message, "session_id": session_id},
+            {"message": message, "session_id": session_id, "skip_memory": False},
             ensure_ascii=False,
         ).encode("utf-8")
         request = urllib.request.Request(
@@ -450,103 +426,6 @@ class PopupApp:
             )
         except Exception:
             pass
-
-    def show_code_approval(self) -> None:
-        bridge = get_editor_bridge()
-        pending = bridge.pending_approval_actions()
-        if not pending:
-            return
-        window = self.windows.get("companion")
-        if window is None:
-            return
-
-        html = self._build_approval_html(pending)
-        try:
-            window.evaluate_js(f"document.body.insertAdjacentHTML('beforeend', {json.dumps(html)});")
-        except Exception:
-            pass
-
-    def approve_pending_changes(self) -> None:
-        get_editor_bridge().approve_all_pending_actions()
-        self._close_approval_overlay()
-
-    def reject_pending_changes(self, reason: str = "User rejected in popup") -> None:
-        get_editor_bridge().reject_all_pending_actions(reason)
-        self._close_approval_overlay()
-
-    def _close_approval_overlay(self) -> None:
-        window = self.windows.get("companion")
-        if window is None:
-            return
-        try:
-            window.evaluate_js("const el = document.getElementById('codeApprovalOverlay'); if (el) el.remove();")
-        except Exception:
-            pass
-
-    def _build_approval_html(self, actions: list[dict]) -> str:
-        changes = []
-        for action in actions:
-            preview = (action.get("meta") or {}).get("preview") or {}
-            cmd = action.get("command", "")
-            changes.append({
-                "filepath": preview.get("path", "unknown"),
-                "description": preview.get("label", cmd),
-                "before": preview.get("before", ""),
-                "after": preview.get("after", ""),
-            })
-
-        return f'''
-<div id="codeApprovalOverlay" style="
-  position:fixed;top:0;left:0;right:0;bottom:0;
-  background:rgba(20,20,20,0.95);z-index:10000;
-  padding:20px;overflow-y:auto;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-  color:#ddd;font-size:13px;">
-  <h2 style="margin-top:0;color:#fff;">Code Review Required</h2>
-  <div id="changesContainer"></div>
-  <div style="display:flex;gap:12px;justify-content:flex-end;margin-top:16px;padding-top:16px;border-top:1px solid #444;">
-    <button onclick="pywebview.api.reject_approval()" style="padding:10px 20px;background:#e03131;color:white;border:none;border-radius:4px;cursor:pointer;">Reject</button>
-    <button onclick="pywebview.api.approve_approval()" style="padding:10px 20px;background:#2f9e44;color:white;border:none;border-radius:4px;cursor:pointer;">Approve</button>
-  </div>
-  <script>
-    (function() {{
-      const changes = {json.dumps(changes)};
-      function escapeHtml(text) {{
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-      }}
-      function renderDiff(old, newText) {{
-        const oldLines = (old || '').split('\\n');
-        const newLines = (newText || '').split('\\n');
-        const max = Math.max(oldLines.length, newLines.length);
-        let html = '';
-        for (let i = 0; i < max; i++) {{
-          const oldL = oldLines[i] || null;
-          const newL = newLines[i] || null;
-          if (oldL === null && newL !== null) {{
-            html += '<div style="color:#69db7c;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + escapeHtml(newL) + '</div>';
-          }} else if (oldL !== null && newL === null) {{
-            html += '<div style="color:#ff6b6b;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + escapeHtml(oldL) + '</div>';
-          }} else if (oldL !== newL) {{
-            if (oldL) html += '<div style="color:#ff6b6b;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + escapeHtml(oldL) + '</div>';
-            if (newL) html += '<div style="color:#69db7c;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + escapeHtml(newL) + '</div>';
-          }} else {{
-            html += '<div style="color:#ddd;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + escapeHtml(oldL || '') + '</div>';
-          }}
-        }}
-        return html;
-      }}
-      const container = document.getElementById('changesContainer');
-      container.innerHTML = changes.map(c =>
-        '<div style="margin-bottom:20px;padding:12px;background:#1a1a1a;border-radius:6px;border-left:3px solid #4a9eff;">' +
-        '<div style="font-weight:600;color:#fff;margin-bottom:8px;word-break:break-all;">' + escapeHtml(c.filepath) + '</div>' +
-        (c.description ? '<div style="color:#888;font-size:12px;margin-bottom:10px;">' + escapeHtml(c.description) + '</div>' : '') +
-        '<div style="background:#0a0a0a;border-radius:4px;padding:10px;max-height:180px;overflow:auto;">' + renderDiff(c.before, c.after) + '</div>' +
-        '</div>'
-      ).join('');
-    }})();
-  </script>
-</div>'''
 
     def sync_bubble_height(self, height: int) -> None:
         # Width stays fixed in the combined window; just re-evaluate visibility.

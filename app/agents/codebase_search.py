@@ -54,6 +54,22 @@ def _iter_word_tokens(text: str):
         yield "".join(current)
 
 
+def _clean_reference_path(raw_ref: str) -> str:
+    raw = str(raw_ref or "").strip(_REFERENCE_TRAILING_PUNCT).replace("\\", "/")
+    if not raw or "://" in raw or raw.startswith("~"):
+        return ""
+    if raw.startswith("./"):
+        raw = raw[2:]
+    if ":" in raw:
+        path_part, _, suffix = raw.partition(":")
+        suffix = suffix.strip()
+        if path_part and suffix and (suffix[0].isdigit() or suffix.lower().startswith("l")):
+            raw = path_part.strip()
+        else:
+            return ""
+    return raw
+
+
 class _IndexedFile:
     __slots__ = ("path", "rel", "lowered", "stem", "normalized_stem", "tokens", "normalized_tokens", "text_searchable")
 
@@ -100,6 +116,7 @@ class CodebaseSearch:
                 entry = _IndexedFile(path, self.project_root)
                 inventory.append(entry)
                 index.setdefault(filename.lower(), []).append(entry.rel)
+                index.setdefault(path.stem.lower(), []).append(entry.rel)
         self._inventory = inventory
         self._file_index = index
         self._inventory_built_at = now
@@ -158,13 +175,28 @@ class CodebaseSearch:
             return True
 
     def is_source_candidate(self, rel: str) -> bool:
-        lowered = str(rel or "").strip().lower()
+        rel_path = self._project_relative_path(rel)
+        lowered = rel_path.lower()
         if not lowered:
             return False
         suffix = Path(lowered).suffix
         if suffix in _BINARY_FILE_SUFFIXES:
             return False
         return not any(lowered.startswith(prefix) for prefix in _DEPRIORITIZED_ROOT_PREFIXES)
+
+    def _project_relative_path(self, raw_path: str, *, must_be_file: bool = False) -> str:
+        raw = _clean_reference_path(raw_path)
+        if not raw:
+            return ""
+        try:
+            candidate = Path(raw)
+            resolved = candidate.resolve() if candidate.is_absolute() else (self.project_root / candidate).resolve()
+            rel = resolved.relative_to(self.project_root)
+        except (OSError, ValueError):
+            return ""
+        if must_be_file and not resolved.is_file():
+            return ""
+        return str(rel)
 
     # ------------------------------------------------------------------ #
     # Scoring                                                              #
@@ -266,14 +298,14 @@ class CodebaseSearch:
 
     def _resolve_ref(self, raw_ref: str) -> list[str]:
         """Resolve a file-reference token to zero or more repo-relative paths."""
-        raw = str(raw_ref or "").strip(_REFERENCE_TRAILING_PUNCT)
+        raw = _clean_reference_path(raw_ref)
         if not raw:
             return []
         # Exact path on disk
-        if "/" in raw:
-            resolved = (self.project_root / raw).resolve()
-            if resolved.is_file() and str(resolved).startswith(str(self.project_root)):
-                return [str(resolved.relative_to(self.project_root))]
+        if "/" in raw or Path(raw).is_absolute():
+            rel = self._project_relative_path(raw, must_be_file=True)
+            if rel:
+                return [rel]
         index = self.get_project_file_index()
         lowered = raw.lower()
         bare = lowered.rsplit("/", 1)[-1]
@@ -313,8 +345,8 @@ class CodebaseSearch:
         limit: int = 3,
     ) -> list[str]:
         file_refs     = [s for s in (file_refs     or []) if s and s.strip()]
-        recent_targets = [s for s in (recent_targets or []) if s and s.strip()]
-        open_tabs     = [s for s in (open_tabs     or []) if s and s.strip()]
+        recent_targets = [p for s in (recent_targets or []) if (p := self._project_relative_path(s, must_be_file=True))]
+        open_tabs     = [p for s in (open_tabs     or []) if (p := self._project_relative_path(s, must_be_file=True))]
         recent_texts  = [s for s in (recent_texts  or []) if s and s.strip()]
 
         seen: set[str] = set()
@@ -334,6 +366,7 @@ class CodebaseSearch:
 
         # 2. Active file when the message refers to it by phrase
         lowered_input = str(user_input or "").lower()
+        active_file = self._project_relative_path(active_file, must_be_file=True)
         if active_file and active_file not in seen and any(
             phrase in lowered_input for phrase in ("this file", "current file", "that file", "the file")
         ):

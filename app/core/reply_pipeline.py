@@ -6,14 +6,21 @@ from difflib import SequenceMatcher
 import re
 import string
 
-from app.core.generation import clean_model_text, collapse_hidden_tag_gaps, finalize_model_response
-from app.core.request_analysis import RequestAnalysis
+from app.core.generation import collapse_hidden_tag_gaps
 
 _EMPTY_REPLY_SENTINEL = "__AKANE_EMPTY_REPLY__"
 _PUNCT = str.maketrans({ch: " " for ch in string.punctuation})
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _FOLLOWUP_STARTS = {"how", "what", "why", "when", "where", "who", "can", "could", "would", "should", "do", "does", "is", "are", "want"}
 _FILLER = ("mmm", "mm", "hmm", "hm", "ah", "oh", "heh")
+
+
+def clean_model_text(text: str) -> str:
+    return collapse_hidden_tag_gaps(str(text or "")).replace("`", "").strip()
+
+
+def finalize_model_response(text: str) -> str:
+    return clean_model_text(text)
 
 
 def _collapse_visible(text: str) -> str:
@@ -99,34 +106,14 @@ def _compact(text: str, *, sentences: int = 3) -> str:
     return _strip_trailing_followup_question(text)
 
 
-def _strip_robotic_review_prefix(reply: str) -> str:
-    text = str(reply or "").strip()
-    lowered = text.lower()
-    for prefix in ("after reviewing ", "after inspecting ", "after looking at ", "based on "):
-        if lowered.startswith(prefix):
-            cut = len(prefix)
-            return text[cut:cut + 1].upper() + text[cut + 1:].lstrip()
-    return text
-
-
-def _strip_coding_preface(reply: str) -> str:
-    lines = str(reply or "").splitlines()
-    if not lines:
-        return ""
-    lowered = lines[0].lower()
-    if "direct coding response" in lowered or "no file operations needed" in lowered or "no editor operations needed" in lowered:
-        return "\n".join(lines[1:]).strip()
-    return reply
-
-
 def _normalize_reply_seed(reply: str) -> str:
-    return _strip_coding_preface(_strip_robotic_review_prefix(_strip_filler(_collapse_visible(reply))))
+    return _strip_filler(_collapse_visible(reply))
 
 
 def postprocess_reply(
     reply: str,
     *,
-    analysis: RequestAnalysis,
+    analysis,
     compact_mode: bool = True,
     previous_assistant_reply: str = "",
 ) -> str:

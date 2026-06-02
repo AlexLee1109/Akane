@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
 from app.core.config import (
     CODER_INITIAL_CHUNKS_PER_FILE,
@@ -20,7 +21,6 @@ from app.core.config import (
     TOP_P,
 )
 from app.integrations.editor_bridge import get_editor_bridge
-from app.core.generation import clean_model_text, collapse_hidden_tag_gaps, execute_read_requests
 from app.core.model_loader import ModelManager
 
 # ------------------------------------------------------------------ #
@@ -45,6 +45,69 @@ _ARG_REQUIRED_ACTIONS = {
     "read_file", "read_file_chunk", "list_files", "save_file",
 }
 _ACTION_WAIT_SECONDS = 5.5
+_READ_MAX_LINES_PER_FILE = 420
+_READ_MAX_CHARS_PER_FILE = 16_000
+
+
+def collapse_hidden_tag_gaps(text: str) -> str:
+    value = str(text or "").replace("\r\n", "\n").replace("\t", " ")
+    lines: list[str] = []
+    previous_blank = False
+    for raw in value.split("\n"):
+        line = raw.rstrip()
+        if line:
+            lines.append(line)
+            previous_blank = False
+        elif not previous_blank:
+            lines.append("")
+            previous_blank = True
+    return "\n".join(lines)
+
+
+def clean_model_text(text: str) -> str:
+    return collapse_hidden_tag_gaps(str(text or "")).replace("`", "").strip()
+
+
+def _read_numbered_preview(path: Path) -> str:
+    lines: list[str] = []
+    chars = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for number, raw in enumerate(handle, start=1):
+            if number > _READ_MAX_LINES_PER_FILE or chars >= _READ_MAX_CHARS_PER_FILE:
+                lines.append("...[trimmed]")
+                break
+            line = raw.rstrip("\n")
+            lines.append(f"{number:>4}| {line}")
+            chars += len(line) + 1
+    return "\n".join(lines)
+
+
+def execute_read_requests(filepaths: list[str]) -> list[str]:
+    root = Path.cwd().resolve()
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in filepaths:
+        filepath = _sanitize_path_argument(str(raw or ""), preserve_suffix=False)
+        if not filepath or filepath in seen:
+            continue
+        seen.add(filepath)
+        resolved = (root / filepath).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            out.append(f"[READ_RESULT]Access denied: {filepath} is outside project directory[/READ_RESULT]")
+            continue
+        if not resolved.exists():
+            out.append(f"[READ_RESULT]Error reading {filepath}: file not found[/READ_RESULT]")
+            continue
+        if not resolved.is_file():
+            out.append(f"[READ_RESULT]Error reading {filepath}: not a file[/READ_RESULT]")
+            continue
+        try:
+            out.append(f"[READ_RESULT]{filepath} (line-numbered):\n{_read_numbered_preview(resolved)}[/READ_RESULT]")
+        except OSError as exc:
+            out.append(f"[READ_RESULT]Error reading {filepath}: {exc}[/READ_RESULT]")
+    return out
 
 
 # ------------------------------------------------------------------ #
@@ -72,19 +135,25 @@ def _extract_message_text(result: dict) -> str:
     if not choices:
         return ""
     content = (choices[0].get("message") or {}).get("content")
+    return _content_to_text(content).strip()
+
+
+def _content_to_text(content) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
-        return content.strip()
+        return content
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
             if isinstance(item, str):
                 parts.append(item)
-            elif isinstance(item, dict) and item.get("text"):
-                parts.append(str(item["text"]))
-        return "".join(parts).strip()
-    return str(content).strip()
+            elif isinstance(item, dict):
+                value = item.get("text") or item.get("content")
+                if isinstance(value, str):
+                    parts.append(value)
+        return "".join(parts)
+    return str(content)
 
 
 def _remaining_seconds(deadline: float | None) -> float:
@@ -95,6 +164,21 @@ def _remaining_seconds(deadline: float | None) -> float:
 
 def _budget_exhausted(deadline: float | None, *, reserve: float = 0.0) -> bool:
     return _remaining_seconds(deadline) <= reserve
+
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    lowered = str(value or "").strip().lower()
+    if not lowered:
+        return bool(default)
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
 
 
 def _request_coder_completion(messages: list[dict], *, deadline: float | None = None, json_mode: bool = True) -> dict:
@@ -207,6 +291,59 @@ def _request_payload_with_repair(
 # Payload sanitisation                                                 #
 # ------------------------------------------------------------------ #
 
+def _split_path_suffix(path: str) -> tuple[str, str]:
+    raw = str(path or "").strip().replace("\\", "/")
+    if raw.startswith("./"):
+        raw = raw[2:]
+    if ":" not in raw:
+        return raw, ""
+    path_part, _, suffix = raw.partition(":")
+    suffix = suffix.strip()
+    if path_part and suffix and (suffix[0].isdigit() or suffix.lower().startswith("l")):
+        return path_part.strip(), f":{suffix}"
+    return raw, ""
+
+
+def _sanitize_relative_path(path: str) -> str:
+    raw, _ = _split_path_suffix(path)
+    raw = raw.strip().strip("`'\".,;()[]{}").replace("\\", "/")
+    if raw.startswith("./"):
+        raw = raw[2:]
+    if not raw or raw.startswith("/") or raw.startswith("~") or "://" in raw or ":" in raw:
+        return ""
+    parts = PurePosixPath(raw).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _sanitize_path_argument(argument: str, *, preserve_suffix: bool = True) -> str:
+    path, suffix = _split_path_suffix(argument)
+    sanitized = _sanitize_relative_path(path)
+    if not sanitized:
+        return ""
+    return sanitized + (suffix if preserve_suffix else "")
+
+
+def _sanitize_path_first_line_argument(argument: str) -> str:
+    first_line, sep, rest = str(argument or "").partition("\n")
+    sanitized = _sanitize_path_argument(first_line)
+    if not sanitized:
+        return ""
+    return sanitized + (sep + rest if sep else "")
+
+
+def _sanitize_range_argument(argument: str) -> str:
+    header, sep, rest = str(argument or "").partition("\n")
+    path_part, colon, range_part = header.replace("\\", "/").partition(":")
+    if not colon or not range_part.strip():
+        return ""
+    sanitized = _sanitize_path_argument(path_part, preserve_suffix=False)
+    if not sanitized:
+        return ""
+    return f"{sanitized}:{range_part.strip()}" + (sep + rest if sep else "")
+
+
 def _sanitize_read_requests(payload: dict) -> list[str]:
     raw = payload.get("read_requests") or []
     if not isinstance(raw, list):
@@ -214,12 +351,8 @@ def _sanitize_read_requests(payload: dict) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for item in raw:
-        path = str(item or "").strip().replace("\\", "/")
-        if ":" in path and "/" in path:
-            path = path.split(":", 1)[0].strip()
-        if path.startswith("./"):
-            path = path[2:]
-        if not path or path in seen or path.startswith("/") or path.startswith(".."):
+        path = _sanitize_path_argument(str(item or ""), preserve_suffix=False)
+        if not path or path in seen:
             continue
         seen.add(path)
         result.append(path)
@@ -243,10 +376,20 @@ def _sanitize_actions(payload: dict) -> list[dict]:
         if command in _ARG_REQUIRED_ACTIONS and not argument:
             continue
         if command in {"open_file", "read_file", "read_file_chunk"}:
-            argument = argument.replace("\\", "/")
-            if argument.startswith("./"):
-                argument = argument[2:]
-            if argument.startswith("/") or argument.startswith(".."):
+            argument = _sanitize_path_argument(argument)
+            if not argument:
+                continue
+        elif command in {"list_files", "create_file", "save_file"}:
+            argument = _sanitize_path_argument(argument, preserve_suffix=False)
+            if not argument:
+                continue
+        elif command in {"write_file", "append_file"}:
+            argument = _sanitize_path_first_line_argument(argument)
+            if not argument:
+                continue
+        elif command == "replace_file_range":
+            argument = _sanitize_range_argument(argument)
+            if not argument:
                 continue
         actions.append({"command": command, "argument": argument})
         if len(actions) >= 8:
@@ -369,13 +512,13 @@ def _fresh_reads(
     bridge = get_editor_bridge()
     snapshot = bridge.snapshot().get("context", {})
     connected = bool(snapshot.get("connected"))
-    active_file = str(snapshot.get("active_file") or "").strip()
+    active_file = _sanitize_relative_path(str(snapshot.get("active_file") or ""))
 
     # Deduplicate while preserving order
     seen: set[str] = set()
     normalized: list[str] = []
     for p in targets:
-        p = str(p or "").strip()
+        p = _sanitize_path_argument(str(p or ""), preserve_suffix=False)
         if p and p not in seen:
             seen.add(p)
             normalized.append(p)
@@ -435,15 +578,15 @@ def _action_target_path(action: dict, active_file: str) -> str:
     command = str(action.get("command") or "").lower()
     argument = str(action.get("argument") or "")
     if command in {"read_file", "open_file"}:
-        return argument.split(":", 1)[0].strip()
+        return _sanitize_path_argument(argument, preserve_suffix=False)
     if command in {"create_file", "save_file"}:
-        return argument.strip() or active_file
+        return _sanitize_path_argument(argument, preserve_suffix=False) or _sanitize_relative_path(active_file)
     if command in {"write_file", "append_file"}:
-        return argument.split("\n", 1)[0].strip()
+        return _sanitize_path_argument(argument.split("\n", 1)[0], preserve_suffix=False)
     if command == "replace_file_range":
-        return argument.split("\n", 1)[0].split(":", 1)[0].strip()
+        return _sanitize_path_argument(argument.split("\n", 1)[0].split(":", 1)[0], preserve_suffix=False)
     if command in {"replace_selection", "insert_text", "format_document"}:
-        return active_file
+        return _sanitize_relative_path(active_file)
     return ""
 
 
@@ -460,7 +603,7 @@ def _prepare_editor_actions(actions: list[dict], active_file: str) -> list[dict]
         needs_active and preferred and preferred != active_file
         and not any(
             str(a.get("command") or "").lower() == "open_file"
-            and str(a.get("argument") or "").split(":", 1)[0].strip() == preferred
+            and _sanitize_path_argument(str(a.get("argument") or ""), preserve_suffix=False) == preferred
             for a in queued
         )
     ):
@@ -484,7 +627,7 @@ def _queue_editor_actions(actions: list[dict], *, progress_callback=None, deadli
         ]
     bridge = get_editor_bridge()
     snapshot = bridge.snapshot().get("context", {})
-    active_file = str(snapshot.get("active_file") or "").strip()
+    active_file = _sanitize_relative_path(str(snapshot.get("active_file") or ""))
     queued = _prepare_editor_actions(actions, active_file)
 
     # Auto-append save after in-place edits
@@ -638,7 +781,7 @@ def run_coder_specialist(
         )
         summary      = clean_model_text(str(payload.get("summary") or "")).strip()
         reason       = clean_model_text(str(payload.get("reason")  or "")).strip()
-        done         = bool(payload.get("done"))
+        done         = _coerce_bool(payload.get("done"))
         read_requests = _sanitize_read_requests(payload)
         actions       = _sanitize_actions(payload)
         last_error = str(payload.get("_error") or last_error or "").strip()
@@ -715,7 +858,7 @@ def run_coder_specialist(
 
             # Verify the touched files
             snap = bridge.snapshot().get("context", {})
-            active_file = str(snap.get("active_file") or "").strip()
+            active_file = _sanitize_relative_path(str(snap.get("active_file") or ""))
             touched = list(dict.fromkeys(
                 p for a in actions if (p := _action_target_path(a, active_file))
             ))
@@ -772,7 +915,7 @@ def run_coder_specialist(
             p
             for item in all_action_results
             if item.get("ok")
-            for p in [str(item.get("argument", "")).split("\n")[0].split(":")[0].strip()]
+            for p in [_sanitize_path_argument(str(item.get("argument", "")).split("\n")[0].split(":")[0], preserve_suffix=False)]
             if p
         ))
         final_summary = (

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
-import re
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -21,6 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.config import (
     CHAT_HISTORY_CONTEXT_TOKENS,
+    LLAMA_CONTEXT_WINDOW,
     MAX_TOKENS,
     REPETITION_PENALTY,
     SERVER_HOST,
@@ -32,82 +32,52 @@ from app.core.config import (
     _coerce_int,
 )
 from app.core.character import build_system_prompt
-from app.core.generation import HiddenTagStreamFilter, collapse_hidden_tag_gaps
+from app.core.generation import HiddenTagStreamFilter, strip_emoji_chars
 from app.core.model_loader import ModelManager, content_to_text
-from app.integrations.editor_bridge import get_editor_bridge
-from app.integrations.vscode_launcher import launch_vscode
 from app.memory_store import MEMORY_PATH, format_for_prompt, get_all, reload_from_disk, remember_user_message
 from app.ui.assets import resolve_ui_asset
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).parent / "ui" / "static"
 DEFAULT_SESSION_ID = "popup"
 
-_MAX_HISTORY_MESSAGES = 8
-_MAX_HISTORY_CHARS = max(600, min(CHAT_HISTORY_CONTEXT_TOKENS * 4, 1800))
+_MAX_STORED_MESSAGES = max(1, _coerce_int(os.environ.get("AKANE_STORED_MESSAGES", os.environ.get("AKANE_HISTORY_MESSAGES", 16)), 16))
+_SHALLOW_HISTORY_MESSAGES = max(0, _coerce_int(os.environ.get("AKANE_SHALLOW_HISTORY_MESSAGES", 2), 2))
+_DEEP_HISTORY_MESSAGES = max(_SHALLOW_HISTORY_MESSAGES, _coerce_int(os.environ.get("AKANE_DEEP_HISTORY_MESSAGES", 8), 8))
+_SHALLOW_HISTORY_TOKENS = max(0, _coerce_int(os.environ.get("AKANE_SHALLOW_HISTORY_TOKENS", 160), 160))
+_DEEP_HISTORY_TOKENS = max(_SHALLOW_HISTORY_TOKENS, _coerce_int(os.environ.get("AKANE_DEEP_HISTORY_TOKENS", 512), 512))
+_HISTORY_SAFETY_TOKENS = _coerce_int(os.environ.get("AKANE_HISTORY_SAFETY_TOKENS", 160), 160)
+_MAX_HISTORY_MESSAGE_CHARS = _coerce_int(os.environ.get("AKANE_MAX_HISTORY_MESSAGE_CHARS", 900), 900)
 _MAX_MEMORY_CHARS = _coerce_int(os.environ.get("AKANE_MAX_MEMORY_CHARS", 1800), 1800)
-_MAX_EDITOR_CHARS = _coerce_int(os.environ.get("AKANE_MAX_EDITOR_CHARS", 1600), 1600)
 _FAST_MAX_TOKENS = min(MAX_TOKENS, 160)
 _generation_lock = threading.Lock()
 _state_lock = threading.Lock()
 _SESSIONS: dict[str, "SessionState"] = {}
-_LOG_PROMPTS = _coerce_bool(os.environ.get("AKANE_LOG_PROMPTS", "1"), True)
-_LOG_PATH = Path(os.environ.get("AKANE_LOG_PATH", "/tmp/akane_server.log"))
-_LOG_MAX_CHARS = _coerce_int(os.environ.get("AKANE_LOG_MAX_CHARS", 120_000), 120_000)
 
 _STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
 }
-_HIDDEN_TAGS = "MEM|FORGET|PROJECT|EDITOR|ASK_CODER|CODE|READ|WRITE|SHELL|READ_RESULT|THINK"
-_POPUP_STRIP_REGEX = re.compile(rf"\[({_HIDDEN_TAGS})\].*?(?:\[/\1\]|$)", re.DOTALL | re.IGNORECASE)
-_XML_STRIP_REGEX = re.compile(
-    r"<(think|thinking|tool_call|read|write|shell|code|read_result)>.*?(?:</\1>|$)",
-    re.DOTALL | re.IGNORECASE,
+_HIDDEN_TAG_NAMES = (
+    "READ_RESULT", "ASK_CODER", "FORGET", "PROJECT", "EDITOR", "WRITE",
+    "SHELL", "THINK", "CODE", "READ", "MEM",
 )
-_PATH_RE = re.compile(
-    r"(?P<path>(?:\.{0,2}/)?[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)+|[A-Za-z0-9_.@+-]+\.[A-Za-z0-9_+-]+)"
-    r"(?::\d+(?::\d+)?)?"
+_XML_TAG_NAMES = ("tool_call", "thinking", "read_result", "think", "write", "shell", "code", "read")
+_SQUARE_TAGS = tuple((f"[{name}]".lower(), f"[/{name}]".lower()) for name in _HIDDEN_TAG_NAMES)
+_XML_TAGS = tuple((f"<{name}>", f"</{name}>") for name in _XML_TAG_NAMES)
+_FOLLOWUP_PHRASES = (
+    "what did i", "what did we", "what were we", "what was that", "what about",
+    "you said", "i said", "we said", "we talked", "earlier", "last time",
+    "previous", "before", "again", "same", "continue", "go on", "remind me",
+    "remember", "that one", "this one", "the last", "from before",
 )
-_FILE_REF_SUFFIXES = (".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md", ".txt", ".css", ".html", ".sh")
-_NON_SOURCE_FILE_SUFFIXES = {
-    ".node", ".so", ".dylib", ".dll", ".exe", ".bin", ".o", ".a", ".obj",
-    ".class", ".jar", ".war", ".pyd", ".whl", ".zip", ".tar", ".gz", ".7z",
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf",
+_FOLLOWUP_WORDS = {
+    "it", "that", "this", "those", "these", "they", "them", "he", "she", "him",
+    "her", "same", "again", "why", "how",
 }
-_INFRA_PATH_PREFIXES = ("integrations/", "extensions/", ".vscode-server/", ".vscode/", ".idea/", ".zed/", ".github/")
-_CODE_HINTS = (
-    "code", "file", "bug", "error", "traceback", "stack", "function", "class", "server",
-    "python", "javascript", "typescript", "css", "html", ".py", ".js", ".ts", ".tsx", ".json",
-)
 
 
-def _build_logger() -> logging.Logger:
-    logger = logging.getLogger("akane.server")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-
-    try:
-        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(
-            _LOG_PATH,
-            maxBytes=2_000_000,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    except OSError as exc:
-        print(f"[Akane:log] Could not open log file {_LOG_PATH}: {exc}", flush=True)
-
-    return logger
-
-
-_LOGGER = _build_logger()
+_DATETIME_CONTEXT_CACHE: tuple[str, str] | None = None
 
 
 def _log_terminal_stream(label: str, text: str = "") -> None:
@@ -117,7 +87,7 @@ def _log_terminal_stream(label: str, text: str = "") -> None:
 
 @dataclass
 class SessionState:
-    messages: deque = field(default_factory=lambda: deque(maxlen=_MAX_HISTORY_MESSAGES))
+    messages: deque = field(default_factory=lambda: deque(maxlen=_MAX_STORED_MESSAGES))
     streaming_reply_preview: str = ""
     version: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -199,26 +169,8 @@ def _json_line(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
 
 
-def _log_text(label: str, text: str, *, session_id: str | None = None) -> None:
-    if not _LOG_PROMPTS:
-        return
-    value = str(text or "")
-    if len(value) > _LOG_MAX_CHARS:
-        value = value[:_LOG_MAX_CHARS].rstrip() + "\n[log trimmed]"
-    session = _normalize_session_id(session_id)
-    _LOGGER.info("\n===== %s session=%s =====\n%s\n===== end %s =====", label, session, value, label)
-
-
-def _log_prompt(messages: list[dict], *, session_id: str | None = None, stream: bool = False) -> None:
-    payload = json.dumps(messages, ensure_ascii=False, indent=2)
-    _log_text("prompt stream" if stream else "prompt", payload, session_id=session_id)
-
-
 def _log_reply(reply: str, *, session_id: str | None = None, raw: str = "") -> None:
     _log_terminal_stream("done", reply)
-    if raw and raw != reply:
-        _log_text("raw reply", raw, session_id=session_id)
-    _log_text("reply", reply, session_id=session_id)
 
 
 def _clip(text: str, limit: int) -> str:
@@ -268,99 +220,166 @@ def _clear_messages(session_id: str | None = None) -> None:
         state.version += 1
 
 
-def _clean_reference_path(raw_path: str) -> str:
-    path = str(raw_path or "").strip().strip("`'\".,:;()[]{}").replace("\\", "/")
-    if not path or "://" in path or path.startswith("~"):
-        return ""
-    if path.startswith("./"):
-        path = path[2:]
-    if ":" in path:
-        head, _, tail = path.partition(":")
-        if tail.strip()[:1].isdigit() or tail.strip().lower().startswith("l"):
-            path = head.strip()
-    return path
-
-
-def _project_relative_path(raw_path: str, *, must_be_file: bool = False) -> str:
-    path = _clean_reference_path(raw_path)
-    if not path:
-        return ""
-    try:
-        candidate = Path(path)
-        resolved = candidate.resolve() if candidate.is_absolute() else (PROJECT_ROOT / candidate).resolve()
-        rel = resolved.relative_to(PROJECT_ROOT)
-    except (OSError, ValueError):
-        return ""
-    if must_be_file and not resolved.is_file():
-        return ""
-    return rel.as_posix()
-
-
-def _explicit_paths_in_text(text: str) -> list[str]:
-    seen: set[str] = set()
-    paths: list[str] = []
-    for match in _PATH_RE.finditer(str(text or "")):
-        raw = _clean_reference_path(match.group("path"))
-        candidates = [raw]
-        if raw and not Path(raw).suffix:
-            candidates.extend(f"{raw}{suffix}" for suffix in _FILE_REF_SUFFIXES)
-        for candidate in candidates:
-            rel = _project_relative_path(candidate, must_be_file=True)
-            if rel and rel not in seen:
-                seen.add(rel)
-                paths.append(rel)
-                break
-    return paths
-
-
-def _is_infra_path(path: str) -> bool:
-    lowered = str(path or "").strip().lower()
-    return bool(lowered) and any(lowered.startswith(prefix) for prefix in _INFRA_PATH_PREFIXES)
-
-
-def _filter_coder_preload_paths(paths: list[str], user_input: str) -> list[str]:
-    allow_infra = any(token in str(user_input or "").lower() for token in ("vscode", "extension", "integration"))
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw in paths:
-        rel = _project_relative_path(raw, must_be_file=True)
-        if not rel or rel in seen:
+def _find_tag(source_lower: str, start: int, tags: tuple[tuple[str, str], ...]) -> tuple[int, str, str] | None:
+    best: tuple[int, str, str] | None = None
+    for opener, closer in tags:
+        index = source_lower.find(opener, start)
+        if index < 0:
             continue
-        suffix = Path(rel.lower()).suffix
-        if suffix in _NON_SOURCE_FILE_SUFFIXES or (_is_infra_path(rel) and not allow_infra):
-            continue
-        seen.add(rel)
-        out.append(rel)
-    return out
+        if best is None or index < best[0] or (index == best[0] and len(opener) > len(best[1])):
+            best = (index, opener, closer)
+    return best
 
 
-def _response_uses_tool_calls(raw: str) -> bool:
-    text = str(raw or "").lower()
-    return bool(text and ("<tool_call>" in text or re.search(r"\[(read|editor|ask_coder)\]", text)))
-
-
-def _response_uses_disabled_coding_tools(raw: str) -> bool:
-    text = str(raw or "").lower()
-    return bool(text and ("<tool_call>" in text or re.search(r"\[(editor|ask_coder)\]", text)))
+def _strip_tag_blocks(source: str, tags: tuple[tuple[str, str], ...]) -> str:
+    source_lower = source.lower()
+    pieces: list[str] = []
+    start = 0
+    while start < len(source):
+        found = _find_tag(source_lower, start, tags)
+        if found is None:
+            pieces.append(source[start:])
+            break
+        index, opener, closer = found
+        pieces.append(source[start:index])
+        end = source_lower.find(closer, index + len(opener))
+        if end < 0:
+            break
+        start = end + len(closer)
+    return "".join(pieces)
 
 
 def _strip_popup_tags(text: str) -> str:
     if not text:
         return text
     source = str(text)
-    cleaned = _POPUP_STRIP_REGEX.sub("", source)
-    cleaned = _XML_STRIP_REGEX.sub("", cleaned)
+    if "[" not in source and "<" not in source:
+        return source
+    cleaned = _strip_tag_blocks(source, _SQUARE_TAGS) if "[" in source else source
+    if "<" in cleaned:
+        cleaned = _strip_tag_blocks(cleaned, _XML_TAGS)
     if cleaned == source:
         return source
     return "\n".join(line.rstrip() for line in cleaned.splitlines() if line.strip())
 
 
+def _collapse_reply_whitespace(text: str) -> str:
+    value = str(text or "").replace("\r\n", "\n").replace("\t", " ")
+    lines: list[str] = []
+    blank_count = 0
+    for raw in value.split("\n"):
+        line = raw.rstrip()
+        if line:
+            blank_count = 0
+            lines.append(line)
+        else:
+            blank_count += 1
+            if blank_count <= 1:
+                lines.append("")
+    return "\n".join(lines)
+
+
 def _clean_reply(text: str) -> str:
-    cleaned = _strip_popup_tags(text).replace("/no_think", "")
-    cleaned = collapse_hidden_tag_gaps(cleaned).replace("\r\n", "\n")
-    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip(" `\n\t")
+    cleaned = strip_emoji_chars(_strip_popup_tags(text))
+    return _collapse_reply_whitespace(cleaned).strip(" `\n\t")
+
+
+@lru_cache(maxsize=2048)
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(str(text or "")) // 4) if text else 0
+
+
+def _trim_to_tokens(text: str, token_budget: int) -> str:
+    text = str(text or "").strip()
+    if token_budget <= 0 or not text:
+        return ""
+    max_chars = max(24, token_budget * 4)
+    if len(text) <= max_chars:
+        return text
+    marker = "[earlier part clipped] "
+    if max_chars <= len(marker) + 24:
+        return text[-max_chars:].lstrip()
+    return marker + text[-(max_chars - len(marker)):].lstrip()
+
+
+@lru_cache(maxsize=512)
+def _discord_user_message(content: str) -> str:
+    if not content.startswith("Discord "):
+        return content
+    for marker in ("\nMessage:\n", "\nUser message:\n"):
+        if marker in content:
+            return content.split(marker, 1)[1].strip()
+    return content
+
+
+@lru_cache(maxsize=512)
+def _discord_history_content(content: str) -> str:
+    if not content.startswith("Discord "):
+        return content
+    speaker = ""
+    for line in content.splitlines():
+        if line.startswith(("User:", "Speaker:")):
+            speaker = line.split(":", 1)[1].strip()
+            break
+    message = _discord_user_message(content)
+    if not speaker:
+        return message
+    location = "DM" if content.startswith("Discord direct") else "server"
+    return f"Discord {location} {speaker}: {message}"
+
+
+@lru_cache(maxsize=512)
+def _cached_history_content(role: str, raw_content: str) -> str:
+    content = _clean_reply(raw_content)
+    if role == "user":
+        content = _discord_history_content(content)
+    return _clip(content, _MAX_HISTORY_MESSAGE_CHARS)
+
+
+def _history_content(message: dict) -> str:
+    role = str(message.get("role", "") or "")
+    content = str(message.get("content", "") or "")
+    return _cached_history_content(role, content)
+
+
+def _word_tokens(text: str) -> list[str]:
+    words: list[str] = []
+    start: int | None = None
+    for index, char in enumerate(text):
+        is_word = ("a" <= char <= "z") or char == "'"
+        if is_word and start is None:
+            start = index
+        elif not is_word and start is not None:
+            word = text[start:index].strip("'")
+            if word:
+                words.append(word)
+            start = None
+    if start is not None:
+        word = text[start:].strip("'")
+        if word:
+            words.append(word)
+    return words
+
+
+def _needs_deep_history(user_input: str) -> bool:
+    text = _discord_user_message(str(user_input or "").strip()).lower()
+    words = _word_tokens(text)
+    if not words:
+        return False
+    if any(phrase in text for phrase in _FOLLOWUP_PHRASES):
+        return True
+    if len(words) <= 8 and any(word in _FOLLOWUP_WORDS for word in words):
+        return True
+    return bool("?" in text and len(words) <= 4)
+
+
+def _history_token_budget(system_prompt: str, user_input: str, *, deep: bool) -> int:
+    usable = max(256, LLAMA_CONTEXT_WINDOW - _FAST_MAX_TOKENS - _HISTORY_SAFETY_TOKENS)
+    prompt_tokens = _estimate_tokens(system_prompt)
+    user_tokens = _estimate_tokens(user_input)
+    remaining = usable - prompt_tokens - user_tokens
+    target = _DEEP_HISTORY_TOKENS if deep else _SHALLOW_HISTORY_TOKENS
+    return max(0, min(CHAT_HISTORY_CONTEXT_TOKENS, target, remaining))
 
 
 def _extract_message_text(result: dict) -> str:
@@ -370,51 +389,90 @@ def _extract_message_text(result: dict) -> str:
     return content_to_text((choices[0].get("message") or {}).get("content")).strip()
 
 
-def _looks_codey(text: str) -> bool:
-    lowered = str(text or "").lower()
-    return any(hint in lowered for hint in _CODE_HINTS) or bool(_explicit_paths_in_text(text))
+def _date_label(day) -> str:
+    return f"{day.strftime('%A, %B')} {day.day}, {day.year}"
+
+
+def _datetime_context(now: datetime | None = None) -> str:
+    global _DATETIME_CONTEXT_CACHE
+    current = now or datetime.now().astimezone()
+    if current.tzinfo is None:
+        current = current.astimezone()
+    key = current.strftime("%Y-%m-%d")
+    if now is None and _DATETIME_CONTEXT_CACHE and _DATETIME_CONTEXT_CACHE[0] == key:
+        return _DATETIME_CONTEXT_CACHE[1]
+    today = current.date()
+    time_text = current.strftime("%I:%M %p").lstrip("0")
+    tz_name = current.tzname() or "local time"
+    result = (
+        "DATE/TIME:\n"
+        f"- Current local date/time: {_date_label(today)} at {time_text} {tz_name}.\n"
+        f"- Yesterday: {_date_label(today - timedelta(days=1))}.\n"
+        f"- Today: {_date_label(today)}.\n"
+        f"- Tomorrow: {_date_label(today + timedelta(days=1))}."
+    )
+    if now is None:
+        _DATETIME_CONTEXT_CACHE = (key, result)
+    return result
 
 
 def _system_prompt(user_text: str, *, skip_memory: bool) -> str:
-    sections: list[str] = []
-    if not skip_memory:
+    include_memory = not skip_memory
+    datetime_context = _datetime_context()
+    memory = ""
+    if include_memory:
         memory = format_for_prompt()
         if memory:
-            sections.append("Memory:\n" + _clip(memory, _MAX_MEMORY_CHARS))
-    if _looks_codey(user_text):
-        editor = get_editor_bridge().format_for_prompt()
-        if editor:
-            sections.append(_clip(editor, _MAX_EDITOR_CHARS))
-    return build_system_prompt("\n\n".join(sections), include_memory=not skip_memory)
+            memory = _clip(memory, _MAX_MEMORY_CHARS)
+
+    sections: list[str] = [
+        "CONTINUITY:\n"
+        "- Use recent conversation messages to resolve follow-ups like it, that, this, same, again, and you said.\n"
+        "- Keep track of who is speaking. In Discord, the User field names the current user.\n"
+        "- Do not treat Discord metadata as the user's wording; answer the Message field."
+    ]
+    sections.append(datetime_context)
+    if memory:
+        sections.append("Memory:\n" + memory)
+    return build_system_prompt("\n\n".join(sections), include_memory=include_memory)
 
 
-def _history_messages(session_id: str | None) -> list[dict]:
+def _history_messages(session_id: str | None, *, system_prompt: str, user_input: str, deep: bool) -> list[dict]:
     state = _session_state(session_id)
     with state.lock:
         messages = list(state.messages)
 
-    total = 0
+    message_limit = _DEEP_HISTORY_MESSAGES if deep else _SHALLOW_HISTORY_MESSAGES
+    remaining_tokens = _history_token_budget(system_prompt, user_input, deep=deep)
+    if message_limit <= 0 or remaining_tokens <= 0:
+        return []
+
     kept: list[dict] = []
-    for message in reversed(messages[-_MAX_HISTORY_MESSAGES:]):
+    for message in reversed(messages[-message_limit:]):
         role = str(message.get("role", "") or "")
         if role not in {"user", "assistant"}:
             continue
-        content = _clip(_clean_reply(str(message.get("content", "") or "")), 700)
+        content = _history_content(message)
         if not content:
             continue
-        cost = len(content)
-        if kept and total + cost > _MAX_HISTORY_CHARS:
+        content = _trim_to_tokens(content, remaining_tokens)
+        if not content:
             break
+        cost = _estimate_tokens(content)
         kept.append({"role": role, "content": content})
-        total += cost
+        remaining_tokens -= cost
+        if remaining_tokens <= 0:
+            break
     kept.reverse()
     return kept
 
 
 def _chat_messages(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> list[dict]:
+    system_prompt = _system_prompt(user_input, skip_memory=skip_memory)
+    deep_history = _needs_deep_history(user_input)
     return [
-        {"role": "system", "content": _system_prompt(user_input, skip_memory=skip_memory)},
-        *_history_messages(session_id),
+        {"role": "system", "content": system_prompt},
+        *_history_messages(session_id, system_prompt=system_prompt, user_input=user_input, deep=deep_history),
         {"role": "user", "content": user_input},
     ]
 
@@ -451,11 +509,10 @@ def _generate_reply(user_input: str, *, skip_memory: bool = False, session_id: s
         _log_terminal_stream("user", user_input)
         remember_user_message(user_input)
         messages = _chat_messages(user_input, skip_memory=skip_memory, session_id=session_id)
-        _log_prompt(messages, session_id=session_id, stream=False)
         _append_message("user", user_input, session_id)
         result = _request_completion(messages, stream=False)
         raw = _extract_message_text(result)
-        remember_user_message(raw)
+        remember_user_message(raw, allow_natural=False)
         reply = _clean_reply(raw) or "I lost the thread for a second. Try that again."
         _log_reply(reply, session_id=session_id, raw=raw)
         _append_message("assistant", reply, session_id)
@@ -469,13 +526,12 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
             _set_streaming_reply_preview("", session_id)
             remember_user_message(text)
             messages = _chat_messages(text, skip_memory=skip_memory, session_id=session_id)
-            _log_prompt(messages, session_id=session_id, stream=True)
             _append_message("user", text, session_id)
             yield _json_line({"type": "start", "messages": list(_session_state(session_id).messages)})
 
             hidden_filter = HiddenTagStreamFilter()
-            raw_parts: list[str] = []
-            visible_parts: list[str] = []
+            raw = ""
+            displayed = ""
             stream = _request_completion(messages, stream=True)
 
             for chunk in stream:
@@ -485,25 +541,21 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
                 token = content_to_text((choices[0].get("delta") or {}).get("content"))
                 if not token:
                     continue
-                raw_parts.append(token)
-                visible = hidden_filter.feed(token)
+                raw += token
+                visible = strip_emoji_chars(hidden_filter.feed(token))
                 if not visible:
                     continue
-                visible_parts.append(visible)
-                preview = "".join(visible_parts)
-                _set_streaming_reply_preview(preview, session_id)
+                displayed += visible
+                _set_streaming_reply_preview(displayed, session_id)
                 yield _json_line({"type": "delta", "content": visible, "append": True})
 
-            tail = hidden_filter.flush()
+            tail = strip_emoji_chars(hidden_filter.flush())
             if tail:
-                visible_parts.append(tail)
-                preview = "".join(visible_parts)
-                _set_streaming_reply_preview(preview, session_id)
+                displayed += tail
+                _set_streaming_reply_preview(displayed, session_id)
                 yield _json_line({"type": "delta", "content": tail, "append": True})
 
-            raw = "".join(raw_parts)
-            remember_user_message(raw)
-            displayed = "".join(visible_parts)
+            remember_user_message(raw, allow_natural=False)
             reply = _clean_reply(raw) or _clean_reply(displayed) or "I lost the thread for a second. Try that again."
             _log_reply(reply, session_id=session_id, raw=raw)
             if reply != displayed.strip():
@@ -515,7 +567,6 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
     except Exception as exc:
         _set_streaming_reply_preview("", session_id)
         _log_terminal_stream("error", str(exc))
-        _LOGGER.exception("Chat generation failed for session=%s", _normalize_session_id(session_id))
         yield _json_line({"type": "error", "error": str(exc)})
 
 
@@ -533,14 +584,6 @@ def _handle_command(text: str, session_id: str | None = None) -> dict | None:
             MEMORY_PATH.unlink()
         reload_from_disk()
         return {"reply": "", "messages": [], "notice": "Memory wiped and context cleared."}
-    if text == "/vscode":
-        return {"reply": "", "messages": _state_messages(session_id), "notice": launch_vscode(), "ephemeral": True}
-    if text in {"/approve", "/reject"}:
-        bridge = get_editor_bridge()
-        actions = bridge.approve_all_pending_actions() if text == "/approve" else bridge.reject_all_pending_actions()
-        verb = "Approved" if text == "/approve" else "Rejected"
-        notice = f"{verb} {len(actions)} pending code change(s)." if actions else "No pending code changes."
-        return {"reply": "", "messages": _state_messages(session_id), "notice": notice, "ephemeral": True}
     return None
 
 
@@ -548,7 +591,6 @@ def _app_state_payload(session_id: str | None = None, *, include_messages: bool 
     state = _session_state(session_id)
     payload = {
         "model": ModelManager.get_instance().status(),
-        "editor": get_editor_bridge().snapshot(),
         "version": state.version,
     }
     if include_messages:
@@ -581,50 +623,17 @@ def create_app() -> FastAPI:
     async def api_memory():
         return JSONResponse(get_all())
 
-    @app.get("/api/editor/state")
-    async def api_editor_state():
-        return JSONResponse(get_editor_bridge().snapshot())
-
-    @app.get("/api/editor/actions")
-    async def api_editor_actions(after: int = 0):
-        return JSONResponse({"actions": get_editor_bridge().actions_after(int(after))})
-
-    @app.post("/api/editor/context")
-    async def api_editor_context(request: Request):
-        return JSONResponse({"ok": True, "state": get_editor_bridge().update_context(await _request_payload(request))})
-
-    @app.post("/api/editor/action-result")
-    async def api_editor_action_result(request: Request):
-        payload = await _request_payload(request)
-        action_id = _coerce_int(payload.get("id", 0), 0)
-        if action_id <= 0:
-            return JSONResponse({"error": "Missing action id."}, status_code=400)
-        summary = get_editor_bridge().complete_action(
-            action_id=action_id,
-            ok=_coerce_bool(payload.get("ok", False)),
-            result=str(payload.get("result", "")),
-            error=str(payload.get("error", "")),
-        )
-        if summary is None:
-            return JSONResponse({"error": "Unknown action id."}, status_code=404)
-        return JSONResponse({"ok": True, "summary": summary})
-
     @app.post("/api/backend")
     async def api_backend(request: Request):
         payload = await _request_payload(request)
         try:
             status = ModelManager.get_instance().switch_backend(
-                str(payload.get("backend", "")).strip().lower(),
+                str(payload.get("backend", "llama_cpp")).strip().lower(),
                 local_model_path=str(payload["local_model_path"]) if "local_model_path" in payload else None,
-                openrouter_model=str(payload["model_name"]) if "model_name" in payload else None,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"ok": True, "model": status})
-
-    @app.post("/api/open-vscode")
-    async def api_open_vscode():
-        return JSONResponse({"ok": True, "notice": launch_vscode(), "editor": get_editor_bridge().snapshot()})
 
     @app.post("/api/quit")
     async def api_quit():

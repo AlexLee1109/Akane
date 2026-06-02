@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import json
-import ssl
+import os
 import threading
 import time
 from pathlib import Path
-from urllib import error as urlerror
-from urllib import request as urlrequest
 
-try:
-    import certifi
-except ImportError:  # pragma: no cover
-    certifi = None
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def content_to_text(content) -> str:
@@ -34,120 +33,6 @@ def content_to_text(content) -> str:
     return str(content)
 
 
-class OpenRouterBackend:
-    def __init__(
-        self,
-        *,
-        api_key: str,
-        model: str,
-        base_url: str,
-        site_url: str = "",
-        app_name: str = "Akane",
-        ca_bundle: str = "",
-        skip_ssl_verify: bool = False,
-    ) -> None:
-        if not api_key:
-            raise RuntimeError("OPENROUTER_API_KEY is required")
-        if not model:
-            raise RuntimeError("OPENROUTER_CODER_MODEL is required")
-        self.api_key = api_key
-        self.model = model
-        self.base_url = base_url.rstrip("/")
-        self.site_url = site_url
-        self.app_name = app_name or "Akane"
-        self.ca_bundle = ca_bundle
-        self.skip_ssl_verify = skip_ssl_verify
-        self._ssl_context = None
-
-    def _context(self):
-        if self._ssl_context is not None:
-            return self._ssl_context
-        if self.skip_ssl_verify:
-            self._ssl_context = ssl._create_unverified_context()
-        elif self.ca_bundle:
-            self._ssl_context = ssl.create_default_context(cafile=self.ca_bundle)
-        elif certifi is not None:
-            self._ssl_context = ssl.create_default_context(cafile=certifi.where())
-        else:
-            self._ssl_context = ssl.create_default_context()
-        return self._ssl_context
-
-    def _request(self, payload: dict, timeout: float | None):
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "X-Title": self.app_name,
-        }
-        if self.site_url:
-            headers["HTTP-Referer"] = self.site_url
-        req = urlrequest.Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        try:
-            return urlrequest.urlopen(req, timeout=timeout or 120, context=self._context())
-        except urlerror.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenRouter request failed: {exc.code} {body}") from exc
-        except urlerror.URLError as exc:
-            raise RuntimeError(f"OpenRouter request failed: {exc.reason}") from exc
-
-    def create_chat_completion(
-        self,
-        *,
-        messages,
-        max_tokens,
-        temperature,
-        model=None,
-        top_k=None,
-        top_p=None,
-        repeat_penalty=None,
-        stream=False,
-        response_format=None,
-        timeout: float | None = None,
-    ):
-        payload = {
-            "model": model or self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": stream,
-        }
-        if top_p is not None:
-            payload["top_p"] = top_p
-        if response_format is not None:
-            payload["response_format"] = response_format
-
-        response = self._request(payload, timeout)
-        if not stream:
-            with response as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            choice = (data.get("choices") or [{}])[0]
-            message = choice.get("message") or {}
-            return {"choices": [{"message": {"content": content_to_text(message.get("content"))}, "finish_reason": choice.get("finish_reason", "")}]}
-
-        def events():
-            with response as resp:
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    choice = (event.get("choices") or [{}])[0]
-                    delta = choice.get("delta") or {}
-                    yield {"choices": [{"delta": {"content": content_to_text(delta.get("content"))}, "finish_reason": choice.get("finish_reason", "")}]}
-
-        return events()
-
-
 class ModelManager:
     _instance: "ModelManager | None" = None
     _instance_lock = threading.Lock()
@@ -166,13 +51,6 @@ class ModelManager:
             LLAMA_THREADS_BATCH,
             LLAMA_UBATCH_SIZE,
             MODEL_PATH,
-            OPENROUTER_API_KEY,
-            OPENROUTER_APP_NAME,
-            OPENROUTER_BASE_URL,
-            OPENROUTER_CA_BUNDLE,
-            OPENROUTER_CODER_MODEL,
-            OPENROUTER_SKIP_SSL_VERIFY,
-            OPENROUTER_SITE_URL,
         )
 
         self.DEVICE = DEVICE
@@ -186,19 +64,11 @@ class ModelManager:
         self.LLAMA_OFFLOAD_KQV = LLAMA_OFFLOAD_KQV
         self.LLAMA_OP_OFFLOAD = LLAMA_OP_OFFLOAD
         self.LLAMA_IDLE_UNLOAD_SECONDS = max(0.0, float(LLAMA_IDLE_UNLOAD_SECONDS))
+        self.LLAMA_CACHE_MB = max(0, _env_int("AKANE_LLAMA_CACHE_MB", 256))
         self._local_model_path = Path(MODEL_PATH)
-        self.OPENROUTER_API_KEY = OPENROUTER_API_KEY
-        self.OPENROUTER_CODER_MODEL = OPENROUTER_CODER_MODEL
-        self.OPENROUTER_BASE_URL = OPENROUTER_BASE_URL
-        self.OPENROUTER_CA_BUNDLE = OPENROUTER_CA_BUNDLE
-        self.OPENROUTER_SITE_URL = OPENROUTER_SITE_URL
-        self.OPENROUTER_APP_NAME = OPENROUTER_APP_NAME
-        self.OPENROUTER_SKIP_SSL_VERIFY = OPENROUTER_SKIP_SSL_VERIFY
         self._llm = None
-        self._coder = None
         self._loading = False
         self._load_error: Exception | None = None
-        self._coder_error: Exception | None = None
         self._lock = threading.RLock()
         self._idle_timer: threading.Timer | None = None
 
@@ -218,7 +88,6 @@ class ModelManager:
                 "error": str(self._load_error) if self._load_error else None,
                 "backend": "llama_cpp",
                 "local_model_path": str(self._local_model_path),
-                "openrouter_model": self.OPENROUTER_CODER_MODEL,
             }
 
     def _cancel_idle_timer(self) -> None:
@@ -240,16 +109,26 @@ class ModelManager:
             self._cancel_idle_timer()
             self._llm = None
 
+    def _install_prompt_cache(self) -> None:
+        if self.LLAMA_CACHE_MB <= 0 or self._llm is None or not hasattr(self._llm, "set_cache"):
+            return
+        try:
+            from llama_cpp import LlamaRAMCache
+
+            self._llm.set_cache(LlamaRAMCache(capacity_bytes=self.LLAMA_CACHE_MB * 1024 * 1024))
+            print(f"Prompt cache enabled: {self.LLAMA_CACHE_MB} MB", flush=True)
+        except Exception as exc:
+            print(f"Prompt cache disabled: {exc}", flush=True)
+
     def switch_backend(
         self,
-        backend: str,
+        backend: str = "llama_cpp",
         *,
         local_model_path: str | None = None,
-        openrouter_model: str | None = None,
     ) -> dict[str, object]:
-        backend = str(backend or "").strip().lower()
-        if backend not in {"llama_cpp", "openrouter"}:
-            raise ValueError("Backend must be 'llama_cpp' or 'openrouter'.")
+        backend = str(backend or "llama_cpp").strip().lower() or "llama_cpp"
+        if backend != "llama_cpp":
+            raise ValueError("Only the 'llama_cpp' backend is available.")
         with self._lock:
             if local_model_path is not None:
                 value = str(local_model_path).strip()
@@ -258,13 +137,6 @@ class ModelManager:
                 self._local_model_path = Path(value)
                 self._llm = None
                 self._load_error = None
-            if openrouter_model is not None:
-                value = str(openrouter_model).strip()
-                if not value:
-                    raise ValueError("OpenRouter model cannot be empty.")
-                self.OPENROUTER_CODER_MODEL = value
-                self._coder = None
-                self._coder_error = None
         return self.status()
 
     def ensure_loaded(self) -> None:
@@ -299,32 +171,12 @@ class ModelManager:
                     kwargs["n_gpu_layers"] = self.LLAMA_GPU_LAYERS
                 print(f"Loading model {self._local_model_path} n_ctx={self.LLAMA_CONTEXT_WINDOW}", flush=True)
                 self._llm = Llama(**kwargs)
+                self._install_prompt_cache()
             except Exception as exc:
                 self._load_error = exc
                 raise
             finally:
                 self._loading = False
-
-    def ensure_coder_loaded(self) -> None:
-        if self._coder is not None:
-            return
-        with self._lock:
-            if self._coder is not None:
-                return
-            try:
-                self._coder = OpenRouterBackend(
-                    api_key=self.OPENROUTER_API_KEY,
-                    model=self.OPENROUTER_CODER_MODEL,
-                    base_url=self.OPENROUTER_BASE_URL,
-                    site_url=self.OPENROUTER_SITE_URL,
-                    app_name=self.OPENROUTER_APP_NAME,
-                    ca_bundle=self.OPENROUTER_CA_BUNDLE,
-                    skip_ssl_verify=self.OPENROUTER_SKIP_SSL_VERIFY,
-                )
-                self._coder_error = None
-            except Exception as exc:
-                self._coder_error = exc
-                raise
 
     @property
     def llm(self):
@@ -332,28 +184,6 @@ class ModelManager:
             raise RuntimeError(f"Model failed to load: {self._load_error}") from self._load_error
         self.ensure_loaded()
         return self._llm
-
-    @property
-    def coder_llm(self):
-        if self._coder_error:
-            raise RuntimeError(f"Coder model failed to load: {self._coder_error}") from self._coder_error
-        self.ensure_coder_loaded()
-        return self._coder
-
-    def _local_messages_for_generation(self, messages):
-        model_name = str(self._local_model_path).lower()
-        if "qwen3" not in model_name and "qwen-3" not in model_name:
-            return messages
-        items = messages if isinstance(messages, list) else list(messages)
-        if any("/think" in content_to_text((m if isinstance(m, dict) else {}).get("content")).lower() or "/no_think" in content_to_text((m if isinstance(m, dict) else {}).get("content")).lower() for m in items):
-            return items
-        for index in range(len(items) - 1, -1, -1):
-            msg = items[index] if isinstance(items[index], dict) else {}
-            if msg.get("role") == "user":
-                patched = list(items)
-                patched[index] = {**msg, "content": f"{content_to_text(msg.get('content')).rstrip()}\n/no_think"}
-                return patched
-        return [*items, {"role": "user", "content": "/no_think"}]
 
     def create_chat_completion(
         self,
@@ -369,23 +199,10 @@ class ModelManager:
         response_format=None,
         timeout: float | None = None,
     ):
-        if role == "coder" and self.OPENROUTER_CODER_MODEL:
-            return self.coder_llm.create_chat_completion(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repeat_penalty=repeat_penalty,
-                stream=stream,
-                response_format=response_format,
-                timeout=timeout,
-            )
-
         with self._lock:
             self._cancel_idle_timer()
         result = self.llm.create_chat_completion(
-            messages=self._local_messages_for_generation(messages),
+            messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             top_k=top_k,

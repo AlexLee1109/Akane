@@ -1,6 +1,14 @@
-"""Persistent user memory system with in-memory caching and synchronous writes."""
+"""Persistent user memory system with in-memory caching and synchronous writes.
+
+The store is intentionally conservative about extraction. Natural-language
+understanding belongs to the model, which can emit hidden memory tags after it
+has read the whole turn. This module validates, normalizes, deduplicates, and
+persists those structured operations.
+"""
 
 import copy
+import hashlib
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +19,7 @@ import orjson
 MEMORY_PATH = Path(__file__).parent / "memory.json"
 
 DEFAULT_MEMORY = {
+    "schema_version": 2,
     "user": {},
     "preferences": [],
     "facts": [],
@@ -25,60 +34,61 @@ _ENTRY_LIMITS = {
     "preferences": 24,
     "facts": 32,
 }
-
-_GENERIC_MEMORY_PREFIXES = (
-    "what ", "why ", "how ", "when ", "where ", "who ", "should ", "could ", "would ",
-    "can you ", "do you ", "is it ", "are you ",
-)
-_GENERIC_MEMORY_PHRASES = (
-    "what do you think", "tell me more", "show me", "go deeper", "full breakdown",
-    "can you help", "i need help", "look at", "check the code", "read the file",
-    "open vscode", "open the project", "thermal throttling", "reply faster",
-)
-_CLAUSE_SPLIT_CHARS = ".!?\n"
-_TOKEN_STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "how", "i", "if",
-    "in", "into", "is", "it", "me", "my", "of", "on", "or", "our", "so", "that", "the", "this",
-    "to", "was", "we", "with", "you", "your",
+_VALID_MEMORY_CATEGORIES = {"user", "preferences", "facts"}
+_TAG_PAIRS = {
+    "MEM": "[/MEM]",
+    "FORGET": "[/FORGET]",
+    "PROJECT": "[/PROJECT]",
 }
-_PUNCT_TRANSLATION = str.maketrans({ch: " " for ch in "\"'`.,:;!?()[]{}<>|/\\@#$%^&*=+~"})
-_NAME_PREFIXES = ("my name is ", "name's ", "name is ", "call me ", "i am ", "i'm ", "i go by ")
-_PREFERENCE_PREFIXES = (
-    ("i prefer ", "prefers "),
-    ("i like ", "likes "),
-    ("i love ", "loves "),
-    ("i enjoy ", "enjoys "),
-    ("i want ", "wants "),
-    ("i need ", "needs "),
-    ("i don't like ", "doesn't like "),
-    ("i do not like ", "doesn't like "),
-    ("i hate ", "doesn't like "),
+_CONTROL_CHARS = str.maketrans({chr(i): " " for i in range(32) if chr(i) not in "\n\t"})
+_LOW_VALUE_PUNCT = str.maketrans({ch: " " for ch in "\"'`.,:;!?()[]{}<>|/\\@#$%^&*=+~"})
+_DISCORD_CONTEXT_PREFIX = "discord context."
+_TRANSIENT_MEMORY_PHRASES = (
+    "asked me",
+    "asking me",
+    "asked about",
+    "current message",
+    "current request",
+    "right now",
+    "this chat",
+    "this conversation",
+    "this message",
+    "this request",
+    "today",
+    "tonight",
+    "tomorrow",
+    "yesterday",
+    "needs help",
+    "wants help",
+    "wants me to",
+    "speaker id",
+    "discord context",
 )
-_FACT_PREFIXES = (
-    ("i use ", "uses "),
-    ("i'm using ", "uses "),
-    ("im using ", "uses "),
-    ("i have ", "has "),
-    ("i'm on ", "uses "),
-    ("im on ", "uses "),
-    ("i run ", "runs "),
+_NAME_PATTERNS = (
+    re.compile(r"\bmy name is\s+([A-Za-z][A-Za-z' -]{0,47})(?:[.!?,]|$)", re.IGNORECASE),
+    re.compile(r"\bcall me\s+([A-Za-z][A-Za-z' -]{0,47})(?:[.!?,]|$)", re.IGNORECASE),
 )
-_PROJECT_PREFIXES = (
-    "i am working on ", "i'm working on ", "im working on ",
-    "i am building ", "i'm building ", "im building ",
-    "i am making ", "i'm making ", "im making ",
-    "i am creating ", "i'm creating ", "im creating ",
+_FAVORITE_RE = re.compile(
+    r"\bmy favorite\s+([A-Za-z][A-Za-z0-9 _/-]{1,40})\s+is\s+([^.!?\n]{2,120})",
+    re.IGNORECASE,
 )
-_MEMORY_WRAPPERS = (
-    "please remember that ",
-    "remember that ",
-    "remember, ",
-    "remember ",
-    "you should remember that ",
-    "keep in mind that ",
-    "keep in mind ",
-    "note that ",
+_PREFERENCE_RE = re.compile(
+    r"\b(?:i|we)\s+(?:really\s+|especially\s+)?(like|love|enjoy|prefer)\s+([^.!?\n]{2,120})",
+    re.IGNORECASE,
 )
+_USE_RE = re.compile(
+    r"\b(?:i|we)\s+(?:use|run|am running|have)\s+([^.!?\n]{2,120})",
+    re.IGNORECASE,
+)
+_STABLE_USE_HINTS = {
+    "pc", "computer", "mac", "windows", "linux", "raspberry", "pi", "gpu", "cpu",
+    "ram", "model", "qwen", "llama", "python", "discord", "vscode", "server",
+    "laptop", "desktop", "keyboard", "monitor",
+}
+_VAGUE_MEMORY_VALUES = {
+    "it", "that", "this", "those", "them", "you", "your", "me", "him", "her",
+    "stuff", "things", "something", "anything", "everything",
+}
 
 
 def _fresh_default_memory() -> dict:
@@ -90,6 +100,9 @@ def _ensure_memory_shape(data: dict) -> dict:
     normalized = _fresh_default_memory()
     if not isinstance(data, dict):
         return normalized
+
+    if isinstance(data.get("schema_version"), int):
+        normalized["schema_version"] = max(2, data["schema_version"])
 
     for key in ("user", "activities"):
         if isinstance(data.get(key), dict):
@@ -115,18 +128,25 @@ def _touch_metadata(data: dict) -> None:
 
 
 def _new_list_entry(content: str) -> dict:
-    return {"content": content, "created": _now(), "mentions": 1}
+    now = _now()
+    return {
+        "id": _entry_id(content),
+        "content": content,
+        "created": now,
+        "last_seen": now,
+        "mentions": 1,
+    }
 
 
 def _touch_list_entry(entries: list[dict], content: str) -> bool:
-    normalized = _normalize_entry_text(content)
-    normalized_tokens = _entry_token_set(normalized)
+    fingerprint = _entry_fingerprint(content)
     for entry in entries:
         existing = _normalize_entry_text(entry.get("content", ""))
-        if _entries_match(existing, normalized, normalized_tokens):
+        if _entries_match(existing, content, fingerprint):
             entry["mentions"] = entry.get("mentions", 1) + 1
             entry["last_seen"] = _now()
-            if len(normalized) > len(existing):
+            entry["id"] = entry.get("id") or _entry_id(content)
+            if _is_better_entry_text(content, existing):
                 entry["content"] = content
             return True
     return False
@@ -160,64 +180,70 @@ def _normalize_user_field(key: str, value: str) -> str:
 
 
 def _normalize_entry_text(value: str) -> str:
-    return " ".join(str(value or "").strip().split())
+    text = str(value or "").translate(_CONTROL_CHARS).strip()
+    return " ".join(text.split())
 
 
-def _entry_token_set(value: str) -> set[str]:
-    return {
-        token.lower()
-        for token in _tokenize_words(_normalize_entry_text(value))
-        if len(token) > 2 and token.lower() not in _TOKEN_STOPWORDS
-    }
+def _entry_fingerprint(value: str) -> str:
+    cleaned = _normalize_entry_text(value).lower().translate(_LOW_VALUE_PUNCT)
+    cleaned = re.sub(r"^(?:the\s+)?(?:user|speaker)\s+", "", cleaned)
+    return " ".join(cleaned.split())
 
 
-def _entries_match(existing: str, candidate: str, candidate_tokens: set[str] | None = None) -> bool:
-    existing_norm = _normalize_entry_text(existing).lower()
-    candidate_norm = _normalize_entry_text(candidate).lower()
+def _entry_id(value: str) -> str:
+    digest = hashlib.sha256(_entry_fingerprint(value).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def _entries_match(existing: str, candidate: str, candidate_fingerprint: str | None = None) -> bool:
+    existing_norm = _entry_fingerprint(existing)
+    candidate_norm = candidate_fingerprint if candidate_fingerprint is not None else _entry_fingerprint(candidate)
     if not existing_norm or not candidate_norm:
         return False
-    if existing_norm == candidate_norm:
+    return existing_norm == candidate_norm
+
+
+def _is_better_entry_text(candidate: str, existing: str) -> bool:
+    candidate = _normalize_entry_text(candidate)
+    existing = _normalize_entry_text(existing)
+    if not existing:
         return True
-    existing_tokens = _entry_token_set(existing_norm)
-    candidate_tokens = candidate_tokens if candidate_tokens is not None else _entry_token_set(candidate_norm)
-    if not existing_tokens or not candidate_tokens:
+    if candidate == existing:
         return False
-    overlap = len(existing_tokens & candidate_tokens)
-    smaller = min(len(existing_tokens), len(candidate_tokens))
-    return smaller > 0 and overlap >= smaller and abs(len(existing_tokens) - len(candidate_tokens)) <= 1
-
-
-def _looks_like_generic_memory(content: str) -> bool:
-    lowered = _normalize_entry_text(content).lower()
-    if not lowered:
-        return True
-    if "?" in lowered or "[" in lowered or "]" in lowered or "<" in lowered or ">" in lowered:
-        return True
-    if any(lowered.startswith(prefix) for prefix in _GENERIC_MEMORY_PREFIXES):
-        return True
-    return any(phrase in lowered for phrase in _GENERIC_MEMORY_PHRASES)
+    return len(candidate) > len(existing) and len(candidate) <= 220
 
 
 def _memory_entry_allowed(category: str, content: str) -> bool:
     normalized = _normalize_entry_text(content)
+    if category not in {"preferences", "facts"}:
+        return False
+    if not normalized or len(normalized) < 4 or len(normalized) > 220:
+        return False
+    if any(marker in normalized for marker in ("[MEM]", "[/MEM]", "[PROJECT]", "[/PROJECT]", "[FORGET]", "[/FORGET]")):
+        return False
+    if "<" in normalized or ">" in normalized:
+        return False
     lowered = normalized.lower()
-    if not normalized or len(normalized) < 4 or len(normalized) > 180:
+    if any(phrase in lowered for phrase in _TRANSIENT_MEMORY_PHRASES):
         return False
-    if _looks_like_generic_memory(normalized):
+    if lowered.startswith(("akane ", "assistant ", "the assistant ")):
         return False
+    if "?" in normalized:
+        return False
+    words = normalized.translate(_LOW_VALUE_PUNCT).split()
+    if len(words) < 2:
+        return False
+    if len(set(word.lower() for word in words)) <= 1 and len(words) > 2:
+        return False
+    return True
 
-    tokens = _entry_token_set(normalized)
-    if category == "preferences":
-        return bool(tokens) and any(
-            lowered.startswith(prefix)
-            for prefix in ("prefers ", "likes ", "loves ", "enjoys ", "wants ", "needs ", "doesn't like ", "does not like ")
-        )
-    if category == "facts":
-        starts_like_fact = lowered.startswith(("uses ", "has ", "runs ", "works on ", "working on "))
-        return (
-            (starts_like_fact and len(tokens) >= 2)
-            or (len(tokens) >= 3 and any(char.isdigit() for char in normalized))
-        )
+
+def _project_detail_allowed(content: str) -> bool:
+    normalized = _normalize_entry_text(content)
+    if not normalized or len(normalized) > 180:
+        return False
+    if "?" in normalized or "[" in normalized or "]" in normalized or "<" in normalized or ">" in normalized:
+        return False
     return True
 
 
@@ -225,34 +251,26 @@ def _clean_extracted_value(value: str) -> str:
     return _normalize_entry_text(value).strip(" ,;:-")
 
 
+def _clean_natural_memory_value(value: str) -> str:
+    value = _clean_extracted_value(value)
+    value = re.split(r"\s+(?:and|but|because)\s+i\s+", value, maxsplit=1, flags=re.IGNORECASE)[0]
+    value = re.sub(r"\s+(?:too|as well)$", "", value, flags=re.IGNORECASE).strip()
+    value = value.strip("\"'` ")
+    return value[:120].strip()
+
+
+def _specific_enough_memory_value(value: str) -> bool:
+    normalized = _entry_fingerprint(value)
+    if not normalized or normalized in _VAGUE_MEMORY_VALUES:
+        return False
+    words = normalized.split()
+    return len(words) >= 2 or len(normalized) >= 4
+
+
 def _looks_like_valid_name(value: str) -> bool:
     candidate = _clean_extracted_value(value)
     parts = candidate.replace("-", " ").replace("'", " ").split()
     return bool(candidate) and len(candidate) <= 48 and not any(ch.isdigit() for ch in candidate) and 1 <= len(parts) <= 4 and all(part.isalpha() for part in parts)
-
-
-def _split_user_clauses(text: str) -> list[str]:
-    source = str(text or "")
-    for char in _CLAUSE_SPLIT_CHARS:
-        source = source.replace(char, "\n")
-    return [clause for part in source.splitlines() if (clause := _clean_extracted_value(part))]
-
-
-def _tokenize_words(text: str) -> list[str]:
-    return " ".join(str(text or "").translate(_PUNCT_TRANSLATION).split()).split()
-
-
-def _memory_clause_variants(clause: str) -> list[str]:
-    """Return a small set of durable-memory phrasings worth parsing."""
-    cleaned = _clean_extracted_value(clause)
-    if not cleaned:
-        return []
-    lowered = cleaned.lower()
-    for wrapper in _MEMORY_WRAPPERS:
-        if lowered.startswith(wrapper):
-            unwrapped = _clean_extracted_value(cleaned[len(wrapper):])
-            return [cleaned, unwrapped] if unwrapped and unwrapped != cleaned else [cleaned]
-    return [cleaned]
 
 
 def _normalize_user_key(value: str) -> str:
@@ -263,93 +281,189 @@ def _normalize_user_key(value: str) -> str:
     return key[:48]
 
 
-def _extract_user_field_from_clause(clause: str) -> tuple[str, str] | None:
-    lowered = clause.lower()
-    for connector in (" is ", " are "):
-        if connector not in lowered:
-            continue
-        left, right = clause.split(connector, 1)
-        left_lower = left.strip().lower()
-        if not left_lower.startswith("my "):
-            continue
-        value = _clean_extracted_value(right)
-        key = _normalize_user_key(left)
-        if not key or not value or len(value) > 120:
-            return None
-        if key == "name" and not _looks_like_valid_name(value):
-            return None
-        return key, value
-    return None
-
-
 def _add_unique_op(ops: list[tuple[str, str]], seen: set[tuple[str, str]], op: tuple[str, str]) -> None:
     if op not in seen:
         seen.add(op)
         ops.append(op)
 
 
-def _extract_memory_ops_from_user_text(user_text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+def _extract_tag_contents(text: str, opener: str, closer: str) -> list[str]:
+    source = str(text or "")
+    if not source:
+        return []
+    haystack = source.lower()
+    open_tag = opener.lower()
+    close_tag = closer.lower()
+    if open_tag not in haystack:
+        return []
+    parts: list[str] = []
+    start = 0
+    while True:
+        open_idx = haystack.find(open_tag, start)
+        if open_idx == -1:
+            return parts
+        content_idx = open_idx + len(opener)
+        close_idx = haystack.find(close_tag, content_idx)
+        if close_idx == -1:
+            return parts
+        content = source[content_idx:close_idx].strip()
+        if content:
+            parts.append(content)
+        start = close_idx + len(closer)
+
+
+def _decode_json_object(value: str) -> dict | None:
+    raw = str(value or "").strip()
+    if not raw or raw[0] != "{" or raw[-1] != "}":
+        return None
+    try:
+        decoded = orjson.loads(raw)
+    except orjson.JSONDecodeError:
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _parse_memory_payload(raw: str) -> tuple[str, str] | None:
+    """Parse one structured [MEM] body into a store operation."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+
+    decoded = _decode_json_object(text)
+    if decoded is not None:
+        category = str(decoded.get("category") or decoded.get("type") or "").strip().lower()
+        content = decoded.get("content")
+        if category in {"preference", "preferences"}:
+            category = "preferences"
+        elif category in {"fact", "facts"}:
+            category = "facts"
+        elif category in {"user", "profile"}:
+            category = "user"
+        if category == "user":
+            key = str(decoded.get("key") or "").strip()
+            value = str(decoded.get("value") if decoded.get("value") is not None else content or "").strip()
+            if key and value:
+                return "user", f"{key}: {value}"
+            return None
+        if category in {"preferences", "facts"} and content:
+            return category, str(content).strip()
+        return None
+
+    if ":" not in text:
+        return None
+    category, content = text.split(":", 1)
+    category = category.strip().lower()
+    content = content.strip()
+    if category in {"preference", "preferences"}:
+        return "preferences", content
+    if category in {"fact", "facts"}:
+        return "facts", content
+    if category == "user":
+        return "user", content
+    if category == "name":
+        return "user", f"name: {content}"
+    return None
+
+
+def _looks_like_discord_wrapped_prompt(text: str) -> bool:
+    return str(text or "").lstrip().lower().startswith(_DISCORD_CONTEXT_PREFIX)
+
+
+def _natural_language_memory_ops(user_text: str) -> list[tuple[str, str]]:
+    """Extract only high-confidence first-person memory from raw user text."""
+    text = _normalize_entry_text(user_text)
+    if not text or _looks_like_discord_wrapped_prompt(text):
+        return []
+
+    ops: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for pattern in _NAME_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        name = _clean_natural_memory_value(match.group(1))
+        if _looks_like_valid_name(name):
+            _add_unique_op(ops, seen, ("user", f"name: {name}"))
+            break
+
+    favorite = _FAVORITE_RE.search(text)
+    if favorite:
+        subject = _clean_natural_memory_value(favorite.group(1)).lower()
+        value = _clean_natural_memory_value(favorite.group(2))
+        if subject and value:
+            _add_unique_op(ops, seen, ("preferences", f"Favorite {subject}: {value}"))
+
+    for verb, raw_value in _PREFERENCE_RE.findall(text):
+        value = _clean_natural_memory_value(raw_value)
+        lowered_value = value.lower()
+        if (
+            not value
+            or not _specific_enough_memory_value(value)
+            or any(phrase in lowered_value for phrase in _TRANSIENT_MEMORY_PHRASES)
+        ):
+            continue
+        label = "Prefers" if verb.lower() == "prefer" else "Likes"
+        _add_unique_op(ops, seen, ("preferences", f"{label} {value}"))
+
+    for raw_value in _USE_RE.findall(text):
+        value = _clean_natural_memory_value(raw_value)
+        tokens = set(value.lower().translate(_LOW_VALUE_PUNCT).split())
+        if value and _specific_enough_memory_value(value) and tokens & _STABLE_USE_HINTS:
+            _add_unique_op(ops, seen, ("facts", f"Uses {value}"))
+
+    return ops
+
+
+def _extract_memory_ops_from_user_text(
+    user_text: str,
+    *,
+    include_natural: bool = False,
+) -> tuple[list[tuple[str, str]], list[str], list[tuple[str, str]]]:
+    """Extract only explicit structured memory tags from raw user text.
+
+    Natural-language messages are no longer scanned for words or prefixes. The
+    assistant's hidden tags, emitted after semantic interpretation, are the
+    normal memory extraction path. This parser exists for manual/API callers
+    that send structured tags directly.
+    """
     text = str(user_text or "").strip()
     if not text:
-        return [], []
+        return [], [], []
 
     mem_ops: list[tuple[str, str]] = []
+    forget_queries: list[str] = []
     project_ops: list[tuple[str, str]] = []
     seen_mem: set[tuple[str, str]] = set()
+    seen_forget: set[str] = set()
     seen_projects: set[tuple[str, str]] = set()
 
-    for raw_clause in _split_user_clauses(text):
-        for clause in _memory_clause_variants(raw_clause):
-            lowered = clause.lower()
+    for raw in _extract_tag_contents(text, "[MEM]", _TAG_PAIRS["MEM"]):
+        parsed = _parse_memory_payload(raw)
+        if parsed:
+            _add_unique_op(mem_ops, seen_mem, parsed)
 
-            for prefix in _NAME_PREFIXES:
-                if not lowered.startswith(prefix):
-                    continue
-                name = _clean_extracted_value(clause[len(prefix):])
-                if _looks_like_valid_name(name):
-                    _add_unique_op(mem_ops, seen_mem, ("user", f"name: {name}"))
-                break
+    if include_natural:
+        for parsed in _natural_language_memory_ops(text):
+            _add_unique_op(mem_ops, seen_mem, parsed)
 
-            user_field = _extract_user_field_from_clause(clause)
-            if user_field:
-                key, value = user_field
-                _add_unique_op(mem_ops, seen_mem, ("user", f"{key}: {value}"))
+    for raw in _extract_tag_contents(text, "[FORGET]", _TAG_PAIRS["FORGET"]):
+        query = _clean_extracted_value(raw).lower()
+        if query and query not in seen_forget:
+            seen_forget.add(query)
+            forget_queries.append(query)
 
-            for prefix, mapped in _PREFERENCE_PREFIXES:
-                if not lowered.startswith(prefix):
-                    continue
-                value = _clean_extracted_value(clause[len(prefix):])
-                if value:
-                    _add_unique_op(mem_ops, seen_mem, ("preferences", f"{mapped}{value.lower()}"))
-                break
+    for raw in _extract_tag_contents(text, "[PROJECT]", _TAG_PAIRS["PROJECT"]):
+        if ":" in raw:
+            name, detail = raw.split(":", 1)
+        else:
+            name, detail = raw, ""
+        name = _clean_extracted_value(name).lower()
+        detail = _clean_extracted_value(detail).lower()
+        if name:
+            _add_unique_op(project_ops, seen_projects, (name, detail))
 
-            for prefix, mapped in _FACT_PREFIXES:
-                if not lowered.startswith(prefix):
-                    continue
-                value = _clean_extracted_value(clause[len(prefix):])
-                if value:
-                    _add_unique_op(mem_ops, seen_mem, ("facts", f"{mapped}{value.lower()}"))
-                break
-
-            for prefix in _PROJECT_PREFIXES:
-                if not lowered.startswith(prefix):
-                    continue
-                raw_project = _clean_extracted_value(clause[len(prefix):]).lower()
-                if not raw_project:
-                    break
-                name = raw_project
-                detail = ""
-                for connector in (" using ", " with ", " for ", " on ", " at "):
-                    if connector in name:
-                        left, right = name.split(connector, 1)
-                        name = _clean_extracted_value(left).lower()
-                        detail = _clean_extracted_value(right).lower()
-                        break
-                if name:
-                    _add_unique_op(project_ops, seen_projects, (name, detail))
-                break
-
-    return mem_ops, project_ops
+    return mem_ops, forget_queries, project_ops
 
 
 def _enforce_entry_limit(data: dict, category: str) -> None:
@@ -488,12 +602,26 @@ def apply_tag_operations(
         _touch_metadata(data)
 
         for mem_cat, content in mem_ops:
+            mem_cat = str(mem_cat or "").strip().lower()
+            if mem_cat in {"preference", "preferences"}:
+                mem_cat = "preferences"
+            elif mem_cat in {"fact", "facts"}:
+                mem_cat = "facts"
+            elif mem_cat not in _VALID_MEMORY_CATEGORIES:
+                continue
+
             content = _normalize_entry_text(content)
             if mem_cat == "user":
                 if ":" in content:
                     key, value = content.split(":", 1)
-                    key = key.strip()
+                    key = _normalize_user_key(key)
+                    if not key:
+                        continue
                     norm_value = _normalize_user_field(key, value)
+                    if not norm_value or len(norm_value) > 160:
+                        continue
+                    if key == "name" and not _looks_like_valid_name(norm_value):
+                        continue
                     data["user"][key] = norm_value
                 continue
             if not _memory_entry_allowed(mem_cat, content):
@@ -547,7 +675,7 @@ def apply_tag_operations(
 
             if activity is None:
                 activity = data["activities"][name] = {"details": [], "status": "active", "created": _now()}
-            if detail and detail not in activity["details"] and not _looks_like_generic_memory(detail):
+            if detail and detail not in activity["details"] and _project_detail_allowed(detail):
                 activity["details"].append(detail)
                 activity["updated"] = _now()
 
@@ -556,14 +684,17 @@ def apply_tag_operations(
     return True
 
 
-def remember_user_message(user_text: str) -> bool:
-    """Infer durable memory from a raw user message and persist it."""
-    mem_ops, project_ops = _extract_memory_ops_from_user_text(user_text)
-    if not mem_ops and not project_ops:
+def remember_user_message(user_text: str, *, allow_natural: bool = True) -> bool:
+    """Apply explicit structured memory tags from a raw user message."""
+    mem_ops, forget_queries, project_ops = _extract_memory_ops_from_user_text(
+        user_text,
+        include_natural=allow_natural,
+    )
+    if not mem_ops and not forget_queries and not project_ops:
         return False
     return apply_tag_operations(
         mem_ops=mem_ops,
-        forget_queries=[],
+        forget_queries=forget_queries,
         project_ops=project_ops,
     )
 

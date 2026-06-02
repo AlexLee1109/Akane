@@ -9,10 +9,9 @@ from app.core.config import ADVISOR_ONLY
 SOUL_PATH = Path(__file__).resolve().parent.parent / "soul.md"
 IDENTITY_PATH = Path(__file__).resolve().parent.parent / "identity.md"
 
-_PromptFileCache = tuple[int, str]
-_SOUL_CACHE: _PromptFileCache | None = None
-_IDENTITY_CACHE: _PromptFileCache | None = None
-_BASE_PROMPT_CACHE: dict[tuple[tuple[int, int, int], bool], str] = {}
+_SOUL_CACHE: str | None = None
+_IDENTITY_CACHE: str | None = None
+_BASE_PROMPT_CACHE: dict[bool, str] = {}
 _MEMORY_RULES = (
     "MEMORY:\n"
     "- Use stored memory only when relevant.\n"
@@ -26,57 +25,43 @@ _MEMORY_RULES = (
 )
 
 
-def _load_cached(path: Path, cache: _PromptFileCache | None) -> _PromptFileCache:
+def _read_prompt_file(path: Path) -> str:
     try:
-        mtime = path.stat().st_mtime_ns
-        if cache and cache[0] == mtime:
-            return cache
-        return mtime, path.read_text(encoding="utf-8").strip()
+        return path.read_text(encoding="utf-8").strip()
     except OSError:
-        return -1, ""
+        return ""
 
 
 def load_soul() -> str:
     global _SOUL_CACHE
-    _SOUL_CACHE = _load_cached(SOUL_PATH, _SOUL_CACHE)
-    return _SOUL_CACHE[1]
+    if _SOUL_CACHE is None:
+        _SOUL_CACHE = _read_prompt_file(SOUL_PATH)
+    return _SOUL_CACHE
 
 
 def load_identity() -> str:
     global _IDENTITY_CACHE
-    _IDENTITY_CACHE = _load_cached(IDENTITY_PATH, _IDENTITY_CACHE)
-    return _IDENTITY_CACHE[1]
+    if _IDENTITY_CACHE is None:
+        _IDENTITY_CACHE = _read_prompt_file(IDENTITY_PATH)
+    return _IDENTITY_CACHE
 
 
 def prompt_revision() -> tuple[int, int, int]:
-    load_soul()
-    load_identity()
-    return (
-        _SOUL_CACHE[0] if _SOUL_CACHE else -1,
-        _IDENTITY_CACHE[0] if _IDENTITY_CACHE else -1,
-        int(ADVISOR_ONLY),
-    )
+    return (1 if load_soul() else 0, 1 if load_identity() else 0, int(ADVISOR_ONLY))
 
 
 def _base_system_prompt(*, include_memory: bool) -> str:
-    revision = prompt_revision()
-    key = (revision, include_memory)
-    cached = _BASE_PROMPT_CACHE.get(key)
+    cached = _BASE_PROMPT_CACHE.get(include_memory)
     if cached is not None:
         return cached
 
-    parts = [
-        _SOUL_CACHE[1] if _SOUL_CACHE else "",
-        _IDENTITY_CACHE[1] if _IDENTITY_CACHE else "",
-    ]
+    parts = [load_soul(), load_identity()]
     if include_memory:
         parts.append(_MEMORY_RULES)
     if ADVISOR_ONLY:
         parts.append("Advisor-only mode: do not claim to edit files.")
     result = "\n\n".join(part for part in parts if part)
-    if len(_BASE_PROMPT_CACHE) > 8:
-        _BASE_PROMPT_CACHE.clear()
-    _BASE_PROMPT_CACHE[key] = result
+    _BASE_PROMPT_CACHE[include_memory] = result
     return result
 
 

@@ -57,8 +57,11 @@ def collapse_hidden_tag_gaps(text: str) -> str:
 def strip_emoji_chars(text: str) -> str:
     if not text:
         return text or ""
+    value = str(text)
+    if value.isascii():
+        return value
     out: list[str] = []
-    for char in str(text):
+    for char in value:
         code = ord(char)
         if (
             0x1F000 <= code <= 0x1FAFF
@@ -118,6 +121,10 @@ class HiddenTagStreamFilter:
         if not text:
             return ""
         self._buffer += str(text)
+        if not self._hidden_close and "[" not in self._buffer and "<" not in self._buffer:
+            out = self._buffer
+            self._buffer = ""
+            return out
         out: list[str] = []
 
         while self._buffer:

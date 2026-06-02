@@ -119,54 +119,26 @@ def _parse_json_body(body: str) -> dict:
     return payload if isinstance(payload, dict) else _error_payload("Akane server returned invalid JSON.")
 
 
-def _parse_stream_line(line: str) -> tuple[str, str]:
-    try:
-        event = json.loads(line)
-    except json.JSONDecodeError:
-        return "", ""
-    if not isinstance(event, dict):
-        return "", ""
-    event_type = str(event.get("type", "") or "")
-    if event_type == "error":
-        return "error", str(event.get("error") or event.get("detail") or "Streaming failed.").strip()
-    if event_type == "done":
-        return "reply", str(event.get("reply", "") or "").strip()
-    if event_type == "delta":
-        return "delta", str(event.get("content", "") or "").strip()
-    return "", ""
-
-
 def _post_chat(prompt: str, session_id: str, *, skip_memory: bool = True) -> dict:
     data = json.dumps(
         {"message": prompt, "session_id": session_id, "skip_memory": skip_memory},
         ensure_ascii=False,
     ).encode("utf-8")
     request = urlrequest.Request(
-        f"{DISCORD_SERVER_URL}/api/chat/stream",
+        f"{DISCORD_SERVER_URL}/api/chat",
         data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"},
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
 
     try:
         with urlrequest.urlopen(request, timeout=_CHAT_TIMEOUT_SECONDS) as response:
-            content_type = str(response.headers.get("Content-Type", "") or "").lower()
-            if "application/json" in content_type:
-                return _parse_json_body(response.read().decode("utf-8", errors="replace"))
-
-            latest_delta = ""
-            for raw_line in response:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                kind, value = _parse_stream_line(line)
-                if kind == "error":
-                    return _error_payload(value)
-                if kind == "reply" and value:
-                    return {"reply": value}
-                if kind == "delta" and value:
-                    latest_delta = value
-            return {"reply": latest_delta} if latest_delta else _error_payload("Akane server returned no reply.")
+            payload = _parse_json_body(response.read().decode("utf-8", errors="replace"))
+            error = str(payload.get("error", "") or payload.get("detail", "")).strip()
+            if error:
+                return _error_payload(error)
+            reply = str(payload.get("reply", "") or payload.get("notice", "")).strip()
+            return {"reply": reply} if reply else _error_payload("Akane server returned no reply.")
     except urlerror.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         payload = _parse_json_body(body) if body else {}

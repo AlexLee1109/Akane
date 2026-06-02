@@ -2,16 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from pathlib import Path
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(str(os.environ.get(name, default)).strip())
-    except (TypeError, ValueError):
-        return int(default)
 
 
 def content_to_text(content) -> str:
@@ -42,12 +34,14 @@ class ModelManager:
             LLAMA_CONTEXT_WINDOW,
             LLAMA_FLASH_ATTN,
             LLAMA_GPU_LAYERS,
-            LLAMA_IDLE_UNLOAD_SECONDS,
+            LLAMA_LAST_N_TOKENS_SIZE,
             LLAMA_OFFLOAD_KQV,
             LLAMA_OP_OFFLOAD,
             LLAMA_THREADS,
             LLAMA_THREADS_BATCH,
             LLAMA_UBATCH_SIZE,
+            LLAMA_USE_MLOCK,
+            LLAMA_USE_MMAP,
             MODEL_PATH,
         )
 
@@ -60,14 +54,15 @@ class ModelManager:
         self.LLAMA_GPU_LAYERS = LLAMA_GPU_LAYERS
         self.LLAMA_OFFLOAD_KQV = LLAMA_OFFLOAD_KQV
         self.LLAMA_OP_OFFLOAD = LLAMA_OP_OFFLOAD
-        self.LLAMA_IDLE_UNLOAD_SECONDS = max(0.0, float(LLAMA_IDLE_UNLOAD_SECONDS))
-        self.LLAMA_CACHE_MB = max(0, _env_int("AKANE_LLAMA_CACHE_MB", 256))
+        self.LLAMA_USE_MMAP = LLAMA_USE_MMAP
+        self.LLAMA_USE_MLOCK = LLAMA_USE_MLOCK
+        self.LLAMA_LAST_N_TOKENS_SIZE = max(0, int(LLAMA_LAST_N_TOKENS_SIZE))
         self._local_model_path = Path(MODEL_PATH)
         self._llm = None
         self._loading = False
         self._load_error: Exception | None = None
         self._lock = threading.RLock()
-        self._idle_timer: threading.Timer | None = None
+        self._inference_lock = threading.Lock()
 
     @classmethod
     def get_instance(cls) -> "ModelManager":
@@ -87,35 +82,14 @@ class ModelManager:
                 "local_model_path": str(self._local_model_path),
             }
 
-    def _cancel_idle_timer(self) -> None:
-        if self._idle_timer is not None:
-            self._idle_timer.cancel()
-            self._idle_timer = None
-
-    def _schedule_idle_unload(self) -> None:
-        if self.LLAMA_IDLE_UNLOAD_SECONDS <= 0:
-            return
-        with self._lock:
-            self._cancel_idle_timer()
-            self._idle_timer = threading.Timer(self.LLAMA_IDLE_UNLOAD_SECONDS, self.unload_local_model)
-            self._idle_timer.daemon = True
-            self._idle_timer.start()
-
     def unload_local_model(self) -> None:
         with self._lock:
-            self._cancel_idle_timer()
             self._llm = None
 
-    def _install_prompt_cache(self) -> None:
-        if self.LLAMA_CACHE_MB <= 0 or self._llm is None or not hasattr(self._llm, "set_cache"):
-            return
-        try:
-            from llama_cpp import LlamaRAMCache
-
-            self._llm.set_cache(LlamaRAMCache(capacity_bytes=self.LLAMA_CACHE_MB * 1024 * 1024))
-            print(f"Prompt cache enabled: {self.LLAMA_CACHE_MB} MB", flush=True)
-        except Exception as exc:
-            print(f"Prompt cache disabled: {exc}", flush=True)
+    def _batch_settings(self) -> tuple[int, int]:
+        n_batch = max(1, min(int(self.LLAMA_BATCH_SIZE), int(self.LLAMA_CONTEXT_WINDOW)))
+        n_ubatch = max(1, min(int(self.LLAMA_UBATCH_SIZE), n_batch))
+        return n_batch, n_ubatch
 
     def switch_backend(
         self,
@@ -131,9 +105,11 @@ class ModelManager:
                 value = str(local_model_path).strip()
                 if not value:
                     raise ValueError("Local model path cannot be empty.")
-                self._local_model_path = Path(value)
-                self._llm = None
-                self._load_error = None
+                path = Path(value)
+                if path != self._local_model_path:
+                    self._local_model_path = path
+                    self._llm = None
+                    self._load_error = None
         return self.status()
 
     def ensure_loaded(self) -> None:
@@ -147,28 +123,33 @@ class ModelManager:
             try:
                 from llama_cpp import Llama
 
+                n_batch, n_ubatch = self._batch_settings()
                 kwargs = {
                     "model_path": str(self._local_model_path),
                     "n_ctx": self.LLAMA_CONTEXT_WINDOW,
-                    "n_batch": self.LLAMA_BATCH_SIZE,
-                    "n_ubatch": min(self.LLAMA_UBATCH_SIZE, self.LLAMA_BATCH_SIZE),
+                    "n_batch": n_batch,
+                    "n_ubatch": n_ubatch,
                     "n_threads": self.LLAMA_THREADS or None,
                     "n_threads_batch": self.LLAMA_THREADS_BATCH or None,
                     "flash_attn": self.LLAMA_FLASH_ATTN,
                     "offload_kqv": self.LLAMA_OFFLOAD_KQV,
                     "op_offload": self.LLAMA_OP_OFFLOAD,
-                    "use_mmap": True,
-                    "use_mlock": False,
-                    "last_n_tokens_size": 64,
+                    "use_mmap": self.LLAMA_USE_MMAP,
+                    "use_mlock": self.LLAMA_USE_MLOCK,
+                    "last_n_tokens_size": self.LLAMA_LAST_N_TOKENS_SIZE,
                     "logits_all": False,
                     "embedding": False,
+                    "no_perf": True,
                     "verbose": False,
                 }
                 if self.LLAMA_GPU_LAYERS:
                     kwargs["n_gpu_layers"] = self.LLAMA_GPU_LAYERS
-                print(f"Loading model {self._local_model_path} n_ctx={self.LLAMA_CONTEXT_WINDOW}", flush=True)
+                print(
+                    f"Loading model {self._local_model_path} "
+                    f"n_ctx={self.LLAMA_CONTEXT_WINDOW} n_batch={n_batch} n_ubatch={n_ubatch}",
+                    flush=True,
+                )
                 self._llm = Llama(**kwargs)
-                self._install_prompt_cache()
             except Exception as exc:
                 self._load_error = exc
                 raise
@@ -196,8 +177,6 @@ class ModelManager:
         response_format=None,
         timeout: float | None = None,
     ):
-        with self._lock:
-            self._cancel_idle_timer()
         kwargs = {
             "messages": messages,
             "max_tokens": max_tokens,
@@ -209,15 +188,12 @@ class ModelManager:
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
-        result = self.llm.create_chat_completion(**kwargs)
         if not stream:
-            self._schedule_idle_unload()
-            return result
+            with self._inference_lock:
+                return self.llm.create_chat_completion(**kwargs)
 
         def wrapped():
-            try:
-                yield from result
-            finally:
-                self._schedule_idle_unload()
+            with self._inference_lock:
+                yield from self.llm.create_chat_completion(**kwargs)
 
         return wrapped()

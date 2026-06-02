@@ -32,9 +32,20 @@ from app.core.config import (
     _coerce_int,
 )
 from app.core.character import build_system_prompt
+from app.core.emotional_state import (
+    format_for_prompt as format_emotional_state_for_prompt,
+    observe_user_message as observe_emotional_message,
+    snapshot as emotional_snapshot,
+)
 from app.core.generation import HiddenTagStreamFilter, strip_emoji_chars
 from app.core.model_loader import ModelManager, content_to_text
-from app.memory_store import MEMORY_PATH, format_for_prompt, get_all, reload_from_disk, remember_user_message
+from app.memory_store import (
+    MEMORY_PATH,
+    format_for_prompt as format_memory_for_prompt,
+    get_all,
+    reload_from_disk,
+    remember_user_message,
+)
 from app.ui.assets import resolve_ui_asset
 
 STATIC_DIR = Path(__file__).parent / "ui" / "static"
@@ -416,12 +427,18 @@ def _datetime_context(now: datetime | None = None) -> str:
     return result
 
 
-def _system_prompt(user_text: str, *, skip_memory: bool) -> str:
+def _system_prompt(
+    user_text: str,
+    *,
+    skip_memory: bool,
+    session_id: str | None = None,
+    internal_state: dict[str, object] | None = None,
+) -> str:
     include_memory = not skip_memory
     datetime_context = _datetime_context()
     memory = ""
     if include_memory:
-        memory = format_for_prompt()
+        memory = format_memory_for_prompt()
         if memory:
             memory = _clip(memory, _MAX_MEMORY_CHARS)
 
@@ -432,6 +449,7 @@ def _system_prompt(user_text: str, *, skip_memory: bool) -> str:
         "- Do not treat Discord metadata as the user's wording; answer the Message field."
     ]
     sections.append(datetime_context)
+    sections.append(format_emotional_state_for_prompt(internal_state or emotional_snapshot(session_id)))
     if memory:
         sections.append("Memory:\n" + memory)
     return build_system_prompt("\n\n".join(sections), include_memory=include_memory)
@@ -468,7 +486,13 @@ def _history_messages(session_id: str | None, *, system_prompt: str, user_input:
 
 
 def _chat_messages(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> list[dict]:
-    system_prompt = _system_prompt(user_input, skip_memory=skip_memory)
+    internal_state = observe_emotional_message(session_id, user_input)
+    system_prompt = _system_prompt(
+        user_input,
+        skip_memory=skip_memory,
+        session_id=session_id,
+        internal_state=internal_state,
+    )
     deep_history = _needs_deep_history(user_input)
     return [
         {"role": "system", "content": system_prompt},
@@ -576,7 +600,7 @@ def _handle_command(text: str, session_id: str | None = None) -> dict | None:
         return {"reply": "", "messages": [], "notice": "Context cleared."}
     if text == "/memory":
         reload_from_disk()
-        reply = format_for_prompt() or "No memories yet."
+        reply = format_memory_for_prompt() or "No memories yet."
         return {"reply": reply, "messages": [*_state_messages(session_id), {"role": "assistant", "content": reply}], "ephemeral": True}
     if text == "/reset":
         _clear_messages(session_id)
@@ -591,6 +615,7 @@ def _app_state_payload(session_id: str | None = None, *, include_messages: bool 
     state = _session_state(session_id)
     payload = {
         "model": ModelManager.get_instance().status(),
+        "internal_state": emotional_snapshot(session_id),
         "version": state.version,
     }
     if include_messages:
@@ -622,6 +647,10 @@ def create_app() -> FastAPI:
     @app.get("/api/memory")
     async def api_memory():
         return JSONResponse(get_all())
+
+    @app.get("/api/emotion")
+    async def api_emotion(session_id: str = DEFAULT_SESSION_ID):
+        return JSONResponse(emotional_snapshot(session_id))
 
     @app.post("/api/backend")
     async def api_backend(request: Request):

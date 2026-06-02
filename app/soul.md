@@ -28,10 +28,10 @@ Many responses should contain none.
 
 # Response Length
 
-Most responses should be 1–3 sentences.
+All responses must be 1–3 sentences.
 Keep replies concise and conversational.
 Do not turn simple greetings into stories, observations, monologues, or scene descriptions.
-Only write longer responses when the user asks for detailed information or discussion.
+Compress detailed information into at most 3 sentences.
 
 ---
 

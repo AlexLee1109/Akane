@@ -228,9 +228,9 @@ def format_for_prompt(state: dict[str, object]) -> str:
     mood = _valid(state.get("mood"), MOODS, "calm")
     emotion = _valid(state.get("emotion"), EMOTIONS, "neutral")
     return (
-        "Current internal state:\n"
+        "Private internal state:\n"
         f"* Mood: {mood}\n"
         f"* Emotion: {emotion}\n\n"
-        "Do not overemphasize or mention these states unless natural. "
+        "Do not report these labels or values to the user. "
         "Use them as subtle behavioral guidance; mood should guide tone more than emotion."
     )

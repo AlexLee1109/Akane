@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from pathlib import Path
 
 
@@ -39,7 +38,6 @@ class ModelManager:
 
     def __init__(self) -> None:
         from app.core.config import (
-            DEVICE,
             LLAMA_BATCH_SIZE,
             LLAMA_CONTEXT_WINDOW,
             LLAMA_FLASH_ATTN,
@@ -53,7 +51,6 @@ class ModelManager:
             MODEL_PATH,
         )
 
-        self.DEVICE = DEVICE
         self.LLAMA_CONTEXT_WINDOW = LLAMA_CONTEXT_WINDOW
         self.LLAMA_BATCH_SIZE = LLAMA_BATCH_SIZE
         self.LLAMA_UBATCH_SIZE = LLAMA_UBATCH_SIZE
@@ -201,15 +198,18 @@ class ModelManager:
     ):
         with self._lock:
             self._cancel_idle_timer()
-        result = self.llm.create_chat_completion(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repeat_penalty=repeat_penalty,
-            stream=stream,
-        )
+        kwargs = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "repeat_penalty": repeat_penalty,
+            "stream": stream,
+        }
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        result = self.llm.create_chat_completion(**kwargs)
         if not stream:
             self._schedule_idle_unload()
             return result

@@ -13,7 +13,17 @@ _PromptFileCache = tuple[int, str]
 _SOUL_CACHE: _PromptFileCache | None = None
 _IDENTITY_CACHE: _PromptFileCache | None = None
 _BASE_PROMPT_CACHE: dict[tuple[tuple[int, int, int], bool], str] = {}
-_FULL_PROMPT_CACHE: dict[tuple[tuple[int, int, int], bool, str], str] = {}
+_MEMORY_RULES = (
+    "MEMORY:\n"
+    "- Use stored memory only when relevant.\n"
+    "- Never invent memories or claim something was stored if it was not.\n"
+    "- When the user gives a durable fact or preference, append one hidden tag:\n"
+    "[MEM]fact: <stable learned info>[/MEM]\n"
+    "[MEM]preference: <stable user preference>[/MEM]\n"
+    "[MEM]user: name: <name>[/MEM]\n"
+    "[PROJECT]<project name>: <short durable detail>[/PROJECT]\n"
+    "[FORGET]<thing to remove>[/FORGET]"
+)
 
 
 def _load_cached(path: Path, cache: _PromptFileCache | None) -> _PromptFileCache:
@@ -49,24 +59,18 @@ def prompt_revision() -> tuple[int, int, int]:
 
 
 def _base_system_prompt(*, include_memory: bool) -> str:
-    key = (prompt_revision(), include_memory)
+    revision = prompt_revision()
+    key = (revision, include_memory)
     cached = _BASE_PROMPT_CACHE.get(key)
     if cached is not None:
         return cached
 
-    parts = [load_soul(), load_identity()]
+    parts = [
+        _SOUL_CACHE[1] if _SOUL_CACHE else "",
+        _IDENTITY_CACHE[1] if _IDENTITY_CACHE else "",
+    ]
     if include_memory:
-        parts.append(
-            "MEMORY:\n"
-            "- Use stored memory only when relevant.\n"
-            "- Never invent memories or claim something was stored if it was not.\n"
-            "- When the user gives a durable fact or preference, append one hidden tag:\n"
-            "[MEM]fact: <stable learned info>[/MEM]\n"
-            "[MEM]preference: <stable user preference>[/MEM]\n"
-            "[MEM]user: name: <name>[/MEM]\n"
-            "[PROJECT]<project name>: <short durable detail>[/PROJECT]\n"
-            "[FORGET]<thing to remove>[/FORGET]"
-        )
+        parts.append(_MEMORY_RULES)
     if ADVISOR_ONLY:
         parts.append("Advisor-only mode: do not claim to edit files.")
     result = "\n\n".join(part for part in parts if part)
@@ -78,15 +82,5 @@ def _base_system_prompt(*, include_memory: bool) -> str:
 
 def build_system_prompt(runtime_context: str = "", *, include_memory: bool = True) -> str:
     context = str(runtime_context or "").strip()
-    key = (prompt_revision(), include_memory, context)
-    cached = _FULL_PROMPT_CACHE.get(key)
-    if cached is not None:
-        return cached
-    parts = [_base_system_prompt(include_memory=include_memory)]
-    if context:
-        parts.append(context)
-    result = "\n\n".join(part for part in parts if part)
-    if len(_FULL_PROMPT_CACHE) > 16:
-        _FULL_PROMPT_CACHE.clear()
-    _FULL_PROMPT_CACHE[key] = result
-    return result
+    base = _base_system_prompt(include_memory=include_memory)
+    return f"{base}\n\n{context}" if context else base

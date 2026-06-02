@@ -34,6 +34,7 @@ _OPENERS = tuple(
     )
 )
 _OPENER_PREFIXES = frozenset(opener[:i].lower() for opener, _ in _OPENERS for i in range(1, len(opener) + 1))
+_MAX_OPENER_LEN = max(len(opener) for opener, _ in _OPENERS)
 
 
 def collapse_hidden_tag_gaps(text: str) -> str:
@@ -70,6 +71,33 @@ def strip_emoji_chars(text: str) -> str:
     return "".join(out)
 
 
+def strip_hidden_blocks(text: str) -> str:
+    if not text:
+        return text or ""
+    source = str(text)
+    if "[" not in source and "<" not in source:
+        return source
+    source_lower = source.lower()
+    pieces: list[str] = []
+    start = 0
+    while start < len(source):
+        match: tuple[int, str, str] | None = None
+        for opener, close in _OPENERS:
+            idx = source_lower.find(opener.lower(), start)
+            if idx >= 0 and (match is None or idx < match[0]):
+                match = (idx, opener, close)
+        if match is None:
+            pieces.append(source[start:])
+            break
+        idx, opener, close = match
+        pieces.append(source[start:idx])
+        end = source_lower.find(close.lower(), idx + len(opener))
+        if end < 0:
+            break
+        start = end + len(close)
+    return "".join(pieces)
+
+
 class HiddenTagStreamFilter:
     """Remove hidden/tool tags from token streams."""
 
@@ -81,7 +109,7 @@ class HiddenTagStreamFilter:
     def _hold_prefix(buffer: str) -> int:
         lower = buffer.lower()
         best = 0
-        for i in range(1, min(len(lower), 24) + 1):
+        for i in range(1, min(len(lower), _MAX_OPENER_LEN) + 1):
             if lower[-i:] in _OPENER_PREFIXES:
                 best = i
         return best
@@ -129,7 +157,7 @@ class HiddenTagStreamFilter:
             self._buffer = self._buffer[idx + len(opener):]
             self._hidden_close = close
 
-        return collapse_hidden_tag_gaps("".join(out))
+        return "".join(out)
 
     def flush(self) -> str:
         if self._hidden_close:
@@ -138,4 +166,4 @@ class HiddenTagStreamFilter:
             return ""
         out = self._buffer
         self._buffer = ""
-        return collapse_hidden_tag_gaps(out)
+        return out

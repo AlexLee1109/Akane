@@ -13,11 +13,14 @@ from app.core.config import (
     DISCORD_PREFIX,
     DISCORD_REPLY_TO_DMS,
     DISCORD_SERVER_URL,
+    DISCORD_UNPROMPTED_IDLE_MINUTES,
 )
 
 _CHAT_TIMEOUT_SECONDS = 300
 _RETRY_DELAYS = (0.0, 1.0, 2.0)
 _DISCORD_MESSAGE_LIMIT = 1900
+_RESET_CHAT_COMMAND = "/reset_chat"
+_IDLE_SYNTHETIC_MESSAGE = "Write one short autonomous Discord message from Akane."
 
 
 def _log(label: str, text: str = "") -> None:
@@ -91,16 +94,27 @@ def _model_prompt(message, user_text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _server_prompt(message, user_text: str) -> str:
+    text = str(user_text or "").strip()
+    return text if text == _RESET_CHAT_COMMAND else _model_prompt(message, text)
+
+
+def _is_reset_chat_text(text: str) -> bool:
+    return str(text or "").strip() == _RESET_CHAT_COMMAND
+
+
 def _should_handle(message, bot_user_id: int) -> bool:
     if getattr(message.author, "bot", False):
-        return False
-    if _is_dm(message):
-        return DISCORD_REPLY_TO_DMS
-    if DISCORD_ALLOWED_CHANNEL_IDS and int(message.channel.id) not in DISCORD_ALLOWED_CHANNEL_IDS:
         return False
     content = str(message.content or "").strip()
     if not content:
         return False
+    if _is_dm(message):
+        return DISCORD_REPLY_TO_DMS or _is_reset_chat_text(content)
+    if DISCORD_ALLOWED_CHANNEL_IDS and int(message.channel.id) not in DISCORD_ALLOWED_CHANNEL_IDS:
+        return False
+    if _is_reset_chat_text(content):
+        return True
     return (
         bool(DISCORD_PREFIX and content.lower().startswith(DISCORD_PREFIX.lower()))
         or _mention_user_id(content) == bot_user_id
@@ -167,6 +181,33 @@ async def _post_chat_async(prompt: str, session_id: str, *, skip_memory: bool = 
     return last
 
 
+def _idle_interval_seconds() -> float:
+    return max(1.0, float(DISCORD_UNPROMPTED_IDLE_MINUTES) * 60.0)
+
+
+def _idle_enabled() -> bool:
+    return DISCORD_UNPROMPTED_IDLE_MINUTES > 0
+
+
+def _idle_message_is_safe(text: str) -> bool:
+    value = " ".join(str(text or "").split()).strip()
+    return len(value.split()) >= 2
+
+
+async def _generate_idle_message(session_id: str) -> str:
+    for attempt in range(2):
+        result = await _post_chat_async(_IDLE_SYNTHETIC_MESSAGE, session_id, skip_memory=True)
+        error = str(result.get("error", "") or result.get("detail", "")).strip()
+        if error:
+            _log("idle-error", error)
+            return ""
+        reply = str(result.get("reply", "") or "").strip()
+        if _idle_message_is_safe(reply):
+            return reply
+        _log("idle-skip", f"unsafe generation attempt {attempt + 1}")
+    return ""
+
+
 def _chunks(text: str) -> list[str]:
     text = str(text or "").strip()
     if not text:
@@ -194,6 +235,11 @@ async def _send_reply(message, text: str) -> None:
         await message.channel.send(part)
 
 
+async def _send_channel_message(channel, text: str) -> None:
+    for part in _chunks(text):
+        await channel.send(part)
+
+
 def run_discord_bot() -> None:
     if not DISCORD_BOT_TOKEN:
         raise SystemExit("Missing Discord bot token. Set AKANE_DISCORD_BOT_TOKEN or DISCORD_BOT_TOKEN.")
@@ -205,17 +251,57 @@ def run_discord_bot() -> None:
     intents = discord.Intents.default()
     intents.message_content = True
     client = discord.Client(intents=intents)
+    idle_tasks: dict[str, asyncio.Task] = {}
+
+    async def idle_loop(channel, session_id: str) -> None:
+        try:
+            while True:
+                await asyncio.sleep(_idle_interval_seconds())
+                reply = await _generate_idle_message(session_id)
+                if reply:
+                    _log("idle-send", f"{session_id}: {reply}")
+                    await _send_channel_message(channel, reply)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            _log("idle-error", str(exc))
+
+    def schedule_idle(channel, session_id: str) -> None:
+        if not _idle_enabled():
+            return
+        previous = idle_tasks.pop(session_id, None)
+        if previous:
+            previous.cancel()
+        idle_tasks[session_id] = asyncio.create_task(idle_loop(channel, session_id))
+
+    def track_real_user_message(message) -> None:
+        if getattr(message.author, "bot", False) or _is_dm(message):
+            return
+        session_id = _session_id(message)
+        if DISCORD_ALLOWED_CHANNEL_IDS:
+            if int(message.channel.id) not in DISCORD_ALLOWED_CHANNEL_IDS:
+                return
+        schedule_idle(message.channel, session_id)
 
     @client.event
     async def on_ready() -> None:
         _log("ready", f"logged in as {client.user}")
         _log("status", f"forwarding to {DISCORD_SERVER_URL}")
+        if _idle_enabled():
+            _log("idle", f"interval={DISCORD_UNPROMPTED_IDLE_MINUTES:g}m")
+            for channel_id in DISCORD_ALLOWED_CHANNEL_IDS:
+                channel = client.get_channel(channel_id)
+                if channel is not None:
+                    guild = getattr(channel, "guild", None)
+                    if guild is not None:
+                        schedule_idle(channel, f"discord:guild:{guild.id}:channel:{channel.id}")
 
     @client.event
     async def on_message(message) -> None:
         if client.user is None:
             return
         bot_user_id = int(client.user.id)
+        track_real_user_message(message)
         if not _should_handle(message, bot_user_id):
             return
 
@@ -225,7 +311,7 @@ def run_discord_bot() -> None:
 
         scope = _session_id(message)
         _log("user", f"{message.author} ({scope}): {prompt}")
-        model_prompt = _model_prompt(message, prompt)
+        model_prompt = _server_prompt(message, prompt)
 
         async with message.channel.typing():
             result = await _post_chat_async(model_prompt, scope, skip_memory=True)

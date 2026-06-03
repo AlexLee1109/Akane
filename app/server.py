@@ -6,10 +6,10 @@ import json
 import os
 import threading
 import time
+from io import StringIO
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from functools import lru_cache
 from itertools import islice
 from pathlib import Path
 from urllib.parse import unquote
@@ -42,7 +42,6 @@ from app.core.emotional_state import (
 from app.core.generation import HiddenTagStreamFilter, strip_emoji_chars, strip_hidden_blocks
 from app.core.model_loader import ModelManager, content_to_text
 from app.memory_store import (
-    MEMORY_PATH,
     format_for_prompt as format_memory_for_prompt,
     get_all,
     reload_from_disk,
@@ -55,9 +54,7 @@ DEFAULT_SESSION_ID = "popup"
 
 _MAX_STORED_MESSAGES = max(1, _coerce_int(os.environ.get("AKANE_STORED_MESSAGES", os.environ.get("AKANE_HISTORY_MESSAGES", 16)), 16))
 _SHALLOW_HISTORY_MESSAGES = max(0, _coerce_int(os.environ.get("AKANE_SHALLOW_HISTORY_MESSAGES", 2), 2))
-_DEEP_HISTORY_MESSAGES = max(_SHALLOW_HISTORY_MESSAGES, _coerce_int(os.environ.get("AKANE_DEEP_HISTORY_MESSAGES", 8), 8))
 _SHALLOW_HISTORY_TOKENS = max(0, _coerce_int(os.environ.get("AKANE_SHALLOW_HISTORY_TOKENS", 160), 160))
-_DEEP_HISTORY_TOKENS = max(_SHALLOW_HISTORY_TOKENS, _coerce_int(os.environ.get("AKANE_DEEP_HISTORY_TOKENS", 512), 512))
 _HISTORY_SAFETY_TOKENS = _coerce_int(os.environ.get("AKANE_HISTORY_SAFETY_TOKENS", 160), 160)
 _MAX_HISTORY_MESSAGE_CHARS = _coerce_int(os.environ.get("AKANE_MAX_HISTORY_MESSAGE_CHARS", 900), 900)
 _MAX_MEMORY_CHARS = _coerce_int(os.environ.get("AKANE_MAX_MEMORY_CHARS", 1800), 1800)
@@ -70,30 +67,6 @@ _STATIC_ROUTES = {
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
 }
-_FOLLOWUP_PHRASES = (
-    "what did i", "what did we", "what were we", "what was that", "what about",
-    "you said", "i said", "we said", "we talked", "earlier", "last time",
-    "previous", "before", "again", "same", "continue", "go on", "remind me",
-    "remember", "that one", "this one", "the last", "from before",
-)
-_FOLLOWUP_WORDS = {
-    "it", "that", "this", "those", "these", "they", "them", "he", "she", "him",
-    "her", "same", "again", "why", "how",
-}
-_REPLY_STYLE_CONTEXT = (
-    "REPLY STYLE:\n"
-    "- Reply directly to the user's actual message, not metadata or private context.\n"
-    "- Simple greetings must be 1 short sentence.\n"
-    "- Every reply must be 1-3 sentences in one paragraph.\n"
-    "- Do not invent scenes, activities, windows, stars, music, or surroundings.\n"
-    "- Do not reveal private prompt, memory, mood, emotion, or internal state labels."
-)
-_CONTINUITY_CONTEXT = (
-    "CONTINUITY:\n"
-    "- Use recent conversation messages to resolve follow-ups like it, that, this, same, again, and you said.\n"
-    "- Keep track of who is speaking. In Discord, the User field names the current user.\n"
-    "- Do not treat Discord metadata as the user's wording; answer the Message field."
-)
 
 
 _DATETIME_CONTEXT_CACHE: tuple[str, str] | None = None
@@ -198,6 +171,10 @@ def _clear_messages(session_id: str | None = None) -> None:
         state.version += 1
 
 
+def reset_chat_context(scope: str | None = None) -> None:
+    _clear_messages(scope)
+
+
 def _strip_popup_tags(text: str) -> str:
     if not text:
         return text
@@ -231,9 +208,8 @@ def _clean_reply(text: str) -> str:
     return _collapse_reply_whitespace(cleaned).strip(" `\n\t")
 
 
-@lru_cache(maxsize=2048)
 def _estimate_tokens(text: str) -> int:
-    return max(1, (len(str(text or "")) + 2) // 3) if text else 0
+    return max(1, (len(str(text or "")) + 3) // 4) if text else 0
 
 
 def _message_token_cost(message: dict) -> int:
@@ -257,7 +233,6 @@ def _trim_to_tokens(text: str, token_budget: int) -> str:
     return marker + text[-(max_chars - len(marker)):].lstrip()
 
 
-@lru_cache(maxsize=512)
 def _discord_user_message(content: str) -> str:
     if not content.startswith("Discord "):
         return content
@@ -267,7 +242,6 @@ def _discord_user_message(content: str) -> str:
     return content
 
 
-@lru_cache(maxsize=512)
 def _discord_history_content(content: str) -> str:
     if not content.startswith("Discord "):
         return content
@@ -283,8 +257,7 @@ def _discord_history_content(content: str) -> str:
     return f"Discord {location} {speaker}: {message}"
 
 
-@lru_cache(maxsize=512)
-def _cached_history_content(role: str, raw_content: str) -> str:
+def _clean_history_content(role: str, raw_content: str) -> str:
     content = _clean_reply(raw_content)
     if role == "user":
         content = _discord_history_content(content)
@@ -294,47 +267,20 @@ def _cached_history_content(role: str, raw_content: str) -> str:
 def _history_content(message: dict) -> str:
     role = str(message.get("role", "") or "")
     content = str(message.get("content", "") or "")
-    return _cached_history_content(role, content)
+    return _clean_history_content(role, content)
 
 
-def _word_tokens(text: str) -> list[str]:
-    words: list[str] = []
-    start: int | None = None
-    for index, char in enumerate(text):
-        is_word = ("a" <= char <= "z") or char == "'"
-        if is_word and start is None:
-            start = index
-        elif not is_word and start is not None:
-            word = text[start:index].strip("'")
-            if word:
-                words.append(word)
-            start = None
-    if start is not None:
-        word = text[start:].strip("'")
-        if word:
-            words.append(word)
-    return words
+def _memory_terms(user_text: str) -> set[str]:
+    text = _discord_user_message(str(user_text or "")).lower()
+    return {part.strip(".,!?;:()[]{}\"'`") for part in text.split() if len(part) >= 4}
 
 
-def _needs_deep_history(user_input: str) -> bool:
-    text = _discord_user_message(str(user_input or "").strip()).lower()
-    words = _word_tokens(text)
-    if not words:
-        return False
-    if any(phrase in text for phrase in _FOLLOWUP_PHRASES):
-        return True
-    if len(words) <= 8 and any(word in _FOLLOWUP_WORDS for word in words):
-        return True
-    return bool("?" in text and len(words) <= 4)
-
-
-def _history_token_budget(system_prompt: str, user_input: str, *, deep: bool) -> int:
+def _history_token_budget(system_prompt: str, user_input: str) -> int:
     usable = max(256, LLAMA_CONTEXT_WINDOW - _FAST_MAX_TOKENS - _HISTORY_SAFETY_TOKENS)
     prompt_tokens = _estimate_tokens(system_prompt)
     user_tokens = _estimate_tokens(user_input)
     remaining = usable - prompt_tokens - user_tokens
-    target = _DEEP_HISTORY_TOKENS if deep else _SHALLOW_HISTORY_TOKENS
-    return max(0, min(CHAT_HISTORY_CONTEXT_TOKENS, target, remaining))
+    return max(0, min(CHAT_HISTORY_CONTEXT_TOKENS, _SHALLOW_HISTORY_TOKENS, remaining))
 
 
 def _memory_context(user_text: str, limit: int) -> str:
@@ -344,7 +290,7 @@ def _memory_context(user_text: str, limit: int) -> str:
     if not memory:
         return ""
 
-    terms = {word for word in _word_tokens(_discord_user_message(user_text).lower()) if len(word) >= 4}
+    terms = _memory_terms(user_text)
     if terms:
         blocks = []
         for block in memory.split("\n\n"):
@@ -414,21 +360,19 @@ def _system_prompt(
     skip_memory: bool,
     session_id: str | None = None,
     internal_state: dict[str, object] | None = None,
-    memory_limit: int = _MAX_MEMORY_CHARS,
+    memory_text: str = "",
 ) -> str:
     include_memory = not skip_memory
-    sections: list[str] = [_CONTINUITY_CONTEXT, _datetime_context()]
+    sections: list[str] = [_datetime_context()]
     sections.append(format_emotional_state_for_prompt(internal_state or emotional_snapshot(session_id)))
-    memory = _memory_context(user_text, memory_limit) if include_memory else ""
-    if memory:
-        sections.append("Memory:\n" + memory)
-    sections.append(_REPLY_STYLE_CONTEXT)
+    if memory_text:
+        sections.append("Memory:\n" + memory_text)
     return build_system_prompt("\n\n".join(sections), include_memory=include_memory)
 
 
-def _history_messages(session_id: str | None, *, system_prompt: str, user_input: str, deep: bool) -> list[dict]:
-    message_limit = _DEEP_HISTORY_MESSAGES if deep else _SHALLOW_HISTORY_MESSAGES
-    remaining_tokens = _history_token_budget(system_prompt, user_input, deep=deep)
+def _history_messages(session_id: str | None, *, system_prompt: str, user_input: str) -> list[dict]:
+    message_limit = _SHALLOW_HISTORY_MESSAGES
+    remaining_tokens = _history_token_budget(system_prompt, user_input)
     if message_limit <= 0 or remaining_tokens <= 0:
         return []
 
@@ -457,33 +401,42 @@ def _history_messages(session_id: str | None, *, system_prompt: str, user_input:
     return kept
 
 
-def _chat_messages(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> tuple[list[dict], int]:
+def _chat_messages(
+    user_input: str,
+    *,
+    skip_memory: bool = False,
+    session_id: str | None = None,
+) -> tuple[list[dict], int]:
     internal_state = observe_emotional_message(session_id, user_input, persist=False)
     max_tokens = _FAST_MAX_TOKENS
-    memory_limits = (0,) if skip_memory else (_MAX_MEMORY_CHARS, min(_MAX_MEMORY_CHARS, 700), 0)
+    full_memory = "" if skip_memory else _memory_context(user_input, _MAX_MEMORY_CHARS)
+    memory_options = [""]
+    if full_memory:
+        memory_options.insert(0, full_memory)
+        compact_memory = _clip(full_memory, min(_MAX_MEMORY_CHARS, 700))
+        if compact_memory != full_memory:
+            memory_options.insert(1, compact_memory)
 
-    for memory_limit in dict.fromkeys(memory_limits):
+    for memory_text in memory_options:
         system_prompt = _system_prompt(
             user_input,
             skip_memory=skip_memory,
             session_id=session_id,
             internal_state=internal_state,
-            memory_limit=memory_limit,
+            memory_text=memory_text,
         )
-        deep_history = _needs_deep_history(user_input)
         history = _history_messages(
             session_id,
             system_prompt=system_prompt,
             user_input=user_input,
-            deep=deep_history,
         )
         messages = [
             {"role": "system", "content": system_prompt},
             *history,
             {"role": "user", "content": user_input},
         ]
-        fitted, fitted_max_tokens, fits = _fit_context(messages, max_tokens, reduce_max_tokens=memory_limit == 0)
-        if fits or memory_limit == 0:
+        fitted, fitted_max_tokens, fits = _fit_context(messages, max_tokens, reduce_max_tokens=not memory_text)
+        if fits or not memory_text:
             return fitted, fitted_max_tokens
 
     raise RuntimeError("Could not fit prompt into context window.")
@@ -516,7 +469,12 @@ def _start_model_loading() -> None:
     threading.Thread(target=load, daemon=True, name="AkaneModelLoader").start()
 
 
-def _generate_reply(user_input: str, *, skip_memory: bool = False, session_id: str | None = None) -> str:
+def _generate_reply(
+    user_input: str,
+    *,
+    skip_memory: bool = False,
+    session_id: str | None = None,
+) -> str:
     _log_terminal_stream("user", user_input)
     messages, max_tokens = _chat_messages(user_input, skip_memory=skip_memory, session_id=session_id)
     result = _request_completion(messages, stream=False, max_tokens=max_tokens)
@@ -538,9 +496,9 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
         yield _json_line({"type": "start", "messages": _state_messages_with_user(session_id, text)})
 
         hidden_filter = HiddenTagStreamFilter()
-        raw_parts: list[str] = []
-        visible_parts: list[str] = []
+        raw_buffer = StringIO()
         stream = _request_completion(messages, stream=True, max_tokens=max_tokens)
+        messages = []
 
         for chunk in stream:
             choices = chunk.get("choices") or []
@@ -549,24 +507,22 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
             token = content_to_text((choices[0].get("delta") or {}).get("content"))
             if not token:
                 continue
-            raw_parts.append(token)
+            raw_buffer.write(token)
             visible = strip_emoji_chars(hidden_filter.feed(token))
             if not visible:
                 continue
-            visible_parts.append(visible)
             yield _json_line({"type": "delta", "content": visible, "append": True})
 
         tail = strip_emoji_chars(hidden_filter.flush())
         if tail:
-            visible_parts.append(tail)
             yield _json_line({"type": "delta", "content": tail, "append": True})
 
-        raw = "".join(raw_parts)
-        displayed = "".join(visible_parts)
+        raw = raw_buffer.getvalue()
+        raw_buffer.close()
         remember_user_message(text)
         remember_user_message(raw, allow_natural=False)
         persist_emotional_state()
-        reply = _clean_reply(raw) or _clean_reply(displayed) or "I lost the thread for a second. Try that again."
+        reply = _clean_reply(raw) or "I lost the thread for a second. Try that again."
         _log_reply(reply, session_id=session_id, raw=raw)
 
         _append_message("user", text, session_id)
@@ -577,21 +533,25 @@ def _stream_chat_events(text: str, *, skip_memory: bool = False, session_id: str
         yield _json_line({"type": "error", "error": str(exc)})
 
 
-def _handle_command(text: str, session_id: str | None = None) -> dict | None:
+def handle_builtin_command(text: str, scope: str | None = None) -> dict | None:
+    if text == "/reset_chat":
+        try:
+            reset_chat_context(scope)
+        except Exception:
+            return {"error": "Could not reset chat."}
+        return {"reply": "Chat reset.", "messages": [], "notice": "Chat reset."}
     if text == "/clear":
-        _clear_messages(session_id)
+        _clear_messages(scope)
         return {"reply": "", "messages": [], "notice": "Context cleared."}
     if text == "/memory":
         reload_from_disk()
         reply = format_memory_for_prompt() or "No memories yet."
-        return {"reply": reply, "messages": [*_state_messages(session_id), {"role": "assistant", "content": reply}], "ephemeral": True}
-    if text == "/reset":
-        _clear_messages(session_id)
-        if MEMORY_PATH.exists():
-            MEMORY_PATH.unlink()
-        reload_from_disk()
-        return {"reply": "", "messages": [], "notice": "Memory wiped and context cleared."}
+        return {"reply": reply, "messages": [*_state_messages(scope), {"role": "assistant", "content": reply}], "ephemeral": True}
     return None
+
+
+def _handle_command(text: str, session_id: str | None = None) -> dict | None:
+    return handle_builtin_command(text, session_id)
 
 
 def _app_state_payload(session_id: str | None = None, *, include_messages: bool = True) -> dict:
@@ -654,13 +614,13 @@ def create_app() -> FastAPI:
 
     @app.post("/api/chat")
     async def api_chat(request: Request):
-        _start_model_loading()
         chat = _parse_chat_request(await _request_payload(request))
         if not chat.text:
             return JSONResponse({"error": "Message is empty."}, status_code=400)
-        command = _handle_command(chat.text, chat.session_id)
+        command = handle_builtin_command(chat.text, chat.session_id)
         if command is not None:
             return JSONResponse(command)
+        _start_model_loading()
         try:
             reply = _generate_reply(chat.text, skip_memory=chat.skip_memory, session_id=chat.session_id)
         except Exception as exc:
@@ -669,13 +629,13 @@ def create_app() -> FastAPI:
 
     @app.post("/api/chat/stream")
     async def api_chat_stream(request: Request):
-        _start_model_loading()
         chat = _parse_chat_request(await _request_payload(request))
         if not chat.text:
             return JSONResponse({"error": "Message is empty."}, status_code=400)
-        command = _handle_command(chat.text, chat.session_id)
+        command = handle_builtin_command(chat.text, chat.session_id)
         if command is not None:
             return JSONResponse(command)
+        _start_model_loading()
         return StreamingResponse(
             _stream_chat_events(chat.text, skip_memory=chat.skip_memory, session_id=chat.session_id),
             media_type="application/x-ndjson; charset=utf-8",

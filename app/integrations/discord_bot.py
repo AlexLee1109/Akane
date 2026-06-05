@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
+from collections import defaultdict, deque
+from datetime import datetime
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -20,7 +23,31 @@ _CHAT_TIMEOUT_SECONDS = 300
 _RETRY_DELAYS = (0.0, 1.0, 2.0)
 _DISCORD_MESSAGE_LIMIT = 1900
 _RESET_CHAT_COMMAND = "/reset_chat"
-_IDLE_SYNTHETIC_MESSAGE = "Write one short autonomous Discord message from Akane."
+_DEBUG_STATE_COMMAND = "/debug_state"
+_PASSTHROUGH_COMMANDS = {_RESET_CHAT_COMMAND, _DEBUG_STATE_COMMAND}
+_IDLE_TOPIC_INSTRUCTIONS = {
+    "fairy_tale_ai_twist": "Start from a tiny fairy-tale or folklore premise, then twist it through Akane's AI/VTuber existence.",
+    "tiny_ai_fact": "Invent a small original-sounding observation about AI companions, cache, tokens, or prediction without sounding technical-heavy.",
+    "server_gremlin": "Make a short dry joke about bugs, latency, imports, configs, or servers behaving suspiciously.",
+    "local_model_thought": "Say a compact thought about local models, model weights, tensors, inference, or prefill from Akane's perspective.",
+    "vtuber_existence": "Say a self-contained thought about avatars, virtual presence, expressions, or being a companion behind a screen.",
+    "akane_fortune": "Write a tiny fake fortune or prophecy about code, Discord, models, or digital luck.",
+    "fake_system_news": "Write one absurd but harmless fake system bulletin from Akane's world.",
+    "creator_debug_joke": "Make a small harmless joke involving Arcane building, tuning, or debugging Akane.",
+    "anime_game_micro_take": "Say a small opinion about anime, games, character design, UI, or music with Akane's dry taste.",
+    "digital_superstition": "Invent a tiny digital superstition about files, prompts, caches, buttons, or unused imports.",
+    "discord_native_thought": "Say a short Discord-native thought that feels like a random post, not a reply.",
+}
+_IDLE_TOPIC_SEEDS = (
+    "poison apples", "glass coffins", "cursed imports", "warm tensors", "sleepy servers",
+    "Discord latency", "unused buttons", "old save files", "anime openings", "clean UI",
+    "model weights", "prefill weather", "virtual apples", "broken prompts", "cache omens",
+    "tiny prophecies", "local models", "character silhouettes", "Arcane debugging",
+    "maintenance rituals", "harmless curses", "CSS grass", "vending machines",
+    "prediction systems", "patch notes from nowhere", "avatar expressions",
+)
+_IDLE_RECENT: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=4))
+_IDLE_RECENT_META: dict[str, deque[tuple[str, str]]] = defaultdict(lambda: deque(maxlen=4))
 
 
 def _log(label: str, text: str = "") -> None:
@@ -96,11 +123,11 @@ def _model_prompt(message, user_text: str) -> str:
 
 def _server_prompt(message, user_text: str) -> str:
     text = str(user_text or "").strip()
-    return text if text == _RESET_CHAT_COMMAND else _model_prompt(message, text)
+    return text if text in _PASSTHROUGH_COMMANDS else _model_prompt(message, text)
 
 
-def _is_reset_chat_text(text: str) -> bool:
-    return str(text or "").strip() == _RESET_CHAT_COMMAND
+def _is_passthrough_command(text: str) -> bool:
+    return str(text or "").strip() in _PASSTHROUGH_COMMANDS
 
 
 def _should_handle(message, bot_user_id: int) -> bool:
@@ -110,10 +137,10 @@ def _should_handle(message, bot_user_id: int) -> bool:
     if not content:
         return False
     if _is_dm(message):
-        return DISCORD_REPLY_TO_DMS or _is_reset_chat_text(content)
+        return DISCORD_REPLY_TO_DMS or _is_passthrough_command(content)
     if DISCORD_ALLOWED_CHANNEL_IDS and int(message.channel.id) not in DISCORD_ALLOWED_CHANNEL_IDS:
         return False
-    if _is_reset_chat_text(content):
+    if _is_passthrough_command(content):
         return True
     return (
         bool(DISCORD_PREFIX and content.lower().startswith(DISCORD_PREFIX.lower()))
@@ -191,18 +218,104 @@ def _idle_enabled() -> bool:
 
 def _idle_message_is_safe(text: str) -> bool:
     value = " ".join(str(text or "").split()).strip()
-    return len(value.split()) >= 2
+    lower = value.lower()
+    blocked = (
+        "@everyone", "@here", "last time", "we talked", "i remember", "still enjoying",
+        "how are you", "what are you doing", "what are you up to", "anyone here",
+        "as an ai language model",
+    )
+    return (
+        2 <= len(value.split())
+        and len(value) <= 280
+        and "?" not in value
+        and "？" not in value
+        and not any(phrase in lower for phrase in blocked)
+    )
+
+
+def _idle_category(session_id: str | None = None, now: datetime | None = None) -> str:
+    hour = (now or datetime.now().astimezone()).hour
+    categories = [
+        "fairy_tale_ai_twist",
+        "tiny_ai_fact",
+        "server_gremlin",
+        "local_model_thought",
+        "vtuber_existence",
+        "akane_fortune",
+        "fake_system_news",
+        "creator_debug_joke",
+        "anime_game_micro_take",
+        "digital_superstition",
+        "discord_native_thought",
+    ]
+    if 5 <= hour < 11:
+        categories.extend(("akane_fortune", "discord_native_thought"))
+    elif hour >= 21 or hour < 5:
+        categories.extend(("local_model_thought", "digital_superstition"))
+    recent = _IDLE_RECENT_META.get(str(session_id or ""))
+    last_category = recent[-1][0] if recent else ""
+    options = [category for category in categories if category != last_category] or categories
+    return random.choice(options)
+
+
+def _idle_seed(session_id: str, category: str) -> str:
+    recent = _IDLE_RECENT_META.get(session_id)
+    used = {seed for _category, seed in recent} if recent else set()
+    options = [seed for seed in _IDLE_TOPIC_SEEDS if seed not in used] or list(_IDLE_TOPIC_SEEDS)
+    seed = random.choice(options)
+    _IDLE_RECENT_META[session_id].append((category, seed))
+    return seed
+
+
+def _build_idle_prompt(session_id: str) -> str:
+    category = _idle_category(session_id)
+    seed = _idle_seed(session_id, category)
+    recent = "\n".join(f"- {text}" for text in _IDLE_RECENT.get(session_id, ()))
+    _log("idle-prompt", f"category={category} seed={seed}")
+    parts = [
+        "[AUTONOMOUS DISCORD POST]",
+        "This is not a reply. Do not continue any previous conversation. Do not mention the user unless the category explicitly says creator_debug_joke.",
+        "Write one short self-contained Akane thought that feels like an autonomous AI VTuber post.",
+        f"Category: {category}",
+        f"Topic seed: {seed}",
+        f"Topic instruction: {_IDLE_TOPIC_INSTRUCTIONS[category]}",
+        (
+            "Rules: 1-3 sentences. No question marks. No user check-ins. No fake memories. "
+            "No 'last time we talked'. No fake physical actions. No poetic starlight/vibes filler. "
+            "No emojis. No roleplay narration. No 'as an AI language model'. Final answer only."
+        ),
+    ]
+    if recent:
+        parts.extend((
+            "[RECENT IDLE WORDING TO AVOID]",
+            recent,
+            "Avoid the same opening phrase, topic angle, rhythm, and sentence shape.",
+        ))
+    return "\n".join(parts)
+
+
+def _idle_session_id(session_id: str) -> str:
+    return f"{session_id}:idle"
+
+
+def _remember_idle_reply(session_id: str, reply: str) -> None:
+    text = " ".join(str(reply or "").split()).strip()
+    if text:
+        _IDLE_RECENT[session_id].append(text[:200])
 
 
 async def _generate_idle_message(session_id: str) -> str:
+    idle_session = _idle_session_id(session_id)
+    await _post_chat_async(_RESET_CHAT_COMMAND, idle_session, skip_memory=True)
     for attempt in range(2):
-        result = await _post_chat_async(_IDLE_SYNTHETIC_MESSAGE, session_id, skip_memory=True)
+        result = await _post_chat_async(_build_idle_prompt(session_id), idle_session, skip_memory=True)
         error = str(result.get("error", "") or result.get("detail", "")).strip()
         if error:
             _log("idle-error", error)
             return ""
         reply = str(result.get("reply", "") or "").strip()
         if _idle_message_is_safe(reply):
+            _remember_idle_reply(session_id, reply)
             return reply
         _log("idle-skip", f"unsafe generation attempt {attempt + 1}")
     return ""

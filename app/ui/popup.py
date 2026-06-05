@@ -5,6 +5,7 @@ from urllib.parse import quote, urlencode, urljoin
 from urllib.error import HTTPError, URLError
 import urllib.request
 import threading
+import time
 
 import webview
 
@@ -37,6 +38,16 @@ WINDOW_TITLES = {
 }
 AVATAR_IMAGE_PATH = IMAGES_DIR / "Vtuber_model.png"
 AVATAR_BOUNDS_WH = (333, 1334)
+
+
+def _log_popup_timing(**values: float | int) -> None:
+    parts = []
+    for key, value in values.items():
+        if isinstance(value, float):
+            parts.append(f"{key}={value:.3f}s")
+        else:
+            parts.append(f"{key}={value}")
+    print(f"[Akane:popup:timing] {' '.join(parts)}", flush=True)
 
 
 @dataclass(frozen=True)
@@ -183,6 +194,10 @@ class PopupApp:
             return
 
     def _run_message_stream(self, message: str) -> None:
+        started_at = time.perf_counter()
+        first_line_at = None
+        first_delta_at = None
+        line_count = 0
         message = str(message or "").strip()
         if not message:
             self._emit_stream_event({"type": "error", "error": "Message is empty."})
@@ -190,17 +205,39 @@ class PopupApp:
         session_id = DEFAULT_SESSION_ID
         try:
             for line in self._remote_stream_lines(message, session_id):
-                self._emit_stream_line(line)
+                line_count += 1
+                line_at = time.perf_counter()
+                if first_line_at is None:
+                    first_line_at = line_at
+                event = self._emit_stream_line(line)
+                if first_delta_at is None and event and event.get("type") == "delta":
+                    first_delta_at = line_at
+            done_at = time.perf_counter()
+            _log_popup_timing(
+                first_line=(first_line_at or done_at) - started_at,
+                first_delta=(first_delta_at or done_at) - started_at,
+                total=done_at - started_at,
+                lines=line_count,
+            )
         except Exception as exc:
+            done_at = time.perf_counter()
+            _log_popup_timing(
+                first_line=(first_line_at or done_at) - started_at,
+                first_delta=(first_delta_at or done_at) - started_at,
+                total=done_at - started_at,
+                lines=line_count,
+            )
             self._emit_stream_event({"type": "error", "error": str(exc)})
 
-    def _emit_stream_line(self, line: str | bytes) -> None:
+    def _emit_stream_line(self, line: str | bytes) -> dict | None:
         if isinstance(line, bytes):
             line = line.decode("utf-8", errors="replace")
         line = str(line or "").strip()
         if not line:
-            return
-        self._emit_stream_event(json.loads(line))
+            return None
+        event = json.loads(line)
+        self._emit_stream_event(event)
+        return event
 
     def _remote_stream_lines(self, message: str, session_id: str):
         payload = json.dumps(

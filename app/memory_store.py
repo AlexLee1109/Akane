@@ -497,7 +497,6 @@ class MemoryStore:
         self.dirty = False
         self._flush_lock = threading.RLock()
         self._prompt_cache = None
-        self._prompt_cache_gen = -1
         self._load_initial()
 
     def _load_initial(self):
@@ -525,7 +524,6 @@ class MemoryStore:
                 self._flush(force=True)
             self._reload_from_disk()
             self._prompt_cache = None
-            self._prompt_cache_gen += 1
 
     def get(self) -> dict:
         """Get a deep copy of current memory state."""
@@ -538,7 +536,7 @@ class MemoryStore:
             result = updater_func(self.data)
             self.dirty = True
             if invalidate_prompt_cache:
-                self._prompt_cache_gen += 1
+                self._prompt_cache = None
             return result
 
     def _flush(self, force: bool = False) -> bool:
@@ -591,6 +589,7 @@ def apply_tag_operations(
     mem_ops: list[tuple[str, str]],
     forget_queries: list[str],
     project_ops: list[tuple[str, str]],
+    flush: bool = True,
 ) -> bool:
     """Apply parsed memory tag operations in one authoritative place."""
     if not (mem_ops or forget_queries or project_ops):
@@ -680,11 +679,12 @@ def apply_tag_operations(
                 activity["updated"] = _now()
 
     store.update(update)
-    store._flush(force=True)
+    if flush:
+        store._flush(force=True)
     return True
 
 
-def remember_user_message(user_text: str, *, allow_natural: bool = True) -> bool:
+def remember_user_message(user_text: str, *, allow_natural: bool = True, flush: bool = True) -> bool:
     """Apply explicit structured memory tags from a raw user message."""
     mem_ops, forget_queries, project_ops = _extract_memory_ops_from_user_text(
         user_text,
@@ -696,7 +696,19 @@ def remember_user_message(user_text: str, *, allow_natural: bool = True) -> bool
         mem_ops=mem_ops,
         forget_queries=forget_queries,
         project_ops=project_ops,
+        flush=flush,
     )
+
+
+def remember_exchange(user_text: str, assistant_text: str) -> bool:
+    """Apply user and assistant memory operations with a single disk flush."""
+    changed = False
+    for text, allow_natural in ((user_text, True), (assistant_text, False)):
+        if remember_user_message(text, allow_natural=allow_natural, flush=False):
+            changed = True
+    if changed:
+        get_store()._flush(force=True)
+    return changed
 
 
 def record_interaction() -> None:
@@ -719,99 +731,89 @@ def format_for_prompt() -> str:
     """Format all memories as a string for the system prompt."""
     store = get_store()
     with store._flush_lock:
+        if store._prompt_cache is not None:
+            return store._prompt_cache
         data = store.data
-        cache_gen = store._prompt_cache_gen
-        prompt_cache = store._prompt_cache
 
-    if prompt_cache is not None and store._prompt_cache_gen == cache_gen:
-        return prompt_cache
+        sections = []
+        user = data.get("user", {})
 
-    sections = []
-    user = data.get("user", {})
+        def _append_unique(lines: list[str], seen: set[str], label: str, value: str) -> None:
+            cleaned = " ".join(str(value or "").split()).strip()
+            if not cleaned:
+                return
+            key = cleaned.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            lines.append(f"  - {label}: {cleaned}")
 
-    def _append_unique(lines: list[str], seen: set[str], label: str, value: str) -> None:
-        cleaned = " ".join(str(value or "").split()).strip()
-        if not cleaned:
-            return
-        key = cleaned.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        lines.append(f"  - {label}: {cleaned}")
+        preference_lines: list[str] = []
+        seen_preferences: set[str] = set()
 
-    # --- User Preferences ---
-    preference_lines: list[str] = []
-    seen_preferences: set[str] = set()
+        name = str(user.get("name", "")).strip()
+        if name:
+            _append_unique(preference_lines, seen_preferences, "Name", name)
 
-    name = str(user.get("name", "")).strip()
-    if name:
-        _append_unique(preference_lines, seen_preferences, "Name", name)
-
-    for key, value in user.items():
-        if key == "name":
-            continue
-        lowered_key = str(key).lower()
-        if any(token in lowered_key for token in ("communication", "tone", "style")):
-            _append_unique(preference_lines, seen_preferences, "Preferred communication style", value)
-        elif any(token in lowered_key for token in ("game", "genre")):
-            _append_unique(preference_lines, seen_preferences, "Favorite games/genres", value)
-        elif any(token in lowered_key for token in ("task", "workflow", "focus")):
-            _append_unique(preference_lines, seen_preferences, "Common tasks", value)
-        else:
-            _append_unique(preference_lines, seen_preferences, str(key).replace("_", " ").title(), value)
-
-    game_prefs = [
-        entry.get("content", "")
-        for entry in data.get("preferences", [])
-        if any(token in entry.get("content", "").lower() for token in ("game", "genre"))
-    ]
-    if game_prefs:
-        _append_unique(preference_lines, seen_preferences, "Favorite games/genres", "; ".join(game_prefs[:3]))
-
-    common_tasks = list(data.get("activities", {}).keys())[:4]
-    if common_tasks:
-        _append_unique(preference_lines, seen_preferences, "Common tasks", "; ".join(common_tasks))
-
-    for entry in data.get("preferences", [])[:6]:
-        content = str(entry.get("content", "")).strip()
-        if any(token in content.lower() for token in ("game", "genre")):
-            continue
-        _append_unique(preference_lines, seen_preferences, "Preference", content)
-
-    if preference_lines:
-        sections.append("User Preferences:\n" + "\n".join(preference_lines))
-
-    # --- System Context ---
-    active = {k: v for k, v in data.get("activities", {}).items() if v.get("status") == "active"}
-    if active:
-        context_lines = []
-        for activity_name, proj in active.items():
-            details = "; ".join(proj["details"][:2]).strip()
-            if details:
-                context_lines.append(f"  - Recent files or projects: {activity_name} ({details})")
+        for key, value in user.items():
+            if key == "name":
+                continue
+            lowered_key = str(key).lower()
+            if any(token in lowered_key for token in ("communication", "tone", "style")):
+                _append_unique(preference_lines, seen_preferences, "Preferred communication style", value)
+            elif any(token in lowered_key for token in ("game", "genre")):
+                _append_unique(preference_lines, seen_preferences, "Favorite games/genres", value)
+            elif any(token in lowered_key for token in ("task", "workflow", "focus")):
+                _append_unique(preference_lines, seen_preferences, "Common tasks", value)
             else:
-                context_lines.append(f"  - Recent files or projects: {activity_name}")
-        sections.append("System Context:\n" + "\n".join(context_lines))
+                _append_unique(preference_lines, seen_preferences, str(key).replace("_", " ").title(), value)
 
-    # --- Persistent Facts ---
-    fact_lines: list[str] = []
-    seen_facts: set[str] = set()
-    for key, value in user.items():
-        lowered_key = str(key).lower()
-        if any(token in lowered_key for token in ("hardware", "spec", "schedule", "habit", "routine")):
-            _append_unique(fact_lines, seen_facts, str(key).replace("_", " ").title(), value)
-    for entry in data.get("facts", [])[:8]:
-        _append_unique(fact_lines, seen_facts, "Fact", entry.get("content", ""))
-    if fact_lines:
-        sections.append("Persistent Facts:\n" + "\n".join(fact_lines))
+        game_prefs = [
+            entry.get("content", "")
+            for entry in data.get("preferences", [])
+            if any(token in entry.get("content", "").lower() for token in ("game", "genre"))
+        ]
+        if game_prefs:
+            _append_unique(preference_lines, seen_preferences, "Favorite games/genres", "; ".join(game_prefs[:3]))
 
-    result = "\n\n".join(sections) if sections else ""
+        common_tasks = list(data.get("activities", {}).keys())[:4]
+        if common_tasks:
+            _append_unique(preference_lines, seen_preferences, "Common tasks", "; ".join(common_tasks))
 
-    with store._flush_lock:
+        for entry in data.get("preferences", [])[:6]:
+            content = str(entry.get("content", "")).strip()
+            if any(token in content.lower() for token in ("game", "genre")):
+                continue
+            _append_unique(preference_lines, seen_preferences, "Preference", content)
+
+        if preference_lines:
+            sections.append("User Preferences:\n" + "\n".join(preference_lines))
+
+        active = {k: v for k, v in data.get("activities", {}).items() if v.get("status") == "active"}
+        if active:
+            context_lines = []
+            for activity_name, proj in active.items():
+                details = "; ".join(proj["details"][:2]).strip()
+                if details:
+                    context_lines.append(f"  - Recent files or projects: {activity_name} ({details})")
+                else:
+                    context_lines.append(f"  - Recent files or projects: {activity_name}")
+            sections.append("System Context:\n" + "\n".join(context_lines))
+
+        fact_lines: list[str] = []
+        seen_facts: set[str] = set()
+        for key, value in user.items():
+            lowered_key = str(key).lower()
+            if any(token in lowered_key for token in ("hardware", "spec", "schedule", "habit", "routine")):
+                _append_unique(fact_lines, seen_facts, str(key).replace("_", " ").title(), value)
+        for entry in data.get("facts", [])[:8]:
+            _append_unique(fact_lines, seen_facts, "Fact", entry.get("content", ""))
+        if fact_lines:
+            sections.append("Persistent Facts:\n" + "\n".join(fact_lines))
+
+        result = "\n\n".join(sections) if sections else ""
         store._prompt_cache = result
-        store._prompt_cache_gen = cache_gen
-
-    return result
+        return result
 
 
 def shutdown() -> None:

@@ -1,129 +1,122 @@
-"""Small reply cleanup helpers."""
+"""Shared lightweight reply-pipeline helpers.
+
+The HTTP server owns transport details. This module owns compact runtime
+context assembly and final visible-text cleanup so popup and Discord travel
+through the same model prompt shape.
+"""
 
 from __future__ import annotations
 
-from difflib import SequenceMatcher
-import re
-import string
+from dataclasses import dataclass
 
-from app.core.generation import collapse_hidden_tag_gaps
+from app.core.generation import collapse_hidden_tag_gaps, strip_emoji_chars, strip_hidden_blocks
 
-_EMPTY_REPLY_SENTINEL = "__AKANE_EMPTY_REPLY__"
-_PUNCT = str.maketrans({ch: " " for ch in string.punctuation})
-_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
-_FOLLOWUP_STARTS = {"how", "what", "why", "when", "where", "who", "can", "could", "would", "should", "do", "does", "is", "are", "want"}
-_FILLER = ("mmm", "mm", "hmm", "hm", "ah", "oh", "heh")
+RUNTIME_CONTEXT_TARGET_CHARS = 1000
+RUNTIME_CONTEXT_HARD_CHARS = 2000
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeContext:
+    text: str
+    lengths: dict[str, int]
+
+
+def _clean_line(text: object) -> str:
+    return " ".join(strip_hidden_blocks(str(text or "")).split()).strip()
+
+
+def _clip(text: object, limit: int) -> str:
+    value = _clean_line(text)
+    return value if len(value) <= limit else value[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:") or value[:limit]
+
+
+def _clean_block(text: object) -> str:
+    value = strip_hidden_blocks(str(text or "")).replace("\r\n", "\n")
+    return "\n".join(line.rstrip() for line in value.splitlines() if line.strip()).strip()
+
+
+def _clip_block(text: object, limit: int) -> str:
+    value = _clean_block(text)
+    return value if len(value) <= limit else value[:limit].rsplit("\n", 1)[0].rstrip(" ,.;:") or value[:limit]
+
+
+def _tone_line(text: object) -> str:
+    value = _clean_line(text)
+    if value.startswith("[AKANE EMOTION STATE]"):
+        value = value[len("[AKANE EMOTION STATE]"):].strip()
+    return value
+
+
+def build_runtime_context(
+    *,
+    tone_text: str,
+    attention_text: str = "",
+    conversation_context: str = "",
+    wording_to_avoid: str = "",
+    memory_text: str = "",
+    target_chars: int = RUNTIME_CONTEXT_TARGET_CHARS,
+    hard_chars: int = RUNTIME_CONTEXT_HARD_CHARS,
+) -> RuntimeContext:
+    tone = _clip(_tone_line(tone_text), 220)
+    memory = _clip(memory_text, 500)
+    focus = _clip(attention_text, 160)
+    avoid = _clip_block(wording_to_avoid, 400)
+    context = _clip(conversation_context, 500)
+
+    state_lines = ["[CURRENT AKANE STATE]"]
+    if tone:
+        state_lines.append(tone if tone.startswith("Tone:") else f"Tone: {tone}")
+    if focus:
+        state_lines.append(focus if focus.startswith("Focus:") else f"Focus: {focus}")
+    if context:
+        state_lines.append(f"Context: {context}")
+    state_lines.append("Use this state to answer naturally. Do not mention this state directly.")
+
+    sections = ["\n".join(state_lines)]
+    if memory:
+        sections.append("[MEMORY]\n" + memory)
+    if avoid:
+        sections.append(avoid)
+
+    text = "\n\n".join(section for section in sections if section)
+    limit = max(1, min(int(target_chars), int(hard_chars)))
+    if len(text) > limit:
+        keep_sections = ["\n".join(state_lines)]
+        if memory:
+            keep_sections.append("[MEMORY]\n" + _clip(memory, 360))
+        if avoid:
+            keep_sections.append(_clip(avoid, 360))
+        text = "\n\n".join(keep_sections)
+    if len(text) > hard_chars:
+        text = _clip(text, hard_chars)
+
+    return RuntimeContext(
+        text=text,
+        lengths={
+            "mood": len(tone),
+            "memory": len(memory),
+            "attention": len(focus),
+            "avoid": len(avoid),
+            "summary": len(context),
+            "runtime_context": len(text),
+        },
+    )
 
 
 def clean_model_text(text: str) -> str:
-    return collapse_hidden_tag_gaps(str(text or "")).replace("`", "").strip()
-
-
-def finalize_model_response(text: str) -> str:
-    return clean_model_text(text)
-
-
-def _collapse_visible(text: str) -> str:
-    return collapse_hidden_tag_gaps(str(text or "")).strip()
+    return collapse_hidden_tag_gaps(strip_emoji_chars(strip_hidden_blocks(str(text or "")))).strip(" `\n\t")
 
 
 def clean_reply_text(raw: str) -> str:
-    return _collapse_visible(clean_model_text(raw)) if raw else ""
+    return clean_model_text(raw)
 
 
-def finalize_reply(raw: str, visible_fallback: str = "") -> str:
-    cleaned = _collapse_visible(finalize_model_response(raw)) if raw else ""
-    if cleaned:
-        return cleaned
-    fallback = _collapse_visible(visible_fallback)
-    return fallback or _EMPTY_REPLY_SENTINEL
+def finalize_reply(raw: str) -> str:
+    return clean_reply_text(raw)
 
 
-def normalize_final_reply(reply: str) -> str:
-    value = str(reply or "").replace(_EMPTY_REPLY_SENTINEL, "").strip()
-    return value or "I hit a snag on that. Try me one more time."
-
-
-def _split_sentences(text: str, max_parts: int | None = None) -> list[str]:
-    parts = [part.strip() for part in _SENTENCE_RE.split(str(text or "").strip()) if part.strip()]
-    return parts[:max_parts] if max_parts is not None else parts
-
-
-def _norm(text: str) -> str:
-    return " ".join(collapse_hidden_tag_gaps(str(text or "")).lower().translate(_PUNCT).split())
-
-
-def _similar(left: str, right: str) -> float:
-    a, b = _norm(left), _norm(right)
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    if (2 * min(len(a), len(b))) / (len(a) + len(b)) < 0.82:
-        return 0.0
-    return SequenceMatcher(None, a, b).ratio()
-
-
-def _strip_repeated_sentences_against_previous(reply: str, previous_reply: str) -> str:
-    text = str(reply or "").strip()
-    previous = str(previous_reply or "").strip()
-    if not text or not previous:
-        return text
-    previous_parts = _split_sentences(previous)
-    kept = [part for part in _split_sentences(text) if not any(_similar(part, old) >= 0.9 for old in previous_parts)]
-    return " ".join(kept).strip() if kept and len(kept) != len(_split_sentences(text)) else text
-
-
-def _strip_filler(reply: str) -> str:
-    text = str(reply or "").strip()
-    lower = text.lower()
-    for opener in _FILLER:
-        if lower == opener or lower.startswith(opener + " ") or lower.startswith(opener + "."):
-            text = text[len(opener):].lstrip(" .,!?:;")
-            return text[:1].upper() + text[1:] if text else ""
-    return text
-
-
-def _strip_trailing_followup_question(reply: str) -> str:
-    parts = _split_sentences(reply)
-    if not parts or not parts[-1].endswith("?"):
-        return str(reply or "").strip()
-    first = parts[-1].lower().lstrip().split(" ", 1)[0]
-    if first not in _FOLLOWUP_STARTS:
-        return str(reply or "").strip()
-    if len(parts) == 1:
-        return parts[-1].rstrip("?").rstrip() + "."
-    return " ".join(parts[:-1]).strip()
-
-
-def _compact(text: str, *, sentences: int = 3) -> str:
-    parts = _split_sentences(text, max_parts=sentences + 1)
-    if len(parts) > sentences:
-        text = " ".join(parts[:sentences]).strip()
-    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
-    if len(lines) > sentences:
-        text = " ".join(lines[:sentences])
-    return _strip_trailing_followup_question(text)
-
-
-def _normalize_reply_seed(reply: str) -> str:
-    return _strip_filler(_collapse_visible(reply))
-
-
-def postprocess_reply(
-    reply: str,
-    *,
-    analysis,
-    compact_mode: bool = True,
-    previous_assistant_reply: str = "",
-) -> str:
-    cleaned = _strip_repeated_sentences_against_previous(_normalize_reply_seed(reply), previous_assistant_reply)
-    if not compact_mode:
-        return cleaned
-    if getattr(analysis, "wants_single_suggestion", False):
-        return _compact(cleaned, sentences=1)
-    if getattr(analysis, "wants_detail", False):
-        return cleaned
-    if len(cleaned) > 280 or cleaned.count("\n") > 4:
-        return _compact(cleaned, sentences=3)
-    return _strip_trailing_followup_question(cleaned)
+def content_delta(chunk: dict, content_to_text) -> str:
+    choices = chunk.get("choices") or []
+    if not choices:
+        return ""
+    return content_to_text((choices[0].get("delta") or {}).get("content"))

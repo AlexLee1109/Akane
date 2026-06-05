@@ -33,6 +33,7 @@ _OPENERS = tuple(
         reverse=True,
     )
 )
+_OPENERS_LOWER = tuple((opener.lower(), close.lower(), opener, close) for opener, close in _OPENERS)
 _OPENER_PREFIXES = frozenset(opener[:i].lower() for opener, _ in _OPENERS for i in range(1, len(opener) + 1))
 _MAX_OPENER_LEN = max(len(opener) for opener, _ in _OPENERS)
 
@@ -85,16 +86,16 @@ def strip_hidden_blocks(text: str) -> str:
     start = 0
     while start < len(source):
         match: tuple[int, str, str] | None = None
-        for opener, close in _OPENERS:
-            idx = source_lower.find(opener.lower(), start)
+        for opener_lower, close_lower, opener, _close in _OPENERS_LOWER:
+            idx = source_lower.find(opener_lower, start)
             if idx >= 0 and (match is None or idx < match[0]):
-                match = (idx, opener, close)
+                match = (idx, opener, close_lower)
         if match is None:
             pieces.append(source[start:])
             break
         idx, opener, close = match
         pieces.append(source[start:idx])
-        end = source_lower.find(close.lower(), idx + len(opener))
+        end = source_lower.find(close, idx + len(opener))
         if end < 0:
             break
         start = end + len(close)
@@ -107,6 +108,7 @@ class HiddenTagStreamFilter:
     def __init__(self) -> None:
         self._buffer = ""
         self._hidden_close = ""
+        self._hidden_close_lower = ""
 
     @staticmethod
     def _hold_prefix(buffer: str) -> int:
@@ -130,7 +132,7 @@ class HiddenTagStreamFilter:
         while self._buffer:
             lower = self._buffer.lower()
             if self._hidden_close:
-                close = self._hidden_close.lower()
+                close = self._hidden_close_lower
                 idx = lower.find(close)
                 if idx == -1:
                     keep = max(len(close) - 1, 0)
@@ -138,11 +140,12 @@ class HiddenTagStreamFilter:
                     return "".join(out)
                 self._buffer = self._buffer[idx + len(self._hidden_close):]
                 self._hidden_close = ""
+                self._hidden_close_lower = ""
                 continue
 
             match: tuple[int, str, str] | None = None
-            for opener, close in _OPENERS:
-                idx = lower.find(opener.lower())
+            for opener_lower, _close_lower, opener, close in _OPENERS_LOWER:
+                idx = lower.find(opener_lower)
                 if idx < 0:
                     continue
                 if match is None or idx < match[0]:
@@ -163,6 +166,7 @@ class HiddenTagStreamFilter:
                 out.append(self._buffer[:idx])
             self._buffer = self._buffer[idx + len(opener):]
             self._hidden_close = close
+            self._hidden_close_lower = close.lower()
 
         return "".join(out)
 
@@ -170,6 +174,7 @@ class HiddenTagStreamFilter:
         if self._hidden_close:
             self._buffer = ""
             self._hidden_close = ""
+            self._hidden_close_lower = ""
             return ""
         out = self._buffer
         self._buffer = ""

@@ -19,9 +19,11 @@ from app.core.config import (
     REPETITION_PENALTY,
     TOP_K,
     TOP_P,
+    _coerce_bool,
 )
+from app.core.generation import collapse_hidden_tag_gaps
 from app.integrations.editor_bridge import get_editor_bridge
-from app.core.model_loader import ModelManager
+from app.core.model_loader import ModelManager, content_to_text
 
 # ------------------------------------------------------------------ #
 # Constants                                                            #
@@ -47,21 +49,6 @@ _ARG_REQUIRED_ACTIONS = {
 _ACTION_WAIT_SECONDS = 5.5
 _READ_MAX_LINES_PER_FILE = 420
 _READ_MAX_CHARS_PER_FILE = 16_000
-
-
-def collapse_hidden_tag_gaps(text: str) -> str:
-    value = str(text or "").replace("\r\n", "\n").replace("\t", " ")
-    lines: list[str] = []
-    previous_blank = False
-    for raw in value.split("\n"):
-        line = raw.rstrip()
-        if line:
-            lines.append(line)
-            previous_blank = False
-        elif not previous_blank:
-            lines.append("")
-            previous_blank = True
-    return "\n".join(lines)
 
 
 def clean_model_text(text: str) -> str:
@@ -135,25 +122,7 @@ def _extract_message_text(result: dict) -> str:
     if not choices:
         return ""
     content = (choices[0].get("message") or {}).get("content")
-    return _content_to_text(content).strip()
-
-
-def _content_to_text(content) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                value = item.get("text") or item.get("content")
-                if isinstance(value, str):
-                    parts.append(value)
-        return "".join(parts)
-    return str(content)
+    return content_to_text(content).strip()
 
 
 def _remaining_seconds(deadline: float | None) -> float:
@@ -164,21 +133,6 @@ def _remaining_seconds(deadline: float | None) -> float:
 
 def _budget_exhausted(deadline: float | None, *, reserve: float = 0.0) -> bool:
     return _remaining_seconds(deadline) <= reserve
-
-
-def _coerce_bool(value, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    lowered = str(value or "").strip().lower()
-    if not lowered:
-        return bool(default)
-    if lowered in {"1", "true", "yes", "on"}:
-        return True
-    if lowered in {"0", "false", "no", "off"}:
-        return False
-    return bool(default)
 
 
 def _request_coder_completion(messages: list[dict], *, deadline: float | None = None, json_mode: bool = True) -> dict:
@@ -734,11 +688,6 @@ def run_coder_specialist(
         max_chunks=CODER_INITIAL_CHUNKS_PER_FILE,
         deadline=deadline,
     )
-    print(
-        f"[Akane][coder] start apply_now={apply_now} targets={initial_targets} reads={len(fresh_reads)}",
-        flush=True,
-    )
-
     # ── Build initial message list ─────────────────────────────────
     messages: list[dict] = [
         {"role": "system", "content": _build_system_prompt(apply_now=apply_now)},
@@ -785,12 +734,6 @@ def run_coder_specialist(
         read_requests = _sanitize_read_requests(payload)
         actions       = _sanitize_actions(payload)
         last_error = str(payload.get("_error") or last_error or "").strip()
-
-        print(
-            f"[Akane][coder] turn={turn} summary={len(summary)} "
-            f"reads={len(read_requests)} actions={len(actions)} done={done}",
-            flush=True,
-        )
 
         if summary:
             last_summary = summary
@@ -933,11 +876,6 @@ def run_coder_specialist(
         else:
             final_summary = "The coding model could not produce a reliable result for this request."
 
-    print(
-        f"[Akane][coder] done summary={len(final_summary)} "
-        f"applied={actions_applied} tool_used={tool_used}",
-        flush=True,
-    )
     return CoderOutcome(
         summary=final_summary.strip(),
         action_results=all_action_results,

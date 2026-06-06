@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from app.core.config import MAX_TOKENS, REPETITION_PENALTY, TEMPERATURE, TOP_K, TOP_P
+from app.core.model_loader import ModelManager, content_to_text
+
 STREAM_HIDDEN_TAGS = {
     "MEM": "[/MEM]",
     "FORGET": "[/FORGET]",
@@ -179,3 +182,42 @@ class HiddenTagStreamFilter:
         out = self._buffer
         self._buffer = ""
         return out
+
+
+def _request(messages: list[dict], *, max_tokens: int, stream: bool):
+    return ModelManager.get_instance().create_chat_completion(
+        messages=messages,
+        max_tokens=max(1, min(int(max_tokens), MAX_TOKENS)),
+        temperature=TEMPERATURE,
+        top_k=TOP_K,
+        top_p=TOP_P,
+        repeat_penalty=REPETITION_PENALTY,
+        stream=stream,
+    )
+
+
+def completion_text(messages: list[dict], *, max_tokens: int) -> str:
+    result = _request(messages, max_tokens=max_tokens, stream=False)
+    choices = result.get("choices") or []
+    if not choices:
+        return ""
+    return content_to_text((choices[0].get("message") or {}).get("content"))
+
+
+def stream_completion(messages: list[dict], *, max_tokens: int):
+    for chunk in _request(messages, max_tokens=max_tokens, stream=True):
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        text = content_to_text((choices[0].get("delta") or {}).get("content"))
+        if text:
+            yield text
+
+
+def clean_visible_text(text: str) -> str:
+    source = str(text or "")
+    cleaned = strip_hidden_blocks(source)
+    if cleaned != source:
+        cleaned = "\n".join(line.rstrip() for line in cleaned.splitlines() if line.strip())
+    cleaned = strip_emoji_chars(cleaned)
+    return collapse_hidden_tag_gaps(cleaned).strip(" `\n\t")

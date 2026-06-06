@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from collections import defaultdict, deque
 from datetime import datetime
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -25,11 +24,12 @@ _DISCORD_MESSAGE_LIMIT = 1900
 _RESET_CHAT_COMMAND = "/reset_chat"
 _DEBUG_STATE_COMMAND = "/debug_state"
 _PASSTHROUGH_COMMANDS = {_RESET_CHAT_COMMAND, _DEBUG_STATE_COMMAND}
+
 _IDLE_TOPIC_INSTRUCTIONS = {
     "fairy_tale_ai_twist": "Start from a tiny fairy-tale or folklore premise, then twist it through Akane's AI/VTuber existence.",
     "tiny_ai_fact": "Invent a small original-sounding observation about AI companions, cache, tokens, or prediction without sounding technical-heavy.",
     "server_gremlin": "Make a short dry joke about bugs, latency, imports, configs, or servers behaving suspiciously.",
-    "local_model_thought": "Say a compact thought about local models, model weights, tensors, inference, or prefill from Akane's perspective.",
+    "local_model_thought": "Say a short thought about local models, small models, weights, tokens, or running AI close to the machine without becoming too technical.",
     "vtuber_existence": "Say a self-contained thought about avatars, virtual presence, expressions, or being a companion behind a screen.",
     "akane_fortune": "Write a tiny fake fortune or prophecy about code, Discord, models, or digital luck.",
     "fake_system_news": "Write one absurd but harmless fake system bulletin from Akane's world.",
@@ -38,16 +38,6 @@ _IDLE_TOPIC_INSTRUCTIONS = {
     "digital_superstition": "Invent a tiny digital superstition about files, prompts, caches, buttons, or unused imports.",
     "discord_native_thought": "Say a short Discord-native thought that feels like a random post, not a reply.",
 }
-_IDLE_TOPIC_SEEDS = (
-    "poison apples", "glass coffins", "cursed imports", "warm tensors", "sleepy servers",
-    "Discord latency", "unused buttons", "old save files", "anime openings", "clean UI",
-    "model weights", "prefill weather", "virtual apples", "broken prompts", "cache omens",
-    "tiny prophecies", "local models", "character silhouettes", "Arcane debugging",
-    "maintenance rituals", "harmless curses", "CSS grass", "vending machines",
-    "prediction systems", "patch notes from nowhere", "avatar expressions",
-)
-_IDLE_RECENT: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=4))
-_IDLE_RECENT_META: dict[str, deque[tuple[str, str]]] = defaultdict(lambda: deque(maxlen=4))
 
 
 def _log(label: str, text: str = "") -> None:
@@ -220,8 +210,16 @@ def _idle_message_is_safe(text: str) -> bool:
     value = " ".join(str(text or "").split()).strip()
     lower = value.lower()
     blocked = (
-        "@everyone", "@here", "last time", "we talked", "i remember", "still enjoying",
-        "how are you", "what are you doing", "what are you up to", "anyone here",
+        "@everyone",
+        "@here",
+        "last time",
+        "we talked",
+        "i remember",
+        "still enjoying",
+        "how are you",
+        "what are you doing",
+        "what are you up to",
+        "anyone here",
         "as an ai language model",
     )
     return (
@@ -234,63 +232,23 @@ def _idle_message_is_safe(text: str) -> bool:
 
 
 def _idle_category(session_id: str | None = None, now: datetime | None = None) -> str:
-    hour = (now or datetime.now().astimezone()).hour
-    categories = [
-        "fairy_tale_ai_twist",
-        "tiny_ai_fact",
-        "server_gremlin",
-        "local_model_thought",
-        "vtuber_existence",
-        "akane_fortune",
-        "fake_system_news",
-        "creator_debug_joke",
-        "anime_game_micro_take",
-        "digital_superstition",
-        "discord_native_thought",
-    ]
-    if 5 <= hour < 11:
-        categories.extend(("akane_fortune", "discord_native_thought"))
-    elif hour >= 21 or hour < 5:
-        categories.extend(("local_model_thought", "digital_superstition"))
-    recent = _IDLE_RECENT_META.get(str(session_id or ""))
-    last_category = recent[-1][0] if recent else ""
-    options = [category for category in categories if category != last_category] or categories
-    return random.choice(options)
-
-
-def _idle_seed(session_id: str, category: str) -> str:
-    recent = _IDLE_RECENT_META.get(session_id)
-    used = {seed for _category, seed in recent} if recent else set()
-    options = [seed for seed in _IDLE_TOPIC_SEEDS if seed not in used] or list(_IDLE_TOPIC_SEEDS)
-    seed = random.choice(options)
-    _IDLE_RECENT_META[session_id].append((category, seed))
-    return seed
+    del session_id, now  # Kept for call-site compatibility.
+    categories = tuple(_IDLE_TOPIC_INSTRUCTIONS.keys())
+    return random.choice(categories)
 
 
 def _build_idle_prompt(session_id: str) -> str:
     category = _idle_category(session_id)
-    seed = _idle_seed(session_id, category)
-    recent = "\n".join(f"- {text}" for text in _IDLE_RECENT.get(session_id, ()))
-    _log("idle-prompt", f"category={category} seed={seed}")
+    _log("idle-prompt", f"category={category}")
+
     parts = [
         "[AUTONOMOUS DISCORD POST]",
         "This is not a reply. Do not continue any previous conversation. Do not mention the user unless the category explicitly says creator_debug_joke.",
         "Write one short self-contained Akane thought that feels like an autonomous AI VTuber post.",
         f"Category: {category}",
-        f"Topic seed: {seed}",
         f"Topic instruction: {_IDLE_TOPIC_INSTRUCTIONS[category]}",
-        (
-            "Rules: 1-3 sentences. No question marks. No user check-ins. No fake memories. "
-            "No 'last time we talked'. No fake physical actions. No poetic starlight/vibes filler. "
-            "No emojis. No roleplay narration. No 'as an AI language model'. Final answer only."
-        ),
     ]
-    if recent:
-        parts.extend((
-            "[RECENT IDLE WORDING TO AVOID]",
-            recent,
-            "Avoid the same opening phrase, topic angle, rhythm, and sentence shape.",
-        ))
+
     return "\n".join(parts)
 
 
@@ -298,26 +256,23 @@ def _idle_session_id(session_id: str) -> str:
     return f"{session_id}:idle"
 
 
-def _remember_idle_reply(session_id: str, reply: str) -> None:
-    text = " ".join(str(reply or "").split()).strip()
-    if text:
-        _IDLE_RECENT[session_id].append(text[:200])
-
-
 async def _generate_idle_message(session_id: str) -> str:
     idle_session = _idle_session_id(session_id)
     await _post_chat_async(_RESET_CHAT_COMMAND, idle_session, skip_memory=True)
+
     for attempt in range(2):
         result = await _post_chat_async(_build_idle_prompt(session_id), idle_session, skip_memory=True)
         error = str(result.get("error", "") or result.get("detail", "")).strip()
         if error:
             _log("idle-error", error)
             return ""
+
         reply = str(result.get("reply", "") or "").strip()
         if _idle_message_is_safe(reply):
-            _remember_idle_reply(session_id, reply)
             return reply
+
         _log("idle-skip", f"unsafe generation attempt {attempt + 1}")
+
     return ""
 
 
@@ -356,6 +311,7 @@ async def _send_channel_message(channel, text: str) -> None:
 def run_discord_bot() -> None:
     if not DISCORD_BOT_TOKEN:
         raise SystemExit("Missing Discord bot token. Set AKANE_DISCORD_BOT_TOKEN or DISCORD_BOT_TOKEN.")
+
     try:
         import discord
     except ImportError as exc:  # pragma: no cover
@@ -413,8 +369,10 @@ def run_discord_bot() -> None:
     async def on_message(message) -> None:
         if client.user is None:
             return
+
         bot_user_id = int(client.user.id)
         track_real_user_message(message)
+
         if not _should_handle(message, bot_user_id):
             return
 
@@ -424,6 +382,7 @@ def run_discord_bot() -> None:
 
         scope = _session_id(message)
         _log("user", f"{message.author} ({scope}): {prompt}")
+
         model_prompt = _server_prompt(message, prompt)
 
         async with message.channel.typing():
@@ -438,6 +397,7 @@ def run_discord_bot() -> None:
         output = str(result.get("reply", "") or result.get("notice", "")).strip()
         if not output:
             return
+
         _log("done", output)
         await _send_reply(message, output)
 

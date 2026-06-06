@@ -10,7 +10,6 @@ UI_ASSET_PATHS = {
     "/images/Text Bubble decoration.png": IMAGES_DIR / "Text Bubble decoration.png",
     "/images/input_bar.png": IMAGES_DIR / "input_bar.png",
     "/images/Send_button.png": IMAGES_DIR / "Send_button.png",
-    "/images/Message icon.png": IMAGES_DIR / "Message icon.png",
     "/images/Minimize icon.png": IMAGES_DIR / "Minimize icon.png",
     "/images/Close Icon.png": IMAGES_DIR / "Close Icon.png",
 }

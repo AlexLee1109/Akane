@@ -1,18 +1,51 @@
-"""Shared lightweight reply-pipeline helpers.
-
-The HTTP server owns transport details. This module owns compact runtime
-context assembly and final visible-text cleanup so popup and Discord travel
-through the same model prompt shape.
-"""
+"""Single prompt, generation, and post-generation path for Akane replies."""
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 
-from app.core.generation import collapse_hidden_tag_gaps, strip_emoji_chars, strip_hidden_blocks
+from app.core.attention_state import (
+    format_attention_for_prompt,
+    get_attention_state,
+    observe_attention,
+)
+from app.core.character import build_system_prompt, get_static_system_prompt
+from app.core.config import LLAMA_CONTEXT_WINDOW, MAX_TOKENS
+from app.core.conversation_state import (
+    format_conversation_context,
+    format_recent_wording_avoidance,
+    get_conversation_state,
+    observe_turn,
+)
+from app.core.emotional_state import (
+    format_for_prompt as format_emotion_for_prompt,
+    observe_user_message,
+    persist as persist_emotion,
+    snapshot as emotion_snapshot,
+)
+from app.core.generation import (
+    HiddenTagStreamFilter,
+    clean_visible_text,
+    completion_text,
+    stream_completion,
+    strip_emoji_chars,
+    strip_hidden_blocks,
+)
+from app.core.model_loader import ModelManager
+from app.memory_store import format_for_prompt as format_memory_for_prompt
+from app.memory_store import remember_exchange
 
-RUNTIME_CONTEXT_TARGET_CHARS = 1000
-RUNTIME_CONTEXT_HARD_CHARS = 2000
+RUNTIME_CONTEXT_TARGET_CHARS = 800
+RUNTIME_CONTEXT_HARD_CHARS = 1200
+MEMORY_CHARS = 300
+FOCUS_CHARS = 120
+AVOID_CHARS = 240
+CONTEXT_CHARS = 160
+TONE_CHARS = 180
+_MAX_METRICS = 64
+_METRICS: dict[str, dict[str, float | int]] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,30 +54,66 @@ class RuntimeContext:
     lengths: dict[str, int]
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedReply:
+    user_text: str
+    actual_user_text: str
+    session_id: str
+    skip_memory: bool
+    messages: list[dict]
+    max_tokens: int
+    runtime_context: str
+    lengths: dict[str, int]
+    prompt_chars: int
+    started_at: float
+    context_seconds: float
+    prompt_seconds: float
+
+
+def _timing_enabled() -> bool:
+    return str(os.environ.get("AKANE_TIMING", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _clean_line(text: object) -> str:
     return " ".join(strip_hidden_blocks(str(text or "")).split()).strip()
 
 
 def _clip(text: object, limit: int) -> str:
     value = _clean_line(text)
-    return value if len(value) <= limit else value[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:") or value[:limit]
+    if len(value) <= limit:
+        return value
+    return value[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:") or value[:limit]
 
 
-def _clean_block(text: object) -> str:
-    value = strip_hidden_blocks(str(text or "")).replace("\r\n", "\n")
-    return "\n".join(line.rstrip() for line in value.splitlines() if line.strip()).strip()
-
-
-def _clip_block(text: object, limit: int) -> str:
-    value = _clean_block(text)
-    return value if len(value) <= limit else value[:limit].rsplit("\n", 1)[0].rstrip(" ,.;:") or value[:limit]
-
-
-def _tone_line(text: object) -> str:
-    value = _clean_line(text)
-    if value.startswith("[AKANE EMOTION STATE]"):
-        value = value[len("[AKANE EMOTION STATE]"):].strip()
+def _actual_message(text: str) -> str:
+    value = str(text or "").strip()
+    if not value.startswith("Discord "):
+        return value
+    for marker in ("\nMessage:\n", "\nUser message:\n"):
+        if marker in value:
+            return value.split(marker, 1)[1].strip()
     return value
+
+
+def _without_label(text: str, label: str) -> str:
+    value = _clean_line(text)
+    prefix = label + ":"
+    return value[len(prefix):].strip() if value.lower().startswith(prefix.lower()) else value
+
+
+def _append_bounded(lines: list[str], label: str, value: str, limit: int, total_limit: int) -> int:
+    body = _clip(_without_label(value, label), limit)
+    if not body:
+        return 0
+    prefix = f"{label}: "
+    available = total_limit - len("\n".join(lines)) - len(prefix) - 1
+    if available <= 0:
+        return 0
+    body = _clip(body, available)
+    if not body:
+        return 0
+    lines.append(prefix + body)
+    return len(body)
 
 
 def build_runtime_context(
@@ -57,66 +126,239 @@ def build_runtime_context(
     target_chars: int = RUNTIME_CONTEXT_TARGET_CHARS,
     hard_chars: int = RUNTIME_CONTEXT_HARD_CHARS,
 ) -> RuntimeContext:
-    tone = _clip(_tone_line(tone_text), 220)
-    memory = _clip(memory_text, 500)
-    focus = _clip(attention_text, 160)
-    avoid = _clip_block(wording_to_avoid, 400)
-    context = _clip(conversation_context, 500)
-
-    state_lines = ["[CURRENT AKANE STATE]"]
-    if tone:
-        state_lines.append(tone if tone.startswith("Tone:") else f"Tone: {tone}")
-    if focus:
-        state_lines.append(focus if focus.startswith("Focus:") else f"Focus: {focus}")
-    if context:
-        state_lines.append(f"Context: {context}")
-    state_lines.append("Use this state to answer naturally. Do not mention this state directly.")
-
-    sections = ["\n".join(state_lines)]
-    if memory:
-        sections.append("[MEMORY]\n" + memory)
-    if avoid:
-        sections.append(avoid)
-
-    text = "\n\n".join(section for section in sections if section)
-    limit = max(1, min(int(target_chars), int(hard_chars)))
-    if len(text) > limit:
-        keep_sections = ["\n".join(state_lines)]
-        if memory:
-            keep_sections.append("[MEMORY]\n" + _clip(memory, 360))
-        if avoid:
-            keep_sections.append(_clip(avoid, 360))
-        text = "\n\n".join(keep_sections)
+    limit = max(1, min(int(target_chars), int(hard_chars), RUNTIME_CONTEXT_HARD_CHARS))
+    lines = ["[CURRENT AKANE STATE]"]
+    lengths = {
+        "mood": _append_bounded(lines, "Tone", tone_text, TONE_CHARS, limit),
+        "memory": _append_bounded(lines, "Memory", memory_text, MEMORY_CHARS, limit),
+        "attention": _append_bounded(lines, "Focus", attention_text, FOCUS_CHARS, limit),
+        "avoid": _append_bounded(lines, "Avoid wording", wording_to_avoid, AVOID_CHARS, limit),
+        "summary": _append_bounded(lines, "Context", conversation_context, CONTEXT_CHARS, limit),
+    }
+    footer = "Use this state silently. Do not mention it."
+    if len("\n".join([*lines, footer])) <= limit:
+        lines.append(footer)
+    text = "\n".join(lines)
     if len(text) > hard_chars:
-        text = _clip(text, hard_chars)
-
-    return RuntimeContext(
-        text=text,
-        lengths={
-            "mood": len(tone),
-            "memory": len(memory),
-            "attention": len(focus),
-            "avoid": len(avoid),
-            "summary": len(context),
-            "runtime_context": len(text),
-        },
-    )
+        text = text[:hard_chars].rstrip()
+    lengths["runtime_context"] = len(text)
+    return RuntimeContext(text=text, lengths=lengths)
 
 
-def clean_model_text(text: str) -> str:
-    return collapse_hidden_tag_gaps(strip_emoji_chars(strip_hidden_blocks(str(text or "")))).strip(" `\n\t")
-
-
-def clean_reply_text(raw: str) -> str:
-    return clean_model_text(raw)
-
-
-def finalize_reply(raw: str) -> str:
-    return clean_reply_text(raw)
-
-
-def content_delta(chunk: dict, content_to_text) -> str:
-    choices = chunk.get("choices") or []
-    if not choices:
+def _memory_context(user_text: str) -> str:
+    memory = format_memory_for_prompt()
+    if not memory:
         return ""
-    return content_to_text((choices[0].get("delta") or {}).get("content"))
+    terms = {
+        word.strip(".,!?;:()[]{}\"'`").lower()
+        for word in user_text.split()
+        if len(word.strip(".,!?;:()[]{}\"'`")) >= 4
+    }
+    if not terms:
+        return ""
+    blocks = [
+        block
+        for block in memory.split("\n\n")
+        if any(term in block.lower() for term in terms)
+    ]
+    return _clip("\n".join(blocks), MEMORY_CHARS)
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, (len(text) + 3) // 4)
+
+
+def _max_tokens(system_prompt: str, user_text: str) -> int:
+    prompt_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_text) + 16
+    return max(1, min(MAX_TOKENS, LLAMA_CONTEXT_WINDOW - prompt_tokens - 8))
+
+
+def _remember_metrics(prepared: PreparedReply) -> None:
+    _METRICS[prepared.session_id] = {
+        "runtime_context_chars": len(prepared.runtime_context),
+        "prompt_chars": prepared.prompt_chars,
+        "updated_at": time.time(),
+    }
+    if len(_METRICS) > _MAX_METRICS:
+        oldest = min(_METRICS, key=lambda key: float(_METRICS[key].get("updated_at") or 0.0))
+        _METRICS.pop(oldest, None)
+
+
+def prepare_reply(
+    user_text: str,
+    *,
+    session_id: str | None = None,
+    skip_memory: bool = False,
+) -> PreparedReply:
+    started = time.perf_counter()
+    text = str(user_text or "").strip()
+    if not text:
+        raise ValueError("Message is empty.")
+    session = (str(session_id or "popup").strip() or "popup")[:120]
+    actual = _actual_message(text)
+
+    context_started = time.perf_counter()
+    tone = format_emotion_for_prompt(emotion_snapshot(session))
+    attention = format_attention_for_prompt(get_attention_state(session))
+    conversation = format_conversation_context(session, include_focus=False)
+    avoidance = format_recent_wording_avoidance(session)
+    memory = "" if skip_memory else _memory_context(actual)
+    runtime = build_runtime_context(
+        tone_text=tone,
+        memory_text=memory,
+        attention_text=attention,
+        wording_to_avoid=avoidance,
+        conversation_context=conversation,
+    )
+    context_seconds = time.perf_counter() - context_started
+
+    prompt_started = time.perf_counter()
+    system_prompt = build_system_prompt(runtime.text, include_memory=not skip_memory)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": text},
+    ]
+    prompt_seconds = time.perf_counter() - prompt_started
+    prompt_chars = len(system_prompt) + len(text)
+    prepared = PreparedReply(
+        user_text=text,
+        actual_user_text=actual,
+        session_id=session,
+        skip_memory=skip_memory,
+        messages=messages,
+        max_tokens=_max_tokens(system_prompt, text),
+        runtime_context=runtime.text,
+        lengths=runtime.lengths,
+        prompt_chars=prompt_chars,
+        started_at=started,
+        context_seconds=context_seconds,
+        prompt_seconds=prompt_seconds,
+    )
+    _remember_metrics(prepared)
+    if _timing_enabled():
+        print(
+            "[Akane:context:size] "
+            f"runtime={runtime.lengths['runtime_context']} "
+            f"memory={runtime.lengths['memory']} "
+            f"convo={runtime.lengths['summary']} "
+            f"attention={runtime.lengths['attention']} "
+            f"avoid={runtime.lengths['avoid']} "
+            f"prompt={prompt_chars}",
+            flush=True,
+        )
+    return prepared
+
+
+def _commit(prepared: PreparedReply, raw: str, reply: str) -> None:
+    remember_exchange(prepared.user_text, raw)
+    observe_user_message(prepared.session_id, prepared.actual_user_text, persist=False)
+    focus = observe_attention(prepared.session_id, prepared.actual_user_text)
+    observe_turn(prepared.session_id, "user", prepared.actual_user_text, focus_state=focus)
+    observe_turn(prepared.session_id, "assistant", reply, focus_state=focus)
+    persist_emotion()
+
+
+def generate_reply(prepared: PreparedReply) -> str:
+    raw = completion_text(prepared.messages, max_tokens=prepared.max_tokens)
+    reply = clean_visible_text(raw)
+    if not reply:
+        raise RuntimeError("Model returned no visible reply.")
+    _commit(prepared, raw, reply)
+    return reply
+
+
+def stream_reply(prepared: PreparedReply):
+    raw_parts: list[str] = []
+    hidden = HiddenTagStreamFilter()
+    first_delta = 0.0
+    generation_started = time.perf_counter()
+
+    for text in stream_completion(prepared.messages, max_tokens=prepared.max_tokens):
+        if not first_delta:
+            first_delta = time.perf_counter()
+        raw_parts.append(text)
+        visible = strip_emoji_chars(hidden.feed(text))
+        if visible:
+            yield "delta", visible
+
+    tail = strip_emoji_chars(hidden.flush())
+    if tail:
+        yield "delta", tail
+
+    generation_done = time.perf_counter()
+    raw = "".join(raw_parts)
+    reply = clean_visible_text(raw)
+    if not reply:
+        raise RuntimeError("Model returned no visible reply.")
+    _commit(prepared, raw, reply)
+    done = time.perf_counter()
+
+    if _timing_enabled():
+        first = first_delta or generation_done
+        print(
+            "[Akane:timing] "
+            f"context={prepared.context_seconds:.3f}s "
+            f"prompt={prepared.prompt_seconds:.3f}s "
+            f"first_delta={first - prepared.started_at:.3f}s "
+            f"gen={generation_done - generation_started:.3f}s "
+            f"post={done - generation_done:.3f}s "
+            f"total={done - prepared.started_at:.3f}s "
+            f"prompt_chars={prepared.prompt_chars} "
+            f"runtime_chars={len(prepared.runtime_context)} "
+            f"output_chars={len(reply)}",
+            flush=True,
+        )
+        if first - prepared.started_at >= 2.0:
+            print("[Akane:stream] native streaming active; first chunk delayed by model prefill", flush=True)
+    yield "done", reply
+
+
+def debug_state_report(session_id: str | None) -> str:
+    session = (str(session_id or "popup").strip() or "popup")[:120]
+    mood = emotion_snapshot(session)
+    focus = get_attention_state(session)
+    conversation = get_conversation_state(session)
+    avoidance = format_recent_wording_avoidance(session)
+    metrics = _METRICS.get(session, {})
+    prefix = ModelManager.get_instance().prefix_cache_status()
+    variables = mood.get("variables") if isinstance(mood.get("variables"), dict) else {}
+
+    lines = [
+        "Akane debug state",
+        "",
+        "Mood:",
+        f"- mood: {mood.get('mood', 'calm')} ({float(mood.get('mood_intensity') or 0):.2f})",
+        f"- emotion: {mood.get('emotion', 'neutral')} ({float(mood.get('emotion_intensity') or 0):.2f})",
+        f"- turns: {int(mood.get('emotion_turns') or 0)}",
+    ]
+    for name in ("energy", "social", "focus", "comfort", "stimulation", "tension", "playfulness", "affection"):
+        lines.append(f"- {name}: {float(variables.get(name) or 0):.2f}")
+    lines.extend(["", "Focus:"])
+    if focus:
+        lines.append(f"- topic: {_clip(focus.get('topic'), 80)}")
+        lines.append(f"- summary: {_clip(focus.get('summary'), 160)}")
+    else:
+        lines.append("- No active focus.")
+    lines.extend(["", "Context:"])
+    if conversation:
+        lines.append(f"- summary: {_clip(conversation.get('summary'), 160)}")
+        lines.append(f"- last user: {_clip(conversation.get('last_user_summary'), 160)}")
+        lines.append(f"- last assistant: {_clip(conversation.get('last_assistant_summary'), 160)}")
+        lines.append(f"- recent turns: {len(conversation.get('recent_turns') or [])}")
+    else:
+        lines.append("- No recent conversation context.")
+    lines.extend([
+        "",
+        "Prompt:",
+        f"- runtime context chars: {int(metrics.get('runtime_context_chars') or 0)}",
+        f"- prompt chars: {int(metrics.get('prompt_chars') or 0)}",
+        f"- wording avoidance chars: {len(avoidance)}",
+        f"- prefix cache: {'on' if prefix.get('enabled') else 'off'} ({int(prefix.get('tokens') or 0)} tokens)",
+    ])
+    return "\n".join(lines)
+
+
+def warm_caches() -> None:
+    get_static_system_prompt(include_memory=True)
+    get_static_system_prompt(include_memory=False)
+    format_memory_for_prompt()

@@ -1,198 +1,118 @@
-"""Lightweight in-memory focus tracking for Akane."""
+"""One short in-memory focus per session."""
 
 from __future__ import annotations
 
+import threading
 import time
+from dataclasses import dataclass
 
-_ACTIVE: dict[str, dict[str, object]] = {}
-_MAX_STATES = 64
+_MAX_SESSIONS = 64
+_STALE_SECONDS = 60 * 60
 _TOPIC_CHARS = 80
 _SUMMARY_CHARS = 160
-_STALE_SECONDS = 60 * 60
 _LOW_CONTENT = {
-    "hello", "hi", "hey", "yo", "lol", "thanks", "thank you", "ok", "okay",
-    "gm", "gn", "good morning", "good night", "hello there", "hi there", "hey there",
-    "/debug_state",
+    "hello", "hi", "hey", "yo", "lol", "ok", "okay", "thanks", "thank you",
+    "good morning", "good night", "/debug_state",
 }
-_FOCUS_PHRASES = (
-    "what do you like doing",
-    "who are you",
-    "what are you",
-    "what do you like",
-    "what anime do you like",
-)
 _STOPWORDS = {
-    "about", "again", "akane", "are", "can", "could", "does", "doing", "for", "from",
-    "have", "how", "into", "keep", "like", "make", "more", "need", "please", "should",
-    "that", "the", "this", "what", "when", "where", "with", "would", "your", "you",
+    "a", "an", "and", "are", "can", "could", "do", "does", "doing", "for", "from",
+    "how", "i", "is", "it", "like", "me", "more", "of", "on", "please", "the",
+    "this", "to", "we", "what", "when", "where", "with", "would", "you", "your",
+    "akane",
 }
 
 
-def _clamp(value: object, default: float = 0.0) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        number = float(default)
-    return max(0.0, min(1.0, number))
+@dataclass(slots=True)
+class AttentionState:
+    topic: str
+    summary: str
+    updated_at: float
 
 
-def _session_id(session_id: str | None) -> str:
+_STATES: dict[str, AttentionState] = {}
+_LOCK = threading.RLock()
+
+
+def _key(session_id: str | None) -> str:
     return (str(session_id or "default").strip() or "default")[:120]
 
 
-def _clean(text: str) -> str:
+def _clean(text: object) -> str:
     return " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split()).strip()
 
 
-def _clip(text: str, limit: int) -> str:
-    text = _clean(text)
-    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:") or text[:limit]
-
-
-def _words(text: str) -> list[str]:
-    words: list[str] = []
-    current: list[str] = []
-    for char in str(text or "").lower():
-        if char.isalnum() or char in {"_", "-", "."}:
-            current.append(char)
-        elif current:
-            word = "".join(current).strip("._-")
-            if word:
-                words.append(word)
-            current.clear()
-    if current:
-        word = "".join(current).strip("._-")
-        if word:
-            words.append(word)
-    return words
+def _clip(text: object, limit: int) -> str:
+    value = _clean(text)
+    if len(value) <= limit:
+        return value
+    return value[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:") or value[:limit]
 
 
 def _terms(text: str) -> list[str]:
-    terms: list[str] = []
-    for word in _words(text):
-        if word in _STOPWORDS:
-            continue
-        if len(word) >= 4 or any(mark in word for mark in "_-."):
-            terms.append(word)
-    return terms
+    words = []
+    for raw in _clean(text).lower().split():
+        word = raw.strip(".,!?;:()[]{}\"'`")
+        if len(word) >= 4 and word not in _STOPWORDS:
+            words.append(word)
+    return words[:2]
 
 
-def _is_low_content(text: str) -> bool:
-    cleaned = _clean(text).lower().strip(".,!?;:()[]{}\"'`")
-    if any(phrase in cleaned for phrase in _FOCUS_PHRASES):
-        return False
-    return len(cleaned) < 4 or cleaned in _LOW_CONTENT or not _terms(cleaned)
-
-
-def _focus_from_text(text: str) -> dict[str, object] | None:
-    cleaned = _clip(text, _SUMMARY_CHARS)
-    if not cleaned or _is_low_content(cleaned):
-        return None
-    terms = _terms(cleaned)
-    topic = _clip(" ".join(terms[:6]) or cleaned, _TOPIC_CHARS)
-    strength = 0.34 + min(0.36, len(terms) * 0.045) + min(0.20, len(cleaned) / 900)
-    return {
-        "topic": topic,
-        "summary": cleaned,
-        "terms": terms[:12],
-        "strength": round(_clamp(strength), 3),
-    }
-
-
-def _fresh(state: dict[str, object] | None, now: float) -> dict[str, object] | None:
-    if not state:
-        return None
-    elapsed = max(0.0, now - float(state.get("updated_at") or now))
-    if elapsed > _STALE_SECONDS:
-        return None
-    strength = _clamp(state.get("strength"), 0.3) - elapsed / _STALE_SECONDS * 0.35
-    if strength < 0.08:
-        return None
-    return {
-        "topic": _clip(str(state.get("topic") or ""), _TOPIC_CHARS),
-        "summary": _clip(str(state.get("summary") or ""), _SUMMARY_CHARS),
-        "strength": round(strength, 3),
-        "updated_at": float(state.get("updated_at") or now),
-        "terms": list(state.get("terms") or [])[:12],
-    }
+def _low_content(text: str) -> bool:
+    return _clean(text).lower().strip(".,!?;:()[]{}\"'`") in _LOW_CONTENT
 
 
 def _prune(now: float) -> None:
-    if len(_ACTIVE) <= _MAX_STATES:
-        return
-    for key, state in list(_ACTIVE.items()):
-        if _fresh(state, now) is None:
-            _ACTIVE.pop(key, None)
-    extra = len(_ACTIVE) - _MAX_STATES
-    if extra > 0:
-        old = sorted(_ACTIVE.items(), key=lambda item: float(item[1].get("updated_at") or 0.0))
-        for key, _state in old[:extra]:
-            _ACTIVE.pop(key, None)
+    for key, state in list(_STATES.items()):
+        if now - state.updated_at > _STALE_SECONDS:
+            _STATES.pop(key, None)
+    if len(_STATES) > _MAX_SESSIONS:
+        oldest = sorted(_STATES.items(), key=lambda item: item[1].updated_at)
+        for key, _state in oldest[:len(_STATES) - _MAX_SESSIONS]:
+            _STATES.pop(key, None)
 
 
-def _public(state: dict[str, object] | None) -> dict[str, object] | None:
-    if not state:
+def _public(state: AttentionState | None, now: float) -> dict[str, object] | None:
+    if state is None or now - state.updated_at > _STALE_SECONDS:
         return None
-    topic = _clip(str(state.get("topic") or ""), _TOPIC_CHARS)
-    summary = _clip(str(state.get("summary") or ""), _SUMMARY_CHARS)
-    if not topic or not summary:
-        return None
+    strength = max(0.0, 1.0 - (now - state.updated_at) / _STALE_SECONDS)
     return {
-        "topic": topic,
-        "summary": summary,
-        "strength": round(_clamp(state.get("strength")), 3),
-        "updated_at": float(state.get("updated_at") or time.time()),
+        "topic": state.topic,
+        "summary": state.summary,
+        "strength": round(strength, 3),
+        "updated_at": state.updated_at,
     }
 
 
 def observe_attention(session_id: str | None, user_text: str, *, now: float | None = None) -> dict[str, object] | None:
-    current_time = time.time() if now is None else float(now)
-    _prune(current_time)
-    key = _session_id(session_id)
-    current = _fresh(_ACTIVE.get(key), current_time)
-    focus = _focus_from_text(user_text)
-    if focus is None:
-        if current is None:
-            _ACTIVE.pop(key, None)
-        return _public(current)
+    current = time.time() if now is None else float(now)
+    text = _clip(user_text, _SUMMARY_CHARS)
+    with _LOCK:
+        _prune(current)
+        key = _key(session_id)
+        if not text or _low_content(text):
+            return _public(_STATES.get(key), current)
+        terms = _terms(text)
+        topic = _clip(" ".join(terms) if terms else text, _TOPIC_CHARS)
+        _STATES[key] = AttentionState(topic=topic, summary=text, updated_at=current)
+        return _public(_STATES[key], current)
 
-    current_terms = set(str(term) for term in (current or {}).get("terms", []))
-    new_terms = set(str(term) for term in focus.get("terms", []))
-    if current and current_terms & new_terms:
-        focus["topic"] = current.get("topic") or focus["topic"]
-        focus["terms"] = sorted(current_terms | new_terms)[:12]
-        focus["strength"] = round(min(1.0, _clamp(current.get("strength"), 0.3) + 0.08), 3)
-    elif current and _clamp(current.get("strength")) > 0.55 and _clamp(focus.get("strength")) < 0.44:
-        return _public(current)
 
-    focus["updated_at"] = current_time
-    _ACTIVE[key] = focus
-    return _public(focus)
+def get_attention_state(session_id: str | None, *, now: float | None = None) -> dict[str, object] | None:
+    current = time.time() if now is None else float(now)
+    with _LOCK:
+        _prune(current)
+        return _public(_STATES.get(_key(session_id)), current)
 
 
 def decay_attention(session_id: str | None, *, now: float | None = None) -> dict[str, object] | None:
-    current_time = time.time() if now is None else float(now)
-    _prune(current_time)
-    key = _session_id(session_id)
-    state = _fresh(_ACTIVE.get(key), current_time)
-    if state is None:
-        _ACTIVE.pop(key, None)
-        return None
-    _ACTIVE[key] = state
-    return _public(state)
-
-
-def get_attention_state(session_id: str | None) -> dict[str, object] | None:
-    return decay_attention(session_id)
+    return get_attention_state(session_id, now=now)
 
 
 def format_attention_for_prompt(state: dict[str, object] | None) -> str:
-    if not state:
-        return ""
-    topic = _clip(str(state.get("topic") or ""), _TOPIC_CHARS)
-    summary = _clip(str(state.get("summary") or ""), _SUMMARY_CHARS)
-    return f"Focus: {topic}. {summary}" if topic and summary else ""
+    topic = _clip((state or {}).get("topic"), _TOPIC_CHARS)
+    return f"Focus: {topic}" if topic else ""
 
 
 def clear_attention(session_id: str | None = None) -> None:
-    _ACTIVE.pop(_session_id(session_id), None)
+    with _LOCK:
+        _STATES.pop(_key(session_id), None)

@@ -176,7 +176,6 @@ class PopupApp:
         self._bubble_visible = False
         self._bubble_text = ""
         self._composer_visible = False
-        self._memory_visible = False
         self._ensure_server()
 
     def _emit_stream_event(self, payload: dict) -> None:
@@ -452,14 +451,12 @@ class PopupApp:
         self._set_composer_visible(not self._composer_visible)
 
     def toggle_memory(self) -> None:
-        self._memory_visible = not self._memory_visible
         window = self.windows.get("companion")
         if window is None:
             return
         try:
             window.evaluate_js(
-                f"document.body.setAttribute('data-memory-visible', '{'true' if self._memory_visible else 'false'}');"
-                f"window.__akaneToggleMemory && window.__akaneToggleMemory();"
+                "window.__akaneToggleMemory && window.__akaneToggleMemory();"
             )
         except Exception:
             pass

@@ -11,7 +11,7 @@ from app.core.attention_state import (
     get_attention_state,
     observe_attention,
 )
-from app.core.character import build_system_prompt, get_static_system_prompt
+from app.core.character import build_system_prompt, get_static_system_prompt, prompt_cache_status
 from app.core.config import LLAMA_CONTEXT_WINDOW, MAX_TOKENS
 from app.core.conversation_state import (
     format_conversation_context,
@@ -30,10 +30,8 @@ from app.core.generation import (
     clean_visible_text,
     completion_text,
     stream_completion,
-    strip_emoji_chars,
     strip_hidden_blocks,
 )
-from app.core.model_loader import ModelManager
 from app.memory_store import format_for_prompt as format_memory_for_prompt
 from app.memory_store import remember_exchange
 
@@ -74,15 +72,17 @@ def _timing_enabled() -> bool:
     return str(os.environ.get("AKANE_TIMING", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _clean_line(text: object) -> str:
-    return " ".join(strip_hidden_blocks(str(text or "")).split()).strip()
+def _normalize_context_text(text: object, *, model_text: bool = False) -> str:
+    value = str(text or "")
+    if model_text:
+        value = strip_hidden_blocks(value)
+    return " ".join(value.split()).strip()
 
 
-def _clip(text: object, limit: int) -> str:
-    value = _clean_line(text)
-    if len(value) <= limit:
-        return value
-    return value[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:") or value[:limit]
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:") or text[:limit]
 
 
 def _actual_message(text: str) -> str:
@@ -95,21 +95,26 @@ def _actual_message(text: str) -> str:
     return value
 
 
-def _without_label(text: str, label: str) -> str:
-    value = _clean_line(text)
-    prefix = label + ":"
-    return value[len(prefix):].strip() if value.lower().startswith(prefix.lower()) else value
-
-
-def _append_bounded(lines: list[str], label: str, value: str, limit: int, total_limit: int) -> int:
-    body = _clip(_without_label(value, label), limit)
+def _append_bounded(
+    lines: list[str],
+    label: str,
+    value: str,
+    limit: int,
+    total_limit: int,
+    *,
+    model_text: bool = False,
+) -> int:
+    body = _normalize_context_text(value, model_text=model_text)
+    label_prefix = label + ":"
+    if body.lower().startswith(label_prefix.lower()):
+        body = body[len(label_prefix):].strip()
     if not body:
         return 0
     prefix = f"{label}: "
     available = total_limit - len("\n".join(lines)) - len(prefix) - 1
     if available <= 0:
         return 0
-    body = _clip(body, available)
+    body = _clip(body, min(limit, available))
     if not body:
         return 0
     lines.append(prefix + body)
@@ -132,7 +137,14 @@ def build_runtime_context(
         "mood": _append_bounded(lines, "Tone", tone_text, TONE_CHARS, limit),
         "memory": _append_bounded(lines, "Memory", memory_text, MEMORY_CHARS, limit),
         "attention": _append_bounded(lines, "Focus", attention_text, FOCUS_CHARS, limit),
-        "avoid": _append_bounded(lines, "Avoid wording", wording_to_avoid, AVOID_CHARS, limit),
+        "avoid": _append_bounded(
+            lines,
+            "Avoid wording",
+            wording_to_avoid,
+            AVOID_CHARS,
+            limit,
+            model_text=True,
+        ),
         "summary": _append_bounded(lines, "Context", conversation_context, CONTEXT_CHARS, limit),
     }
     footer = "Use this state silently. Do not mention it."
@@ -150,9 +162,9 @@ def _memory_context(user_text: str) -> str:
     if not memory:
         return ""
     terms = {
-        word.strip(".,!?;:()[]{}\"'`").lower()
+        term
         for word in user_text.split()
-        if len(word.strip(".,!?;:()[]{}\"'`")) >= 4
+        if len(term := word.strip(".,!?;:()[]{}\"'`").lower()) >= 4
     }
     if not terms:
         return ""
@@ -161,15 +173,12 @@ def _memory_context(user_text: str) -> str:
         for block in memory.split("\n\n")
         if any(term in block.lower() for term in terms)
     ]
-    return _clip("\n".join(blocks), MEMORY_CHARS)
-
-
-def _estimate_tokens(text: str) -> int:
-    return max(1, (len(text) + 3) // 4)
+    normalized = _normalize_context_text("\n".join(blocks))
+    return _clip(normalized, MEMORY_CHARS)
 
 
 def _max_tokens(system_prompt: str, user_text: str) -> int:
-    prompt_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_text) + 16
+    prompt_tokens = (len(system_prompt) + 3) // 4 + (len(user_text) + 3) // 4 + 16
     return max(1, min(MAX_TOKENS, LLAMA_CONTEXT_WINDOW - prompt_tokens - 8))
 
 
@@ -250,6 +259,7 @@ def prepare_reply(
 
 
 def _commit(prepared: PreparedReply, raw: str, reply: str) -> None:
+    # Hidden memory operation tags are parsed from raw output before visible cleanup removes them.
     remember_exchange(prepared.user_text, raw)
     observe_user_message(prepared.session_id, prepared.actual_user_text, persist=False)
     focus = observe_attention(prepared.session_id, prepared.actual_user_text)
@@ -258,13 +268,19 @@ def _commit(prepared: PreparedReply, raw: str, reply: str) -> None:
     persist_emotion()
 
 
-def generate_reply(prepared: PreparedReply) -> str:
-    raw = completion_text(prepared.messages, max_tokens=prepared.max_tokens)
+def _finish_reply(prepared: PreparedReply, raw: str) -> str:
     reply = clean_visible_text(raw)
     if not reply:
         raise RuntimeError("Model returned no visible reply.")
     _commit(prepared, raw, reply)
     return reply
+
+
+def generate_reply(prepared: PreparedReply) -> str:
+    return _finish_reply(
+        prepared,
+        completion_text(prepared.messages, max_tokens=prepared.max_tokens),
+    )
 
 
 def stream_reply(prepared: PreparedReply):
@@ -277,20 +293,17 @@ def stream_reply(prepared: PreparedReply):
         if not first_delta:
             first_delta = time.perf_counter()
         raw_parts.append(text)
-        visible = strip_emoji_chars(hidden.feed(text))
+        visible = hidden.feed(text)
         if visible:
             yield "delta", visible
 
-    tail = strip_emoji_chars(hidden.flush())
+    tail = hidden.flush()
     if tail:
         yield "delta", tail
 
     generation_done = time.perf_counter()
     raw = "".join(raw_parts)
-    reply = clean_visible_text(raw)
-    if not reply:
-        raise RuntimeError("Model returned no visible reply.")
-    _commit(prepared, raw, reply)
+    reply = _finish_reply(prepared, raw)
     done = time.perf_counter()
 
     if _timing_enabled():
@@ -313,6 +326,10 @@ def stream_reply(prepared: PreparedReply):
     yield "done", reply
 
 
+def _debug_text(value: object, limit: int, *, model_text: bool = False) -> str:
+    return _clip(_normalize_context_text(value, model_text=model_text), limit)
+
+
 def debug_state_report(session_id: str | None) -> str:
     session = (str(session_id or "popup").strip() or "popup")[:120]
     mood = emotion_snapshot(session)
@@ -320,7 +337,7 @@ def debug_state_report(session_id: str | None) -> str:
     conversation = get_conversation_state(session)
     avoidance = format_recent_wording_avoidance(session)
     metrics = _METRICS.get(session, {})
-    prefix = ModelManager.get_instance().prefix_cache_status()
+    prompt_cache = prompt_cache_status(include_memory=True)
     variables = mood.get("variables") if isinstance(mood.get("variables"), dict) else {}
 
     lines = [
@@ -335,15 +352,22 @@ def debug_state_report(session_id: str | None) -> str:
         lines.append(f"- {name}: {float(variables.get(name) or 0):.2f}")
     lines.extend(["", "Focus:"])
     if focus:
-        lines.append(f"- topic: {_clip(focus.get('topic'), 80)}")
-        lines.append(f"- summary: {_clip(focus.get('summary'), 160)}")
+        lines.append(f"- topic: {_debug_text(focus.get('topic'), 80)}")
+        lines.append(f"- summary: {_debug_text(focus.get('summary'), 160)}")
     else:
         lines.append("- No active focus.")
     lines.extend(["", "Context:"])
     if conversation:
-        lines.append(f"- summary: {_clip(conversation.get('summary'), 160)}")
-        lines.append(f"- last user: {_clip(conversation.get('last_user_summary'), 160)}")
-        lines.append(f"- last assistant: {_clip(conversation.get('last_assistant_summary'), 160)}")
+        lines.append(f"- summary: {_debug_text(conversation.get('summary'), 160)}")
+        lines.append(f"- last user: {_debug_text(conversation.get('last_user_summary'), 160)}")
+        lines.append(
+            "- last assistant: "
+            + _debug_text(
+                conversation.get("last_assistant_summary"),
+                160,
+                model_text=True,
+            )
+        )
         lines.append(f"- recent turns: {len(conversation.get('recent_turns') or [])}")
     else:
         lines.append("- No recent conversation context.")
@@ -353,7 +377,7 @@ def debug_state_report(session_id: str | None) -> str:
         f"- runtime context chars: {int(metrics.get('runtime_context_chars') or 0)}",
         f"- prompt chars: {int(metrics.get('prompt_chars') or 0)}",
         f"- wording avoidance chars: {len(avoidance)}",
-        f"- prefix cache: {'on' if prefix.get('enabled') else 'off'} ({int(prefix.get('tokens') or 0)} tokens)",
+        f"- static prompt cache: base={prompt_cache['base_prompt']} soul={prompt_cache['soul']} identity={prompt_cache['identity']}",
     ])
     return "\n".join(lines)
 

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 _MAX_SESSIONS = 64
 _STALE_SECONDS = 60 * 60
 _TOPIC_CHARS = 80
-_SUMMARY_CHARS = 160
+_SUMMARY_CHARS = 120
 _LOW_CONTENT = {
     "hello", "hi", "hey", "yo", "lol", "ok", "okay", "thanks", "thank you",
     "good morning", "good night", "/debug_state",

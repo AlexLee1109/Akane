@@ -58,26 +58,6 @@ def collapse_hidden_tag_gaps(text: str) -> str:
     return "\n".join(lines)
 
 
-def strip_emoji_chars(text: str) -> str:
-    if not text:
-        return text or ""
-    value = str(text)
-    if value.isascii():
-        return value
-    out: list[str] = []
-    for char in value:
-        code = ord(char)
-        if (
-            0x1F000 <= code <= 0x1FAFF
-            or 0x2600 <= code <= 0x27BF
-            or 0xFE00 <= code <= 0xFE0F
-            or code in {0x200D, 0x20E3, 0x00A9, 0x00AE, 0x2122, 0x3030, 0x303D, 0x3297, 0x3299}
-        ):
-            continue
-        out.append(char)
-    return "".join(out)
-
-
 def strip_hidden_blocks(text: str) -> str:
     if not text:
         return text or ""
@@ -219,5 +199,4 @@ def clean_visible_text(text: str) -> str:
     cleaned = strip_hidden_blocks(source)
     if cleaned != source:
         cleaned = "\n".join(line.rstrip() for line in cleaned.splitlines() if line.strip())
-    cleaned = strip_emoji_chars(cleaned)
     return collapse_hidden_tag_gaps(cleaned).strip(" `\n\t")

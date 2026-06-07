@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import os
+import inspect
 import threading
-import time
 from pathlib import Path
 
 from app.core.config import (
@@ -23,26 +22,9 @@ from app.core.config import (
     MODEL_PATH,
 )
 
-USE_STATIC_PREFIX_CACHE = True
-_PREFIX_MARKER = "\n__AKANE_STATIC_PREFIX_BOUNDARY__\n"
-_PREFIX_TRIM_TOKENS = 8
-_PREFIX_CACHE = {
-    "revision": None,
-    "include_memory": None,
-    "state": None,
-    "tokens": 0,
-    "enabled": USE_STATIC_PREFIX_CACHE,
-    "disabled_reason": "",
-}
-
-
-def _timing_enabled() -> bool:
-    return str(os.environ.get("AKANE_TIMING", "")).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _prefix_log(text: str) -> None:
-    if _timing_enabled():
-        print(f"[Akane:prefix_cache] {text}", flush=True)
+_NO_THINK_DIRECTIVE = "/no_think"
+_NO_THINK_ALIASES = ("/no_think", "/nothink")
+_NO_THINK_TEMPLATE_KWARGS = {"enable_thinking": False}
 
 
 def content_to_text(content) -> str:
@@ -56,6 +38,55 @@ def content_to_text(content) -> str:
             for item in content
         )
     return str(content)
+
+
+def _is_qwen_model(llm, model_path: Path) -> bool:
+    values = [str(model_path)]
+    metadata = getattr(llm, "metadata", {}) or {}
+    if isinstance(metadata, dict):
+        values.extend(str(value) for value in metadata.values())
+    return any("qwen" in value.lower() for value in values)
+
+
+def _supports_chat_template_kwargs(llm) -> bool:
+    try:
+        parameters = inspect.signature(llm.create_chat_completion).parameters
+    except (TypeError, ValueError):
+        return False
+    return "chat_template_kwargs" in parameters
+
+
+def _has_no_think_directive(content) -> bool:
+    text = content_to_text(content).lower()
+    return any(alias in text for alias in _NO_THINK_ALIASES)
+
+
+def _content_with_no_think(content):
+    if _has_no_think_directive(content):
+        return content
+    if isinstance(content, str):
+        value = content.rstrip()
+        return f"{value}\n\n{_NO_THINK_DIRECTIVE}" if value else _NO_THINK_DIRECTIVE
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": f"\n{_NO_THINK_DIRECTIVE}"}]
+    value = str(content or "").rstrip()
+    return f"{value}\n\n{_NO_THINK_DIRECTIVE}" if value else _NO_THINK_DIRECTIVE
+
+
+def _messages_with_no_think(messages):
+    if not isinstance(messages, list):
+        return messages
+    copied = [dict(message) if isinstance(message, dict) else message for message in messages]
+    for index in range(len(copied) - 1, -1, -1):
+        message = copied[index]
+        if isinstance(message, dict) and message.get("role") == "user":
+            message["content"] = _content_with_no_think(message.get("content"))
+            return copied
+    for index, message in enumerate(copied):
+        if isinstance(message, dict) and message.get("role") == "system":
+            message["content"] = _content_with_no_think(message.get("content"))
+            return copied
+    return [{"role": "system", "content": _NO_THINK_DIRECTIVE}, *copied]
 
 
 class ModelManager:
@@ -86,140 +117,6 @@ class ModelManager:
             "backend": "llama_cpp",
             "local_model_path": str(self._local_model_path),
         }
-
-    def prefix_cache_status(self) -> dict[str, object]:
-        return {
-            "enabled": bool(_PREFIX_CACHE["enabled"]),
-            "tokens": int(_PREFIX_CACHE["tokens"] or 0),
-            "include_memory": bool(_PREFIX_CACHE["include_memory"]),
-            "disabled_reason": str(_PREFIX_CACHE["disabled_reason"] or ""),
-        }
-
-    def _clear_prefix_cache(self) -> None:
-        _PREFIX_CACHE.update({
-            "revision": None,
-            "include_memory": None,
-            "state": None,
-            "tokens": 0,
-            "enabled": USE_STATIC_PREFIX_CACHE,
-            "disabled_reason": "",
-        })
-
-    def _disable_prefix_cache(self, reason: str) -> None:
-        self._clear_prefix_cache()
-        _PREFIX_CACHE["enabled"] = False
-        _PREFIX_CACHE["disabled_reason"] = reason
-        _prefix_log(f"disabled reason={reason}")
-
-    def _chat_formatter(self, llm):
-        try:
-            from llama_cpp import llama_chat_format
-
-            handler = (
-                getattr(llm, "chat_handler", None)
-                or getattr(llm, "_chat_handlers", {}).get(getattr(llm, "chat_format", ""))
-                or llama_chat_format.get_chat_completion_handler(getattr(llm, "chat_format", ""))
-            )
-        except Exception:
-            return None
-        for cell in getattr(handler, "__closure__", None) or ():
-            formatter = cell.cell_contents
-            if not callable(formatter):
-                continue
-            try:
-                if hasattr(formatter(messages=[{"role": "system", "content": "Akane"}]), "prompt"):
-                    return formatter
-            except Exception:
-                continue
-        return None
-
-    def _prefix_tokens(self, llm, prompt: str) -> list[int] | None:
-        formatter = self._chat_formatter(llm)
-        if formatter is None:
-            return None
-        result = formatter(messages=[{"role": "system", "content": prompt + _PREFIX_MARKER}])
-        formatted = str(result.prompt)
-        marker_at = formatted.find(_PREFIX_MARKER)
-        if marker_at < 0:
-            return None
-        tokens = list(llm.tokenize(
-            formatted[:marker_at].encode("utf-8"),
-            add_bos=not bool(getattr(result, "added_special", False)),
-            special=True,
-        ))
-        if len(tokens) > _PREFIX_TRIM_TOKENS + 1:
-            tokens = tokens[:-_PREFIX_TRIM_TOKENS]
-        return tokens
-
-    def _build_prefix_cache(self, llm, include_memory: bool) -> bool:
-        if not USE_STATIC_PREFIX_CACHE:
-            return False
-        missing = [
-            name
-            for name in ("save_state", "load_state", "eval", "tokenize", "reset")
-            if not hasattr(llm, name)
-        ]
-        if missing:
-            self._disable_prefix_cache(f"{missing[0]}_unavailable")
-            return False
-        try:
-            from app.core.character import get_static_system_prompt, prompt_revision
-
-            prompt = get_static_system_prompt(include_memory=include_memory)
-            tokens = self._prefix_tokens(llm, prompt)
-            if not tokens:
-                self._disable_prefix_cache("chat_formatter_unavailable")
-                return False
-            started = time.perf_counter()
-            llm.reset()
-            llm.eval(tokens)
-            _PREFIX_CACHE.update({
-                "revision": prompt_revision(),
-                "include_memory": include_memory,
-                "state": llm.save_state(),
-                "tokens": len(tokens),
-                "enabled": True,
-                "disabled_reason": "",
-            })
-            _prefix_log(f"built tokens={len(tokens)} time={time.perf_counter() - started:.2f}s")
-            return True
-        except Exception as exc:
-            self._disable_prefix_cache(type(exc).__name__)
-            return False
-
-    def _restore_prefix_cache(self, llm, messages) -> None:
-        if not USE_STATIC_PREFIX_CACHE or not messages:
-            return
-        system = messages[0] if isinstance(messages[0], dict) else {}
-        system_text = str(system.get("content") or "")
-        if system.get("role") != "system" or not system_text:
-            return
-        include_memory = "[AKANE MEMORY RULES]" in system_text
-        try:
-            from app.core.character import get_static_system_prompt, prompt_revision
-
-            static_prompt = get_static_system_prompt(include_memory=include_memory)
-            if not system_text.startswith(static_prompt):
-                return
-            if (
-                not _PREFIX_CACHE["enabled"]
-                or _PREFIX_CACHE["revision"] != prompt_revision()
-                or _PREFIX_CACHE["include_memory"] is not include_memory
-                or _PREFIX_CACHE["state"] is None
-            ):
-                if not self._build_prefix_cache(llm, include_memory):
-                    return
-            llm.load_state(_PREFIX_CACHE["state"])
-            _prefix_log(
-                f"restored=true dynamic_chars={len(system_text) - len(static_prompt)} "
-                f"tokens={_PREFIX_CACHE['tokens']}"
-            )
-        except Exception as exc:
-            try:
-                llm.reset()
-            except Exception:
-                pass
-            _prefix_log(f"restored=false reason={type(exc).__name__}")
 
     def _load_kwargs(self) -> dict[str, object]:
         n_batch = max(1, min(int(LLAMA_BATCH_SIZE), int(LLAMA_CONTEXT_WINDOW)))
@@ -264,7 +161,6 @@ class ModelManager:
                     flush=True,
                 )
                 self._llm = Llama(**kwargs)
-                self._build_prefix_cache(self._llm, include_memory=True)
             except Exception as exc:
                 self._load_error = exc
                 raise
@@ -287,7 +183,6 @@ class ModelManager:
     def unload_local_model(self) -> None:
         with self._load_lock:
             self._llm = None
-            self._clear_prefix_cache()
 
     def switch_backend(
         self,
@@ -307,8 +202,17 @@ class ModelManager:
                     self._local_model_path = path
                     self._llm = None
                     self._load_error = None
-                    self._clear_prefix_cache()
         return self.status()
+
+    def _completion_kwargs(self, llm, kwargs: dict[str, object]) -> dict[str, object]:
+        if not _is_qwen_model(llm, self._local_model_path):
+            return kwargs
+        updated = dict(kwargs)
+        if _supports_chat_template_kwargs(llm):
+            updated["chat_template_kwargs"] = dict(_NO_THINK_TEMPLATE_KWARGS)
+        else:
+            updated["messages"] = _messages_with_no_think(updated.get("messages"))
+        return updated
 
     def create_chat_completion(
         self,
@@ -339,13 +243,11 @@ class ModelManager:
         if not stream:
             with self._inference_lock:
                 llm = self.llm
-                self._restore_prefix_cache(llm, messages)
-                return llm.create_chat_completion(**kwargs)
+                return llm.create_chat_completion(**self._completion_kwargs(llm, kwargs))
 
         def wrapped():
             with self._inference_lock:
                 llm = self.llm
-                self._restore_prefix_cache(llm, messages)
-                yield from llm.create_chat_completion(**kwargs)
+                yield from llm.create_chat_completion(**self._completion_kwargs(llm, kwargs))
 
         return wrapped()

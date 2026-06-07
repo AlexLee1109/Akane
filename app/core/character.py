@@ -9,12 +9,14 @@ from app.core.config import ADVISOR_ONLY
 SOUL_PATH = Path(__file__).resolve().parent.parent / "soul.md"
 IDENTITY_PATH = Path(__file__).resolve().parent.parent / "identity.md"
 
+_SIGNATURE_UNSET = object()
 _SOUL_CACHE: str | None = None
 _IDENTITY_CACHE: str | None = None
 _SOUL_BODY_CACHE: str | None = None
 _IDENTITY_BODY_CACHE: str | None = None
 _BASE_PROMPT_CACHE: dict[bool, str] = {}
-_BASE_PROMPT_SECTION_CACHE: dict[bool, dict[str, int]] = {}
+_SOUL_SIGNATURE: tuple[int, int] | None | object = _SIGNATURE_UNSET
+_IDENTITY_SIGNATURE: tuple[int, int] | None | object = _SIGNATURE_UNSET
 
 _RUNTIME_RULES = (
     "[AKANE RUNTIME HARD RULES]\n"
@@ -42,6 +44,36 @@ _MEMORY_RULES = (
 )
 
 
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _clear_prompt_caches() -> None:
+    global _SOUL_CACHE, _IDENTITY_CACHE, _SOUL_BODY_CACHE, _IDENTITY_BODY_CACHE
+    _SOUL_CACHE = None
+    _IDENTITY_CACHE = None
+    _SOUL_BODY_CACHE = None
+    _IDENTITY_BODY_CACHE = None
+    _BASE_PROMPT_CACHE.clear()
+
+
+def _refresh_prompt_files() -> None:
+    global _SOUL_SIGNATURE, _IDENTITY_SIGNATURE
+    soul_signature = _file_signature(SOUL_PATH)
+    identity_signature = _file_signature(IDENTITY_PATH)
+    if (
+        (_SOUL_SIGNATURE is not _SIGNATURE_UNSET and soul_signature != _SOUL_SIGNATURE)
+        or (_IDENTITY_SIGNATURE is not _SIGNATURE_UNSET and identity_signature != _IDENTITY_SIGNATURE)
+    ):
+        _clear_prompt_caches()
+    _SOUL_SIGNATURE = soul_signature
+    _IDENTITY_SIGNATURE = identity_signature
+
+
 def _read(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8").strip()
@@ -57,8 +89,15 @@ def _clean_prompt_file(text: str) -> str:
     )
 
 
+def _runtime_rules() -> str:
+    if not ADVISOR_ONLY:
+        return _RUNTIME_RULES
+    return _RUNTIME_RULES + "\n- Advisor-only mode: do not claim to edit files."
+
+
 def load_soul() -> str:
     global _SOUL_CACHE
+    _refresh_prompt_files()
     if _SOUL_CACHE is None:
         _SOUL_CACHE = _read(SOUL_PATH)
     return _SOUL_CACHE
@@ -66,6 +105,7 @@ def load_soul() -> str:
 
 def load_identity() -> str:
     global _IDENTITY_CACHE
+    _refresh_prompt_files()
     if _IDENTITY_CACHE is None:
         _IDENTITY_CACHE = _read(IDENTITY_PATH)
     return _IDENTITY_CACHE
@@ -73,6 +113,7 @@ def load_identity() -> str:
 
 def _soul_body() -> str:
     global _SOUL_BODY_CACHE
+    _refresh_prompt_files()
     if _SOUL_BODY_CACHE is None:
         _SOUL_BODY_CACHE = _clean_prompt_file(load_soul())
     return _SOUL_BODY_CACHE
@@ -80,16 +121,14 @@ def _soul_body() -> str:
 
 def _identity_body() -> str:
     global _IDENTITY_BODY_CACHE
+    _refresh_prompt_files()
     if _IDENTITY_BODY_CACHE is None:
         _IDENTITY_BODY_CACHE = _clean_prompt_file(load_identity())
     return _IDENTITY_BODY_CACHE
 
 
-def prompt_revision() -> tuple[int, int, int]:
-    return (len(_soul_body()), len(_identity_body()), int(ADVISOR_ONLY))
-
-
 def prompt_cache_status(include_memory: bool = True) -> dict[str, str]:
+    _refresh_prompt_files()
     return {
         "soul": "hit" if _SOUL_BODY_CACHE is not None else "miss",
         "identity": "hit" if _IDENTITY_BODY_CACHE is not None else "miss",
@@ -98,37 +137,32 @@ def prompt_cache_status(include_memory: bool = True) -> dict[str, str]:
 
 
 def _base_system_prompt(*, include_memory: bool) -> str:
+    _refresh_prompt_files()
     cached = _BASE_PROMPT_CACHE.get(include_memory)
     if cached is not None:
         return cached
 
+    runtime_rules = _runtime_rules()
     soul = "[AKANE SOUL / VOICE]\n" + _soul_body()
     identity = "[AKANE IDENTITY]\n" + _identity_body()
-    parts = [_RUNTIME_RULES, soul, identity]
-    lengths = {
-        "runtime_rules": len(_RUNTIME_RULES),
-        "soul": len(soul),
-        "identity": len(identity),
-        "memory_rules": 0,
-        "advisor": 0,
-    }
+    parts = [runtime_rules, soul, identity]
     if include_memory:
         parts.append(_MEMORY_RULES)
-        lengths["memory_rules"] = len(_MEMORY_RULES)
-    if ADVISOR_ONLY:
-        advisor = "Advisor-only mode: do not claim to edit files."
-        parts.append(advisor)
-        lengths["advisor"] = len(advisor)
 
     prompt = "\n\n".join(part for part in parts if part)
     _BASE_PROMPT_CACHE[include_memory] = prompt
-    _BASE_PROMPT_SECTION_CACHE[include_memory] = lengths
     return prompt
 
 
 def prompt_section_lengths(include_memory: bool = True) -> dict[str, int]:
-    _base_system_prompt(include_memory=include_memory)
-    return dict(_BASE_PROMPT_SECTION_CACHE[include_memory])
+    soul = "[AKANE SOUL / VOICE]\n" + _soul_body()
+    identity = "[AKANE IDENTITY]\n" + _identity_body()
+    return {
+        "runtime_rules": len(_runtime_rules()),
+        "soul": len(soul),
+        "identity": len(identity),
+        "memory_rules": len(_MEMORY_RULES) if include_memory else 0,
+    }
 
 
 def get_static_system_prompt(*, include_memory: bool = True) -> str:

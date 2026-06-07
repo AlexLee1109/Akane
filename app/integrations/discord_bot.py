@@ -77,43 +77,13 @@ def _message_text(message, bot_user_id: int) -> str:
     return content
 
 
-def _one_line(value, limit: int = 120) -> str:
-    text = " ".join(str(value or "").split())
-    return text[:limit].strip()
-
-
-def _author_name(author) -> str:
-    display = _one_line(getattr(author, "display_name", ""))
-    global_name = _one_line(getattr(author, "global_name", ""))
-    username = _one_line(getattr(author, "name", ""))
-    if display and username and display != username:
-        return f"{display} (@{username})"
-    if global_name and username and global_name != username:
-        return f"{global_name} (@{username})"
-    return display or username or "Unknown user"
-
-
 def _model_prompt(message, user_text: str) -> str:
-    author = getattr(message, "author", None)
-    guild = getattr(message, "guild", None)
-    if guild is not None:
-        lines = [
-            "Discord server message",
-            f"User: {_author_name(author)}",
-            f"Server: {_one_line(getattr(guild, 'name', ''))}",
-        ]
-    else:
-        lines = [
-            "Discord direct message",
-            f"User: {_author_name(author)}",
-        ]
-    lines.extend(("", "Message:", str(user_text or "").strip()))
-    return "\n".join(lines).strip()
+    del message
+    return str(user_text or "").strip()
 
 
 def _server_prompt(message, user_text: str) -> str:
-    text = str(user_text or "").strip()
-    return text if text in _PASSTHROUGH_COMMANDS else _model_prompt(message, text)
+    return _model_prompt(message, user_text)
 
 
 def _is_passthrough_command(text: str) -> bool:

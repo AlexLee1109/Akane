@@ -657,9 +657,6 @@ def _build_system_prompt(*, apply_now: bool) -> str:
         "- Use write_file only when replacing an entire small file with complete content.\n"
         "- For debugging, name the likely bug and the smallest fix; do not punt to another model.\n"
         "- Never claim a change succeeded unless editor actions ran and were confirmed.\n"
-        "- summary must be a short, natural sentence in Akane's voice — direct, calm, not robotic.\n"
-        "- Never start with a heading, label, or self-description.\n"
-        "- Write like you noticed something, not like you're filing a report.\n"
         f"- {mode}"
     )
 

@@ -87,7 +87,7 @@ def _is_raspberry_pi() -> bool:
 
 IS_RASPBERRY_PI = _bool_secret("RASPBERRY_PI", _is_raspberry_pi())
 APP_MODE = (_secret_or_env("APP_MODE", "popup") or "popup").lower()
-SERVER_HOST = _secret_or_env("SERVER_HOST", "127.0.0.1") or "127.0.0.1"
+SERVER_HOST = _secret_or_env("SERVER_HOST", "0.0.0.0") or "0.0.0.0"
 SERVER_PORT = _int_secret("SERVER_PORT", 8000)
 POPUP_BACKEND_URL = _secret_or_env("POPUP_BACKEND_URL", f"http://127.0.0.1:{SERVER_PORT}").rstrip("/")
 DISCORD_SERVER_URL = _secret_or_env("DISCORD_SERVER_URL", f"http://127.0.0.1:{SERVER_PORT}").rstrip("/")
@@ -127,28 +127,10 @@ LLAMA_LAST_N_TOKENS_SIZE = _int_secret("LLAMA_LAST_N_TOKENS_SIZE", 64)
 CHAT_HISTORY_CONTEXT_TOKENS = _int_secret("CHAT_HISTORY_CONTEXT_TOKENS", 1024)
 
 STATIC_DIR = "static"
-VSCODE_COMMAND = _secret_or_env("VSCODE_COMMAND", "")
 ADVISOR_ONLY = _bool_secret("ADVISOR_ONLY", False)
-
-OPENROUTER_BASE_URL = _secret_or_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-OPENROUTER_API_KEY = _secret_or_env("OPENROUTER_API_KEY", "")
-OPENROUTER_CODER_MODEL = _secret_or_env("OPENROUTER_CODER_MODEL", "")
-OPENROUTER_SITE_URL = _secret_or_env("OPENROUTER_SITE_URL", "")
-OPENROUTER_APP_NAME = _secret_or_env("OPENROUTER_APP_NAME", "Akane")
-OPENROUTER_CA_BUNDLE = _secret_or_env("OPENROUTER_CA_BUNDLE", "")
-OPENROUTER_SKIP_SSL_VERIFY = _bool_secret("OPENROUTER_SKIP_SSL_VERIFY", False)
 
 MAX_TOKENS = _int_secret("MAX_TOKENS", 160)
 TEMPERATURE = _float_secret("TEMPERATURE", 0.75)
 TOP_K = _int_secret("TOP_K", 30)
 TOP_P = _float_secret("TOP_P", 0.9)
 REPETITION_PENALTY = _float_secret("REPETITION_PENALTY", 1.08)
-
-CODER_MAX_TOKENS = _int_secret("CODER_MAX_TOKENS", 768)
-CODER_TEMPERATURE = _float_secret("CODER_TEMPERATURE", 0.1)
-CODER_MAX_TURNS = _int_secret("CODER_MAX_TURNS", 2)
-CODER_MAX_INITIAL_TARGETS = _int_secret("CODER_MAX_INITIAL_TARGETS", 2)
-CODER_READ_CHUNK_LINES = _int_secret("CODER_READ_CHUNK_LINES", 180)
-CODER_INITIAL_CHUNKS_PER_FILE = _int_secret("CODER_INITIAL_CHUNKS_PER_FILE", 1)
-CODER_MAX_READ_CHUNKS_PER_FILE = _int_secret("CODER_MAX_READ_CHUNKS_PER_FILE", 3)
-CODER_TIMEOUT_SECONDS = _float_secret("CODER_TIMEOUT_SECONDS", 30.0)

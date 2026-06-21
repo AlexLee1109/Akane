@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
 import os
 import threading
 import time
@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import uvicorn
+import orjson
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -32,6 +33,15 @@ from app.memory_store import (
     format_for_prompt as format_memory_for_prompt,
     get_all,
     reload_from_disk,
+)
+from app.integrations.vscode_workspace import (
+    MAX_REQUEST_BYTES,
+    clear_workspace_context,
+    complete_file_request,
+    next_file_request,
+    update_active_context,
+    update_workspace_index,
+    workspace_status,
 )
 from app.ui.assets import resolve_ui_asset
 
@@ -106,7 +116,9 @@ def _state_messages(session_id: str | None = None) -> list[dict]:
 
 
 def _state_messages_with_user(session_id: str | None, content: str) -> list[dict]:
-    return [*_state_messages(session_id), {"role": "user", "content": content}]
+    messages = _state_messages(session_id)
+    messages.append({"role": "user", "content": content})
+    return messages
 
 
 def _append_message(role: str, content: str, session_id: str | None = None) -> None:
@@ -147,8 +159,8 @@ def _parse_chat_request(payload: dict) -> ChatRequestData:
     )
 
 
-def _json_line(payload: dict) -> str:
-    return json.dumps(payload, ensure_ascii=False) + "\n"
+def _json_line(payload: dict) -> bytes:
+    return orjson.dumps(payload) + b"\n"
 
 
 def _log(label: str, text: str = "") -> None:
@@ -172,9 +184,15 @@ def _generate_reply(
     skip_memory: bool = False,
     session_id: str | None = None,
 ) -> str:
+    try:
+        prepared = prepare_reply(user_input, skip_memory=skip_memory, session_id=session_id)
+        if not prepared.direct_reply:
+            _start_model_loading()
+        reply = generate_reply(prepared)
+    except Exception:
+        _log("user", user_input)
+        raise
     _log("user", user_input)
-    prepared = prepare_reply(user_input, skip_memory=skip_memory, session_id=session_id)
-    reply = generate_reply(prepared)
     _append_message("user", user_input, session_id)
     _append_message("assistant", reply, session_id)
     _log("done", reply)
@@ -186,23 +204,23 @@ def _stream_chat_events(
     *,
     skip_memory: bool = False,
     session_id: str | None = None,
-    request_started_at: float | None = None,
-    json_parsed_at: float | None = None,
 ):
-    del request_started_at, json_parsed_at
     try:
-        _log("user", text)
         prepared = prepare_reply(text, skip_memory=skip_memory, session_id=session_id)
+        if not prepared.direct_reply:
+            _start_model_loading()
         yield _json_line({"type": "start", "messages": _state_messages_with_user(session_id, text)})
         for event_type, content in stream_reply(prepared):
             if event_type == "delta":
                 yield _json_line({"type": "delta", "content": content, "append": True})
                 continue
+            _log("user", text)
             _append_message("user", text, session_id)
             _append_message("assistant", content, session_id)
             _log("done", content)
             yield _json_line({"type": "done", "reply": content, "messages": _state_messages(session_id)})
     except Exception as exc:
+        _log("user", text)
         _log("error", str(exc))
         yield _json_line({"type": "error", "error": str(exc)})
 
@@ -237,17 +255,20 @@ def _handle_command(text: str, session_id: str | None = None) -> dict | None:
 
 def _app_state_payload(session_id: str | None = None, *, include_messages: bool = True) -> dict:
     state = _session_state(session_id)
+    with state.lock:
+        version = state.version
+        messages = list(state.messages) if include_messages else None
     payload = {
         "model": ModelManager.get_instance().status(),
         "internal_state": emotional_snapshot(session_id),
-        "version": state.version,
+        "version": version,
     }
-    if include_messages:
-        payload["messages"] = _state_messages(session_id)
+    if messages is not None:
+        payload["messages"] = messages
     return payload
 
 
-def _start_model_loading() -> None:
+def _start_model_loading(*, warm_character: bool = True) -> None:
     manager = ModelManager.get_instance()
     status = manager.status()
     if status["loading"] or status["loaded"]:
@@ -255,8 +276,9 @@ def _start_model_loading() -> None:
 
     def load() -> None:
         try:
-            warm_caches()
             manager.ensure_loaded()
+            if warm_character:
+                warm_caches()
         except Exception as exc:
             _log("model-error", str(exc))
 
@@ -280,6 +302,79 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404)
         path, media_type = static
         return FileResponse(path, media_type=media_type)
+
+    @app.get("/health")
+    async def health():
+        status = ModelManager.get_instance().status()
+        return JSONResponse(
+            {
+                "status": "ok",
+                "model_loaded": bool(status.get("loaded")),
+                "model_loading": bool(status.get("loading")),
+                "vscode": workspace_status(),
+            }
+        )
+
+    @app.post("/api/vscode/index")
+    async def vscode_index(request: Request):
+        try:
+            content_length = int(request.headers.get("content-length", "0") or 0)
+        except ValueError:
+            content_length = 0
+        if content_length > MAX_REQUEST_BYTES:
+            return JSONResponse({"error": "Workspace context is too large."}, status_code=413)
+        try:
+            body = await request.body()
+            if len(body) > MAX_REQUEST_BYTES:
+                return JSONResponse(
+                    {"error": "Workspace context is too large."},
+                    status_code=413,
+                )
+            status = update_workspace_index(orjson.loads(body))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON request body."}, status_code=400)
+        return JSONResponse({"ok": True, **status})
+
+    @app.post("/api/vscode/context")
+    async def vscode_context(request: Request):
+        try:
+            body = await request.body()
+            if len(body) > MAX_REQUEST_BYTES:
+                return JSONResponse({"error": "Editor context is too large."}, status_code=413)
+            status = update_active_context(orjson.loads(body))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON request body."}, status_code=400)
+        return JSONResponse({"ok": True, **status})
+
+    @app.get("/api/vscode/status")
+    async def vscode_status():
+        return JSONResponse(workspace_status())
+
+    @app.get("/api/vscode/requests")
+    async def vscode_requests():
+        return JSONResponse(next_file_request())
+
+    @app.post("/api/vscode/requests/{request_id}")
+    async def vscode_request_response(request_id: str, request: Request):
+        try:
+            body = await request.body()
+            if len(body) > MAX_REQUEST_BYTES:
+                return JSONResponse({"error": "File response is too large."}, status_code=413)
+            result = complete_file_request(request_id, orjson.loads(body))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON request body."}, status_code=400)
+        return JSONResponse(result)
+
+    @app.delete("/api/vscode/context")
+    async def vscode_disconnect():
+        clear_workspace_context()
+        return JSONResponse({"ok": True, "connected": False})
 
     @app.get("/api/state")
     async def api_state(session_id: str = DEFAULT_SESSION_ID, include_messages: str = "1"):
@@ -327,9 +422,9 @@ def create_app() -> FastAPI:
         command = handle_builtin_command(chat.text, chat.session_id)
         if command is not None:
             return JSONResponse(command)
-        _start_model_loading()
         try:
-            reply = _generate_reply(
+            reply = await asyncio.to_thread(
+                _generate_reply,
                 chat.text,
                 skip_memory=chat.skip_memory,
                 session_id=chat.session_id,
@@ -340,23 +435,18 @@ def create_app() -> FastAPI:
 
     @app.post("/api/chat/stream")
     async def api_chat_stream(request: Request):
-        request_started_at = time.perf_counter()
         payload = await _request_payload(request)
-        json_parsed_at = time.perf_counter()
         chat = _parse_chat_request(payload)
         if not chat.text:
             return JSONResponse({"error": "Message is empty."}, status_code=400)
         command = handle_builtin_command(chat.text, chat.session_id)
         if command is not None:
             return JSONResponse(command)
-        _start_model_loading()
         return StreamingResponse(
             _stream_chat_events(
                 chat.text,
                 skip_memory=chat.skip_memory,
                 session_id=chat.session_id,
-                request_started_at=request_started_at,
-                json_parsed_at=json_parsed_at,
             ),
             media_type="application/x-ndjson; charset=utf-8",
             headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},

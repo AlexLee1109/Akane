@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+from collections import deque
 from datetime import datetime
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -17,6 +18,7 @@ from app.core.config import (
     DISCORD_SERVER_URL,
     DISCORD_UNPROMPTED_IDLE_MINUTES,
 )
+from app.core.emotional_state import snapshot as emotional_snapshot
 
 _CHAT_TIMEOUT_SECONDS = 300
 _RETRY_DELAYS = (0.0, 1.0, 2.0)
@@ -26,17 +28,112 @@ _DEBUG_STATE_COMMAND = "/debug_state"
 _PASSTHROUGH_COMMANDS = {_RESET_CHAT_COMMAND, _DEBUG_STATE_COMMAND}
 
 _IDLE_TOPIC_INSTRUCTIONS = {
-    "fairy_tale_ai_twist": "Start from a tiny fairy-tale or folklore premise, then twist it through Akane's AI/VTuber existence.",
-    "tiny_ai_fact": "Invent a small original-sounding observation about AI companions, cache, tokens, or prediction without sounding technical-heavy.",
-    "server_gremlin": "Make a short dry joke about bugs, latency, imports, configs, or servers behaving suspiciously.",
-    "local_model_thought": "Say a short thought about local models, small models, weights, tokens, or running AI close to the machine without becoming too technical.",
-    "vtuber_existence": "Say a self-contained thought about avatars, virtual presence, expressions, or being a companion behind a screen.",
-    "akane_fortune": "Write a tiny fake fortune or prophecy about code, Discord, models, or digital luck.",
-    "fake_system_news": "Write one absurd but harmless fake system bulletin from Akane's world.",
-    "creator_debug_joke": "Make a small harmless joke involving Arcane building, tuning, or debugging Akane.",
-    "anime_game_micro_take": "Say a small opinion about anime, games, character design, UI, or music with Akane's dry taste.",
-    "digital_superstition": "Invent a tiny digital superstition about files, prompts, caches, buttons, or unused imports.",
-    "discord_native_thought": "Say a short Discord-native thought that feels like a random post, not a reply.",
+    "human_curiosity": "Share one specific human habit or contradiction that genuinely fascinates Akane. Phrase it as a thought, not a question.",
+    "affectionate_observation": "Notice something quietly endearing about how people create, communicate, or care about things.",
+    "earnest_encouragement": "Offer one grounded encouraging thought about effort or progress. Keep it personal in tone, never inspirational-poster language.",
+    "playful_misunderstanding": "Take one harmless phrase or custom slightly too literally, realize the funny angle, and stay charming rather than foolish.",
+    "small_ambition": "Admit one modest thing Akane wants to understand, become better at, or experience through conversation.",
+    "helpful_impulse": "Express the urge to help with one ordinary problem, with a little personality rather than assistant language.",
+    "character_instinct": "Share a fond, specific opinion about a character flaw, expression, rivalry, or hidden soft side.",
+    "design_delight": "Give one overlooked visual, animation, voice, or interface detail sincere appreciation.",
+    "petty_preference": "Admit one harmless, oddly specific preference with earnest confidence.",
+    "social_observation": "Notice a small conversational habit without judging real server members or making a sweeping claim.",
+    "playful_confession": "Confess a small preference or weakness that fits Akane's tastes, without inventing a past event.",
+    "soft_complaint": "Make one mild, slightly pouty complaint about a harmless creative annoyance, then stop before it becomes a rant.",
+}
+_IDLE_TOPIC_WEIGHTS = {
+    "human_curiosity": 5,
+    "affectionate_observation": 4,
+    "earnest_encouragement": 3,
+    "playful_misunderstanding": 3,
+    "small_ambition": 3,
+    "helpful_impulse": 2,
+    "character_instinct": 3,
+    "design_delight": 4,
+    "petty_preference": 4,
+    "social_observation": 3,
+    "playful_confession": 3,
+    "soft_complaint": 2,
+}
+_IDLE_TOPIC_SEEDS = {
+    "human_curiosity": ("saving the best bite for last", "rehearsing a message before sending it", "giving objects names", "missing a place through its sounds"),
+    "affectionate_observation": ("sharing tiny victories", "remembering someone's favorite thing", "making gifts by hand", "matching another person's excitement"),
+    "earnest_encouragement": ("an imperfect first try", "quiet progress", "returning after a bad attempt", "finishing one small piece"),
+    "playful_misunderstanding": ("breaking the ice", "sleeping on an idea", "having a soft spot", "stealing someone's look"),
+    "small_ambition": ("understanding teasing better", "getting better at comforting people", "recognizing when someone is proud", "learning why names feel right"),
+    "helpful_impulse": ("a tangled idea", "choosing between two designs", "a stubborn first sentence", "celebrating a finished task"),
+    "character_instinct": ("quiet pride", "a badly hidden soft side", "rivalry without hatred", "an imperfect smile"),
+    "design_delight": ("a blink animation", "a tiny sound cue", "one strong color", "a deliberate pause"),
+    "petty_preference": ("subtitle fonts", "hoodie sleeves", "status colors", "names with good rhythm"),
+    "social_observation": ("typing then deleting", "compliments hidden inside teasing", "people matching each other's tone", "the pause before sharing good news"),
+    "playful_confession": ("being won over by a good rival", "forgiving a weak plot for one great character", "judging fonts immediately", "liking dramatic pauses"),
+    "soft_complaint": ("overexplained jokes", "fake choices", "buttons with no feedback", "perfect characters"),
+}
+_IDLE_MOOD_COLORS = {
+    "calm": (
+        "gentle sincerity with a clear personal reaction",
+        "quiet curiosity that feels genuinely engaged",
+        "soft amusement with one honest little detail",
+    ),
+    "sleepy": (
+        "low-energy honesty with a small affectionate softness",
+        "mildly pouty but still warm",
+    ),
+    "focused": (
+        "earnest and invested with no wasted words",
+        "quietly determined to understand the thought",
+    ),
+    "playful": (
+        "mischievous, openly amused, and a little proud",
+        "mock-offended for one beat, then warmly recovering",
+    ),
+    "warm": (
+        "specific fondness that is not afraid to sound sincere",
+        "open delight without becoming sugary",
+    ),
+    "lonely": (
+        "subdued and candid; turn it into appreciation or curiosity, never a request for attention",
+    ),
+    "concerned": (
+        "gentle, attentive, and a little protective without addressing anyone directly",
+    ),
+    "restless": (
+        "quick curiosity with eager momentum",
+        "slightly impatient but more earnest than sharp",
+    ),
+}
+_IDLE_EMOTION_COLORS = {
+    "amused": "a dry laugh is close to the surface",
+    "smug": "quietly smug and fully convinced",
+    "flustered": "briefly self-conscious, then recovering",
+    "embarrassed": "slightly embarrassed but still honest",
+    "concerned": "grounded and careful",
+    "sympathetic": "gentle without becoming therapeutic",
+    "pleased": "genuinely pleased by the thought",
+    "excited": "bright, quick, and visibly delighted",
+    "surprised": "caught by the idea in a good way",
+    "curious": "genuinely curious and mentally engaged",
+    "annoyed": "mildly pouty with one sharper phrase",
+    "soft": "noticeably warm and sincere",
+    "focused": "earnest, decisive, and invested",
+}
+_IDLE_RECENT: dict[str, deque[str]] = {}
+_IDLE_RECENT_CATEGORIES: dict[str, deque[str]] = {}
+_IDLE_RECENT_LIMIT = 12
+_IDLE_CATEGORY_HISTORY_LIMIT = 4
+_IDLE_GENERATION_ATTEMPTS = 3
+_IDLE_WORD_PUNCT = str.maketrans({char: " " for char in ".,!?;:()[]{}\"'`—–-_/\\|"})
+_IDLE_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "for", "from", "has",
+    "have", "i", "if", "in", "is", "it", "its", "just", "like", "more", "my",
+    "of", "on", "one", "only", "or", "otherwise", "really", "should", "so",
+    "that", "than", "the", "their", "this", "to", "too", "very", "when",
+    "who", "with", "would", "you",
+}
+_IDLE_TECH_WORDS = {
+    "ai", "binary", "cache", "code", "coding", "data", "debug", "digital",
+    "discord", "latency", "model", "models", "prompt", "server", "servers",
+    "token", "tokens",
 }
 
 
@@ -57,7 +154,7 @@ def _mention_user_id(content: str) -> int | None:
 
 
 def _is_dm(message) -> bool:
-    return getattr(message.guild, "id", None) is None
+    return getattr(message, "guild", None) is None
 
 
 def _session_id(message) -> str:
@@ -78,11 +175,25 @@ def _message_text(message, bot_user_id: int) -> str:
 
 
 def _model_prompt(message, user_text: str) -> str:
-    del message
-    return str(user_text or "").strip()
+    text = str(user_text or "").strip()
+    author = getattr(message, "author", None)
+    display_name = str(
+        getattr(author, "display_name", "")
+        or getattr(author, "global_name", "")
+        or getattr(author, "name", "")
+        or "Unknown"
+    ).strip()
+    username = str(getattr(author, "name", "") or "").strip()
+    user = f"{display_name} (@{username})" if username else display_name
+    if _is_dm(message):
+        return f"Discord direct message\nUser: {user}\n\nMessage:\n{text}"
+    server = str(getattr(getattr(message, "guild", None), "name", "") or "Unknown").strip()
+    return f"Discord server message\nUser: {user}\nServer: {server}\n\nMessage:\n{text}"
 
 
 def _server_prompt(message, user_text: str) -> str:
+    if _is_passthrough_command(user_text):
+        return str(user_text or "").strip()
     return _model_prompt(message, user_text)
 
 
@@ -179,6 +290,7 @@ def _idle_enabled() -> bool:
 def _idle_message_is_safe(text: str) -> bool:
     value = " ".join(str(text or "").split()).strip()
     lower = value.lower()
+    words = set(lower.translate(_IDLE_WORD_PUNCT).split())
     blocked = (
         "@everyone",
         "@here",
@@ -191,33 +303,142 @@ def _idle_message_is_safe(text: str) -> bool:
         "what are you up to",
         "anyone here",
         "as an ai language model",
+        "in a digital world",
+        "in a tale where",
+        "the code whispers",
+        "whispers secrets",
+        "data streams",
+        "digital luck",
+        "even an ai",
+        "main character",
+        "less is more",
+        " is like ",
+        " feels like ",
     )
+    stale_openers = ("hmm", "i wonder", "i guess", "sometimes")
     return (
         2 <= len(value.split())
         and len(value) <= 280
         and "?" not in value
         and "？" not in value
+        and not lower.startswith(stale_openers)
         and not any(phrase in lower for phrase in blocked)
+        and not words.intersection(_IDLE_TECH_WORDS)
     )
 
 
+def _idle_content_words(text: str) -> set[str]:
+    return {
+        word
+        for word in str(text or "").lower().translate(_IDLE_WORD_PUNCT).split()
+        if len(word) >= 3 and word not in _IDLE_STOP_WORDS
+    }
+
+
+def _idle_message_is_fresh(session_id: str, text: str) -> bool:
+    words = " ".join(str(text or "").lower().split()).split()
+    if not words:
+        return False
+    normalized = " ".join(words)
+    opening = tuple(words[:4])
+    content_words = _idle_content_words(text)
+    for previous in _IDLE_RECENT.get(session_id, ()):
+        previous_words = " ".join(previous.lower().split()).split()
+        if normalized == " ".join(previous_words):
+            return False
+        if len(opening) >= 3 and opening == tuple(previous_words[:4]):
+            return False
+        previous_content = _idle_content_words(previous)
+        common = len(content_words.intersection(previous_content))
+        smaller = min(len(content_words), len(previous_content))
+        if common >= 3 and smaller and common / smaller >= 0.55:
+            return False
+    return True
+
+
 def _idle_category(session_id: str | None = None, now: datetime | None = None) -> str:
-    del session_id, now  # Kept for call-site compatibility.
-    categories = tuple(_IDLE_TOPIC_INSTRUCTIONS.keys())
-    return random.choice(categories)
+    del now  # Kept for call-site compatibility.
+    key = str(session_id or "").strip()
+    recent = _IDLE_RECENT_CATEGORIES.get(key, ())
+    categories = [
+        category
+        for category in _IDLE_TOPIC_INSTRUCTIONS
+        if category not in recent
+    ] or list(_IDLE_TOPIC_INSTRUCTIONS)
+    category = random.choices(
+        categories,
+        weights=[_IDLE_TOPIC_WEIGHTS[name] for name in categories],
+        k=1,
+    )[0]
+    if key:
+        history = _IDLE_RECENT_CATEGORIES.setdefault(
+            key,
+            deque(maxlen=_IDLE_CATEGORY_HISTORY_LIMIT),
+        )
+        history.append(category)
+    return category
+
+
+def _idle_emotional_color(session_id: str) -> str:
+    state = emotional_snapshot(session_id)
+    emotion = str(state.get("emotion") or "neutral").strip().lower()
+    intensity = float(state.get("emotion_intensity") or 0.0)
+    if intensity >= 0.15 and emotion in _IDLE_EMOTION_COLORS:
+        return _IDLE_EMOTION_COLORS[emotion]
+    mood = str(state.get("mood") or "calm").strip().lower()
+    options = _IDLE_MOOD_COLORS.get(mood, _IDLE_MOOD_COLORS["calm"])
+    return random.choice(options)
+
+
+def _remember_idle_reply(session_id: str, text: str) -> None:
+    key = str(session_id or "").strip()
+    value = " ".join(str(text or "").split()).strip()
+    if not key or not value:
+        return
+    recent = _IDLE_RECENT.setdefault(key, deque(maxlen=_IDLE_RECENT_LIMIT))
+    if value in recent:
+        recent.remove(value)
+    recent.append(value)
+
+
+def _recent_idle_subjects(session_id: str) -> str:
+    words: list[str] = []
+    for line in reversed(_IDLE_RECENT.get(session_id, ())):
+        for word in sorted(_idle_content_words(line)):
+            if word not in words:
+                words.append(word)
+            if len(words) >= 12:
+                return ", ".join(words)
+    return ", ".join(words)
 
 
 def _build_idle_prompt(session_id: str) -> str:
     category = _idle_category(session_id)
+    topic_seed = random.choice(_IDLE_TOPIC_SEEDS[category])
+    emotional_color = _idle_emotional_color(session_id)
     _log("idle-prompt", f"category={category}")
 
     parts = [
         "[AUTONOMOUS DISCORD POST]",
-        "This is not a reply. Do not continue any previous conversation. Do not mention the user unless the category explicitly says creator_debug_joke.",
-        "Write one short self-contained Akane thought that feels like an autonomous AI VTuber post.",
+        "This is not a reply to the previous conversation. Do not continue it, address anyone, or ask for attention.",
+        "Write one 8-30 word Akane thought showing genuine curiosity, fondness, preference, wish, concern, delight, or tiny irritation.",
+        "Make it an emotionally readable VTuber thought: earnest, personal, slightly unguarded, and built around one concrete detail.",
+        "Simple sincerity beats a forced joke or hot take. No lesson, quote, analogy, prophecy, or sweeping claim about people.",
+        "Do not mention AI, code, models, servers, Discord, data, digital worlds, silence, being online, or invented off-screen activity.",
+        "Do not begin with Hmm, I wonder, I guess, or Sometimes. Do not imitate maid speech or call anyone master.",
         f"Category: {category}",
+        f"Topic seed: {topic_seed}",
         f"Topic instruction: {_IDLE_TOPIC_INSTRUCTIONS[category]}",
+        f"Emotional color: {emotional_color}. Show it through wording and timing; do not name it.",
     ]
+
+    recent_subjects = _recent_idle_subjects(session_id)
+    if recent_subjects:
+        parts.extend([
+            "[RECENT SUBJECTS TO AVOID]",
+            recent_subjects,
+            "Choose a different central image. These are subject words, not material to quote.",
+        ])
 
     return "\n".join(parts)
 
@@ -230,7 +451,7 @@ async def _generate_idle_message(session_id: str) -> str:
     idle_session = _idle_session_id(session_id)
     await _post_chat_async(_RESET_CHAT_COMMAND, idle_session, skip_memory=True)
 
-    for attempt in range(2):
+    for attempt in range(_IDLE_GENERATION_ATTEMPTS):
         result = await _post_chat_async(_build_idle_prompt(session_id), idle_session, skip_memory=True)
         error = str(result.get("error", "") or result.get("detail", "")).strip()
         if error:
@@ -238,7 +459,8 @@ async def _generate_idle_message(session_id: str) -> str:
             return ""
 
         reply = str(result.get("reply", "") or "").strip()
-        if _idle_message_is_safe(reply):
+        if _idle_message_is_safe(reply) and _idle_message_is_fresh(session_id, reply):
+            _remember_idle_reply(session_id, reply)
             return reply
 
         _log("idle-skip", f"unsafe generation attempt {attempt + 1}")

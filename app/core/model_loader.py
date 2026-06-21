@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from app.core.config import (
@@ -180,9 +181,17 @@ class ModelManager:
     def get_model(self):
         return self.llm
 
+    @contextmanager
+    def inference(self):
+        with self._inference_lock:
+            yield self.llm
+
     def unload_local_model(self) -> None:
         with self._load_lock:
             self._llm = None
+        from app.core.generation import clear_static_state
+
+        clear_static_state()
 
     def switch_backend(
         self,
@@ -202,6 +211,9 @@ class ModelManager:
                     self._local_model_path = path
                     self._llm = None
                     self._load_error = None
+                    from app.core.generation import clear_static_state
+
+                    clear_static_state()
         return self.status()
 
     def _completion_kwargs(self, llm, kwargs: dict[str, object]) -> dict[str, object]:

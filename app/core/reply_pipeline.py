@@ -6,6 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 
+from app.core.attention_state import format_attention_for_prompt, preview_attention
 from app.core.config import MAX_TOKENS
 from app.core.emotional_state import tone_line_for_message
 from app.core.generation import (
@@ -19,7 +20,7 @@ from app.core.generation import (
 from app.integrations.vscode_context import code_context_for_message
 
 _MAX_METRICS = 64
-_METRICS: dict[str, dict[str, float | int]] = {}
+_METRICS: dict[str, dict[str, object]] = {}
 _DATE_TIME_MINUTE = -1
 _DATE_TIME_TEXT = ""
 _TIMING_ENABLED = str(os.environ.get("AKANE_TIMING", "")).strip().lower() in {
@@ -41,6 +42,9 @@ class PreparedReply:
     max_tokens: int
     started_at: float
     direct_reply: str = ""
+    attention: dict[str, object] | None = None
+    code_context_requested: bool = False
+    code_context_attached: bool = False
 
 
 def _actual_message(text: str) -> str:
@@ -96,16 +100,29 @@ def prepare_reply(
                 "extension in VS Code and run “Akane Local: Connect to Pi” "
                 "or refresh the workspace context."
             )
+    context_attached = bool(code_context.prompt_text)
+    attention = preview_attention(
+        session,
+        actual_text,
+        code_context_requested=code_context.requested,
+        code_context_attached=context_attached,
+    )
+    tone_line = tone_line_for_message(session, actual_text, attention)
+    attention_line = format_attention_for_prompt(attention)
+    runtime_line = "\n".join(part for part in (tone_line, attention_line) if part)
     return PreparedReply(
         user_text=text,
         model_user_text=model_text,
         actual_user_text=actual_text,
         session_id=session,
-        tone_line=tone_line_for_message(session, actual_text),
+        tone_line=runtime_line,
         date_time_line=_date_time_line(),
         max_tokens=MAX_TOKENS,
         started_at=time.perf_counter() if _TIMING_ENABLED else 0.0,
         direct_reply=direct_reply,
+        attention=attention,
+        code_context_requested=code_context.requested,
+        code_context_attached=context_attached,
     )
 
 
@@ -117,6 +134,7 @@ def _remember_metrics(prepared: PreparedReply, reply: str) -> None:
         "tone_included": 1 if prepared.tone_line else 0,
         "date_time_chars": len(prepared.date_time_line),
         "date_time_included": 1 if prepared.date_time_line else 0,
+        "code_context_attached": 1 if prepared.code_context_attached else 0,
         "updated_at": time.time(),
     }
     if len(_METRICS) > _MAX_METRICS:
@@ -139,15 +157,20 @@ def _commit(prepared: PreparedReply, reply: str) -> None:
         )
         from app.memory_store import remember_exchange
 
-        remember_exchange(prepared.user_text, reply)
+        focus = observe_attention(
+            prepared.session_id,
+            prepared.actual_user_text,
+            code_context_requested=prepared.code_context_requested,
+            code_context_attached=prepared.code_context_attached,
+        )
         observe_user_message(
             prepared.session_id,
             prepared.actual_user_text,
+            attention=focus,
             persist=False,
         )
         observe_assistant_reply(prepared.session_id, reply, persist=False)
-        update_cached_tone_line(prepared.session_id)
-        focus = observe_attention(prepared.session_id, prepared.actual_user_text)
+        update_cached_tone_line(prepared.session_id, focus)
         observe_turn(
             prepared.session_id,
             "user",
@@ -160,6 +183,7 @@ def _commit(prepared: PreparedReply, reply: str) -> None:
             reply,
             focus_state=focus,
         )
+        remember_exchange(prepared.user_text, reply)
         persist_emotion()
     except Exception as exc:
         print(f"[Akane:post] warning={type(exc).__name__}", flush=True)
@@ -267,20 +291,8 @@ def _debug_text(value: object, limit: int) -> str:
     return text[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:") or text[:limit]
 
 
-def _debug_time(value: object) -> str:
-    try:
-        stamp = float(value)
-    except (TypeError, ValueError):
-        return "never"
-    if stamp <= 0:
-        return "never"
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp))
-
-
 def debug_state_report(session_id: str | None) -> str:
     from app.core.attention_state import get_attention_state
-    from app.core.character import prompt_cache_status
-    from app.core.conversation_state import get_conversation_state
     from app.core.emotional_state import (
         get_cached_tone_line as cached_tone_line,
         snapshot as emotion_snapshot,
@@ -290,67 +302,24 @@ def debug_state_report(session_id: str | None) -> str:
     mood = emotion_snapshot(session)
     tone_line = cached_tone_line(session)
     focus = get_attention_state(session)
-    conversation = get_conversation_state(session)
     metrics = _METRICS.get(session, {})
-    text_cache = prompt_cache_status(include_memory=False)
-    state_cache = prefix_cache_status()
-    variables = mood.get("variables") if isinstance(mood.get("variables"), dict) else {}
-
+    changes = mood.get("top_changes") if isinstance(mood.get("top_changes"), list) else []
+    changed_text = ", ".join(
+        f"{item.get('name')} {float(item.get('delta') or 0):+.2f}"
+        for item in changes
+        if isinstance(item, dict) and item.get("name")
+    ) or "none"
     lines = [
         "Akane debug state",
-        "",
-        "Mood:",
-        f"- mood: {mood.get('mood', 'calm')} ({float(mood.get('mood_intensity') or 0):.2f})",
-        f"- emotion: {mood.get('emotion', 'neutral')} ({float(mood.get('emotion_intensity') or 0):.2f})",
-        f"- turns: {int(mood.get('emotion_turns') or 0)}",
-        f"- cached tone: {_debug_text(tone_line, 140) or 'none'}",
-        f"- last update: {_debug_time(mood.get('last_emotion_update_at'))}",
+        f"- primary mood: {mood.get('primary_mood', 'calm')} ({float(mood.get('mood_intensity') or 0):.2f})",
+        f"- secondary: {mood.get('secondary_emotion', 'curious')}",
+        f"- top changes: {changed_text}",
+        f"- trigger: {_debug_text(mood.get('trigger'), 40) or 'none'}",
+        f"- attention: {_debug_text((focus or {}).get('topic'), 80) or 'none'}",
+        f"- intent: {_debug_text((focus or {}).get('intent'), 30) or 'none'}",
+        f"- tone: {_debug_text(tone_line, 200) or 'none'}",
+        f"- code context attached: {'yes' if int(metrics.get('code_context_attached') or 0) else 'no'}",
     ]
-    for name in (
-        "energy",
-        "social",
-        "focus",
-        "comfort",
-        "stimulation",
-        "tension",
-        "playfulness",
-        "affection",
-    ):
-        lines.append(f"- {name}: {float(variables.get(name) or 0):.2f}")
-
-    lines.extend(["", "Focus:"])
-    if focus:
-        lines.append(f"- topic: {_debug_text(focus.get('topic'), 80)}")
-        lines.append(f"- summary: {_debug_text(focus.get('summary'), 160)}")
-    else:
-        lines.append("- No active focus.")
-
-    lines.extend(["", "Context:"])
-    if conversation:
-        lines.append(f"- summary: {_debug_text(conversation.get('summary'), 160)}")
-        lines.append(
-            f"- last user: {_debug_text(conversation.get('last_user_summary'), 160)}"
-        )
-        lines.append(
-            "- last assistant: "
-            + _debug_text(conversation.get("last_assistant_summary"), 160)
-        )
-        lines.append(f"- recent turns: {len(conversation.get('recent_turns') or [])}")
-    else:
-        lines.append("- No recent conversation context.")
-
-    lines.extend(
-        [
-            "",
-            "Prompt:",
-            f"- last user chars: {int(metrics.get('user_chars') or 0)}",
-            f"- last reply chars: {int(metrics.get('reply_chars') or 0)}",
-            f"- tone line in last prompt: {'yes' if int(metrics.get('tone_included') or 0) else 'no'}",
-            f"- date/time in last prompt: {'yes' if int(metrics.get('date_time_included') or 0) else 'no'}",
-            f"- static prompt cache: base={text_cache['base_prompt']} soul={text_cache['soul']} identity={text_cache['identity']}",
-            f"- static state cache: {state_cache['status']} ({int(state_cache['tokens'] or 0)} tokens, hash={state_cache['hash'] or 'none'})",
-        ]
-    )
     return "\n".join(lines)
 
 

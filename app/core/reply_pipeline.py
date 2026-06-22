@@ -45,6 +45,7 @@ class PreparedReply:
     attention: dict[str, object] | None = None
     code_context_requested: bool = False
     code_context_attached: bool = False
+    prompt_seconds: float = 0.0
 
 
 def _actual_message(text: str) -> str:
@@ -81,6 +82,7 @@ def prepare_reply(
     skip_memory: bool = False,
 ) -> PreparedReply:
     del skip_memory
+    started_at = time.perf_counter() if _TIMING_ENABLED else 0.0
     text = str(user_text or "").strip()
     if not text:
         raise ValueError("Message is empty.")
@@ -118,11 +120,12 @@ def prepare_reply(
         tone_line=runtime_line,
         date_time_line=_date_time_line(),
         max_tokens=MAX_TOKENS,
-        started_at=time.perf_counter() if _TIMING_ENABLED else 0.0,
+        started_at=started_at,
         direct_reply=direct_reply,
         attention=attention,
         code_context_requested=code_context.requested,
         code_context_attached=context_attached,
+        prompt_seconds=(time.perf_counter() - started_at) if _TIMING_ENABLED else 0.0,
     )
 
 
@@ -194,7 +197,13 @@ def _clean_reply_for_delivery(text: str) -> str:
     return clean_visible_text(text).lstrip()
 
 
-def _timing_log(prepared: PreparedReply, reply: str, *, first_delta: float = 0.0) -> None:
+def _timing_log(
+    prepared: PreparedReply,
+    reply: str,
+    *,
+    model_started_at: float,
+    first_delta: float = 0.0,
+) -> None:
     if not _TIMING_ENABLED:
         return
     done = time.perf_counter()
@@ -202,6 +211,9 @@ def _timing_log(prepared: PreparedReply, reply: str, *, first_delta: float = 0.0
     fields = [
         "[Akane:timing]",
         f"total={done - prepared.started_at:.3f}s",
+        f"prompt={prepared.prompt_seconds:.3f}s",
+        f"to_model={model_started_at - prepared.started_at:.3f}s",
+        f"generation={done - model_started_at:.3f}s",
         f"cache={cache['status']}",
         f"static_prompt_tokens={int(cache['tokens'] or 0)}",
         f"dynamic_prompt_chars={int(cache['dynamic_chars'] or 0)}",
@@ -211,7 +223,7 @@ def _timing_log(prepared: PreparedReply, reply: str, *, first_delta: float = 0.0
         f"output_chars={len(reply)}",
     ]
     if first_delta:
-        fields.insert(1, f"first_delta={first_delta - prepared.started_at:.3f}s")
+        fields.insert(1, f"first_token={first_delta - prepared.started_at:.3f}s")
     print(" ".join(fields), flush=True)
 
 
@@ -220,6 +232,7 @@ def generate_reply(prepared: PreparedReply) -> str:
         reply = prepared.direct_reply
         _commit(prepared, reply)
         return reply
+    model_started_at = time.perf_counter() if _TIMING_ENABLED else 0.0
     raw = completion_text(
         prepared.model_user_text,
         max_tokens=prepared.max_tokens,
@@ -229,7 +242,7 @@ def generate_reply(prepared: PreparedReply) -> str:
     reply = _clean_reply_for_delivery(raw)
     if not reply:
         raise RuntimeError("Model returned no visible reply.")
-    _timing_log(prepared, reply)
+    _timing_log(prepared, reply, model_started_at=model_started_at)
     _commit(prepared, reply)
     return reply
 
@@ -244,10 +257,11 @@ def stream_reply(prepared: PreparedReply):
             _commit(prepared, reply)
         return
 
-    raw_parts: list[str] = []
+    visible_parts: list[str] = []
     hidden = HiddenTagStreamFilter()
     started_visible = False
     first_delta = 0.0
+    model_started_at = time.perf_counter() if _TIMING_ENABLED else 0.0
 
     for text in stream_completion(
         prepared.model_user_text,
@@ -255,7 +269,6 @@ def stream_reply(prepared: PreparedReply):
         tone_line=prepared.tone_line,
         date_time_line=prepared.date_time_line,
     ):
-        raw_parts.append(text)
         visible = hidden.feed(text)
         if not started_visible:
             visible = visible.lstrip()
@@ -263,6 +276,9 @@ def stream_reply(prepared: PreparedReply):
                 continue
             started_visible = True
             first_delta = time.perf_counter()
+        if not visible:
+            continue
+        visible_parts.append(visible)
         yield "delta", visible
 
     tail = hidden.flush()
@@ -272,12 +288,18 @@ def stream_reply(prepared: PreparedReply):
             started_visible = True
             first_delta = time.perf_counter()
     if tail:
+        visible_parts.append(tail)
         yield "delta", tail
 
-    reply = _clean_reply_for_delivery("".join(raw_parts))
+    reply = _clean_reply_for_delivery("".join(visible_parts))
     if not reply:
         raise RuntimeError("Model returned no visible reply.")
-    _timing_log(prepared, reply, first_delta=first_delta)
+    _timing_log(
+        prepared,
+        reply,
+        model_started_at=model_started_at,
+        first_delta=first_delta,
+    )
     try:
         yield "done", reply
     finally:
@@ -324,7 +346,11 @@ def debug_state_report(session_id: str | None) -> str:
 
 
 def warm_caches() -> None:
+    warm_prompt_cache()
+    warm_static_state()
+
+
+def warm_prompt_cache() -> None:
     from app.core.character import get_static_system_prompt
 
     get_static_system_prompt(include_memory=False)
-    warm_static_state()

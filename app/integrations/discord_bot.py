@@ -573,7 +573,7 @@ def run_discord_bot() -> None:
             return
 
         scope = _session_id(message)
-        _log("user", f"{message.author} ({scope}): {prompt}")
+        _log("ingress", f"session={scope} chars={len(prompt)}")
 
         model_prompt = _server_prompt(message, prompt)
 
@@ -590,7 +590,7 @@ def run_discord_bot() -> None:
         if not output:
             return
 
-        _log("done", output)
+        _log("complete", f"session={scope} reply_chars={len(output)}")
         await _send_reply(message, output)
 
     client.run(DISCORD_BOT_TOKEN)

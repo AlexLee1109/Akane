@@ -27,6 +27,7 @@ from app.core.reply_pipeline import (
     prepare_reply,
     stream_reply,
     warm_caches,
+    warm_prompt_cache,
 )
 from app.core.emotional_state import snapshot as emotional_snapshot
 from app.memory_store import (
@@ -184,18 +185,18 @@ def _generate_reply(
     skip_memory: bool = False,
     session_id: str | None = None,
 ) -> str:
+    session = _normalize_session_id(session_id)
+    _log("ingress", f"session={session} stream=0 chars={len(user_input)}")
     try:
+        _start_model_loading()
         prepared = prepare_reply(user_input, skip_memory=skip_memory, session_id=session_id)
-        if not prepared.direct_reply:
-            _start_model_loading()
         reply = generate_reply(prepared)
-    except Exception:
-        _log("user", user_input)
+    except Exception as exc:
+        _log("error", f"session={session} type={type(exc).__name__}")
         raise
-    _log("user", user_input)
     _append_message("user", user_input, session_id)
     _append_message("assistant", reply, session_id)
-    _log("done", reply)
+    _log("complete", f"session={session} reply_chars={len(reply)}")
     return reply
 
 
@@ -205,23 +206,22 @@ def _stream_chat_events(
     skip_memory: bool = False,
     session_id: str | None = None,
 ):
+    session = _normalize_session_id(session_id)
+    _log("ingress", f"session={session} stream=1 chars={len(text)}")
     try:
+        _start_model_loading()
         prepared = prepare_reply(text, skip_memory=skip_memory, session_id=session_id)
-        if not prepared.direct_reply:
-            _start_model_loading()
         yield _json_line({"type": "start", "messages": _state_messages_with_user(session_id, text)})
         for event_type, content in stream_reply(prepared):
             if event_type == "delta":
                 yield _json_line({"type": "delta", "content": content, "append": True})
                 continue
-            _log("user", text)
             _append_message("user", text, session_id)
             _append_message("assistant", content, session_id)
-            _log("done", content)
+            _log("complete", f"session={session} reply_chars={len(content)}")
             yield _json_line({"type": "done", "reply": content, "messages": _state_messages(session_id)})
     except Exception as exc:
-        _log("user", text)
-        _log("error", str(exc))
+        _log("error", f"session={session} type={type(exc).__name__}")
         yield _json_line({"type": "error", "error": str(exc)})
 
 
@@ -269,6 +269,8 @@ def _app_state_payload(session_id: str | None = None, *, include_messages: bool 
 
 
 def _start_model_loading(*, warm_character: bool = True) -> None:
+    if warm_character:
+        warm_prompt_cache()
     manager = ModelManager.get_instance()
     status = manager.status()
     if status["loading"] or status["loaded"]:

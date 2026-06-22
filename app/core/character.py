@@ -142,11 +142,11 @@ def prompt_cache_status(include_memory: bool = True) -> dict[str, str]:
 
 
 def _base_system_prompt(*, include_memory: bool) -> str:
-    _refresh_prompt_files()
     cached = _BASE_PROMPT_CACHE.get(include_memory)
     if cached is not None:
         return cached
 
+    _refresh_prompt_files()
     runtime_rules = _runtime_rules()
     soul = "[AKANE SOUL / VOICE]\n" + _soul_body()
     identity = "[AKANE IDENTITY]\n" + _identity_body()

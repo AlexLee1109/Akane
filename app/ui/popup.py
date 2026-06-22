@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlencode, urljoin
@@ -38,9 +39,17 @@ WINDOW_TITLES = {
 }
 AVATAR_IMAGE_PATH = IMAGES_DIR / "Vtuber_model.png"
 AVATAR_BOUNDS_WH = (333, 1334)
+_TIMING_ENABLED = str(os.environ.get("AKANE_TIMING", "")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _log_popup_timing(**values: float | int) -> None:
+    if not _TIMING_ENABLED:
+        return
     parts = []
     for key, value in values.items():
         if isinstance(value, float):

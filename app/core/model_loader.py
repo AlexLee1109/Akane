@@ -99,6 +99,7 @@ class ModelManager:
         self._llm = None
         self._loading = False
         self._load_error: Exception | None = None
+        self._chat_capabilities: tuple[int, bool, bool] | None = None
         self._load_lock = threading.RLock()
         self._inference_lock = threading.Lock()
 
@@ -189,6 +190,7 @@ class ModelManager:
     def unload_local_model(self) -> None:
         with self._load_lock:
             self._llm = None
+            self._chat_capabilities = None
         from app.core.generation import clear_static_state
 
         clear_static_state()
@@ -211,16 +213,28 @@ class ModelManager:
                     self._local_model_path = path
                     self._llm = None
                     self._load_error = None
+                    self._chat_capabilities = None
                     from app.core.generation import clear_static_state
 
                     clear_static_state()
         return self.status()
 
+    def _capabilities(self, llm) -> tuple[bool, bool]:
+        model_id = id(llm)
+        cached = self._chat_capabilities
+        if cached is not None and cached[0] == model_id:
+            return cached[1], cached[2]
+        is_qwen = _is_qwen_model(llm, self._local_model_path)
+        supports_template_kwargs = is_qwen and _supports_chat_template_kwargs(llm)
+        self._chat_capabilities = (model_id, is_qwen, supports_template_kwargs)
+        return is_qwen, supports_template_kwargs
+
     def _completion_kwargs(self, llm, kwargs: dict[str, object]) -> dict[str, object]:
-        if not _is_qwen_model(llm, self._local_model_path):
+        is_qwen, supports_template_kwargs = self._capabilities(llm)
+        if not is_qwen:
             return kwargs
         updated = dict(kwargs)
-        if _supports_chat_template_kwargs(llm):
+        if supports_template_kwargs:
             updated["chat_template_kwargs"] = dict(_NO_THINK_TEMPLATE_KWARGS)
         else:
             updated["messages"] = _messages_with_no_think(updated.get("messages"))

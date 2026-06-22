@@ -323,7 +323,7 @@ def _cached_request(
         "dynamic_chars": len(suffix),
     })
     return llm.create_completion(
-        prompt=[*_PREFIX["tokens"], *dynamic_tokens],
+        prompt=_PREFIX["tokens"] + dynamic_tokens,
         stop=["<|im_end|>"],
         **_completion_kwargs(max_tokens, stream),
     )

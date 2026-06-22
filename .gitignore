@@ -16,3 +16,4 @@ models/
 logs/
 static/
 hellaswag/
+app/secrets/local_secrets.py

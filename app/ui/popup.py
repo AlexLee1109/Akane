@@ -249,7 +249,12 @@ class PopupApp:
 
     def _remote_stream_lines(self, message: str, session_id: str):
         payload = json.dumps(
-            {"message": message, "session_id": session_id, "skip_memory": False},
+            {
+                "message": message,
+                "session_id": session_id,
+                "source": "popup",
+                "skip_memory": False,
+            },
             ensure_ascii=False,
         ).encode("utf-8")
         request = urllib.request.Request(

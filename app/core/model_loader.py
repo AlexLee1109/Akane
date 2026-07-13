@@ -1,13 +1,15 @@
-"""Singleton llama.cpp model loader."""
+"""Singleton llama.cpp model lifecycle and inference runtime."""
 
 from __future__ import annotations
 
 import inspect
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
 from app.core.config import (
+    GENERATION_STOP_SEQUENCES,
     LLAMA_BATCH_SIZE,
     LLAMA_CONTEXT_WINDOW,
     LLAMA_FLASH_ATTN,
@@ -20,12 +22,24 @@ from app.core.config import (
     LLAMA_UBATCH_SIZE,
     LLAMA_USE_MLOCK,
     LLAMA_USE_MMAP,
+    MAX_TOKENS,
+    MIN_P,
     MODEL_PATH,
+    REPETITION_PENALTY,
+    TEMPERATURE,
+    TOP_K,
+    TOP_P,
 )
 
-_NO_THINK_DIRECTIVE = "/no_think"
-_NO_THINK_ALIASES = ("/no_think", "/nothink")
-_NO_THINK_TEMPLATE_KWARGS = {"enable_thinking": False}
+_THINKING_OFF_TEMPLATE_KWARGS = {"enable_thinking": False}
+
+
+class InferenceCancelled(RuntimeError):
+    pass
+
+
+class InferenceQueueTimeout(RuntimeError):
+    pass
 
 
 def content_to_text(content) -> str:
@@ -41,12 +55,45 @@ def content_to_text(content) -> str:
     return str(content)
 
 
-def _is_qwen_model(llm, model_path: Path) -> bool:
-    values = [str(model_path)]
+def completion_kwargs(max_tokens: int, stream: bool) -> dict[str, object]:
+    options: dict[str, object] = {
+        "max_tokens": max(1, min(int(max_tokens), MAX_TOKENS)),
+        "temperature": TEMPERATURE,
+        "top_k": TOP_K,
+        "top_p": TOP_P,
+        "min_p": MIN_P,
+        "repeat_penalty": REPETITION_PENALTY,
+        "stream": stream,
+    }
+    if GENERATION_STOP_SEQUENCES:
+        options["stop"] = list(GENERATION_STOP_SEQUENCES)
+    return options
+
+
+def _model_identifier_text(llm, model_path: Path) -> str:
+    values = [str(model_path), str(getattr(llm, "model_path", ""))]
     metadata = getattr(llm, "metadata", {}) or {}
     if isinstance(metadata, dict):
         values.extend(str(value) for value in metadata.values())
-    return any("qwen" in value.lower() for value in values)
+    return " ".join(values).lower()
+
+
+def _compact_text(*values: object) -> str:
+    return "".join(char for value in values for char in str(value).lower() if char.isalnum())
+
+
+def _is_gemma_model(llm, model_path: Path) -> bool:
+    return "gemma" in _compact_text(_model_identifier_text(llm, model_path))
+
+
+def _has_embedded_chat_template(llm) -> bool:
+    metadata = getattr(llm, "metadata", {}) or {}
+    if not isinstance(metadata, dict):
+        return False
+    for key in ("tokenizer.chat_template", "tokenizer.ggml.chat_template"):
+        if str(metadata.get(key) or "").strip():
+            return True
+    return False
 
 
 def _supports_chat_template_kwargs(llm) -> bool:
@@ -54,40 +101,20 @@ def _supports_chat_template_kwargs(llm) -> bool:
         parameters = inspect.signature(llm.create_chat_completion).parameters
     except (TypeError, ValueError):
         return False
-    return "chat_template_kwargs" in parameters
+    return "chat_template_kwargs" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
-def _has_no_think_directive(content) -> bool:
-    text = content_to_text(content).lower()
-    return any(alias in text for alias in _NO_THINK_ALIASES)
-
-
-def _content_with_no_think(content):
-    if _has_no_think_directive(content):
-        return content
-    if isinstance(content, str):
-        value = content.rstrip()
-        return f"{value}\n\n{_NO_THINK_DIRECTIVE}" if value else _NO_THINK_DIRECTIVE
-    if isinstance(content, list):
-        return [*content, {"type": "text", "text": f"\n{_NO_THINK_DIRECTIVE}"}]
-    value = str(content or "").rstrip()
-    return f"{value}\n\n{_NO_THINK_DIRECTIVE}" if value else _NO_THINK_DIRECTIVE
-
-
-def _messages_with_no_think(messages):
-    if not isinstance(messages, list):
-        return messages
-    copied = [dict(message) if isinstance(message, dict) else message for message in messages]
-    for index in range(len(copied) - 1, -1, -1):
-        message = copied[index]
-        if isinstance(message, dict) and message.get("role") == "user":
-            message["content"] = _content_with_no_think(message.get("content"))
-            return copied
-    for index, message in enumerate(copied):
-        if isinstance(message, dict) and message.get("role") == "system":
-            message["content"] = _content_with_no_think(message.get("content"))
-            return copied
-    return [{"role": "system", "content": _NO_THINK_DIRECTIVE}, *copied]
+def _friendly_load_error(exc: Exception, model_path: Path) -> Exception:
+    message = str(exc).lower()
+    if "unknown model architecture" in message and "gemma" in _compact_text(message, model_path):
+        return RuntimeError(
+            "Installed llama-cpp-python does not support this Gemma model. "
+            "Upgrade llama-cpp-python to a build with Gemma 4 support."
+        )
+    return exc
 
 
 class ModelManager:
@@ -99,7 +126,6 @@ class ModelManager:
         self._llm = None
         self._loading = False
         self._load_error: Exception | None = None
-        self._chat_capabilities: tuple[int, bool, bool] | None = None
         self._load_lock = threading.RLock()
         self._inference_lock = threading.Lock()
 
@@ -162,12 +188,25 @@ class ModelManager:
                     f"n_ctx={kwargs['n_ctx']} n_batch={kwargs['n_batch']} n_ubatch={kwargs['n_ubatch']}",
                     flush=True,
                 )
-                self._llm = Llama(**kwargs)
+                llm = Llama(**kwargs)
+                self._validate_loaded_model(llm)
+                self._llm = llm
             except Exception as exc:
-                self._load_error = exc
-                raise
+                self._llm = None
+                error = _friendly_load_error(exc, self._local_model_path)
+                self._load_error = error
+                if error is exc:
+                    raise
+                raise error from exc
             finally:
                 self._loading = False
+
+    def _validate_loaded_model(self, llm) -> None:
+        if _is_gemma_model(llm, self._local_model_path) and not _has_embedded_chat_template(llm):
+            raise RuntimeError(
+                "Gemma GGUF is missing tokenizer.chat_template; use an instruction-tuned "
+                "Gemma 4/E4B IT GGUF with the embedded chat template."
+            )
 
     @property
     def llm(self):
@@ -176,68 +215,31 @@ class ModelManager:
         self.ensure_loaded()
         return self._llm
 
-    def load_model(self):
-        return self.llm
-
-    def get_model(self):
-        return self.llm
-
     @contextmanager
-    def inference(self):
-        with self._inference_lock:
-            yield self.llm
-
-    def unload_local_model(self) -> None:
-        with self._load_lock:
-            self._llm = None
-            self._chat_capabilities = None
-        from app.core.generation import clear_static_state
-
-        clear_static_state()
-
-    def switch_backend(
+    def inference(
         self,
-        backend: str = "llama_cpp",
-        *,
-        local_model_path: str | None = None,
-    ) -> dict[str, object]:
-        if str(backend or "llama_cpp").strip().lower() != "llama_cpp":
-            raise ValueError("Only the 'llama_cpp' backend is available.")
-        if local_model_path is not None:
-            value = str(local_model_path).strip()
-            if not value:
-                raise ValueError("Local model path cannot be empty.")
-            path = Path(value)
-            with self._load_lock:
-                if path != self._local_model_path:
-                    self._local_model_path = path
-                    self._llm = None
-                    self._load_error = None
-                    self._chat_capabilities = None
-                    from app.core.generation import clear_static_state
-
-                    clear_static_state()
-        return self.status()
-
-    def _capabilities(self, llm) -> tuple[bool, bool]:
-        model_id = id(llm)
-        cached = self._chat_capabilities
-        if cached is not None and cached[0] == model_id:
-            return cached[1], cached[2]
-        is_qwen = _is_qwen_model(llm, self._local_model_path)
-        supports_template_kwargs = is_qwen and _supports_chat_template_kwargs(llm)
-        self._chat_capabilities = (model_id, is_qwen, supports_template_kwargs)
-        return is_qwen, supports_template_kwargs
+        cancellation: threading.Event | None = None,
+        queue_deadline: float | None = None,
+    ):
+        while not self._inference_lock.acquire(timeout=0.1):
+            if cancellation is not None and cancellation.is_set():
+                raise InferenceCancelled("Generation was cancelled before inference.")
+            if queue_deadline is not None and time.monotonic() >= queue_deadline:
+                raise InferenceQueueTimeout("Generation timed out while waiting for the model.")
+        try:
+            if cancellation is not None and cancellation.is_set():
+                raise InferenceCancelled("Generation was cancelled before inference.")
+            yield self.llm
+        finally:
+            self._inference_lock.release()
 
     def _completion_kwargs(self, llm, kwargs: dict[str, object]) -> dict[str, object]:
-        is_qwen, supports_template_kwargs = self._capabilities(llm)
-        if not is_qwen:
+        if not _is_gemma_model(llm, self._local_model_path) or not _supports_chat_template_kwargs(llm):
             return kwargs
         updated = dict(kwargs)
-        if supports_template_kwargs:
-            updated["chat_template_kwargs"] = dict(_NO_THINK_TEMPLATE_KWARGS)
-        else:
-            updated["messages"] = _messages_with_no_think(updated.get("messages"))
+        template_kwargs = dict(updated.get("chat_template_kwargs") or {})
+        template_kwargs.update(_THINKING_OFF_TEMPLATE_KWARGS)
+        updated["chat_template_kwargs"] = template_kwargs
         return updated
 
     def create_chat_completion(
@@ -248,32 +250,83 @@ class ModelManager:
         temperature,
         top_k=None,
         top_p=None,
+        min_p=None,
         repeat_penalty=None,
+        stop=None,
         stream=False,
-        role: str = "main",
-        response_format=None,
-        timeout: float | None = None,
+        cancellation: threading.Event | None = None,
+        queue_deadline: float | None = None,
     ):
-        del role, timeout
         kwargs = {
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p,
+            "min_p": min_p,
             "repeat_penalty": repeat_penalty,
             "stream": stream,
         }
-        if response_format is not None:
-            kwargs["response_format"] = response_format
+        if stop:
+            kwargs["stop"] = stop
         if not stream:
-            with self._inference_lock:
-                llm = self.llm
+            with self.inference(cancellation, queue_deadline) as llm:
                 return llm.create_chat_completion(**self._completion_kwargs(llm, kwargs))
 
         def wrapped():
-            with self._inference_lock:
-                llm = self.llm
+            with self.inference(cancellation, queue_deadline) as llm:
                 yield from llm.create_chat_completion(**self._completion_kwargs(llm, kwargs))
 
         return wrapped()
+
+    def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int,
+        cancellation: threading.Event | None = None,
+        queue_deadline: float | None = None,
+    ) -> str:
+        result = self.create_chat_completion(
+            messages=messages,
+            cancellation=cancellation,
+            queue_deadline=queue_deadline,
+            **completion_kwargs(max_tokens, False),
+        )
+        choices = result.get("choices") or []
+        if not choices:
+            return ""
+        choice = choices[0]
+        return content_to_text(choice.get("text") or (choice.get("message") or {}).get("content"))
+
+    def stream(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int,
+        cancellation: threading.Event | None = None,
+        queue_deadline: float | None = None,
+    ):
+        response = self.create_chat_completion(
+            messages=messages,
+            cancellation=cancellation,
+            queue_deadline=queue_deadline,
+            **completion_kwargs(max_tokens, True),
+        )
+        try:
+            for chunk in response:
+                if cancellation is not None and cancellation.is_set():
+                    return
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                text = content_to_text(
+                    choice.get("text") or (choice.get("delta") or {}).get("content")
+                )
+                if text:
+                    yield text
+        finally:
+            close = getattr(response, "close", None)
+            if close is not None:
+                close()

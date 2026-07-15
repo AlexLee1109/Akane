@@ -1,4 +1,7 @@
-"""Deterministic, profile-scoped emotional continuity for Akane."""
+"""Legacy emotional-state API retained for compatibility outside the chat runtime.
+
+The active runtime persists ``signal.EmotionState`` through ``LongTermMemoryStore``.
+"""
 
 from __future__ import annotations
 
@@ -6,47 +9,52 @@ import threading
 import time
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
+from typing import Iterable
 
 from app.core.config import EMOTION_STATE_PATH
 from app.core.persistence import atomic_write_json, read_json
 from app.core.signal import TurnSignal, topic_overlap
 from app.core.utils import clamp, compact_text
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 3
 _MAX_PROFILES = 128
-_BASELINE = {
-    "valence": 0.56,
-    "arousal": 0.44,
-    "warmth": 0.58,
-    "social_ease": 0.62,
-    "irritation": 0.08,
-    "curiosity": 0.58,
-    "familiarity": 0.22,
-}
-_CONTINUOUS_FIELDS = tuple(_BASELINE)
+_NEUTRAL_ENERGY = 0.5
+
+
+@dataclass(frozen=True, slots=True)
+class _Reaction:
+    primary: str
+    secondary: str | None
+    intensity: float
+    valence: float
+    energy: float
+    confidence: float
+    cause: str
 
 
 @dataclass(slots=True)
 class AkaneState:
+    """A reaction with continuity, not a personality mode or response template."""
+
     schema_version: int = STATE_SCHEMA_VERSION
-    valence: float = _BASELINE["valence"]
-    arousal: float = _BASELINE["arousal"]
-    warmth: float = _BASELINE["warmth"]
-    social_ease: float = _BASELINE["social_ease"]
-    irritation: float = _BASELINE["irritation"]
-    curiosity: float = _BASELINE["curiosity"]
-    familiarity: float = _BASELINE["familiarity"]
-    recent_intent: str = "casual"
-    recent_tone: str = "neutral"
+    primary: str | None = None
+    secondary: str | None = None
+    intensity: float = 0.0
+    valence: float = 0.0
+    energy: float = _NEUTRAL_ENERGY
+    confidence: float = 0.0
+    cause: str | None = None
+    momentum: float = 0.0
     recent_topic: str = ""
-    transition_reason: str = "baseline"
-    inner_impulse: str = "remain attentive and contribute a perspective of her own"
+    turns_since_cause: int = 0
     updated_at: float = 0.0
 
     @classmethod
     def from_dict(cls, payload: object) -> "AkaneState":
         if not isinstance(payload, dict):
             return cls()
+        if any(name in payload for name in ("warmth", "playfulness", "concern", "irritation")):
+            return _migrate_delivery_state(payload)
         valid_names = {item.name for item in fields(cls)}
         values = {key: value for key, value in payload.items() if key in valid_names}
         try:
@@ -54,247 +62,229 @@ class AkaneState:
         except (TypeError, ValueError):
             return cls()
         state.schema_version = STATE_SCHEMA_VERSION
-        for name in _CONTINUOUS_FIELDS:
-            setattr(state, name, clamp(getattr(state, name), _BASELINE[name]))
-        state.recent_intent = compact_text(state.recent_intent, 32) or "casual"
-        state.recent_tone = compact_text(state.recent_tone, 32) or "neutral"
+        state.primary = compact_text(state.primary, 24).lower() or None
+        state.secondary = compact_text(state.secondary, 24).lower() or None
+        if state.secondary == state.primary:
+            state.secondary = None
+        state.intensity = clamp(state.intensity)
+        state.valence = clamp(state.valence, 0.0, -1.0, 1.0)
+        state.energy = clamp(state.energy, _NEUTRAL_ENERGY)
+        state.confidence = clamp(state.confidence)
+        state.cause = compact_text(state.cause, 100) or None
+        state.momentum = clamp(state.momentum)
         state.recent_topic = compact_text(state.recent_topic, 80)
-        state.transition_reason = compact_text(state.transition_reason, 80) or "loaded"
-        state.inner_impulse = (
-            compact_text(state.inner_impulse, 140)
-            or "remain attentive and contribute a perspective of her own"
-        )
         try:
+            state.turns_since_cause = max(0, int(state.turns_since_cause))
             state.updated_at = max(0.0, float(state.updated_at))
         except (TypeError, ValueError):
+            state.turns_since_cause = 0
             state.updated_at = 0.0
+        state._clear_if_faint()
         return state
 
-    def preview(self, signal: TurnSignal, *, now: float | None = None) -> "AkaneState":
+    def preview(
+        self,
+        signal: TurnSignal,
+        *,
+        recent_turns: Iterable[object] = (),
+        now: float | None = None,
+    ) -> "AkaneState":
         candidate = replace(self)
-        candidate.update(signal, now=now)
+        candidate.update(signal, recent_turns=recent_turns, now=now)
         return candidate
 
-    def update(self, signal: TurnSignal, *, now: float | None = None) -> None:
+    def decayed(self, *, now: float | None = None) -> "AkaneState":
+        candidate = replace(self)
+        candidate._decay_for_time(time.time() if now is None else float(now))
+        candidate._clear_if_faint()
+        return candidate
+
+    def update(
+        self,
+        signal: TurnSignal,
+        *,
+        recent_turns: Iterable[object] = (),
+        now: float | None = None,
+    ) -> None:
         current = time.time() if now is None else float(now)
-        previous_topic = self.recent_topic
-        topic_continuity = topic_overlap(previous_topic, signal.topic)
-        topic_is_new = bool(
-            signal.topic
-            and not signal.low_content
-            and (not previous_topic or topic_continuity < 0.35)
-        )
-        self._decay(current)
-        self.recent_intent = signal.intent
-        self.recent_tone = signal.tone
+        self._decay_for_time(current)
+        continuity = _conversation_continuity(signal, recent_turns, self.recent_topic)
+        reaction = _reaction_from_signal(signal)
+        if reaction is None:
+            self._soften(0.84 if continuity else 0.62)
+            self.turns_since_cause += 1
+        else:
+            self._apply_reaction(reaction, continuity=continuity)
+            self.turns_since_cause = 0
         self.recent_topic = compact_text(signal.topic, 80)
-
-        if topic_is_new:
-            self._nudge("curiosity", 0.032)
-            self._nudge("arousal", 0.012)
-            self._nudge("valence", 0.008)
-        elif topic_continuity >= 0.50 and not signal.low_content:
-            self._nudge("warmth", 0.008)
-            self._nudge("social_ease", 0.008)
-            self._nudge("familiarity", 0.006)
-
-        if signal.technical:
-            self._nudge("arousal", 0.025)
-            self._nudge("curiosity", 0.035)
-            self._toward("warmth", 0.54, 0.08)
-        if signal.sadness:
-            self._nudge("warmth", 0.025)
-            self._nudge("arousal", -0.025)
-            self._nudge("social_ease", -0.01)
-        if signal.praise:
-            self._nudge("valence", 0.045)
-            self._nudge("warmth", 0.035)
-            self._nudge("social_ease", 0.025)
-            self._nudge("familiarity", 0.012)
-        elif signal.friendliness:
-            self._nudge("valence", 0.018)
-            self._nudge("warmth", 0.018)
-            self._nudge("familiarity", 0.008)
-        if signal.teasing:
-            self._nudge("arousal", 0.03)
-            self._nudge("curiosity", 0.015)
-            self._nudge("warmth", 0.01)
-        if signal.criticism or signal.correction_requested:
-            self._nudge("valence", -0.025)
-            self._nudge("social_ease", -0.025)
-            self._nudge("curiosity", 0.015)
-        if signal.frustration and not signal.hostility:
-            self._nudge("irritation", 0.012)
-            self._nudge("arousal", 0.012)
-        if signal.hostility:
-            self._nudge("valence", -0.055)
-            self._nudge("warmth", -0.045)
-            self._nudge("social_ease", -0.055)
-            self._nudge("irritation", 0.065)
-            self._nudge("arousal", 0.035)
-
-        self.transition_reason = _transition_reason(
-            signal,
-            topic_is_new=topic_is_new,
-            topic_continuity=topic_continuity,
-        )
-        self.inner_impulse = _inner_impulse(
-            self,
-            signal,
-            topic_is_new=topic_is_new,
-            topic_continuity=topic_continuity,
-        )
         self.updated_at = current
+        self._clear_if_faint()
 
-    def _decay(self, now: float) -> None:
-        elapsed_hours = (
-            max(0.0, now - self.updated_at) / 3600.0 if self.updated_at else 0.0
+    def _apply_reaction(self, reaction: _Reaction, *, continuity: bool) -> None:
+        previous_primary = self.primary
+        previous_intensity = self.intensity
+        carries = bool(previous_primary and previous_intensity >= 0.14 and self.momentum >= 0.16)
+
+        if previous_primary == reaction.primary:
+            primary = reaction.primary
+            secondary = reaction.secondary or self.secondary
+            intensity = min(1.0, previous_intensity * 0.62 + reaction.intensity * 0.58)
+        elif carries and previous_intensity > reaction.intensity * (1.12 if continuity else 1.35):
+            primary = previous_primary
+            secondary = reaction.primary
+            intensity = min(1.0, previous_intensity * 0.78 + reaction.intensity * 0.28)
+        else:
+            primary = reaction.primary
+            secondary = previous_primary if carries else reaction.secondary
+            intensity = min(1.0, reaction.intensity + previous_intensity * (0.24 if carries else 0.08))
+
+        self.primary = primary
+        self.secondary = secondary if secondary != primary else None
+        self.intensity = intensity
+        blend = 0.62 if carries else 0.82
+        self.valence = clamp(
+            self.valence * (1.0 - blend) + reaction.valence * blend,
+            0.0,
+            -1.0,
+            1.0,
         )
-        amount = min(0.28, 0.035 + elapsed_hours * 0.025)
-        for name, baseline in _BASELINE.items():
-            self._toward(name, baseline, amount)
+        self.energy = clamp(self.energy * (1.0 - blend) + reaction.energy * blend)
+        self.confidence = clamp(max(reaction.confidence, self.confidence * 0.72))
+        self.cause = reaction.cause
+        self.momentum = clamp(self.momentum * 0.45 + reaction.intensity * 0.75)
 
-    def _nudge(self, name: str, delta: float) -> None:
-        setattr(self, name, clamp(getattr(self, name) + delta))
+    def _soften(self, factor: float) -> None:
+        self.intensity *= factor
+        self.momentum *= factor * 0.9
+        self.confidence *= 0.88
+        self.valence *= 0.82
+        self.energy += (_NEUTRAL_ENERGY - self.energy) * 0.24
 
-    def _toward(self, name: str, target: float, amount: float) -> None:
-        current = float(getattr(self, name))
-        setattr(self, name, clamp(current + (target - current) * amount))
+    def _decay_for_time(self, now: float) -> None:
+        if not self.updated_at:
+            return
+        elapsed_hours = max(0.0, now - self.updated_at) / 3600.0
+        if elapsed_hours <= 0.0:
+            return
+        retention = 0.5 ** (elapsed_hours / 12.0)
+        self.intensity *= retention
+        self.momentum *= retention
+        self.confidence *= 0.75 + retention * 0.25
+        self.valence *= retention
+        self.energy = _NEUTRAL_ENERGY + (self.energy - _NEUTRAL_ENERGY) * retention
 
-
-def emotion_label(state: AkaneState) -> str:
-    if state.irritation >= 0.30:
-        return "mildly annoyed"
-    if state.irritation >= 0.20 or (
-        state.recent_intent == "hostility" and state.irritation >= 0.14
-    ):
-        return "guarded"
-    if state.recent_intent == "teasing" and state.valence >= 0.52:
-        return "playful"
-    if state.recent_intent == "praise" and state.valence >= 0.58:
-        return "quietly pleased"
-    if state.recent_intent == "emotional_support":
-        return "concerned"
-    if state.arousal >= 0.58 and state.valence >= 0.58:
-        return "bright"
-    if state.curiosity >= 0.60:
-        return "curious"
-    if state.warmth >= 0.65 and state.valence >= 0.58:
-        return "warm"
-    if state.valence <= 0.43:
-        return "subdued"
-    if state.arousal <= 0.36:
-        return "reflective"
-    return "attentive"
+    def _clear_if_faint(self) -> None:
+        if self.intensity >= 0.11 and self.confidence >= 0.22:
+            return
+        self.primary = None
+        self.secondary = None
+        self.intensity = 0.0
+        self.valence = 0.0
+        self.confidence = 0.0
+        self.cause = None
+        self.momentum = 0.0
 
 
 def summarize_state(state: AkaneState, signal: TurnSignal | None = None) -> str:
-    intent = signal.intent if signal else state.recent_intent
-    parts: list[str] = [emotion_label(state)]
-    if intent == "emotional_support":
-        parts.append("steady rather than clinical")
-    elif intent == "teasing":
-        parts.append("ready to tease back lightly")
-    elif intent in {"criticism", "correction", "hostility"}:
-        parts.append("more direct and less eager to agree")
+    """Describe optional context permissively without prescribing response wording."""
 
-    if state.irritation >= 0.18:
-        parts.append("some irritation is carrying over")
-    elif state.warmth >= 0.66 and state.familiarity >= 0.28:
-        parts.append("familiar warmth is carrying over")
-    bearing = "; ".join(dict.fromkeys(parts))
+    del signal  # The preview already incorporates the current turn and recent context.
+    if not state.primary or state.intensity < 0.11 or state.confidence < 0.22:
+        return ""
+    degree = "slightly" if state.intensity < 0.34 else "noticeably" if state.intensity < 0.66 else "strongly"
+    uncertainty = "may be" if state.confidence < 0.58 else "is"
+    mixed = f" and {state.secondary}" if state.secondary else ""
+    because = f" because of {state.cause}" if state.cause else ""
     return (
-        f"Current emotional bearing: {bearing}. "
-        f"Private inclination: {state.inner_impulse}. Keep this implicit; express it "
-        "through emphasis, rhythm, and what Akane chooses to add."
+        f"Akane {uncertainty} {degree} {state.primary}{mixed}{because}. "
+        "This is subtle context, not something she needs to name; let it affect the reply only if useful."
     )
 
 
 def public_state(state: AkaneState) -> dict[str, object]:
-    payload = {
-        name: round(float(getattr(state, name)), 3)
-        for name in _CONTINUOUS_FIELDS
+    """Expose qualitative debug information without leaking internal scores."""
+
+    return {
+        "schema_version": state.schema_version,
+        "emotional_context": "active" if state.primary else "neutral",
+        "recent_topic": state.recent_topic,
+        "updated_at": state.updated_at,
     }
-    payload.update(
-        {
-            "schema_version": state.schema_version,
-            "mood": emotion_label(state),
-            "recent_intent": state.recent_intent,
-            "recent_tone": state.recent_tone,
-            "recent_topic": state.recent_topic,
-            "transition_reason": state.transition_reason,
-            "inner_impulse": state.inner_impulse,
-            "updated_at": state.updated_at,
-        }
-    )
-    return payload
 
 
-def _transition_reason(
-    signal: TurnSignal,
-    *,
-    topic_is_new: bool,
-    topic_continuity: float,
-) -> str:
-    topic = compact_text(signal.topic, 54) or "the conversation"
-    if signal.hostility:
-        return "guardedness rose after hostility"
+def _reaction_from_signal(signal: TurnSignal) -> _Reaction | None:
+    """Convert strong conversational cues into Akane's possible reaction, not the user's mood."""
+
     if signal.sadness:
-        return "concern deepened around what the user shared"
-    if signal.praise:
-        return "pleasure and ease rose after earned praise"
+        return _Reaction("concerned", "tender", 0.58, -0.28, 0.36, 0.82, "what the user shared")
+    if signal.hostility:
+        return _Reaction("irritated", "guarded", 0.56, -0.48, 0.58, 0.86, "the hostility toward her")
+    if signal.criticism or signal.correction_requested:
+        return _Reaction("concerned", "irritated", 0.34, -0.18, 0.48, 0.68, "the correction to her response")
     if signal.teasing:
-        return "playful energy surfaced"
-    if signal.criticism:
-        return "social ease tightened after criticism"
-    if signal.correction_requested:
-        return "attention shifted to the user's correction"
+        return _Reaction("amused", "competitive", 0.46, 0.42, 0.62, 0.67, "the user's playful challenge")
+    if signal.praise:
+        return _Reaction("pleased", "embarrassed", 0.40, 0.52, 0.58, 0.70, "the user's praise")
     if signal.frustration:
-        return "tension rose around the user's frustration"
-    if signal.technical:
-        return f"interest sharpened around {topic}"
-    if topic_is_new:
-        return f"curiosity sparked around {topic}"
-    if topic_continuity >= 0.50 and not signal.low_content:
-        return f"familiarity grew while staying with {topic}"
-    if signal.low_content:
-        return "emotion carried forward without forcing a new reaction"
-    return "settled into the exchange on her own terms"
+        return _Reaction("concerned", "curious", 0.38, -0.18, 0.46, 0.62, "the problem frustrating the user")
+    if signal.friendliness:
+        return _Reaction("affectionate", None, 0.24, 0.34, 0.52, 0.48, "the warmth in the exchange")
+    if signal.debugging:
+        return _Reaction("curious", "concerned", 0.28, -0.05, 0.56, 0.48, "the unresolved technical problem")
+    return None
 
 
-def _inner_impulse(
-    state: AkaneState,
+def _conversation_continuity(
     signal: TurnSignal,
-    *,
-    topic_is_new: bool,
-    topic_continuity: float,
-) -> str:
-    topic = compact_text(signal.topic, 54) or "the current thought"
-    if signal.hostility:
-        return "hold her ground without escalating"
-    if signal.correction_requested or signal.criticism:
-        return "reconsider the detail honestly instead of defending the old answer"
-    if signal.sadness:
-        return "stay close to what was actually said and respond with steady care"
-    if signal.teasing:
-        return "tease back lightly while keeping the real point intact"
-    if signal.praise:
-        return "enjoy the praise without becoming overly agreeable"
-    if signal.technical:
-        return "get absorbed in the concrete problem and offer a clear point of view"
-    if state.irritation >= 0.20:
-        return "answer honestly with a slightly sharper edge"
-    if topic_is_new:
-        return f"follow her curiosity about {topic} and add a perspective of her own"
-    if topic_continuity >= 0.50 and not signal.low_content:
-        return f"stay with {topic} and build on the shared thread"
+    recent_turns: Iterable[object],
+    previous_topic: str,
+) -> bool:
     if signal.low_content:
-        return state.inner_impulse
-    return "respond from her own perspective instead of merely matching the user"
+        return bool(previous_topic)
+    candidates = [
+        compact_text(getattr(turn, "content", ""), 180)
+        for turn in recent_turns
+        if getattr(turn, "role", "") == "user"
+    ]
+    prior = candidates[-1] if candidates else previous_topic
+    return bool(prior and max(topic_overlap(prior, signal.topic), topic_overlap(previous_topic, signal.topic)) >= 0.34)
+
+
+def _migrate_delivery_state(payload: dict[str, object]) -> AkaneState:
+    candidates = [
+        (clamp(payload.get("concern"), 0.1) - 0.1, "concerned", -0.2),
+        (clamp(payload.get("irritation"), 0.06) - 0.06, "irritated", -0.4),
+        (clamp(payload.get("playfulness"), 0.24) - 0.24, "amused", 0.3),
+        (clamp(payload.get("warmth"), 0.58) - 0.58, "affectionate", 0.35),
+    ]
+    ranked = sorted((item for item in candidates if item[0] >= 0.08), reverse=True)
+    try:
+        updated_at = max(0.0, float(payload.get("updated_at") or 0.0))
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    if not ranked:
+        return AkaneState(
+            recent_topic=compact_text(payload.get("recent_topic"), 80),
+            updated_at=updated_at,
+        )
+    strength, primary, valence = ranked[0]
+    secondary = ranked[1][1] if len(ranked) > 1 else None
+    return AkaneState(
+        primary=primary,
+        secondary=secondary,
+        intensity=clamp(0.18 + strength),
+        valence=valence,
+        energy=clamp(payload.get("energy"), _NEUTRAL_ENERGY),
+        confidence=0.55,
+        cause=compact_text(payload.get("transition_reason"), 100) or "earlier conversation context",
+        momentum=0.28,
+        recent_topic=compact_text(payload.get("recent_topic"), 80),
+        updated_at=updated_at,
+    )
 
 
 class EmotionStore:
-    """Owns profile-scoped state and persists it only after successful turns."""
+    """Own profile-scoped context and persist only successful turns."""
 
     def __init__(self, path: Path = EMOTION_STATE_PATH) -> None:
         self._path = Path(path)
@@ -302,17 +292,31 @@ class EmotionStore:
         self._states: dict[str, AkaneState] = {}
         self._load()
 
-    def preview(self, profile_id: str, signal: TurnSignal) -> AkaneState:
+    def preview(
+        self,
+        profile_id: str,
+        signal: TurnSignal,
+        *,
+        recent_turns: Iterable[object] = (),
+        now: float | None = None,
+    ) -> AkaneState:
         with self._lock:
             state = self._state(profile_id)
             self._prune()
-            return state.preview(signal)
+            return state.preview(signal, recent_turns=recent_turns, now=now)
 
-    def commit(self, profile_id: str, signal: TurnSignal) -> AkaneState:
+    def commit(
+        self,
+        profile_id: str,
+        signal: TurnSignal,
+        *,
+        recent_turns: Iterable[object] = (),
+        now: float | None = None,
+    ) -> AkaneState:
         with self._lock:
             key = compact_text(profile_id, 120) or "local:owner"
             previous = replace(self._state(key))
-            candidate = previous.preview(signal)
+            candidate = previous.preview(signal, recent_turns=recent_turns, now=now)
             self._states[key] = candidate
             self._prune()
             try:
@@ -322,20 +326,21 @@ class EmotionStore:
                 raise
             return replace(candidate)
 
-    def snapshot(self, profile_id: str) -> AkaneState:
+    def snapshot(self, profile_id: str, *, now: float | None = None) -> AkaneState:
         with self._lock:
             state = self._state(profile_id)
             self._prune()
-            return replace(state)
+            return state.decayed(now=now)
 
     def clear(self, profile_id: str) -> None:
         with self._lock:
-            self._states.pop(compact_text(profile_id, 120) or "local:owner", None)
+            key = compact_text(profile_id, 120) or "local:owner"
+            if key not in self._states:
+                return
+            self._states.pop(key)
             self._persist()
 
     def restore(self, profile_id: str, state: AkaneState) -> None:
-        """Restore a prior snapshot when a later commit stage fails."""
-
         key = compact_text(profile_id, 120) or "local:owner"
         with self._lock:
             self._states[key] = replace(state)
@@ -359,15 +364,18 @@ class EmotionStore:
     def _load(self) -> None:
         try:
             payload = read_json(self._path)
-            if not isinstance(payload, dict) or int(payload.get("schema_version", 0)) != STATE_SCHEMA_VERSION:
+            if not isinstance(payload, dict):
+                raise ValueError("invalid state document")
+            schema = int(payload.get("schema_version", 0))
+            if schema not in {2, STATE_SCHEMA_VERSION}:
                 raise ValueError("unsupported schema")
             profiles = payload.get("profiles")
             if not isinstance(profiles, dict):
                 raise ValueError("invalid profiles")
             self._states = {
-                compact_text(key, 120): AkaneState.from_dict(value)
+                profile: AkaneState.from_dict(value)
                 for key, value in profiles.items()
-                if compact_text(key, 120)
+                if (profile := compact_text(key, 120))
             }
             self._prune()
         except FileNotFoundError:
@@ -377,11 +385,13 @@ class EmotionStore:
             self._states = {}
 
     def _persist(self) -> None:
-        payload = {
-            "schema_version": STATE_SCHEMA_VERSION,
-            "profiles": {key: asdict(value) for key, value in self._states.items()},
-        }
-        atomic_write_json(self._path, payload)
+        atomic_write_json(
+            self._path,
+            {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "profiles": {key: asdict(value) for key, value in self._states.items()},
+            },
+        )
 
 
 _EMOTIONS: EmotionStore | None = None

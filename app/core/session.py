@@ -6,7 +6,7 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from app.core.config import (
     GENERATION_QUEUE_TIMEOUT_SECONDS,
@@ -15,10 +15,14 @@ from app.core.config import (
     MAX_TOKENS,
     PROMPT_DEBUG,
 )
-from app.core.memory import MemoryContext, get_memory_store, get_popup_user_store
+from app.core.memory import (
+    InternalTurnResult,
+    MemoryContext,
+    get_internal_state_store,
+    get_memory_store,
+)
 from app.core.prompt import PromptContext, PromptPlan, build_prompt_plan
-from app.core.signal import TurnSignal
-from app.core.state import AkaneState, get_emotion_store, public_state, summarize_state
+from app.core.signal import EmotionState, TurnSignal
 from app.core.utils import compact_text
 from app.integrations.vscode_context import CodeContext, code_context_for_message
 
@@ -63,15 +67,10 @@ class GenerationHandle:
     conversation_id: str
     profile_id: str
     cancellation: threading.Event
-    queued_at: float
     queue_deadline: float
 
-    @property
-    def cancelled(self) -> bool:
-        return self.cancellation.is_set()
-
     def raise_if_cancelled(self) -> None:
-        if self.cancelled:
+        if self.cancellation.is_set():
             raise GenerationCancelled("Generation was cancelled.")
 
 
@@ -104,7 +103,6 @@ class GenerationScheduler:
             conversation_id=conversation_id,
             profile_id=profile_id,
             cancellation=threading.Event(),
-            queued_at=time.time(),
             queue_deadline=time.monotonic() + GENERATION_QUEUE_TIMEOUT_SECONDS,
         )
         with self._lock:
@@ -156,12 +154,11 @@ class TurnPreparation:
     prompt_plan: PromptPlan
     signal: TurnSignal
     memory_context: MemoryContext
-    preview_state: AkaneState
+    internal_turn: InternalTurnResult
     handle: GenerationHandle
     max_tokens: int
     started_at: float
     prompt_seconds: float = 0.0
-    code_context_requested: bool = False
     code_context_attached: bool = False
 
     @property
@@ -182,7 +179,13 @@ class TurnPreparation:
 
     @property
     def messages(self) -> list[dict[str, str]]:
-        return [dict(message) for message in self.prompt_plan.messages]
+        return list(self.prompt_plan.messages)
+
+    @property
+    def preview_state(self) -> EmotionState:
+        """Compatibility view of the proposed persistent emotion."""
+
+        return self.internal_turn.state.emotion
 
 
 def normalize_chat_input(
@@ -245,24 +248,29 @@ def prepare_turn(
             else CodeContext(requested=False, connected=False)
         )
         memory = get_memory_store()
-        signal = memory.preview_signal(
-            chat.conversation_id,
-            chat.text,
-            code_context_requested=code_context.requested,
-            code_context_attached=bool(code_context.prompt_text),
-        )
         memory_context = memory.build_context(
             chat.profile_id,
             chat.conversation_id,
             display_name=chat.display_name,
+            query=chat.text,
             include_memory=not skip_memory,
         )
-        popup_user = (
-            get_popup_user_store().prompt_text()
-            if chat.source == "popup" and not skip_memory
-            else ""
+        long_term = get_internal_state_store()
+        internal_turn = long_term.preview_turn(
+            chat.profile_id,
+            chat.text,
+            now=chat.timestamp,
+            include_memory=not skip_memory,
+            code_context_requested=code_context.requested,
+            code_context_attached=bool(code_context.prompt_text),
         )
-        preview_state = get_emotion_store().preview(chat.profile_id, signal)
+        signal = internal_turn.signal
+        selected_memories = internal_turn.recalled_memories
+        memory_context = replace(
+            memory_context,
+            memory_ids=tuple(memory.id for memory in selected_memories),
+            memory_contents=tuple(memory.content for memory in selected_memories),
+        )
         constraints = _turn_constraints(signal, chat)
         editor_context = code_context.prompt_text
         if code_context.requested and not code_context.connected:
@@ -273,16 +281,25 @@ def prepare_turn(
             chat.text,
             PromptContext(
                 relationship=memory_context.relationship,
-                emotion=summarize_state(preview_state, signal),
-                user_profile=popup_user,
-                rolling_summary=memory_context.rolling_summary,
+                earlier_dialogue=memory_context.earlier_dialogue,
                 recent_turns=memory_context.recent_turns,
                 constraints=constraints,
                 date_time=date_time_line() if _time_context_relevant(chat.text) else "",
                 reply_context=chat.reply_context,
                 external_context=editor_context,
+                internal_context=internal_turn.prompt_context,
             ),
         )
+        system_text = prompt_plan.messages[0]["content"]
+        included_ids = tuple(
+            memory_id
+            for memory_id, content in zip(
+                memory_context.memory_ids,
+                memory_context.memory_contents,
+            )
+            if content in system_text
+        )
+        memory_context = replace(memory_context, memory_ids=included_ids)
         if PROMPT_DEBUG:
             metadata = prompt_plan.debug_metadata()
             print(f"[Akane:prompt] {metadata}", flush=True)
@@ -292,12 +309,11 @@ def prepare_turn(
             prompt_plan=prompt_plan,
             signal=signal,
             memory_context=memory_context,
-            preview_state=preview_state,
+            internal_turn=internal_turn,
             handle=handle,
             max_tokens=MAX_TOKENS,
             started_at=started_at,
             prompt_seconds=time.perf_counter() - started_at,
-            code_context_requested=code_context.requested,
             code_context_attached=bool(code_context.prompt_text),
         )
     except Exception:
@@ -309,19 +325,17 @@ def commit_turn(prepared: TurnPreparation, reply: str) -> None:
     prepared.handle.raise_if_cancelled()
     with _COMMIT_LOCK:
         prepared.handle.raise_if_cancelled()
-        emotions = get_emotion_store()
-        previous_state = emotions.snapshot(prepared.chat_input.profile_id)
-        popup_users = (
-            get_popup_user_store() if prepared.chat_input.source == "popup" else None
-        )
-        previous_popup_user = (
-            popup_users.snapshot() if popup_users is not None else None
-        )
-        emotions.commit(prepared.chat_input.profile_id, prepared.signal)
+        long_term = get_internal_state_store()
+        previous_state = long_term.stored_internal_state(prepared.chat_input.profile_id)
         try:
             prepared.handle.raise_if_cancelled()
-            if popup_users is not None:
-                popup_users.commit(prepared.chat_input.text)
+            long_term.commit_turn(
+                prepared.chat_input.profile_id,
+                prepared.internal_turn,
+                assistant_text=reply,
+                used_memory_ids=prepared.memory_context.memory_ids,
+                now=prepared.chat_input.timestamp,
+            )
             get_memory_store().commit_turn(
                 profile_id=prepared.chat_input.profile_id,
                 conversation_id=prepared.chat_input.conversation_id,
@@ -331,9 +345,7 @@ def commit_turn(prepared: TurnPreparation, reply: str) -> None:
                 signal=prepared.signal,
             )
         except Exception:
-            emotions.restore(prepared.chat_input.profile_id, previous_state)
-            if popup_users is not None and previous_popup_user is not None:
-                popup_users.restore(previous_popup_user)
+            long_term.restore_internal_state(prepared.chat_input.profile_id, previous_state)
             raise
 
 
@@ -364,9 +376,7 @@ def forget_profile(profile_id: str) -> None:
     with _COMMIT_LOCK:
         _SCHEDULER.cancel_profile(profile)
         get_memory_store().clear_profile(profile)
-        get_emotion_store().clear(profile)
-        if profile == "local:owner":
-            get_popup_user_store().clear()
+        get_internal_state_store().clear(profile)
 
 
 def session_state_snapshot(
@@ -376,11 +386,9 @@ def session_state_snapshot(
     conversation = compact_text(conversation_id, 120) or "popup:default"
     profile = compact_text(profile_id, 120) or "local:owner"
     return {
-        "akane": public_state(get_emotion_store().snapshot(profile)),
+        "akane": get_internal_state_store().public_internal_state(profile),
         "memory": get_memory_store().public_conversation(conversation, profile),
-        "popup_user": (
-            get_popup_user_store().public_profile() if profile == "local:owner" else {}
-        ),
+        "popup_user": get_internal_state_store().public_profile(profile),
         "active_generation_id": _SCHEDULER.active_generation_id(conversation),
     }
 
@@ -408,6 +416,27 @@ def timing_enabled() -> bool:
 
 def _turn_constraints(signal: TurnSignal, chat: ChatInput) -> str:
     parts: list[str] = []
+    if signal.identity_attribute:
+        parts.append(
+            f"This asks about Akane's {signal.identity_attribute}; answer with the "
+            "specific canonical facts in the identity section and add nothing unsupported."
+        )
+    if signal.current_activity:
+        location = (
+            "participating in this Discord conversation"
+            if chat.source == "discord"
+            else "talking with the user in the current chat"
+        )
+        parts.append(
+            f"Verified current activity: Akane is {location}. Answer naturally from "
+            "that state; do not invent an offscreen activity or expose implementation internals."
+        )
+    if signal.repetition:
+        parts.append(
+            f"This is a {signal.repetition} repeat of a recent user message. Keep facts "
+            "consistent, acknowledge repetition only if natural, and use a different grounded "
+            "angle instead of paraphrasing the previous reply or inventing a new scenario."
+        )
     if signal.correction_requested:
         parts.append("Honor the user's correction over earlier context.")
     if chat.source == "discord" and chat.group_conversation:

@@ -7,25 +7,15 @@ const elements = {
     document.getElementById("messages") ||
     document.getElementById("speechBody"),
   speechBubble: document.getElementById("speechBubble"),
-  characterWrap: document.getElementById("characterWrap"),
-  characterArt: document.getElementById("characterArt"),
   composer:
     document.getElementById("composer") ||
     document.getElementById("composerWrapper"),
   input: document.getElementById("messageInput"),
   send: document.getElementById("sendButton"),
   notice: document.getElementById("notice"),
-  statusDot:
-    document.getElementById("statusDot") ||
-    document.querySelector(".status-dot"),
-  statusText: document.getElementById("statusText"),
   minimizeButton: document.getElementById("minimizeButton"),
   closeButton: document.getElementById("closeButton"),
   messageActionButton: document.getElementById("messageActionButton"),
-  backendForm: document.getElementById("backendForm"),
-  backendSelect: document.getElementById("backendSelect"),
-  modelInput: document.getElementById("modelInput"),
-  applyBackendButton: document.getElementById("applyBackendButton"),
   emptyState: document.getElementById("emptyState"),
   memoryActionButton: document.getElementById("memoryActionButton"),
   memoryCloseBtn: document.getElementById("memoryCloseBtn"),
@@ -35,9 +25,7 @@ const elements = {
 
 let currentMessages = [];
 let isSending = false;
-let statusPoll = null;
 let preservePreview = false;
-let transientStatus = "";
 let lastRenderedMessagesKey = "";
 let lastKnownStateVersion = -1;
 
@@ -45,12 +33,6 @@ let bubbleVisible = false;
 let bubbleHideTimer = null;
 let bubbleStreaming = false;
 let streamingAssistantText = "";
-let bubbleResizeObserver = null;
-
-let backendValues = {
-  llama_cpp: "",
-  openrouter: "",
-};
 
 const messageTimestampCache = new Map();
 const API_BASE =
@@ -70,22 +52,6 @@ async function callWindowApi(methodName) {
   } catch {
     showNotice("Window action failed.", "error");
   }
-}
-
-async function callWindowApiWithArg(methodName, arg) {
-  if (!window.pywebview?.api?.[methodName]) {
-    return;
-  }
-
-  try {
-    await window.pywebview.api[methodName](arg);
-  } catch {
-    // Ignore optional window synchronization failures.
-  }
-}
-
-function requestComposerFocus() {
-  return;
 }
 
 function setComposerOpenState(open) {
@@ -252,146 +218,6 @@ function formatMemoryForDisplay(memory) {
   );
 }
 
-function syncBubbleWindowSize() {
-  if (POPUP_ROLE !== "bubble" || !elements.speechBubble) {
-    return;
-  }
-
-  if (!bubbleVisible) {
-    void callWindowApiWithArg("sync_bubble_size", [8, 8]);
-    return;
-  }
-
-  const rect =
-    elements.speechBubble.getBoundingClientRect();
-
-  const header =
-    elements.speechBubble.querySelector(
-      ".speech-bubble-header",
-    );
-
-  const body =
-    elements.speechBubble.querySelector(
-      ".speech-bubble-body",
-    );
-
-  const computed =
-    window.getComputedStyle(elements.speechBubble);
-
-  const documentElement = document.documentElement;
-  const documentBody = document.body;
-
-  const headerRect = header?.getBoundingClientRect();
-  const bodyRect = body?.getBoundingClientRect();
-
-  const paddingTop =
-    parseFloat(computed.paddingTop || "0") || 0;
-
-  const paddingRight =
-    parseFloat(computed.paddingRight || "0") || 0;
-
-  const paddingBottom =
-    parseFloat(computed.paddingBottom || "0") || 0;
-
-  const paddingLeft =
-    parseFloat(computed.paddingLeft || "0") || 0;
-
-  const bodyBottom = bodyRect
-    ? bodyRect.bottom - rect.top
-    : 0;
-
-  const headerBottom = headerRect
-    ? headerRect.bottom - rect.top
-    : 0;
-
-  const measuredWidth = Math.max(
-    rect.width,
-    elements.speechBubble.scrollWidth,
-    documentElement?.scrollWidth || 0,
-    documentBody?.scrollWidth || 0,
-    body?.scrollWidth || 0,
-    header?.scrollWidth || 0,
-    (bodyRect?.width || 0) +
-      paddingLeft +
-      paddingRight +
-      28,
-  );
-
-  const measuredHeight = Math.max(
-    rect.height,
-    elements.speechBubble.scrollHeight,
-    documentElement?.scrollHeight || 0,
-    documentBody?.scrollHeight || 0,
-    bodyBottom + paddingBottom + 84,
-    headerBottom + paddingBottom + 84,
-    paddingTop +
-      paddingBottom +
-      (headerRect?.height || 0) +
-      (bodyRect?.height || 0) +
-      120,
-    paddingTop +
-      paddingBottom +
-      (header?.scrollHeight || 0) +
-      (body?.scrollHeight || 0) +
-      120,
-  );
-
-  const nextWidth = Math.ceil(measuredWidth);
-  const nextHeight = Math.ceil(measuredHeight);
-
-  if (
-    !Number.isFinite(nextWidth) ||
-    !Number.isFinite(nextHeight) ||
-    nextWidth <= 0 ||
-    nextHeight <= 0
-  ) {
-    return;
-  }
-
-  void callWindowApiWithArg(
-    "sync_bubble_size",
-    [nextWidth, nextHeight],
-  );
-}
-
-function scheduleBubbleSync() {
-  if (POPUP_ROLE !== "bubble") {
-    return;
-  }
-
-  window.requestAnimationFrame(syncBubbleWindowSize);
-  window.setTimeout(syncBubbleWindowSize, 40);
-  window.setTimeout(syncBubbleWindowSize, 120);
-  window.setTimeout(syncBubbleWindowSize, 260);
-  window.setTimeout(syncBubbleWindowSize, 420);
-}
-
-function ensureBubbleResizeObserver() {
-  if (
-    POPUP_ROLE !== "bubble" ||
-    bubbleResizeObserver ||
-    !elements.speechBubble
-  ) {
-    return;
-  }
-
-  if (typeof ResizeObserver !== "function") {
-    return;
-  }
-
-  bubbleResizeObserver = new ResizeObserver(() => {
-    if (bubbleVisible) {
-      syncBubbleWindowSize();
-    }
-  });
-
-  bubbleResizeObserver.observe(elements.speechBubble);
-
-  if (elements.messages) {
-    bubbleResizeObserver.observe(elements.messages);
-  }
-}
-
 function clearBubbleHideTimer() {
   if (!bubbleHideTimer) {
     return;
@@ -407,8 +233,6 @@ function setBubbleVisible(visible) {
   if (elements.speechBubble) {
     elements.speechBubble.hidden = !bubbleVisible;
   }
-
-  scheduleBubbleSync();
 }
 
 function showBubbleNow() {
@@ -447,23 +271,13 @@ function setBubbleText(text) {
   setBubbleVisible(true);
   elements.messages.innerHTML =
     renderMessageBody(nextText);
-
-  scheduleBubbleSync();
 }
 
 window.__akaneSetBubbleText = setBubbleText;
 
 window.__akanePendingMessage = "";
 
-window.__akaneStreamEvent = (jsonLine) => {
-  let event;
-
-  try {
-    event = JSON.parse(jsonLine);
-  } catch {
-    return;
-  }
-
+window.__akaneStreamEvent = (event) => {
   if (
     event.type === "done" ||
     event.type === "error"
@@ -531,28 +345,6 @@ function showNotice(text, tone = "neutral") {
     () => showNotice(""),
     3200,
   );
-}
-
-function setStatus(model) {
-  let tone = "ready";
-
-  if (model?.error) {
-    tone = "error";
-  } else if (isSending) {
-    tone = "busy";
-  }
-
-  if (elements.statusText) {
-    elements.statusText.textContent = "";
-  }
-
-  if (elements.statusDot) {
-    elements.statusDot.dataset.tone = tone;
-  }
-}
-
-function setTransientStatus(label = "") {
-  transientStatus = label;
 }
 
 function timestampForMessage(message, index) {
@@ -659,43 +451,6 @@ function renderMessages(messages) {
     return;
   }
 
-  if (POPUP_ROLE === "bubble") {
-    const latestAssistant = [
-      ...currentMessages,
-    ]
-      .reverse()
-      .find(
-        (message) =>
-          message.role === "assistant",
-      );
-
-    const lastMessage =
-      currentMessages[
-        currentMessages.length - 1
-      ];
-
-    if (
-      latestAssistant?.content &&
-      (
-        bubbleStreaming ||
-        lastMessage?.role === "assistant"
-      )
-    ) {
-      setBubbleText(latestAssistant.content);
-    } else if (
-      bubbleVisible &&
-      bubbleStreaming
-    ) {
-      window.requestAnimationFrame(
-        syncBubbleWindowSize,
-      );
-    } else if (!bubbleStreaming) {
-      setBubbleVisible(false);
-    }
-
-    return;
-  }
-
   if (POPUP_ROLE === "companion") {
     const latestAssistant = [
       ...currentMessages,
@@ -777,13 +532,6 @@ function upsertStreamingMessages(
   ];
 
   renderMessages(next);
-
-  if (POPUP_ROLE === "bubble") {
-    void callWindowApiWithArg(
-      "push_bubble_text",
-      assistantText || "",
-    );
-  }
 }
 
 function autosizeInput() {
@@ -803,70 +551,8 @@ function autosizeInput() {
 function setSendingState(sending) {
   isSending = sending;
 
-  if (!sending) {
-    transientStatus = "";
-  }
-
   if (elements.send) {
     elements.send.disabled = sending;
-  }
-
-  if (elements.applyBackendButton) {
-    elements.applyBackendButton.disabled =
-      sending;
-  }
-
-  if (elements.backendSelect) {
-    elements.backendSelect.disabled = sending;
-  }
-
-  if (elements.modelInput) {
-    elements.modelInput.disabled = sending;
-  }
-}
-
-function backendPlaceholder(backend) {
-  return backend === "openrouter"
-    ? "OpenRouter model slug"
-    : "Local GGUF path";
-}
-
-function syncBackendControls(model) {
-  if (
-    !elements.backendSelect ||
-    !elements.modelInput
-  ) {
-    return;
-  }
-
-  if (model?.local_model_path) {
-    backendValues.llama_cpp =
-      model.local_model_path;
-  }
-
-  if (model?.openrouter_model) {
-    backendValues.openrouter =
-      model.openrouter_model;
-  }
-
-  const backend =
-    model?.backend ||
-    elements.backendSelect.value ||
-    "llama_cpp";
-
-  elements.backendSelect.value = backend;
-
-  elements.modelInput.placeholder =
-    backendPlaceholder(backend);
-
-  if (
-    document.activeElement !==
-    elements.modelInput
-  ) {
-    elements.modelInput.value =
-      backend === "openrouter"
-        ? backendValues.openrouter
-        : backendValues.llama_cpp;
   }
 }
 
@@ -879,8 +565,6 @@ async function fetchState() {
     payload.version || 0,
   );
 
-  setStatus(payload.model || {});
-  syncBackendControls(payload.model || {});
 }
 
 async function loadStatePayload(
@@ -916,11 +600,6 @@ async function sendMessage(message) {
   }
 
   setSendingState(true);
-
-  setStatus({
-    loading: false,
-    loaded: true,
-  });
 
   streamingAssistantText = "";
 
@@ -1046,11 +725,6 @@ async function sendMessage(message) {
 async function sendCommand(message) {
   setSendingState(true);
 
-  setStatus({
-    loading: false,
-    loaded: true,
-  });
-
   try {
     const response = await fetch(
       apiUrl("/api/chat"),
@@ -1098,80 +772,6 @@ async function sendCommand(message) {
   }
 }
 
-async function switchBackend() {
-  const backend =
-    elements.backendSelect.value;
-
-  const value =
-    elements.modelInput.value.trim();
-
-  const payload = {
-    backend,
-  };
-
-  if (backend === "openrouter") {
-    payload.model_name =
-      value || backendValues.openrouter;
-  } else {
-    payload.local_model_path =
-      value || backendValues.llama_cpp;
-  }
-
-  setSendingState(true);
-
-  try {
-    const response = await fetch(
-      apiUrl("/api/backend"),
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      },
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        data.error ||
-          data.detail ||
-          "Could not switch backend.",
-      );
-    }
-
-    syncBackendControls(data.model || {});
-    setStatus(data.model || {});
-
-    const target =
-      backend === "openrouter"
-        ? data.model?.openrouter_model ||
-          "OpenRouter"
-        : data.model?.local_model_path ||
-          "local model";
-
-    showNotice(
-      `Switched to ${
-        backend === "openrouter"
-          ? "OpenRouter"
-          : "local Llama"
-      }: ${target}`,
-    );
-  } finally {
-    setSendingState(false);
-
-    if (elements.input) {
-      elements.input.disabled = false;
-      elements.input.focus();
-    }
-
-    if (elements.send) {
-      elements.send.disabled = false;
-    }
-  }
-}
-
 function handleStreamEvent(
   event,
   userMessage,
@@ -1204,24 +804,7 @@ function handleStreamEvent(
 
     showBubbleNow();
 
-    /*
-     * Support both possible server formats:
-     *
-     * True deltas:
-     * "Hel", "lo", " there"
-     *
-     * Accumulated output:
-     * "Hel", "Hello", "Hello there"
-     */
-    if (
-      incoming.startsWith(
-        streamingAssistantText,
-      )
-    ) {
-      streamingAssistantText = incoming;
-    } else {
-      streamingAssistantText += incoming;
-    }
+    streamingAssistantText += incoming;
 
     const next = [...currentMessages];
 
@@ -1254,33 +837,10 @@ function handleStreamEvent(
 
     renderMessages(next);
 
-    /*
-     * Python's setBubbleText replaces the displayed
-     * value, so pass the full accumulated response.
-     */
-    void callWindowApiWithArg(
-      "push_bubble_text",
-      streamingAssistantText,
-    );
-
-    return;
-  }
-
-  if (event.type === "status") {
-    setTransientStatus(
-      event.label || "Working...",
-    );
-
-    setStatus({
-      loading: false,
-      loaded: true,
-    });
-
     return;
   }
 
   if (event.type === "done") {
-    setTransientStatus("");
     bubbleStreaming = false;
 
     /*
@@ -1318,41 +878,16 @@ function handleStreamEvent(
       renderMessages(next);
     }
 
-    if (
-      Number.isFinite(
-        Number(event.version),
-      )
-    ) {
-      lastKnownStateVersion = Number(
-        event.version,
-      );
-    }
-
     hideBubbleSoon(10000);
-
-    window.setTimeout(() => {
-      void callWindowApiWithArg(
-        "push_bubble_text",
-        "",
-      );
-    }, 10000);
 
     return;
   }
 
   if (event.type === "error") {
-    setTransientStatus("");
     bubbleStreaming = false;
     streamingAssistantText = "";
 
     hideBubbleSoon(1200);
-
-    window.setTimeout(() => {
-      void callWindowApiWithArg(
-        "push_bubble_text",
-        "",
-      );
-    }, 1200);
 
     throw new Error(
       event.error ||
@@ -1404,29 +939,14 @@ async function refreshStatus() {
         renderMessages(nextMessages);
       }
 
-      setStatus(fullPayload.model || {});
-
-      syncBackendControls(
-        fullPayload.model || {},
-      );
-
       return;
     }
 
     lastKnownStateVersion =
       nextVersion;
 
-    setStatus(payload.model || {});
-
-    syncBackendControls(
-      payload.model || {},
-    );
-  } catch (error) {
-    setStatus({
-      error:
-        error?.message ||
-        "Could not refresh status.",
-    });
+  } catch {
+    return;
   }
 }
 
@@ -1460,7 +980,6 @@ async function handleComposerSubmit(event) {
       elements.send.disabled = false;
     }
 
-    requestComposerFocus();
     focusComposerInput();
   }
 }
@@ -1481,8 +1000,6 @@ elements.input?.addEventListener(
   "pointerdown",
   () => {
     if (!isSending) {
-      requestComposerFocus();
-
       if (elements.send) {
         elements.send.disabled = false;
       }
@@ -1496,7 +1013,6 @@ elements.input?.addEventListener(
   "mousedown",
   () => {
     if (!isSending) {
-      requestComposerFocus();
       focusComposerInput();
     }
   },
@@ -1549,45 +1065,6 @@ elements.messageActionButton?.addEventListener(
     void callWindowApi(
       "toggle_composer",
     );
-  },
-);
-
-elements.backendSelect?.addEventListener(
-  "change",
-  () => {
-    const backend =
-      elements.backendSelect.value;
-
-    elements.modelInput.placeholder =
-      backendPlaceholder(backend);
-
-    elements.modelInput.value =
-      backend === "openrouter"
-        ? backendValues.openrouter
-        : backendValues.llama_cpp;
-  },
-);
-
-elements.backendForm?.addEventListener(
-  "submit",
-  async (event) => {
-    event.preventDefault();
-
-    if (isSending) {
-      return;
-    }
-
-    try {
-      await switchBackend();
-    } catch (error) {
-      showNotice(
-        error?.message ||
-          "Could not switch backend.",
-        "error",
-      );
-    } finally {
-      await refreshStatus();
-    }
   },
 );
 
@@ -1687,46 +1164,12 @@ function toggleMemoryPanel() {
   }
 }
 
-window.__akaneToggleMemory = () => {
-  const wantVisible =
-    document.body.getAttribute(
-      "data-memory-visible",
-    ) === "true";
-
-  if (wantVisible) {
-    void openMemoryPanel();
-  } else {
-    closeMemoryPanel();
-  }
-};
-
 async function boot() {
   document.body.dataset.popupRole =
     POPUP_ROLE;
 
   document.documentElement.dataset.popupRole =
     POPUP_ROLE;
-
-  if (
-    POPUP_ROLE === "composer" ||
-    POPUP_ROLE === "avatar"
-  ) {
-    setComposerOpenState(false);
-  }
-
-  if (POPUP_ROLE === "bubble") {
-    setBubbleVisible(false);
-    bubbleStreaming = false;
-    streamingAssistantText = "";
-
-    ensureBubbleResizeObserver();
-
-    document.fonts?.ready
-      ?.then(() => {
-        scheduleBubbleSync();
-      })
-      .catch(() => {});
-  }
 
   autosizeInput();
 
@@ -1739,23 +1182,14 @@ async function boot() {
       "error",
     );
 
-    setStatus({
-      error:
-        error?.message ||
-        "Could not load chat state.",
-    });
   }
 
-  statusPoll = window.setInterval(
+  window.setInterval(
     refreshStatus,
     2500,
   );
 
-  if (POPUP_ROLE === "composer") {
-    requestComposerFocus();
-  } else if (POPUP_ROLE !== "avatar") {
-    focusComposerInput();
-  }
+  focusComposerInput();
 
   elements.memoryActionButton
     ?.addEventListener(

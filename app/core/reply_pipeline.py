@@ -6,8 +6,9 @@ import threading
 import time
 from dataclasses import dataclass
 
-from app.core.config import STREAM_CHUNK_CHARS, STREAM_FLUSH_SECONDS
+from app.core.config import PROMPT_DEBUG, STREAM_CHUNK_CHARS, STREAM_FLUSH_SECONDS
 from app.core.model_loader import InferenceCancelled, InferenceQueueTimeout, ModelManager
+from app.core.prompt import describe_model_input
 from app.core.session import (
     ChatInput,
     GenerationCancelled,
@@ -60,6 +61,7 @@ def generate_reply(prepared: PreparedReply) -> str:
     model_started_at = time.perf_counter()
     try:
         prepared.handle.raise_if_cancelled()
+        _log_model_input(prepared, generation_mode="non_streaming")
         raw = ModelManager.get_instance().complete(
             prepared.messages,
             max_tokens=prepared.max_tokens,
@@ -93,6 +95,7 @@ def stream_reply(prepared: PreparedReply):
     model_started_at = time.perf_counter()
     try:
         prepared.handle.raise_if_cancelled()
+        _log_model_input(prepared, generation_mode="streaming")
         for text in ModelManager.get_instance().stream(
             prepared.messages,
             max_tokens=prepared.max_tokens,
@@ -148,15 +151,14 @@ def debug_state_report(conversation_id: str | None, profile_id: str | None = Non
     snapshot = session_state_snapshot(conversation, profile_id)
     memory = snapshot.get("memory") or {}
     akane = snapshot.get("akane") or {}
+    emotion = akane.get("emotion") or {}
     with _METRICS_LOCK:
         metrics = dict(_METRICS.get(conversation, {}))
     lines = [
         "Akane debug state",
         "- personality: stable Akane",
         f"- intent: {_debug_text(memory.get('recent_intent'), 40) or 'casual'}",
-        f"- mood: {_debug_text(akane.get('mood'), 40) or 'attentive'}",
-        f"- transition: {_debug_text(akane.get('transition_reason'), 60) or 'baseline'}",
-        f"- inclination: {_debug_text(akane.get('inner_impulse'), 100) or 'attentive'}",
+        f"- emotional context: {_debug_text(emotion.get('dominant'), 40) or 'neutral'}",
         f"- focus: {_debug_text(memory.get('recent_topic'), 80) or 'none'}",
         f"- prompt tokens (estimated): {int(metrics.get('prompt_tokens') or 0)}",
         f"- code context attached: {'yes' if metrics.get('code_context_attached') else 'no'}",
@@ -180,6 +182,23 @@ def _remember_metrics(prepared: PreparedReply, reply: str) -> None:
                 key=lambda key: float(_METRICS[key].get("updated_at") or 0.0),
             )
             _METRICS.pop(oldest, None)
+
+
+def _log_model_input(prepared: PreparedReply, *, generation_mode: str) -> None:
+    if not PROMPT_DEBUG:
+        return
+    earlier_dialogue = prepared.memory_context.earlier_dialogue
+    summary_turns = max(0, len(earlier_dialogue.splitlines()) - 1) if earlier_dialogue else 0
+    metadata = describe_model_input(
+        prepared.messages,
+        transport=prepared.chat_input.source,
+        conversation_id=prepared.chat_input.conversation_id,
+        loaded_recent_turns=len(prepared.memory_context.recent_turns),
+        summary_turns=summary_turns,
+        current_user_text=prepared.chat_input.text,
+        generation_mode=generation_mode,
+    )
+    print(f"[Akane:model-input] {metadata}", flush=True)
 
 
 def _timing_log(

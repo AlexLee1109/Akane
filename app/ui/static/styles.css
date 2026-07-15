@@ -521,10 +521,6 @@ body[data-popup-role="companion"] .notice {
   bottom: calc(var(--composer-bottom) + var(--composer-height) + 12px);
 }
 
-body.is-sending .composer-send {
-  cursor: wait;
-}
-
 .sr-only {
   position: absolute;
   left: -9999px;

@@ -17,11 +17,13 @@ from app.core.config import (
     LLAMA_LAST_N_TOKENS_SIZE,
     LLAMA_OFFLOAD_KQV,
     LLAMA_OP_OFFLOAD,
+    LLAMA_SWA_FULL,
     LLAMA_THREADS,
     LLAMA_THREADS_BATCH,
     LLAMA_UBATCH_SIZE,
     LLAMA_USE_MLOCK,
     LLAMA_USE_MMAP,
+    LLAMA_WARMUP_STATIC_PROMPT,
     MAX_TOKENS,
     MIN_P,
     MODEL_PATH,
@@ -128,6 +130,8 @@ class ModelManager:
         self._load_error: Exception | None = None
         self._load_lock = threading.RLock()
         self._inference_lock = threading.Lock()
+        self._completion_capability_llm = None
+        self._disable_thinking = False
 
     @classmethod
     def get_instance(cls) -> "ModelManager":
@@ -169,6 +173,8 @@ class ModelManager:
         }
         if LLAMA_GPU_LAYERS:
             kwargs["n_gpu_layers"] = LLAMA_GPU_LAYERS
+        if LLAMA_SWA_FULL:
+            kwargs["swa_full"] = True
         return kwargs
 
     def ensure_loaded(self) -> None:
@@ -185,11 +191,15 @@ class ModelManager:
                 kwargs = self._load_kwargs()
                 print(
                     f"Loading model {self._local_model_path} "
-                    f"n_ctx={kwargs['n_ctx']} n_batch={kwargs['n_batch']} n_ubatch={kwargs['n_ubatch']}",
+                    f"n_ctx={kwargs['n_ctx']} n_batch={kwargs['n_batch']} "
+                    f"n_ubatch={kwargs['n_ubatch']} n_threads={kwargs['n_threads']} "
+                    f"flash_attn={kwargs['flash_attn']} "
+                    f"swa_full={kwargs.get('swa_full', False)}",
                     flush=True,
                 )
                 llm = Llama(**kwargs)
                 self._validate_loaded_model(llm)
+                self._warm_static_prompt(llm)
                 self._llm = llm
             except Exception as exc:
                 self._llm = None
@@ -207,6 +217,33 @@ class ModelManager:
                 "Gemma GGUF is missing tokenizer.chat_template; use an instruction-tuned "
                 "Gemma 4/E4B IT GGUF with the embedded chat template."
             )
+
+    def _warm_static_prompt(self, llm) -> None:
+        if not LLAMA_WARMUP_STATIC_PROMPT:
+            return
+        from app.core.character import get_static_system_prompt
+
+        started_at = time.perf_counter()
+        print("Warming static prompt prefix", flush=True)
+        kwargs = completion_kwargs(1, False)
+        kwargs.update(
+            {
+                "messages": [
+                    {"role": "system", "content": get_static_system_prompt()},
+                    {"role": "user", "content": " "},
+                ],
+                "temperature": 0.0,
+                "top_k": 1,
+                "top_p": 1.0,
+                "min_p": 0.0,
+                "repeat_penalty": 1.0,
+            }
+        )
+        llm.create_chat_completion(**self._completion_kwargs(llm, kwargs))
+        print(
+            f"Static prompt prefix ready in {time.perf_counter() - started_at:.2f}s",
+            flush=True,
+        )
 
     @property
     def llm(self):
@@ -234,7 +271,13 @@ class ModelManager:
             self._inference_lock.release()
 
     def _completion_kwargs(self, llm, kwargs: dict[str, object]) -> dict[str, object]:
-        if not _is_gemma_model(llm, self._local_model_path) or not _supports_chat_template_kwargs(llm):
+        if self._completion_capability_llm is not llm:
+            self._disable_thinking = _is_gemma_model(
+                llm,
+                self._local_model_path,
+            ) and _supports_chat_template_kwargs(llm)
+            self._completion_capability_llm = llm
+        if not self._disable_thinking:
             return kwargs
         updated = dict(kwargs)
         template_kwargs = dict(updated.get("chat_template_kwargs") or {})

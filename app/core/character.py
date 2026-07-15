@@ -1,4 +1,4 @@
-"""Validated, process-wide loading of Akane's two character files."""
+"""Validated loading of Akane's two canonical character files."""
 
 from __future__ import annotations
 
@@ -11,13 +11,11 @@ from app.core.config import ADVISOR_ONLY
 SOUL_PATH = Path(__file__).resolve().parent.parent / "soul.md"
 IDENTITY_PATH = Path(__file__).resolve().parent.parent / "identity.md"
 _HARD_RULES = (
-    "Answer the actual request accurately and do not invent missing context.",
-    "Remain Akane in every reply; technical detail changes the depth or structure, not her identity or voice.",
-    "Use specific, concrete language and let personality appear naturally without narrating or forcing it.",
-    "Keep casual replies short. Use more detail when a technical explanation needs it.",
-    "No emojis.",
-    "Do not end a casual reply with a question unless an answer is genuinely required.",
-    "Use the user's name sparingly and only when natural.",
+    "Use relevant recent context naturally, including repetition, corrections, "
+    "contradictions, and unfinished threads; do not treat each message as isolated.",
+    "Never describe yourself as processing input, generating replies, waiting, "
+    "observing, or managing the conversation.",
+    "Do not use emojis.",
 )
 
 
@@ -64,22 +62,45 @@ class CharacterProfile:
     def stable_identity_text(self) -> str:
         return "\n\n".join(
             (
-                "[AKANE IDENTITY]\n" + self.identity,
+                "[AKANE IDENTITY — CANONICAL FACTS]\n" + self.identity,
                 "[AKANE SOUL / VOICE]\n" + self.soul,
             )
         )
 
 
-@lru_cache(maxsize=1)
-def load_character_profile() -> CharacterProfile:
-    """Load and validate the process-wide character definition once."""
+def _file_signature(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise RuntimeError(f"Akane character file is unavailable: {path}") from exc
+    return int(stat.st_mtime_ns), int(stat.st_size)
 
+
+@lru_cache(maxsize=4)
+def _load_character_profile_cached(
+    _soul_signature: tuple[int, int],
+    _identity_signature: tuple[int, int],
+) -> CharacterProfile:
     return CharacterProfile()
 
 
-@lru_cache(maxsize=1)
+def load_character_profile() -> CharacterProfile:
+    """Load, validate, and development-reload the character definition."""
+
+    return _load_character_profile_cached(
+        _file_signature(SOUL_PATH),
+        _file_signature(IDENTITY_PATH),
+    )
+
+
+@lru_cache(maxsize=4)
+def _static_system_prompt_cached(soul: str, identity: str) -> str:
+    profile = CharacterProfile(soul=soul, identity=identity)
+    return "\n\n".join((_hard_rules_text(), profile.stable_identity_text()))
+
+
 def get_static_system_prompt() -> str:
-    """Return the immutable high-priority prompt prefix."""
+    """Return the validated high-priority prompt prefix."""
 
     profile = load_character_profile()
-    return "\n\n".join((_hard_rules_text(), profile.stable_identity_text()))
+    return _static_system_prompt_cached(profile.soul, profile.identity)

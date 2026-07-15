@@ -24,7 +24,7 @@ from app.core.config import (
     SERVER_PORT,
     _coerce_bool,
 )
-from app.core.memory import get_memory_store
+from app.core.memory import get_internal_state_store, get_memory_store
 from app.core.model_loader import ModelManager
 from app.core.reply_pipeline import (
     GenerationEvent,
@@ -46,7 +46,6 @@ from app.core.session import (
     reset_conversation,
     session_state_snapshot,
 )
-from app.core.state import get_emotion_store
 from app.integrations.vscode_workspace import (
     MAX_REQUEST_BYTES,
     clear_workspace_context,
@@ -291,7 +290,7 @@ def _start_model_loading() -> None:
 async def _lifespan(_app: FastAPI):
     load_character_profile()
     get_memory_store()
-    get_emotion_store()
+    get_internal_state_store()
     _start_model_loading()
     try:
         yield

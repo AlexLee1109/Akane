@@ -31,12 +31,3 @@ def compact_text(value: object, limit: int = 180) -> str:
 
 def words(value: object) -> set[str]:
     return {item.lower().strip(".") for item in WORD_RE.findall(str(value or "").lower())}
-
-
-def contains_any(text: str, phrases: tuple[str, ...] | set[str]) -> bool:
-    lower = str(text or "").lower()
-    return any(phrase in lower for phrase in phrases)
-
-
-def session_key(session_id: str | None, default: str = "default") -> str:
-    return (str(session_id or default).strip() or default)[:120]

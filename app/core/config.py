@@ -187,7 +187,6 @@ DATA_DIR = Path(_secret_or_env("DATA_DIR", "data") or "data").expanduser()
 MEMORY_PATH = DATA_DIR / "memory.json"
 POPUP_USER_PATH = DATA_DIR / "popup_user.json"
 LONG_TERM_MEMORY_PATH = DATA_DIR / "long_term_memory.json"
-EMOTION_STATE_PATH = DATA_DIR / "emotion.json"
 MAX_INPUT_CHARS = max(256, _int_secret("MAX_INPUT_CHARS", 8_000))
 SUMMARY_CONTEXT_TOKENS = max(32, _int_secret("SUMMARY_CONTEXT_TOKENS", 160))
 MAX_CONVERSATIONS = max(8, _int_secret("MAX_CONVERSATIONS", 64))

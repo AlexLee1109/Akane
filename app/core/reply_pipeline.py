@@ -1,4 +1,4 @@
-"""One-call generation pipeline with streaming, cancellation, and safe commit."""
+"""Shared single-generation pipeline with grounding, cancellation, and safe commit."""
 
 from __future__ import annotations
 
@@ -7,7 +7,13 @@ import time
 from dataclasses import dataclass
 
 from app.core.config import PROMPT_DEBUG, STREAM_CHUNK_CHARS, STREAM_FLUSH_SECONDS
-from app.core.model_loader import InferenceCancelled, InferenceQueueTimeout, ModelManager
+from app.core.model_loader import (
+    InferenceCancelled,
+    InferenceQueueTimeout,
+    InferenceTiming,
+    ModelManager,
+)
+from app.core.memory import estimate_tokens
 from app.core.prompt import describe_model_input
 from app.core.session import (
     ChatInput,
@@ -21,7 +27,6 @@ from app.core.session import (
     session_state_snapshot,
     timing_enabled,
 )
-
 _MAX_METRICS = 64
 _METRICS: dict[str, dict[str, object]] = {}
 _METRICS_LOCK = threading.Lock()
@@ -58,85 +63,110 @@ def prepare_reply(
 
 
 def generate_reply(prepared: PreparedReply) -> str:
-    model_started_at = time.perf_counter()
-    try:
-        prepared.handle.raise_if_cancelled()
-        _log_model_input(prepared, generation_mode="non_streaming")
-        raw = ModelManager.get_instance().complete(
-            prepared.messages,
-            max_tokens=prepared.max_tokens,
-            cancellation=prepared.handle.cancellation,
-            queue_deadline=prepared.handle.queue_deadline,
-        )
-        prepared.handle.raise_if_cancelled()
-        reply = str(raw or "").strip()
-        if not reply:
-            raise RuntimeError("Model returned no visible reply.")
-        commit_turn(prepared, reply)
-        _remember_metrics(prepared, reply)
-        _timing_log(prepared, reply, model_started_at=model_started_at)
-        return reply
-    except InferenceCancelled as exc:
-        raise GenerationCancelled(str(exc)) from exc
-    except InferenceQueueTimeout as exc:
-        raise GenerationQueueFullError(str(exc)) from exc
-    finally:
-        finish_turn(prepared)
+    for event in _reply_events(prepared, emit_deltas=False):
+        if event.kind == "done":
+            return event.reply
+    raise RuntimeError("Model returned no completion event.")
 
 
 def stream_reply(prepared: PreparedReply):
-    """Yield bounded text chunks and one completion event."""
+    """Yield one grounded reply and one completion event from one model generation."""
 
-    parts: list[str] = []
-    pending: list[str] = []
-    pending_chars = 0
-    first_delta_at = 0.0
-    last_flush_at = time.monotonic()
-    model_started_at = time.perf_counter()
+    yield from _reply_events(prepared, emit_deltas=True)
+
+
+def _reply_events(prepared: PreparedReply, *, emit_deltas: bool):
+    first_delivery_at = 0.0
+    output_chunks = 0
+    timing = InferenceTiming(requested_at=time.perf_counter())
+
     try:
         prepared.handle.raise_if_cancelled()
-        _log_model_input(prepared, generation_mode="streaming")
-        for text in ModelManager.get_instance().stream(
-            prepared.messages,
+        manager = ModelManager.get_instance()
+        messages = prepared.prompt_plan.messages
+        _log_model_input(
+            prepared,
+            generation_mode="streaming" if emit_deltas else "buffered_stream",
+        )
+        parts: list[str] = []
+        pending: list[str] = []
+        pending_chars = 0
+        last_flush_at = time.monotonic()
+        for text in manager.stream(
+            messages,
             max_tokens=prepared.max_tokens,
             cancellation=prepared.handle.cancellation,
             queue_deadline=prepared.handle.queue_deadline,
+            timing=timing,
         ):
-            prepared.handle.raise_if_cancelled()
-            if not text:
-                continue
-            if not first_delta_at:
-                first_delta_at = time.perf_counter()
+            output_chunks += 1
+            if not timing.first_token_at:
+                timing.first_token_at = time.perf_counter()
             parts.append(text)
+            if not emit_deltas:
+                continue
             pending.append(text)
             pending_chars += len(text)
             now = time.monotonic()
-            if pending_chars >= STREAM_CHUNK_CHARS or now - last_flush_at >= STREAM_FLUSH_SECONDS:
-                chunk = "".join(pending)
+            if (
+                pending_chars >= STREAM_CHUNK_CHARS
+                or now - last_flush_at >= STREAM_FLUSH_SECONDS
+            ):
+                prepared.handle.raise_if_cancelled()
+                if not first_delivery_at:
+                    first_delivery_at = time.perf_counter()
+                yield GenerationEvent(
+                    "delta",
+                    prepared.generation_id,
+                    text="".join(pending),
+                )
                 pending.clear()
                 pending_chars = 0
                 last_flush_at = now
-                yield GenerationEvent("delta", prepared.generation_id, text=chunk)
 
+        if emit_deltas and pending:
+            prepared.handle.raise_if_cancelled()
+            if not first_delivery_at:
+                first_delivery_at = time.perf_counter()
+            yield GenerationEvent(
+                "delta",
+                prepared.generation_id,
+                text="".join(pending),
+            )
         prepared.handle.raise_if_cancelled()
-        if pending:
-            yield GenerationEvent("delta", prepared.generation_id, text="".join(pending))
+        if not timing.model_started_at:
+            timing.model_started_at = timing.requested_at
+        if not timing.model_finished_at:
+            timing.model_finished_at = time.perf_counter()
+
+        postprocess_started_at = time.perf_counter()
         reply = "".join(parts).strip()
         if not reply:
             raise RuntimeError("Model returned no visible reply.")
+        postprocess_seconds = time.perf_counter() - postprocess_started_at
+
+        prepared.handle.raise_if_cancelled()
+        persistence_started_at = time.perf_counter()
         commit_turn(prepared, reply)
-        _remember_metrics(prepared, reply)
+        persistence_seconds = time.perf_counter() - persistence_started_at
+        _remember_metrics(prepared)
         _timing_log(
             prepared,
             reply,
-            model_started_at=model_started_at,
-            first_delta_at=first_delta_at,
+            timing=timing,
+            first_delivery_at=first_delivery_at,
+            output_chunks=output_chunks,
+            postprocess_seconds=postprocess_seconds,
+            persistence_seconds=persistence_seconds,
         )
         yield GenerationEvent(
             "done",
             prepared.generation_id,
             reply=reply,
-            metadata={"estimated_prompt_tokens": prepared.prompt_plan.estimated_tokens},
+            metadata={
+                "estimated_prompt_tokens": prepared.prompt_plan.estimated_tokens,
+                "tokenized_prompt_tokens": timing.prompt_tokens or None,
+            },
         )
     except InferenceCancelled as exc:
         raise GenerationCancelled(str(exc)) from exc
@@ -166,13 +196,12 @@ def debug_state_report(conversation_id: str | None, profile_id: str | None = Non
     return "\n".join(lines)
 
 
-def _remember_metrics(prepared: PreparedReply, reply: str) -> None:
+def _remember_metrics(
+    prepared: PreparedReply,
+) -> None:
     with _METRICS_LOCK:
         _METRICS[prepared.session_id] = {
-            "user_chars": len(prepared.user_text),
-            "reply_chars": len(reply),
             "prompt_tokens": prepared.prompt_plan.estimated_tokens,
-            "prompt_sections": dict(prepared.prompt_plan.section_tokens),
             "code_context_attached": prepared.code_context_attached,
             "updated_at": time.time(),
         }
@@ -184,13 +213,17 @@ def _remember_metrics(prepared: PreparedReply, reply: str) -> None:
             _METRICS.pop(oldest, None)
 
 
-def _log_model_input(prepared: PreparedReply, *, generation_mode: str) -> None:
+def _log_model_input(
+    prepared: PreparedReply,
+    *,
+    generation_mode: str,
+) -> None:
     if not PROMPT_DEBUG:
         return
     earlier_dialogue = prepared.memory_context.earlier_dialogue
     summary_turns = max(0, len(earlier_dialogue.splitlines()) - 1) if earlier_dialogue else 0
     metadata = describe_model_input(
-        prepared.messages,
+        prepared.prompt_plan.messages,
         transport=prepared.chat_input.source,
         conversation_id=prepared.chat_input.conversation_id,
         loaded_recent_turns=len(prepared.memory_context.recent_turns),
@@ -205,23 +238,52 @@ def _timing_log(
     prepared: PreparedReply,
     reply: str,
     *,
-    model_started_at: float,
-    first_delta_at: float = 0.0,
+    timing: InferenceTiming,
+    first_delivery_at: float = 0.0,
+    output_chunks: int = 0,
+    postprocess_seconds: float = 0.0,
+    persistence_seconds: float = 0.0,
 ) -> None:
     if not timing_enabled():
         return
     done = time.perf_counter()
+    model_seconds = max(0.0, timing.model_finished_at - timing.model_started_at)
+    decode_seconds = max(0.0, timing.model_finished_at - timing.first_token_at)
+    prompt_eval_seconds = max(
+        0.0,
+        timing.first_token_at
+        - timing.model_started_at
+        - timing.chat_template_seconds
+        - timing.prompt_tokenization_seconds,
+    )
+    output_tokens = estimate_tokens(reply)
     fields = [
         "[Akane:timing]",
         f"total={done - prepared.started_at:.3f}s",
+        f"preprocess={getattr(prepared, 'preprocess_seconds', prepared.prompt_seconds):.3f}s",
         f"prompt={prepared.prompt_seconds:.3f}s",
-        f"queue_to_model={model_started_at - prepared.started_at:.3f}s",
-        f"generation={done - model_started_at:.3f}s",
+        f"memory={getattr(prepared, 'memory_seconds', 0.0):.3f}s",
+        f"subtext={getattr(prepared, 'subtext_seconds', 0.0):.3f}s",
+        f"queue={max(0.0, timing.model_started_at - timing.requested_at):.3f}s",
+        f"chat_template={timing.chat_template_seconds:.3f}s",
+        f"tokenization={timing.prompt_tokenization_seconds:.3f}s",
+        f"prompt_eval={prompt_eval_seconds:.3f}s",
+        f"model_total={model_seconds:.3f}s",
+        f"postprocess={postprocess_seconds:.3f}s",
+        f"persistence={persistence_seconds:.3f}s",
         f"prompt_tokens_est={prepared.prompt_plan.estimated_tokens}",
+        f"prompt_tokens_backend={timing.prompt_tokens}",
+        f"output_tokens_est={output_tokens}",
         f"output_chars={len(reply)}",
     ]
-    if first_delta_at:
-        fields.insert(1, f"first_token={first_delta_at - prepared.started_at:.3f}s")
+    if decode_seconds > 0.0:
+        fields.append(f"tokens_per_second_est={output_tokens / decode_seconds:.2f}")
+    if output_chunks:
+        fields.append(f"stream_chunks={output_chunks}")
+    if timing.first_token_at:
+        fields.insert(1, f"first_token={timing.first_token_at - prepared.started_at:.3f}s")
+    if first_delivery_at:
+        fields.insert(2, f"first_delivery={first_delivery_at - prepared.started_at:.3f}s")
     print(" ".join(fields), flush=True)
 
 

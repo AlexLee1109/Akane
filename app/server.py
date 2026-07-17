@@ -40,14 +40,18 @@ from app.core.session import (
     GenerationQueueFullError,
     cancel_all_generations,
     cancel_generation,
+    commit_turn,
     finish_turn,
     forget_profile,
     normalize_chat_input,
     reset_conversation,
     session_state_snapshot,
 )
+from app.integrations.vscode_context import active_file_reply
 from app.integrations.vscode_workspace import (
     MAX_REQUEST_BYTES,
+    ReviewDecision,
+    claim_editor_review,
     clear_workspace_context,
     update_editor_context,
     workspace_status,
@@ -107,6 +111,7 @@ def _parse_chat_request(payload: dict) -> ChatRequestData:
             display_name=payload.get("display_name", ""),
             reply_context=payload.get("reply_context", ""),
             group_conversation=_coerce_bool(payload.get("group_conversation", False)),
+            autonomous=_coerce_bool(payload.get("autonomous", False)),
         ),
         skip_memory=_coerce_bool(payload.get("skip_memory", False)),
         skip_if_busy=_coerce_bool(payload.get("skip_if_busy", False)),
@@ -153,31 +158,85 @@ def _error_status(exc: Exception) -> int:
 
 def _generate_reply(chat: ChatRequestData) -> str:
     item = chat.chat_input
-    _log(
-        "ingress",
-        f"conversation={item.conversation_id} source={item.source} "
-        f"stream=0 chars={len(item.text)}",
-    )
+    direct_reply = active_file_reply(item.text)
     prepared = prepare_reply(
         item,
         skip_memory=chat.skip_memory,
         skip_if_busy=chat.skip_if_busy,
     )
+    if direct_reply is not None:
+        try:
+            commit_turn(prepared, direct_reply)
+            return direct_reply
+        finally:
+            finish_turn(prepared)
     reply = generate_reply(prepared)
-    _log("complete", f"conversation={item.conversation_id} reply_chars={len(reply)}")
     return reply
+
+
+def _review_vscode_context(decision: ReviewDecision | None = None) -> str:
+    decision = decision or claim_editor_review()
+    snapshot = decision.snapshot
+    if not decision.accepted or snapshot is None:
+        return ""
+    project = f"vscode:project:{snapshot.project_id}"
+    request = ChatRequestData(
+        chat_input=normalize_chat_input(
+            text=(
+                f"Review the current file because {decision.reason}. Give one short, concrete "
+                "warning only when the supplied read-only context supports a real bug, broken "
+                "build, risky change, or project contradiction. Otherwise reply exactly "
+                "[SILENT]. Do not claim to edit files, run commands, or execute tests."
+            ),
+            profile_id=project,
+            conversation_id=f"{project}:reviews",
+            source="popup",
+        ),
+        skip_memory=False,
+        skip_if_busy=True,
+    )
+    reply = _generate_reply(request).strip()
+    return "" if reply.upper().rstrip(".! ") == "[SILENT]" else reply
 
 
 def _stream_chat_events(chat: ChatRequestData):
     item = chat.chat_input
+    direct_reply = active_file_reply(item.text)
+    if direct_reply is not None:
+        prepared = prepare_reply(
+            item,
+            skip_memory=chat.skip_memory,
+            skip_if_busy=chat.skip_if_busy,
+        )
+        try:
+            yield _json_line(
+                {
+                    "type": "start",
+                    "generation_id": prepared.generation_id,
+                    "messages": _messages_with_user(item),
+                }
+            )
+            yield _event_json(
+                GenerationEvent("delta", prepared.generation_id, text=direct_reply),
+                item.conversation_id,
+                item.profile_id,
+            )
+            commit_turn(prepared, direct_reply)
+            yield _event_json(
+                GenerationEvent("done", prepared.generation_id, reply=direct_reply),
+                item.conversation_id,
+                item.profile_id,
+            )
+        finally:
+            finish_turn(prepared)
+        return
     prepared = None
-    _log(
-        "ingress",
-        f"conversation={item.conversation_id} source={item.source} "
-        f"stream=1 chars={len(item.text)}",
-    )
     try:
-        prepared = prepare_reply(item, skip_memory=chat.skip_memory)
+        prepared = prepare_reply(
+            item,
+            skip_memory=chat.skip_memory,
+            skip_if_busy=chat.skip_if_busy,
+        )
         yield _json_line(
             {
                 "type": "start",
@@ -215,7 +274,6 @@ def _event_json(event: GenerationEvent, conversation_id: str, profile_id: str) -
                 "content": event.text,
             }
         )
-    _log("complete", f"conversation={conversation_id} reply_chars={len(event.reply)}")
     return _json_line(
         {
             "type": "done",
@@ -359,6 +417,15 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception:
             return JSONResponse({"error": "Invalid JSON request body."}, status_code=400)
+        decision = claim_editor_review()
+        if decision.accepted:
+            try:
+                suggestion = await asyncio.to_thread(_review_vscode_context, decision)
+            except Exception as exc:
+                _log("vscode-review-error", f"type={type(exc).__name__} detail={exc}")
+            else:
+                if suggestion:
+                    status["suggestion"] = suggestion
         return JSONResponse({"ok": True, **status})
 
     @app.get("/api/vscode/status")

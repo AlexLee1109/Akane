@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 
@@ -84,6 +85,23 @@ _HOSTILITY_MARKERS = _phrase_group(
     "you are stupid|you are useless|you idiot|you're an idiot|you're a useless idiot|"
     "you're a useless|you're stupid|you're useless"
 )
+_INDIRECT_REQUEST_MARKERS = _phrase_group(
+    "any chance you could|could you maybe|do you think you could|i wonder if you could|"
+    "it would be helpful if|it would be nice if|maybe you could|perhaps you could|"
+    "would you mind"
+)
+_EXPLICIT_DISCLOSURE = re.compile(
+    r"\b(?:i am|i feel|i have been feeling|i'm|i've been feeling)\b",
+    re.IGNORECASE,
+)
+_CORRECTION_REFERENCE = _phrase_group(
+    "but you said|i asked for|i meant|not what i asked|that's not what|that is not what|"
+    "you said|your last answer"
+)
+_CRITICISM_MARKERS = _phrase_group(
+    "bad answer|bad take|just answer|not helpful|sounds like a chatbot|stop analyzing|"
+    "stop explaining|too generic|too formal|too robotic|you ignored|you missed"
+)
 
 _IDENTITY_PATTERNS = (
     (
@@ -105,7 +123,14 @@ _IDENTITY_PATTERNS = (
     ),
     (
         "preferences",
-        _phrase_group("what anime|what do you like|what game|your favorite|your preferences"),
+        _phrase_group(
+            "anime are you into|anime do you enjoy|favorite anime|favorite game|"
+            "favorite music|games do you like|interests you have|music do you like|"
+            "name an anime|reconsider your preferences|tastes changed|what anime|"
+            "what are you into|what do you enjoy|"
+            "what do you like|what game|what interests you|what shows do you like|"
+            "which anime|which game|your favorite|your preferences"
+        ),
     ),
     (
         "identity",
@@ -168,6 +193,10 @@ class EmotionState:
     dominant: str = "relaxed"
     secondary: str = ""
     cause: str = ""
+    mood: str = "steady"
+    momentum: float = 0.0
+    last_trigger: str = ""
+    trigger_repetitions: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +208,8 @@ class TurnContext:
     unresolved_problem: bool = False
     repeated_topic_count: int = 0
     last_outcome: str = ""
+    memory_relevance: float = 0.0
+    meaningful_memory: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +219,6 @@ class TurnSignal:
     topic_confidence: float
     intent: str
     tone: str
-    stance: str
     task: str = ""
     correction: str = ""
     trigger: str = ""
@@ -204,7 +234,6 @@ class TurnSignal:
     debugging: bool = False
     task_success: bool = False
     task_failure: bool = False
-    direct: bool = False
     code_context_requested: bool = False
     code_context_attached: bool = False
     identity_attribute: str = ""
@@ -255,11 +284,200 @@ class TurnSignal:
             "irritated": "keep firm boundaries and a controlled tone",
             "guarded": "remain calm, bounded, and factual",
         }.get(state.dominant, "respond naturally and keep the answer proportionate")
+        mood = {
+            "bright": "bright and receptive",
+            "pensive": "quietly thoughtful",
+            "strained": "somewhat strained but controlled",
+            "weary": "low-key and a little weary",
+        }.get(state.mood, "steady")
         return (
-            f"Current disposition: {disposition}.\n"
+            f"Current mood: {mood}.\n"
+            f"Immediate emotional tendency: {disposition}.\n"
             f"Expression: {expression}.\n"
-            "Do not mention or explain the internal state."
+            "Let this affect expression, not factual judgment. Keep it silent; do not name or explain it."
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SubtextAppraisal:
+    """One ephemeral, uncertain interpretation used only for response shaping."""
+
+    kind: str
+    summary: str
+    confidence: float
+    behavioral_effect: str
+
+
+def appraise_subtext(
+    user_text: str,
+    signal: TurnSignal,
+    recent_turns: Iterable[object] | None,
+    *,
+    current_topic: str = "",
+    current_task: str = "",
+    unresolved_problem: bool = False,
+    now: float | None = None,
+) -> SubtextAppraisal | None:
+    """Infer one bounded conversational hypothesis from combined evidence."""
+
+    current = time.time() if now is None else max(0.0, float(now))
+    recent = _active_recent_turns(recent_turns, now=current)[-12:]
+    recent_users = [content for role, content in recent if role == "user"]
+    recent_assistants = [content for role, content in recent if role == "assistant"]
+    candidates: list[tuple[float, int, str, str, str]] = []
+
+    def candidate(
+        kind: str,
+        score: float,
+        summary: str,
+        behavioral_effect: str,
+        priority: int,
+    ) -> None:
+        if score >= 0.60:
+            candidates.append(
+                (
+                    clamp(score),
+                    priority,
+                    kind,
+                    compact_text(summary, 180),
+                    compact_text(behavioral_effect, 180),
+                )
+            )
+
+    similar_users = [
+        content for content in recent_users if message_similarity(content, user_text) >= 0.74
+    ]
+    repeated_turns = len(similar_users) + 1
+    repeated_assistant_pairs = sum(
+        message_similarity(left, right) >= 0.82
+        for left, right in zip(recent_assistants, recent_assistants[1:])
+    )
+    if repeated_turns >= 3:
+        repetition_score = 0.60 + min(0.22, (repeated_turns - 3) * 0.07)
+        repetition_score += min(0.08, repeated_assistant_pairs * 0.04)
+        stalled = repeated_assistant_pairs > 0
+        candidate(
+            "repeated_pattern",
+            repetition_score,
+            (
+                "The user may be checking consistency or signaling that earlier replies "
+                "did not resolve the point."
+                if stalled
+                else "The user may be emphasizing the same point or checking whether the answer changes."
+            ),
+            (
+                "Answer more directly and concisely; lightly recognize the established pattern "
+                "only if natural, while remaining patient and non-dismissive."
+                if repeated_turns >= 5
+                else "Stay patient and answer directly. Change wording, structure, reason, or "
+                "emphasis without changing established facts or preferences, and do not force "
+                "acknowledgment of repetition."
+            ),
+            3,
+        )
+
+    prior_failures = sum(bool(_FAILURE_MARKERS.search(content)) for content in recent_users[-6:])
+    failure_context = bool(current_task or current_topic or signal.technical)
+    candidate(
+        "unresolved_failure",
+        0.38
+        + (0.10 if signal.task_failure else 0.0)
+        + (0.18 if prior_failures else 0.0)
+        + (0.08 if unresolved_problem and prior_failures else 0.0)
+        + (0.04 if failure_context and prior_failures else 0.0),
+        "The user may be indicating that the earlier approach still has not solved the task.",
+        "Acknowledge the prior failure briefly, simplify where useful, and give a concrete next step instead of repeating the same advice.",
+        0,
+    )
+
+    correction_reference = bool(_CORRECTION_REFERENCE.search(user_text))
+    candidate(
+        "correction",
+        0.43
+        + (0.12 if signal.correction_requested else 0.0)
+        + (0.09 if recent_assistants else 0.0)
+        + (0.08 if correction_reference else 0.0),
+        "The user may be redirecting the conversation toward a corrected understanding.",
+        "Prioritize the correction, avoid defending the earlier answer, and confirm the revised target through the answer itself.",
+        1,
+    )
+
+    indirect_hits = len(_INDIRECT_REQUEST_MARKERS.findall(user_text))
+    candidate(
+        "indirect_request",
+        0.42
+        + min(0.18, indirect_hits * 0.12)
+        + (0.08 if "?" in user_text else 0.0)
+        + (0.08 if current_task or current_topic else 0.0)
+        + (0.05 if recent_assistants else 0.0),
+        "The user may be making a request indirectly rather than merely commenting.",
+        "Respond decisively to the likely request while leaving room for the interpretation to be wrong.",
+        4,
+    )
+
+    disclosed = bool(_EXPLICIT_DISCLOSURE.search(user_text))
+    disclosed_vulnerability = bool(_VULNERABILITY_MARKERS.search(user_text))
+    candidate(
+        "emotional_disclosure",
+        0.48
+        + (0.14 if disclosed and (signal.sadness or disclosed_vulnerability) else 0.0)
+        + (0.07 if recent_assistants else 0.0),
+        "The user may want their disclosed experience acknowledged before advice or problem-solving.",
+        "Lead with measured warmth and acknowledgment; do not diagnose, overinterpret, or claim certainty about their feelings.",
+        2,
+    )
+
+    prior_warmth = any(_POSITIVE_MARKERS.search(content) for content in recent_users[-4:])
+    candidate(
+        "tone_shift",
+        0.46
+        + (0.10 if signal.criticism or signal.frustration else 0.0)
+        + (0.09 if prior_warmth else 0.0)
+        + (0.06 if recent_assistants else 0.0),
+        "The user's tone may have shifted because the conversation is not meeting their need.",
+        "Increase caution and directness, acknowledge the concern without assigning a motive, and avoid repeating the same framing.",
+        5,
+    )
+
+    if not candidates:
+        return None
+    score, _priority, kind, summary, effect = sorted(
+        candidates,
+        key=lambda item: (-item[0], item[1], item[2]),
+    )[0]
+    return SubtextAppraisal(kind, summary, score, effect)
+
+
+def _active_recent_turns(
+    recent_turns: Iterable[object] | None,
+    *,
+    now: float,
+) -> list[tuple[str, str]]:
+    active: list[tuple[str, str]] = []
+    for turn in tuple(recent_turns or ())[-12:]:
+        role = str(
+            turn.get("role", "") if isinstance(turn, dict) else getattr(turn, "role", "")
+        )
+        content = str(
+            turn.get("content", turn.get("text", ""))
+            if isinstance(turn, dict)
+            else getattr(turn, "content", "")
+        ).strip()
+        raw_timestamp = (
+            turn.get("timestamp", 0.0)
+            if isinstance(turn, dict)
+            else getattr(turn, "timestamp", 0.0)
+        )
+        try:
+            timestamp = max(0.0, float(raw_timestamp or 0.0))
+        except (TypeError, ValueError):
+            timestamp = 0.0
+        if not content or role not in {"user", "assistant"}:
+            continue
+        if timestamp and now > timestamp and now - timestamp > 6 * 3600:
+            continue
+        active.append((role, content))
+    return active
 
 
 def advance_emotion(state: EmotionState, *, now: float) -> EmotionState:
@@ -304,7 +522,46 @@ def advance_emotion(state: EmotionState, *, now: float) -> EmotionState:
     energy_target = 0.60 if hour < 6 or hour >= 23 else _BASELINES["energy"]
     values["energy"] = _decay(values["energy"], energy_target, elapsed_hours, 24.0)
     cause = state.cause if max(values[name] for name in _ACTIVATIONS) >= 0.12 else ""
-    return _make_state(state, updated_at=current, values=values, cause=cause)
+    momentum = _decay(state.momentum, 0.0, elapsed_hours, 10.0)
+    trigger_repetitions = state.trigger_repetitions if elapsed_hours < 6.0 else 0
+    return _make_state(
+        state,
+        updated_at=current,
+        values=values,
+        cause=cause,
+        momentum=momentum,
+        last_trigger=state.last_trigger if trigger_repetitions else "",
+        trigger_repetitions=trigger_repetitions,
+    )
+
+
+def apply_activity_effect(
+    state: EmotionState,
+    activity_mood: str,
+    *,
+    now: float,
+) -> EmotionState:
+    """Apply one small, non-repeating emotional effect from a completed activity."""
+
+    current = state
+    values = _state_values(current)
+    effects = {
+        "calm": {"arousal": -0.025, "stimulation": -0.015, "valence": 0.01},
+        "curious": {"curiosity": 0.025, "stimulation": 0.015},
+        "focused": {"confidence": 0.018, "stimulation": 0.012},
+        "confident": {"confidence": 0.025, "valence": 0.012},
+        "thoughtful": {"curiosity": 0.016, "arousal": -0.012},
+    }
+    for name, delta in effects.get(activity_mood, {}).items():
+        low = -1.0 if name == "valence" else 0.0
+        values[name] = clamp(values[name] + delta, 0.0, low, 1.0)
+    return _make_state(
+        current,
+        updated_at=now,
+        values=values,
+        cause=current.cause,
+        momentum=current.momentum,
+    )
 
 
 def analyze_turn(
@@ -313,6 +570,7 @@ def analyze_turn(
     emotion_state: EmotionState | None = None,
     turn_context: TurnContext | None = None,
     now: float | None = None,
+    emotion_state_is_current: bool = False,
     code_context_requested: bool = False,
     code_context_attached: bool = False,
 ) -> TurnSignal:
@@ -329,9 +587,14 @@ def analyze_turn(
     )
     current = time.time() if now is None else float(now)
     previous = emotion_state or EmotionState(updated_at=current)
-    updated = _apply_evidence(advance_emotion(previous, now=current), evidence, now=current)
+    current_emotion = (
+        previous
+        if emotion_state_is_current
+        else advance_emotion(previous, now=current)
+    )
+    updated = _apply_evidence(current_emotion, evidence, now=current)
     identity_attribute, current_activity = _identity_focus(lower)
-    intent, stance, tone, trigger = _intent(
+    intent, tone, trigger = _intent(
         evidence,
         updated,
         identity_question=bool(identity_attribute),
@@ -346,7 +609,6 @@ def analyze_turn(
         topic_confidence=confidence,
         intent=intent,
         tone=tone,
-        stance=stance,
         emotion_state=updated,
         task=topic if technical or direct else "",
         correction=summary if correction else "",
@@ -364,7 +626,6 @@ def analyze_turn(
         and max(evidence["task_failure"], evidence["correction"]) >= 0.5,
         task_success=evidence["task_success"] >= 0.5,
         task_failure=evidence["task_failure"] >= 0.5,
-        direct=direct,
         code_context_requested=code_context_requested,
         code_context_attached=code_context_attached,
         identity_attribute=identity_attribute,
@@ -450,7 +711,7 @@ def _appraise(
         sum(char.isupper() for char in letters) / len(letters) if len(letters) >= 6 else 0.0
     )
     criticism = float(
-        bool(re.search(r"\b(?:bad answer|bad take|not helpful|you missed|you ignored)\b", text))
+        bool(_CRITICISM_MARKERS.search(text))
         or (correction and bool(tokens & {"answer", "response", "you"}))
     )
     praise = max(
@@ -491,6 +752,8 @@ def _appraise(
         "repetition": clamp(repeated_failure),
         "user_frustration": clamp(max(failure * 0.68, negative * 0.52, tension * 0.58)),
         "gratitude": clamp(gratitude),
+        "memory_relevance": clamp(context.memory_relevance),
+        "meaningful_memory": float(context.meaningful_memory),
         "serious": clamp(
             max(
                 vulnerability,
@@ -511,10 +774,32 @@ def _apply_evidence(
     now: float,
 ) -> EmotionState:
     values = _state_values(state)
+    trigger = _evidence_trigger(evidence)
+    same_trigger = bool(trigger and trigger == state.last_trigger)
+    repetitions = (
+        min(12, state.trigger_repetitions + 1)
+        if same_trigger
+        else 1 if trigger else max(0, state.trigger_repetitions - 1)
+    )
+    resistance = max(0.42, 1.0 - max(0, repetitions - 1) * 0.26)
+    if trigger == "task_failure" and evidence["repetition"] >= 0.5:
+        resistance = max(0.88, resistance)
+    memory_boost = (
+        1.0 + evidence["memory_relevance"] * 0.16
+        if trigger and evidence["meaningful_memory"] and not same_trigger
+        else 1.0
+    )
+    reaction_scale = resistance * memory_boost
 
     def shift(name: str, delta: float, limit: float = 0.18) -> None:
         low = -1.0 if name == "valence" else 0.0
-        values[name] = clamp(values[name] + clamp(delta, 0.0, -limit, limit), 0.0, low, 1.0)
+        scaled = delta * reaction_scale
+        values[name] = clamp(
+            values[name] + clamp(scaled, 0.0, -limit, limit),
+            0.0,
+            low,
+            1.0,
+        )
 
     pleasant = evidence["pleasantness"]
     tension = evidence["tension"]
@@ -597,11 +882,24 @@ def _apply_evidence(
     )
 
     cause = _cause(evidence, state.cause)
+    activation = max(
+        evidence["hostility"],
+        evidence["vulnerability"],
+        evidence["task_failure"],
+        evidence["task_success"],
+        evidence["criticism"],
+        evidence["playfulness"],
+        evidence["praise"],
+    )
+    momentum = clamp(state.momentum * 0.72 + activation * resistance * 0.24)
     return _make_state(
         state,
         updated_at=now,
         values=values,
         cause=cause,
+        momentum=momentum,
+        last_trigger=trigger,
+        trigger_repetitions=repetitions,
     )
 
 
@@ -650,7 +948,11 @@ def _select_emotions(
     ranked = sorted(scores, key=scores.get, reverse=True)
     dominant = ranked[0]
     if previous.dominant in scores and previous.dominant != dominant:
-        inertia = 0.05 + max(values[name] for name in _ACTIVATIONS) * 0.08
+        inertia = (
+            0.05
+            + max(values[name] for name in _ACTIVATIONS) * 0.08
+            + previous.momentum * 0.08
+        )
         if max(values[name] for name in _ACTIVATIONS) >= 0.30:
             inertia *= 0.40
         if scores[dominant] < scores[previous.dominant] + inertia:
@@ -676,6 +978,9 @@ def _make_state(
     updated_at: float,
     values: dict[str, float],
     cause: str = "",
+    momentum: float | None = None,
+    last_trigger: str | None = None,
+    trigger_repetitions: int | None = None,
 ) -> EmotionState:
     bounded = {
         name: clamp(value, _BASELINES.get(name, 0.0), -1.0 if name == "valence" else 0.0, 1.0)
@@ -687,6 +992,21 @@ def _make_state(
         dominant=dominant,
         secondary=secondary,
         cause=compact_text(cause, 100),
+        mood=_mood_label(bounded, previous.mood),
+        momentum=clamp(previous.momentum if momentum is None else momentum),
+        last_trigger=compact_text(
+            previous.last_trigger if last_trigger is None else last_trigger,
+            32,
+        ),
+        trigger_repetitions=max(
+            0,
+            min(
+                12,
+                previous.trigger_repetitions
+                if trigger_repetitions is None
+                else int(trigger_repetitions),
+            ),
+        ),
         **bounded,
     )
 
@@ -724,12 +1044,48 @@ def _cause(evidence: dict[str, float], previous: str) -> str:
     return previous
 
 
+def _evidence_trigger(evidence: dict[str, float]) -> str:
+    for name in (
+        "hostility",
+        "vulnerability",
+        "task_failure",
+        "task_success",
+        "correction",
+        "criticism",
+        "praise",
+        "playfulness",
+        "technical",
+        "social_warmth",
+    ):
+        if evidence[name] >= 0.5:
+            return name
+    return ""
+
+
+def _mood_label(values: dict[str, float], previous: str) -> str:
+    targets = {
+        "strained": values["frustration"] * 0.65 + values["irritation"] * 0.75,
+        "weary": (1.0 - values["energy"]) * 0.85 + values["concern"] * 0.18,
+        "bright": max(0.0, values["valence"]) * 0.75 + values["warmth"] * 0.36,
+        "pensive": values["curiosity"] * 0.48 + (1.0 - values["arousal"]) * 0.24,
+    }
+    target, score = max(targets.items(), key=lambda item: item[1])
+    thresholds = {"strained": 0.48, "weary": 0.60, "bright": 0.46, "pensive": 0.52}
+    if score < thresholds[target]:
+        return "steady"
+    if previous != "steady" and previous != target:
+        previous_score = targets.get(previous, 0.0)
+        if score < previous_score + 0.12:
+            return previous
+    return target
+
+
 def _intent(
     evidence: dict[str, float],
     state: EmotionState,
     *,
     identity_question: bool,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str, str]:
     technical = evidence["technical"] >= 0.5
     correction = evidence["correction"] >= 0.5
     repeated = evidence["repetition"] >= 0.5
@@ -737,28 +1093,27 @@ def _intent(
         (
             technical,
             "technical",
-            "careful" if evidence["task_failure"] else "attentive",
             "corrective" if correction else "focused",
             "repeated_problem" if repeated else "code_problem" if evidence["task_failure"] else "coding_task",
         ),
-        (evidence["vulnerability"] >= 0.5, "emotional_support", "steady", "gentle", "user_distress"),
-        (evidence["hostility"] >= 0.5, "hostility", "bounded", "guarded", "hostility"),
-        (evidence["criticism"] >= 0.5, "criticism", "careful", "critical", "criticism"),
-        (correction, "correction", "direct", "corrective", "correction"),
-        (evidence["praise"] >= 0.5, "praise", "warm", "kind", "praise"),
-        (evidence["playfulness"] >= 0.5, "teasing", "light", "teasing", "teasing"),
-        (evidence["gratitude"] >= 0.5, "gratitude", "warm", "kind", "thanks"),
-        (identity_question, "identity", "direct", "neutral", "identity_interest"),
-        (evidence["user_frustration"] >= 0.45, "frustration", "reassuring", "upset", "user_frustration"),
-        (evidence["serious"] >= 0.5, "serious", "careful", "neutral", "serious_topic"),
-        (evidence["directness"] >= 0.5, "instruction", "direct", "neutral", ""),
+        (evidence["vulnerability"] >= 0.5, "emotional_support", "gentle", "user_distress"),
+        (evidence["hostility"] >= 0.5, "hostility", "guarded", "hostility"),
+        (evidence["criticism"] >= 0.5, "criticism", "critical", "criticism"),
+        (correction, "correction", "corrective", "correction"),
+        (evidence["praise"] >= 0.5, "praise", "kind", "praise"),
+        (evidence["playfulness"] >= 0.5, "teasing", "teasing", "teasing"),
+        (evidence["gratitude"] >= 0.5, "gratitude", "kind", "thanks"),
+        (identity_question, "identity", "neutral", "identity_interest"),
+        (evidence["user_frustration"] >= 0.45, "frustration", "upset", "user_frustration"),
+        (evidence["serious"] >= 0.5, "serious", "neutral", "serious_topic"),
+        (evidence["directness"] >= 0.5, "instruction", "neutral", ""),
     )
-    for matches, intent, stance, tone, trigger in choices:
+    for matches, intent, tone, trigger in choices:
         if matches:
-            return intent, stance, tone, trigger
+            return intent, tone, trigger
     if state.dominant in {"warm", "concerned"}:
-        return "casual", "warm", "kind", ""
-    return "casual", "warm", "neutral", ""
+        return "casual", "kind", ""
+    return "casual", "neutral", ""
 
 
 def _identity_focus(text: str) -> tuple[str, bool]:

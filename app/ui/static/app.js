@@ -515,6 +515,54 @@ function renderMessages(messages) {
   scrollMessages();
 }
 
+function updateStreamingAssistant(
+  assistantText,
+  userMessage,
+) {
+  const lastMessage =
+    currentMessages[
+      currentMessages.length - 1
+    ];
+
+  if (lastMessage?.role === "assistant") {
+    lastMessage.content = assistantText;
+  } else {
+    if (!currentMessages.length && userMessage) {
+      currentMessages.push({
+        role: "user",
+        content: userMessage,
+      });
+    }
+
+    currentMessages.push({
+      role: "assistant",
+      content: assistantText,
+    });
+  }
+
+  if (POPUP_ROLE === "companion") {
+    setBubbleText(assistantText);
+    return;
+  }
+
+  const row = elements.messages?.lastElementChild;
+  const body = row?.classList.contains(
+    "message-row-assistant",
+  )
+    ? row.querySelector(".bubble-body")
+    : null;
+
+  if (!body) {
+    renderMessages(currentMessages);
+    return;
+  }
+
+  body.innerHTML = renderMessageBody(
+    assistantText,
+  );
+  scrollMessages();
+}
+
 function upsertStreamingMessages(
   userText,
   assistantText = "",
@@ -805,37 +853,10 @@ function handleStreamEvent(
     showBubbleNow();
 
     streamingAssistantText += incoming;
-
-    const next = [...currentMessages];
-
-    const lastMessage =
-      next[next.length - 1];
-
-    if (
-      lastMessage?.role === "assistant"
-    ) {
-      next[next.length - 1] = {
-        ...lastMessage,
-        content: streamingAssistantText,
-      };
-    } else {
-      if (
-        !next.length &&
-        userMessage
-      ) {
-        next.push({
-          role: "user",
-          content: userMessage,
-        });
-      }
-
-      next.push({
-        role: "assistant",
-        content: streamingAssistantText,
-      });
-    }
-
-    renderMessages(next);
+    updateStreamingAssistant(
+      streamingAssistantText,
+      userMessage,
+    );
 
     return;
   }

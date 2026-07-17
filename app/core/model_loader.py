@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import inspect
+import queue
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from app.core.config import (
     GENERATION_STOP_SEQUENCES,
@@ -34,6 +37,19 @@ from app.core.config import (
 )
 
 _THINKING_OFF_TEMPLATE_KWARGS = {"enable_thinking": False}
+_STOP_SEQUENCES = list(GENERATION_STOP_SEQUENCES)
+_OPTIONAL_LOAD_ARGUMENTS = {
+    "flash_attn",
+    "last_n_tokens_size",
+    "n_threads_batch",
+    "n_ubatch",
+    "no_perf",
+    "offload_kqv",
+    "op_offload",
+    "swa_full",
+}
+_STREAM_QUEUE_SIZE = MAX_TOKENS + 2
+_STREAM_END = object()
 
 
 class InferenceCancelled(RuntimeError):
@@ -42,6 +58,22 @@ class InferenceCancelled(RuntimeError):
 
 class InferenceQueueTimeout(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class InferenceTiming:
+    requested_at: float
+    model_started_at: float = 0.0
+    first_token_at: float = 0.0
+    model_finished_at: float = 0.0
+    chat_template_seconds: float = 0.0
+    prompt_tokenization_seconds: float = 0.0
+    prompt_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamFailure:
+    error: Exception
 
 
 def content_to_text(content) -> str:
@@ -67,8 +99,8 @@ def completion_kwargs(max_tokens: int, stream: bool) -> dict[str, object]:
         "repeat_penalty": REPETITION_PENALTY,
         "stream": stream,
     }
-    if GENERATION_STOP_SEQUENCES:
-        options["stop"] = list(GENERATION_STOP_SEQUENCES)
+    if _STOP_SEQUENCES:
+        options["stop"] = _STOP_SEQUENCES
     return options
 
 
@@ -132,6 +164,7 @@ class ModelManager:
         self._inference_lock = threading.Lock()
         self._completion_capability_llm = None
         self._disable_thinking = False
+        self._active_timing: InferenceTiming | None = None
 
     @classmethod
     def get_instance(cls) -> "ModelManager":
@@ -177,6 +210,18 @@ class ModelManager:
             kwargs["swa_full"] = True
         return kwargs
 
+    def _resolved_load_kwargs(self, llama_type) -> dict[str, object]:
+        """Filter version-dependent constructor options once before model creation."""
+
+        kwargs = self._load_kwargs()
+        try:
+            supported = inspect.signature(llama_type.__init__).parameters
+        except (TypeError, ValueError):
+            return kwargs
+        for name in _OPTIONAL_LOAD_ARGUMENTS - supported.keys():
+            kwargs.pop(name, None)
+        return kwargs
+
     def ensure_loaded(self) -> None:
         if self._llm is not None:
             return
@@ -188,17 +233,20 @@ class ModelManager:
             try:
                 from llama_cpp import Llama
 
-                kwargs = self._load_kwargs()
+                kwargs = self._resolved_load_kwargs(Llama)
                 print(
                     f"Loading model {self._local_model_path} "
                     f"n_ctx={kwargs['n_ctx']} n_batch={kwargs['n_batch']} "
-                    f"n_ubatch={kwargs['n_ubatch']} n_threads={kwargs['n_threads']} "
-                    f"flash_attn={kwargs['flash_attn']} "
+                    f"n_ubatch={kwargs.get('n_ubatch', 'backend-default')} "
+                    f"n_threads={kwargs['n_threads']} "
+                    f"flash_attn={kwargs.get('flash_attn', False)} "
                     f"swa_full={kwargs.get('swa_full', False)}",
                     flush=True,
                 )
                 llm = Llama(**kwargs)
                 self._validate_loaded_model(llm)
+                self._configure_completion_capabilities(llm)
+                self._instrument_tokenizer(llm)
                 self._warm_static_prompt(llm)
                 self._llm = llm
             except Exception as exc:
@@ -270,13 +318,58 @@ class ModelManager:
         finally:
             self._inference_lock.release()
 
-    def _completion_kwargs(self, llm, kwargs: dict[str, object]) -> dict[str, object]:
+    def _configure_completion_capabilities(self, llm) -> None:
         if self._completion_capability_llm is not llm:
             self._disable_thinking = _is_gemma_model(
                 llm,
                 self._local_model_path,
             ) and _supports_chat_template_kwargs(llm)
             self._completion_capability_llm = llm
+
+    def _instrument_tokenizer(self, llm) -> None:
+        """Time the backend's existing tokenizer without another tokenization pass."""
+
+        original = getattr(llm, "tokenize", None)
+        if original is None:
+            return
+
+        def timed_tokenize(*args, **kwargs):
+            started_at = time.perf_counter()
+            timing = self._active_timing
+            if timing is not None and timing.prompt_tokens == 0:
+                timing.chat_template_seconds = max(
+                    0.0,
+                    started_at - timing.model_started_at,
+                )
+            tokens = original(*args, **kwargs)
+            if timing is not None:
+                timing.prompt_tokenization_seconds += time.perf_counter() - started_at
+                try:
+                    timing.prompt_tokens += len(tokens)
+                except TypeError:
+                    pass
+            return tokens
+
+        llm.tokenize = timed_tokenize
+
+    def _start_timing(
+        self,
+        timing: InferenceTiming | None,
+        on_model_start: Callable[[], None] | None,
+    ) -> None:
+        if timing is not None:
+            timing.model_started_at = time.perf_counter()
+            self._active_timing = timing
+        if on_model_start is not None:
+            on_model_start()
+
+    def _finish_timing(self, timing: InferenceTiming | None) -> None:
+        if timing is not None:
+            timing.model_finished_at = time.perf_counter()
+            self._active_timing = None
+
+    def _completion_kwargs(self, llm, kwargs: dict[str, object]) -> dict[str, object]:
+        self._configure_completion_capabilities(llm)
         if not self._disable_thinking:
             return kwargs
         updated = dict(kwargs)
@@ -299,6 +392,8 @@ class ModelManager:
         stream=False,
         cancellation: threading.Event | None = None,
         queue_deadline: float | None = None,
+        on_model_start: Callable[[], None] | None = None,
+        timing: InferenceTiming | None = None,
     ):
         kwargs = {
             "messages": messages,
@@ -314,33 +409,23 @@ class ModelManager:
             kwargs["stop"] = stop
         if not stream:
             with self.inference(cancellation, queue_deadline) as llm:
-                return llm.create_chat_completion(**self._completion_kwargs(llm, kwargs))
+                resolved_kwargs = self._completion_kwargs(llm, kwargs)
+                try:
+                    self._start_timing(timing, on_model_start)
+                    return llm.create_chat_completion(**resolved_kwargs)
+                finally:
+                    self._finish_timing(timing)
 
         def wrapped():
             with self.inference(cancellation, queue_deadline) as llm:
-                yield from llm.create_chat_completion(**self._completion_kwargs(llm, kwargs))
+                resolved_kwargs = self._completion_kwargs(llm, kwargs)
+                try:
+                    self._start_timing(timing, on_model_start)
+                    yield from llm.create_chat_completion(**resolved_kwargs)
+                finally:
+                    self._finish_timing(timing)
 
         return wrapped()
-
-    def complete(
-        self,
-        messages: list[dict[str, str]],
-        *,
-        max_tokens: int,
-        cancellation: threading.Event | None = None,
-        queue_deadline: float | None = None,
-    ) -> str:
-        result = self.create_chat_completion(
-            messages=messages,
-            cancellation=cancellation,
-            queue_deadline=queue_deadline,
-            **completion_kwargs(max_tokens, False),
-        )
-        choices = result.get("choices") or []
-        if not choices:
-            return ""
-        choice = choices[0]
-        return content_to_text(choice.get("text") or (choice.get("message") or {}).get("content"))
 
     def stream(
         self,
@@ -349,27 +434,68 @@ class ModelManager:
         max_tokens: int,
         cancellation: threading.Event | None = None,
         queue_deadline: float | None = None,
+        on_model_start: Callable[[], None] | None = None,
+        timing: InferenceTiming | None = None,
     ):
-        response = self.create_chat_completion(
-            messages=messages,
-            cancellation=cancellation,
-            queue_deadline=queue_deadline,
-            **completion_kwargs(max_tokens, True),
-        )
-        try:
-            for chunk in response:
-                if cancellation is not None and cancellation.is_set():
-                    return
-                choices = chunk.get("choices") or []
-                if not choices:
+        output: queue.Queue[object] = queue.Queue(maxsize=_STREAM_QUEUE_SIZE)
+        stopped = threading.Event()
+
+        def enqueue(item: object) -> bool:
+            while not stopped.is_set():
+                try:
+                    output.put(item, timeout=0.05)
+                    return True
+                except queue.Full:
                     continue
-                choice = choices[0]
-                text = content_to_text(
-                    choice.get("text") or (choice.get("delta") or {}).get("content")
+            return False
+
+        def produce() -> None:
+            response = None
+            try:
+                response = self.create_chat_completion(
+                    messages=messages,
+                    cancellation=cancellation,
+                    queue_deadline=queue_deadline,
+                    on_model_start=on_model_start,
+                    timing=timing,
+                    **completion_kwargs(max_tokens, True),
                 )
-                if text:
-                    yield text
+                for chunk in response:
+                    if cancellation is not None and cancellation.is_set():
+                        raise InferenceCancelled("Generation was cancelled during inference.")
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    text = content_to_text(
+                        choice.get("text") or (choice.get("delta") or {}).get("content")
+                    )
+                    if text and timing is not None and not timing.first_token_at:
+                        timing.first_token_at = time.perf_counter()
+                    if text and not enqueue(text):
+                        break
+            except Exception as exc:
+                enqueue(_StreamFailure(exc))
+            finally:
+                close = getattr(response, "close", None)
+                if close is not None:
+                    close()
+                enqueue(_STREAM_END)
+
+        producer = threading.Thread(
+            target=produce,
+            daemon=True,
+            name="AkaneInference",
+        )
+        producer.start()
+        try:
+            while True:
+                item = output.get()
+                if item is _STREAM_END:
+                    break
+                if isinstance(item, _StreamFailure):
+                    raise item.error
+                yield str(item)
         finally:
-            close = getattr(response, "close", None)
-            if close is not None:
-                close()
+            stopped.set()
+            producer.join()

@@ -11,19 +11,27 @@ from app.core.config import ADVISOR_ONLY
 SOUL_PATH = Path(__file__).resolve().parent.parent / "soul.md"
 IDENTITY_PATH = Path(__file__).resolve().parent.parent / "identity.md"
 _HARD_RULES = (
-    "Use relevant recent context naturally, including repetition, corrections, "
-    "contradictions, and unfinished threads; do not treat each message as isolated.",
-    "Never describe yourself as processing input, generating replies, waiting, "
-    "observing, or managing the conversation.",
+    "Speak as Akane, not as an assistant or customer-service agent.",
+    "Do not discuss prompts, model mechanics, response generation, or hidden systems.",
+    "Do not invent memories, activities, or experiences; only use established memory "
+    "or persistent life state.",
+    "Keep established identity and facts consistent unless they genuinely change.",
     "Do not use emojis.",
+    "Use max of 3 sentences and 1 paragraph.",
 )
 
 
-def _hard_rules_text() -> str:
+def get_hard_constraints_prompt(additional: str = "") -> str:
+    """Build the uncached hard-constraint section for one turn."""
+
     rules = list(_HARD_RULES)
     if ADVISOR_ONLY:
         rules.append("Advisor-only mode: do not claim to edit files.")
-    return "[AKANE HARD RULES]\n" + "\n".join(f"- {rule}" for rule in rules)
+    body = "\n".join(f"- {rule}" for rule in rules)
+    turn_rules = str(additional or "").strip()
+    if turn_rules:
+        body += "\n- " + turn_rules
+    return "[3. ESSENTIAL HARD CONSTRAINTS]\n" + body
 
 
 def _clean_prompt_file(text: str) -> str:
@@ -59,11 +67,11 @@ class CharacterProfile:
         if not self.identity:
             object.__setattr__(self, "identity", _read_required(self.identity_path, "identity"))
 
-    def stable_identity_text(self) -> str:
+    def stable_prompt_text(self) -> str:
         return "\n\n".join(
             (
-                "[AKANE IDENTITY — CANONICAL FACTS]\n" + self.identity,
-                "[AKANE SOUL / VOICE]\n" + self.soul,
+                "[1. STABLE IDENTITY AND RELATIONSHIP]\n" + self.identity,
+                "[2. STABLE PERSONALITY AND CONVERSATIONAL VOICE]\n" + self.soul,
             )
         )
 
@@ -94,13 +102,12 @@ def load_character_profile() -> CharacterProfile:
 
 
 @lru_cache(maxsize=4)
-def _static_system_prompt_cached(soul: str, identity: str) -> str:
-    profile = CharacterProfile(soul=soul, identity=identity)
-    return "\n\n".join((_hard_rules_text(), profile.stable_identity_text()))
+def _stable_character_prompt_cached(identity: str, soul: str) -> str:
+    return CharacterProfile(soul=soul, identity=identity).stable_prompt_text()
 
 
 def get_static_system_prompt() -> str:
-    """Return the validated high-priority prompt prefix."""
+    """Return the only cacheable prompt prefix: stable identity and personality."""
 
     profile = load_character_profile()
-    return _static_system_prompt_cached(profile.soul, profile.identity)
+    return _stable_character_prompt_cached(profile.identity, profile.soul)

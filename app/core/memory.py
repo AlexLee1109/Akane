@@ -8,17 +8,18 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from app.core.config import (
     CHAT_HISTORY_CONTEXT_TOKENS,
     CONVERSATION_STALE_DAYS,
+    LONG_TERM_MEMORY_PATH,
     MAX_CONVERSATIONS,
     MEMORY_CONFIDENCE_WEIGHT,
     MEMORY_CONTEXT_TOKENS,
     MEMORY_CONTINUITY_WEIGHT,
-    LONG_TERM_MEMORY_PATH,
     MEMORY_IMPORTANCE_WEIGHT,
     MEMORY_MAX_ENTRIES_PER_PROFILE,
     MEMORY_MAX_RESULTS,
@@ -33,12 +34,14 @@ from app.core.config import (
     SUMMARY_CONTEXT_TOKENS,
 )
 from app.core.persistence import atomic_write_json, read_json
+from app.core.life import LifeState, advance_life_state
 from app.core.signal import (
     EmotionState,
     TurnContext,
     TurnSignal,
     advance_emotion,
     analyze_turn,
+    apply_activity_effect,
     message_similarity,
     normalized_signature,
     topic_overlap,
@@ -47,30 +50,9 @@ from app.core.utils import compact_text
 
 MEMORY_SCHEMA_VERSION = 1
 LONG_TERM_MEMORY_SCHEMA_VERSION = 3
-_SUMMARY_BATCH_TURNS = 4
-_MAX_TURN_CHARS = 8_000
-_MEMORY_CATEGORIES = {
-    "stable_fact",
-    "episode",
-    "tendency",
-    "task_outcome",
-    "unfinished_topic",
-}
-_ACTIVE_MEMORY = "active"
 _MEMORY_PROMPT_INTRO = "A few past details may matter in this conversation:"
 _MEMORY_PROMPT_OUTRO = (
     "Use them only when they genuinely improve the reply, and do not overstate uncertain details."
-)
-_SENSITIVE_TERMS = (
-    "api key",
-    "access token",
-    "auth token",
-    "credit card",
-    "password",
-    "private key",
-    "secret key",
-    "social security",
-    "ssn",
 )
 _MEMORY_STOPWORDS = {
     "and",
@@ -109,51 +91,25 @@ _MEMORY_STOPWORDS = {
     "you",
     "your",
 }
-_REMEMBER_PATTERN = re.compile(
-    r"\b(?:please\s+)?remember(?:\s+that)?\s+(?P<value>[^\n]{3,200})",
-    re.IGNORECASE,
-)
-_PROFILE_NAME_PATTERN = re.compile(
-    r"\b(?:my name is|i am called|i'm called|you can call me|call me)\s+"
-    r"(?P<name>[A-Za-z][A-Za-z' -]{0,48}?)"
-    r"(?=$|[.!?;,]|\s+(?:and|but)\s+I\b)",
-    re.IGNORECASE,
-)
-_PROFILE_PREFERENCE_PATTERN = re.compile(
-    r"\bI\s+(?:really\s+)?"
-    r"(?P<verb>don't like|do not like|dislike|hate|like|love|prefer)\s+"
-    r"(?P<value>[^\n.!?;]{1,160}?)"
-    r"(?=$|[.!?;]|\s+(?:but|and)\s+I\b)",
-    re.IGNORECASE,
-)
-_PROFILE_FAVORITE_PATTERN = re.compile(
-    r"\bmy\s+favorite\s+(?P<subject>[^\n.!?]{1,48}?)\s+is\s+"
-    r"(?P<value>[^\n.!?]{1,100})",
-    re.IGNORECASE,
-)
-_PROFILE_FACT_PATTERNS = (
-    ("lives in", re.compile(r"\bI\s+live\s+in\s+(?P<value>[^\n.!?;]{2,100})", re.I)),
-    ("works as", re.compile(r"\bI\s+work\s+as\s+(?P<value>[^\n.!?;]{2,100})", re.I)),
-    ("birthday", re.compile(r"\bmy\s+birthday\s+is\s+(?P<value>[^\n.!?;]{2,80})", re.I)),
-)
-_PROJECT_PATTERN = re.compile(
-    r"\bI(?:'m| am)\s+(?:still\s+)?working on\s+(?P<value>[^\n.!?;]{3,180})",
+_AKANE_PREFERENCE_TAG = "akane-preference"
+_AKANE_PREFERENCE_UPDATE = re.compile(
+    r"\b(?:change(?:d)? your mind|different favorite|new favorite|not anymore|"
+    r"reconsider|taste(?:s)? changed|prefer now|pick (?:a )?different|"
+    r"choose (?:a )?different)\b",
     re.I,
 )
-_GOAL_PATTERN = re.compile(
-    r"\bmy\s+(?:long[- ]term\s+)?goal is\s+(?P<value>[^\n.!?;]{3,180})",
-    re.I,
-)
-_EPISODE_PATTERN = re.compile(
-    r"\bI\s+(?P<event>(?:finally\s+)?(?:finished|fixed|solved|decided|chose|completed))\s+"
-    r"(?P<value>[^\n.!?;]{3,180})",
-    re.I,
-)
-_INTERACTION_PREFERENCE_PATTERN = re.compile(
-    r"\b(?:please\s+)?(?P<verb>don't|do not|never)\s+"
-    r"(?P<value>(?:ask|call|repeat|summarize|overexplain|use)[^\n.!?;]{1,150})",
-    re.I,
-)
+
+
+_SUMMARY_BATCH_TURNS = 4
+_MAX_TURN_CHARS = 8_000
+_MEMORY_CATEGORIES = {
+    "stable_fact",
+    "episode",
+    "tendency",
+    "task_outcome",
+    "unfinished_topic",
+}
+_ACTIVE_MEMORY = "active"
 
 
 def estimate_tokens(value: object) -> int:
@@ -165,6 +121,14 @@ def estimate_tokens(value: object) -> int:
     byte_estimate = (len(text.encode("utf-8")) + 2) // 3
     word_estimate = (len(text.split()) * 5 + 3) // 4
     return max(1, byte_estimate, word_estimate)
+
+
+def _number(value: object, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,7 +369,6 @@ class WorkingMemory:
     repeated_topic_count: int = 0
     last_outcome: str = ""
     last_user_summary: str = ""
-    last_assistant_summary: str = ""
     recent_events: tuple[InteractionEvent, ...] = ()
 
     @classmethod
@@ -425,7 +388,6 @@ class WorkingMemory:
             repeated_topic_count=max(0, min(20, int(_number(payload.get("repeated_topic_count"), 0)))),
             last_outcome=compact_text(payload.get("last_outcome"), 40).lower(),
             last_user_summary=compact_text(payload.get("last_user_summary"), 180),
-            last_assistant_summary=compact_text(payload.get("last_assistant_summary"), 180),
             recent_events=events,
         )
 
@@ -433,6 +395,7 @@ class WorkingMemory:
 @dataclass(frozen=True, slots=True)
 class InternalState:
     emotion: EmotionState
+    life: LifeState
     working: WorkingMemory = WorkingMemory()
     memories: tuple[Memory, ...] = ()
     updated_at: float = 0.0
@@ -469,6 +432,213 @@ class _MemoryCandidate:
     importance: float
     confidence: float
     tags: tuple[str, ...]
+    supersedes: bool = False
+
+
+_SENSITIVE_TERMS = (
+    "api key",
+    "access token",
+    "auth token",
+    "credit card",
+    "password",
+    "private key",
+    "secret key",
+    "social security",
+    "ssn",
+)
+_REMEMBER_PATTERN = re.compile(
+    r"\b(?:please\s+)?remember(?:\s+that)?\s+(?P<value>[^\n]{3,200})",
+    re.IGNORECASE,
+)
+_PROFILE_NAME_PATTERN = re.compile(
+    r"\b(?:my name is|i am called|i'm called|you can call me|call me)\s+"
+    r"(?P<name>[A-Za-z][A-Za-z' -]{0,48}?)"
+    r"(?=$|[.!?;,]|\s+(?:and|but)\s+I\b)",
+    re.IGNORECASE,
+)
+_PROFILE_PREFERENCE_PATTERN = re.compile(
+    r"\bI\s+(?:really\s+)?"
+    r"(?P<verb>don't like|do not like|dislike|hate|like|love|prefer)\s+"
+    r"(?P<value>[^\n.!?;]{1,160}?)"
+    r"(?=$|[.!?;]|\s+(?:but|and)\s+I\b)",
+    re.IGNORECASE,
+)
+_PROFILE_FAVORITE_PATTERN = re.compile(
+    r"\bmy\s+favorite\s+(?P<subject>[^\n.!?]{1,48}?)\s+is\s+"
+    r"(?P<value>[^\n.!?]{1,100})",
+    re.IGNORECASE,
+)
+_PROFILE_FACT_PATTERNS = (
+    ("lives in", re.compile(r"\bI\s+live\s+in\s+(?P<value>[^\n.!?;]{2,100})", re.I)),
+    ("works as", re.compile(r"\bI\s+work\s+as\s+(?P<value>[^\n.!?;]{2,100})", re.I)),
+    ("birthday", re.compile(r"\bmy\s+birthday\s+is\s+(?P<value>[^\n.!?;]{2,80})", re.I)),
+)
+_PROJECT_PATTERN = re.compile(
+    r"\bI(?:'m| am)\s+(?:still\s+)?working on\s+(?P<value>[^\n.!?;]{3,180})",
+    re.I,
+)
+_GOAL_PATTERN = re.compile(
+    r"\bmy\s+(?:long[- ]term\s+)?goal is\s+(?P<value>[^\n.!?;]{3,180})",
+    re.I,
+)
+_EPISODE_PATTERN = re.compile(
+    r"\bI\s+(?P<event>(?:finally\s+)?(?:finished|fixed|solved|decided|chose|completed))\s+"
+    r"(?P<value>[^\n.!?;]{3,180})",
+    re.I,
+)
+_INTERACTION_PREFERENCE_PATTERN = re.compile(
+    r"\b(?:please\s+)?(?P<verb>don't|do not|never)\s+"
+    r"(?P<value>(?:ask|call|repeat|summarize|overexplain|use)[^\n.!?;]{1,150})",
+    re.I,
+)
+_EXPLICIT_MEMORY_CORRECTION = re.compile(
+    r"(?:\b(?:actually|correction|i meant|instead|changed my mind|no longer|not anymore)\b"
+    r"|(?:^|\s)no,\s+(?:my|i)\b|\bthat(?:'s| is) (?:not right|wrong)\b)",
+    re.I,
+)
+
+
+def _extract_memory_candidates(
+    text: str,
+    slot_value: Callable[[str], str],
+) -> tuple[_MemoryCandidate, ...]:
+    value = compact_text(text, 700)
+    lower = value.lower()
+    if (
+        not value
+        or any(marker in lower for marker in ("hypothetically", "just kidding", "for example"))
+        or any(marker in lower for marker in _SENSITIVE_TERMS)
+    ):
+        return ()
+    candidates: list[_MemoryCandidate] = []
+
+    if match := _PROFILE_NAME_PATTERN.search(value):
+        name = compact_text(match.group("name"), 50).strip(" ,;:-")
+        if 1 <= len(name.split()) <= 4:
+            candidates.append(_candidate(f"The user's name is {name}.", "stable_fact", 0.94, ("slot:name",)))
+
+    if match := _REMEMBER_PATTERN.search(value):
+        fact = compact_text(match.group("value"), 180).strip(" ,.;:-")
+        if fact:
+            candidates.append(_candidate(_as_user_fact(fact), "stable_fact", 0.98, ("explicit-request",)))
+
+    for match in _PROFILE_PREFERENCE_PATTERN.finditer(value):
+        preference = compact_text(match.group("value"), 140).strip(" ,;:-")
+        if not preference:
+            continue
+        verb = " ".join(match.group("verb").lower().split())
+        negative = verb in {"don't like", "do not like", "dislike", "hate"}
+        category = "tendency" if _interaction_preference(preference) else "stable_fact"
+        action = "dislikes" if negative else "prefers" if verb == "prefer" else "likes"
+        slot = "slot:preference:" + slot_value(preference)
+        candidates.append(_candidate(f"The user {action} {preference}.", category, 0.82, (slot,)))
+
+    for match in _PROFILE_FAVORITE_PATTERN.finditer(value):
+        subject = compact_text(match.group("subject"), 48).strip(" ,;:-")
+        favorite = compact_text(match.group("value"), 100).strip(" ,;:-")
+        if subject and favorite:
+            slot = "slot:favorite:" + slot_value(subject)
+            candidates.append(
+                _candidate(f"The user's favorite {subject} is {favorite}.", "stable_fact", 0.88, (slot,))
+            )
+
+    fact_phrases = {
+        "lives in": "The user lives in {value}.",
+        "works as": "The user works as {value}.",
+        "birthday": "The user's birthday is {value}.",
+    }
+    for label, pattern in _PROFILE_FACT_PATTERNS:
+        if match := pattern.search(value):
+            fact = compact_text(match.group("value"), 100).strip(" ,;:-")
+            if fact:
+                candidates.append(
+                    _candidate(
+                        fact_phrases[label].format(value=fact), "stable_fact", 0.86,
+                        ("slot:" + label.replace(" ", "-"),),
+                    )
+                )
+
+    if match := _PROJECT_PATTERN.search(value):
+        project = compact_text(match.group("value"), 180).strip(" ,;:-")
+        if project:
+            candidates.append(_candidate(f"The user is working on {project}.", "stable_fact", 0.78, ("project",)))
+    if match := _GOAL_PATTERN.search(value):
+        goal = compact_text(match.group("value"), 180).strip(" ,;:-")
+        if goal:
+            candidates.append(_candidate(f"The user's long-term goal is {goal}.", "stable_fact", 0.82, ("goal",)))
+    if match := _EPISODE_PATTERN.search(value):
+        event = " ".join(match.group("event").lower().split())
+        detail = compact_text(match.group("value"), 180).strip(" ,;:-")
+        if detail:
+            candidates.append(_candidate(f"The user {event} {detail}.", "episode", 0.70, ("event",)))
+    if match := _INTERACTION_PREFERENCE_PATTERN.search(value):
+        instruction = compact_text(match.group("value"), 150).strip(" ,;:-")
+        if instruction:
+            candidates.append(
+                _candidate(f"The user prefers that Akane not {instruction.lower()}.", "tendency", 0.90, ("interaction-style",))
+            )
+
+    unique: dict[str, _MemoryCandidate] = {}
+    explicit_correction = bool(_EXPLICIT_MEMORY_CORRECTION.search(value))
+    for candidate in candidates:
+        if explicit_correction and any(tag.startswith("slot:") for tag in candidate.tags):
+            candidate = replace(
+                candidate,
+                confidence=max(0.90, candidate.confidence),
+                supersedes=True,
+            )
+        unique.setdefault(normalized_signature(candidate.content), candidate)
+    return tuple(unique.values())
+
+
+def _candidate(
+    content: str,
+    category: str,
+    importance: float,
+    tags: tuple[str, ...],
+    confidence: float = 0.78,
+) -> _MemoryCandidate:
+    return _MemoryCandidate(
+        content=compact_text(content, 240),
+        category=category,
+        importance=importance,
+        confidence=max(0.0, min(1.0, confidence)),
+        tags=tags,
+    )
+
+
+def _as_user_fact(value: str) -> str:
+    fact = compact_text(value, 180).strip(" ,.;:-")
+    replacements = (
+        (r"^i(?:'m| am)\s+", "The user is "),
+        (r"^i like\s+", "The user likes "),
+        (r"^i love\s+", "The user loves "),
+        (r"^i prefer\s+", "The user prefers "),
+        (r"^i (?:don't like|do not like|dislike|hate)\s+", "The user dislikes "),
+        (r"^my\s+", "The user's "),
+    )
+    for pattern, replacement in replacements:
+        if re.search(pattern, fact, re.I):
+            return re.sub(pattern, replacement, fact, count=1, flags=re.I).rstrip(".") + "."
+    return f"The user explicitly stated: {fact}."
+
+
+def _interaction_preference(value: str) -> bool:
+    lower = value.lower()
+    return any(
+        marker in lower
+        for marker in (
+            "answer",
+            "concise",
+            "detail",
+            "explanation",
+            "follow-up",
+            "question",
+            "reply",
+            "response",
+            "tone",
+        )
+    )
 
 
 class MemoryStore:
@@ -479,62 +649,6 @@ class MemoryStore:
         self._lock = threading.RLock()
         self._conversations: dict[str, ConversationRecord] = {}
         self._load()
-
-    def preview_signal(
-        self,
-        conversation_id: str,
-        user_text: str,
-        *,
-        code_context_requested: bool = False,
-        code_context_attached: bool = False,
-    ) -> TurnSignal:
-        """Compatibility helper; the runtime uses coordinated ``preview_turn``."""
-
-        candidate = analyze_turn(
-            user_text,
-            code_context_requested=code_context_requested,
-            code_context_attached=code_context_attached,
-        )
-        with self._lock:
-            previous = self._conversations.get(_key(conversation_id, "local:conversation"))
-            if previous is None:
-                return candidate
-            recent_users = [
-                turn.content for turn in previous.recent_turns if turn.role == "user"
-            ][-4:]
-            repeated = [
-                item for item in recent_users if message_similarity(item, user_text) >= 0.78
-            ]
-            if repeated:
-                exact = any(
-                    normalized_signature(item) == normalized_signature(user_text)
-                    for item in repeated
-                )
-                prior_signal = analyze_turn(repeated[-1])
-                candidate = replace(
-                    candidate,
-                    repetition="exact" if exact else "near",
-                    repetition_count=len(repeated),
-                    current_activity=candidate.current_activity or prior_signal.current_activity,
-                    identity_attribute=(
-                        candidate.identity_attribute or prior_signal.identity_attribute
-                    ),
-                )
-            continuation = candidate.low_content or candidate.intent in {
-                "gratitude",
-                "praise",
-                "teasing",
-                "correction",
-            }
-            if previous.recent_topic and (
-                continuation or topic_overlap(previous.recent_topic, candidate.topic) >= 0.5
-            ):
-                return candidate.with_context(
-                    topic=previous.recent_topic,
-                    task=candidate.task or previous.current_task,
-                    confidence=max(candidate.topic_confidence, 0.62),
-                )
-        return candidate
 
     def build_context(
         self,
@@ -592,7 +706,11 @@ class MemoryStore:
             elif record.profile_id != profile:
                 raise ValueError("Conversation belongs to a different profile.")
             else:
-                record = copy.deepcopy(record)
+                record = copy.copy(record)
+                record.recent_turns = list(record.recent_turns)
+                record.summary_turns = list(record.summary_turns)
+                record.pending_summary_turns = list(record.pending_summary_turns)
+                record.recent_events = list(record.recent_events)
 
             self._conversations = previous_conversations.copy()
             self._conversations[conversation_key] = record
@@ -767,7 +885,17 @@ def _key(value: object, default: str) -> str:
 
 def new_internal_state(now: float | None = None) -> InternalState:
     current = time.time() if now is None else max(0.0, float(now))
-    return InternalState(emotion=EmotionState(updated_at=current), updated_at=current)
+    emotion = EmotionState(updated_at=current)
+    return InternalState(
+        emotion=emotion,
+        life=advance_life_state(
+            None,
+            now=current,
+            emotion_mood=emotion.mood,
+            energy=emotion.energy,
+        ),
+        updated_at=current,
+    )
 
 
 def process_internal_turn(
@@ -779,6 +907,7 @@ def process_internal_turn(
     include_memory: bool = True,
     code_context_requested: bool = False,
     code_context_attached: bool = False,
+    autonomous: bool = False,
 ) -> InternalTurnResult:
     """Purely appraise a turn and return the proposed coordinated state."""
 
@@ -786,22 +915,94 @@ def process_internal_turn(
     previous = state if state is not None else new_internal_state(current)
     current = max(current, previous.updated_at, previous.emotion.updated_at)
     working = previous.working
+    retrieval_config = retrieval or MemoryRetrievalConfig()
+    autonomous_memories: list[Memory] = []
+    preferences: list[str] = []
+    unresolved_interests: list[str] = []
+    for memory in previous.memories:
+        if autonomous and (
+            _AKANE_PREFERENCE_TAG in memory.tags or "life-activity" in memory.tags
+        ):
+            autonomous_memories.append(memory)
+        if not memory.is_available(current):
+            continue
+        if _AKANE_PREFERENCE_TAG in memory.tags:
+            preferences.append(memory.content)
+        if len(unresolved_interests) < 8 and (
+            memory.category == "unfinished_topic"
+            or "goal" in memory.tags
+            or "project" in memory.tags
+        ):
+            unresolved_interests.append(memory.content)
+
+    retrieval_memories = previous.memories
+    query_parts = (user_text, working.current_task)
+    if autonomous:
+        retrieval_memories = tuple(autonomous_memories)
+        query_parts = (
+            previous.life.current_activity,
+            *(memory.content for memory in retrieval_memories[-4:]),
+        )
+    appraisal_query = " ".join(
+        part for part in query_parts if part
+    )
+    recalled = (
+        _retrieve_memories(
+            retrieval_memories,
+            appraisal_query,
+            current,
+            retrieval_config,
+            working,
+        )
+        if include_memory
+        else ()
+    )
     context = TurnContext(
         current_topic=working.current_topic,
         current_task=working.current_task,
         unresolved_problem=working.unresolved_problem,
         repeated_topic_count=working.repeated_topic_count,
         last_outcome=working.last_outcome,
+        memory_relevance=max(
+            (memory.importance * memory.confidence for memory in recalled),
+            default=0.0,
+        ),
+        meaningful_memory=any(
+            memory.importance >= 0.80
+            or memory.category in {"episode", "task_outcome", "unfinished_topic"}
+            for memory in recalled
+        ),
     )
+    elapsed_emotion = advance_emotion(previous.emotion, now=current)
+    life = advance_life_state(
+        previous.life,
+        now=current,
+        preferences=tuple(preferences),
+        emotion_mood=elapsed_emotion.mood,
+        energy=elapsed_emotion.energy,
+        unresolved_interests=tuple(unresolved_interests),
+    )
+    life_changed = life.current_activity != previous.life.current_activity
+    if life_changed:
+        elapsed_emotion = apply_activity_effect(
+            elapsed_emotion,
+            previous.life.mood,
+            now=current,
+        )
     signal = analyze_turn(
-        user_text,
-        emotion_state=previous.emotion,
+        "" if autonomous else user_text,
+        emotion_state=elapsed_emotion,
         turn_context=context,
         now=current,
+        emotion_state_is_current=True,
         code_context_requested=code_context_requested,
         code_context_attached=code_context_attached,
     )
-    continuing = _continues_working_topic(user_text, signal, working)
+    if autonomous:
+        signal = replace(signal, emotion_state=elapsed_emotion)
+    continuing = bool(
+        autonomous and (working.current_topic or working.current_task)
+    ) or _continues_working_topic(user_text, signal, working)
     topic = working.current_topic if continuing and working.current_topic else signal.topic
     task = working.current_task if continuing and working.current_task else signal.task
     if signal.task_failure and not task:
@@ -833,7 +1034,11 @@ def process_internal_turn(
             or message_similarity(working.current_topic, topic) >= 0.78
         )
     )
-    repeated_count = min(20, working.repeated_topic_count + 1) if same_topic else 1
+    repeated_count = (
+        working.repeated_topic_count
+        if autonomous
+        else min(20, working.repeated_topic_count + 1) if same_topic else 1
+    )
     unresolved = working.unresolved_problem if same_topic or continuing else False
     outcome = working.last_outcome if same_topic or continuing else ""
     events = list(working.recent_events)
@@ -870,16 +1075,37 @@ def process_internal_turn(
         unresolved_problem=unresolved,
         repeated_topic_count=repeated_count,
         last_outcome=outcome,
-        last_user_summary=compact_text(signal.summary, 180),
-        last_assistant_summary=working.last_assistant_summary,
+        last_user_summary=(
+            working.last_user_summary if autonomous else compact_text(signal.summary, 180)
+        ),
         recent_events=tuple(events[-16:]),
     )
-    memories = copy.deepcopy(list(previous.memories))
-    for candidate in _extract_memory_candidates(user_text):
+    candidates = () if autonomous else _extract_memory_candidates(user_text, _slot_value)
+    memories = (
+        copy.deepcopy(list(previous.memories))
+        if candidates or signal.task_failure or signal.task_success or life_changed
+        else list(previous.memories)
+    )
+    for candidate in candidates:
         _insert_into_memories(
             memories,
             candidate,
-            source="chat:explicit_user",
+            source="chat:correction" if candidate.supersedes else "chat:explicit_user",
+            created_at=current,
+        )
+    if life_changed and life.previous_activity and life.previous_outcome:
+        _insert_into_memories(
+            memories,
+            _MemoryCandidate(
+                content=(
+                    f"After {life.previous_activity}, Akane {life.previous_outcome}."
+                ),
+                category="episode",
+                importance=min(0.52, 0.44 + elapsed_emotion.momentum * 0.08),
+                confidence=1.0,
+                tags=("life-activity", "life-activity:" + _slot_value(life.previous_activity)),
+            ),
+            source="autonomous:life",
             created_at=current,
         )
     task_tag = "task:" + _slot_value(task) if task else ""
@@ -916,23 +1142,10 @@ def process_internal_turn(
             created_at=current,
         )
 
-    query = " ".join(part for part in (user_text, next_working.current_task) if part)
-    previous_ids = {memory.id for memory in previous.memories}
-    recall_pool = tuple(memory for memory in memories if memory.id in previous_ids)
-    recalled = (
-        _retrieve_memories(
-            recall_pool,
-            query,
-            current,
-            retrieval or MemoryRetrievalConfig(),
-            next_working,
-        )
-        if include_memory
-        else ()
-    )
     _prune_memories(memories)
     next_state = InternalState(
         emotion=signal.emotion_state,
+        life=life,
         working=next_working,
         memories=tuple(memories),
         updated_at=current,
@@ -942,7 +1155,10 @@ def process_internal_turn(
         state=next_state,
         signal=signal,
         recalled_memories=recalled,
-        prompt_context=_internal_prompt_context(signal, next_working, recalled),
+        prompt_context=_internal_prompt_context(
+            signal,
+            WorkingMemory() if autonomous else next_working,
+        ),
     )
 
 
@@ -989,6 +1205,7 @@ class LongTermMemoryStore:
         include_memory: bool = True,
         code_context_requested: bool = False,
         code_context_attached: bool = False,
+        autonomous: bool = False,
     ) -> InternalTurnResult:
         with self._lock:
             state = self._states.get(_key(profile_id, "local:owner"))
@@ -1000,6 +1217,7 @@ class LongTermMemoryStore:
             include_memory=include_memory,
             code_context_requested=code_context_requested,
             code_context_attached=code_context_attached,
+            autonomous=autonomous,
         )
 
     def commit_turn(
@@ -1010,7 +1228,8 @@ class LongTermMemoryStore:
         assistant_text: str = "",
         used_memory_ids: tuple[str, ...] = (),
         now: float | None = None,
-    ) -> None:
+    ) -> InternalState | None:
+        del assistant_text  # Generated wording belongs to conversation history, not autonomous state.
         key = _key(profile_id, "local:owner")
         current = result.state.updated_at if now is None else max(
             result.state.updated_at,
@@ -1019,31 +1238,26 @@ class LongTermMemoryStore:
         )
         with self._lock:
             previous = self._states.get(key)
-            state = copy.deepcopy(result.state)
-            memories = list(state.memories)
             wanted = set(used_memory_ids)
-            for memory in memories:
-                if memory.id in wanted and memory.status == _ACTIVE_MEMORY:
-                    memory.last_used_at = current
-                    memory.access_count += 1
-            working = replace(
-                state.working,
-                last_assistant_summary=compact_text(assistant_text, 180),
-            )
-            self._states[key] = replace(
-                state,
-                working=working,
+            memories = list(result.state.memories)
+            if wanted:
+                memories = [
+                    copy.copy(memory)
+                    if memory.id in wanted and memory.status == _ACTIVE_MEMORY
+                    else memory
+                    for memory in memories
+                ]
+                for memory in memories:
+                    if memory.id in wanted and memory.status == _ACTIVE_MEMORY:
+                        memory.last_used_at = current
+                        memory.access_count += 1
+            next_state = replace(
+                result.state,
                 memories=tuple(memories),
                 updated_at=current,
             )
-            try:
-                self._persist()
-            except Exception:
-                if previous is None:
-                    self._states.pop(key, None)
-                else:
-                    self._states[key] = previous
-                raise
+            self._save_state(key, next_state, previous)
+            return previous
 
     def retrieve(
         self,
@@ -1065,9 +1279,6 @@ class LongTermMemoryStore:
                 state.working,
             )
 
-    def prompt_text(self, query: str = "", profile_id: str = "local:owner") -> str:
-        return format_relevant_memories(self.retrieve(profile_id, query))
-
     def add_memory(
         self,
         profile_id: str,
@@ -1087,6 +1298,7 @@ class LongTermMemoryStore:
             importance=max(0.0, min(1.0, float(importance))),
             confidence=max(0.0, min(1.0, float(confidence))),
             tags=tuple(tags),
+            supersedes=True,
         )
         if not candidate.content or candidate.category not in _MEMORY_CATEGORIES:
             return None
@@ -1104,19 +1316,12 @@ class LongTermMemoryStore:
             )
             if not changed:
                 return copy.deepcopy(memory)
-            self._states[key] = replace(
+            next_state = replace(
                 state,
                 memories=tuple(memories),
                 updated_at=time.time() if created_at is None else float(created_at),
             )
-            try:
-                self._persist()
-            except Exception:
-                if previous is None:
-                    self._states.pop(key, None)
-                else:
-                    self._states[key] = previous
-                raise
+            self._save_state(key, next_state, previous)
             return copy.deepcopy(memory)
 
     def commit(
@@ -1128,7 +1333,7 @@ class LongTermMemoryStore:
         used_memory_ids: tuple[str, ...] = (),
         now: float | None = None,
     ) -> None:
-        candidates = _extract_memory_candidates(user_text)
+        candidates = _extract_memory_candidates(user_text, _slot_value)
         if not candidates and not used_memory_ids:
             return
         key = _key(profile_id, "local:owner")
@@ -1148,28 +1353,18 @@ class LongTermMemoryStore:
                 _memory, inserted = _insert_into_memories(
                     memories,
                     candidate,
-                    source=f"{compact_text(source, 24) or 'chat'}:explicit_user",
+                    source=(
+                        f"{compact_text(source, 24) or 'chat'}:correction"
+                        if candidate.supersedes
+                        else f"{compact_text(source, 24) or 'chat'}:explicit_user"
+                    ),
                     created_at=current,
                 )
                 changed = changed or inserted
             if not changed:
                 return
-            self._states[key] = replace(state, memories=tuple(memories), updated_at=current)
-            try:
-                self._persist()
-            except Exception:
-                if previous is None:
-                    self._states.pop(key, None)
-                else:
-                    self._states[key] = previous
-                raise
-
-    def restore(self, profile_id: str, memories: list[Memory]) -> None:
-        key = _key(profile_id, "local:owner")
-        with self._lock:
-            state = self._states.get(key, new_internal_state())
-            self._states[key] = replace(state, memories=tuple(copy.deepcopy(memories)))
-            self._persist()
+            next_state = replace(state, memories=tuple(memories), updated_at=current)
+            self._save_state(key, next_state, previous)
 
     def restore_internal_state(self, profile_id: str, state: InternalState | None) -> None:
         key = _key(profile_id, "local:owner")
@@ -1205,6 +1400,8 @@ class LongTermMemoryStore:
             item = {"content": memory.content, "category": memory.category}
             if "slot:name" in memory.tags:
                 user["name"] = _memory_name(memory.content)
+            elif _AKANE_PREFERENCE_TAG in memory.tags:
+                continue
             elif memory.category == "tendency" or any(
                 tag.startswith("slot:preference:") for tag in memory.tags
             ):
@@ -1238,6 +1435,22 @@ class LongTermMemoryStore:
             "updated_at": state.updated_at,
         }
 
+    def _save_state(
+        self,
+        key: str,
+        state: InternalState,
+        previous: InternalState | None,
+    ) -> None:
+        self._states[key] = state
+        try:
+            self._persist()
+        except Exception:
+            if previous is None:
+                self._states.pop(key, None)
+            else:
+                self._states[key] = previous
+            raise
+
     def _load(self) -> None:
         try:
             try:
@@ -1250,7 +1463,9 @@ class LongTermMemoryStore:
                 raise ValueError("invalid long-term memory document")
             schema = int(payload.get("schema_version", 0))
             if schema == MEMORY_SCHEMA_VERSION and isinstance(payload.get("user"), dict):
-                migrated = _migrate_legacy_profile(payload["user"])
+                migrated = _normalize_loaded_memories(
+                    _migrate_legacy_profile(payload["user"])
+                )
                 if migrated:
                     current = max(memory.created_at for memory in migrated)
                     self._states = {
@@ -1271,10 +1486,12 @@ class LongTermMemoryStore:
                 if not profile:
                     continue
                 if schema == 2 and isinstance(raw_profile, list):
-                    loaded = tuple(
-                        memory
-                        for item in raw_profile[-MEMORY_MAX_ENTRIES_PER_PROFILE:]
-                        if (memory := Memory.from_dict(item)) is not None
+                    loaded = _normalize_loaded_memories(
+                        [
+                            memory
+                            for item in raw_profile
+                            if (memory := Memory.from_dict(item)) is not None
+                        ]
                     )
                     if loaded:
                         current = max(memory.created_at for memory in loaded)
@@ -1308,9 +1525,6 @@ class LongTermMemoryStore:
         )
 
 
-PopupUserStore = LongTermMemoryStore
-
-
 def format_relevant_memories(memories: tuple[Memory, ...]) -> str:
     if not memories:
         return ""
@@ -1322,6 +1536,57 @@ def format_relevant_memories(memories: tuple[Memory, ...]) -> str:
         + "\n"
         + _MEMORY_PROMPT_OUTRO
     )
+
+
+def preference_domain(text: str) -> str:
+    """Return the concrete preference area named by a preference question."""
+
+    value = compact_text(text, 300).lower()
+    for domain, pattern in (
+        ("anime", r"\b(?:anime|manga)\b"),
+        ("games", r"\b(?:game|games|gaming)\b"),
+        ("music", r"\b(?:music|song|songs|band|artist)\b"),
+        ("books", r"\b(?:book|books|novel|novels|reading)\b"),
+        ("food", r"\b(?:food|meal|snack|dish|cuisine)\b"),
+        ("colors", r"\b(?:color|colors|colour|colours)\b"),
+    ):
+        if re.search(pattern, value):
+            return domain
+    return "general"
+
+
+def preference_update_requested(text: str) -> bool:
+    return bool(_AKANE_PREFERENCE_UPDATE.search(str(text or "")))
+
+
+def established_akane_preference(
+    memories: tuple[Memory, ...],
+    query: str,
+    *,
+    now: float | None = None,
+) -> Memory | None:
+    """Find Akane's latest active preference for the question's domain."""
+
+    current = time.time() if now is None else max(0.0, float(now))
+    domain = preference_domain(query)
+    candidates = [
+        memory
+        for memory in memories
+        if memory.is_available(current) and _AKANE_PREFERENCE_TAG in memory.tags
+    ]
+    if domain != "general":
+        tag = f"{_AKANE_PREFERENCE_TAG}:{domain}"
+        candidates = [memory for memory in candidates if tag in memory.tags]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda memory: (memory.created_at, memory.id))
+
+
+def akane_preference_answer(memory: Memory | None) -> str:
+    if memory is None:
+        return ""
+    prefix = "Akane's established preference: "
+    return memory.content[len(prefix) :] if memory.content.startswith(prefix) else memory.content
 
 
 def _memory_prompt_line(memory: Memory) -> str:
@@ -1360,7 +1625,6 @@ def _continues_working_topic(
 def _internal_prompt_context(
     signal: TurnSignal,
     working: WorkingMemory,
-    memories: tuple[Memory, ...],
 ) -> str:
     parts = [signal.emotion_prompt()]
     continuity: list[str] = []
@@ -1376,9 +1640,6 @@ def _internal_prompt_context(
         continuity.append("This is a repeated attempt on the same problem.")
     if continuity:
         parts.append("Continuity: " + " ".join(continuity))
-    if memories:
-        lines = [compact_text(_memory_prompt_line(memory), 140) for memory in memories]
-        parts.append("Relevant memory:\n" + "\n".join(f"- {line}" for line in lines))
     return "\n".join(parts)
 
 
@@ -1443,24 +1704,46 @@ def _insert_into_memories(
     created_at: float,
     status: str = _ACTIVE_MEMORY,
 ) -> tuple[Memory, bool]:
-    signature = normalized_signature(candidate.content)
     candidate_tags = _normalized_tags(candidate.tags, candidate.content)
     candidate_slots = {tag for tag in candidate_tags if tag.startswith("slot:")}
     for existing in memories:
-        if existing.status != _ACTIVE_MEMORY or existing.category != candidate.category:
+        if existing.category != candidate.category:
             continue
-        exact = normalized_signature(existing.content) == signature
-        same_slot = bool(candidate_slots.intersection(existing.tags))
-        near_duplicate = not same_slot and message_similarity(existing.content, candidate.content) >= 0.94
-        if exact or near_duplicate:
+        if _memory_content_matches(existing, candidate.content, candidate_tags):
             changed = False
             if candidate.importance > existing.importance:
                 existing.importance = candidate.importance
                 changed = True
-            if candidate.confidence > existing.confidence:
-                existing.confidence = candidate.confidence
+            reinforced = max(existing.confidence, candidate.confidence)
+            reinforced = min(0.98, reinforced + (1.0 - reinforced) * 0.20)
+            if reinforced > existing.confidence:
+                existing.confidence = reinforced
                 changed = True
+            if candidate.supersedes and existing.status != _ACTIVE_MEMORY:
+                existing.status = _ACTIVE_MEMORY
+                existing.superseded_by = None
+                existing.source = compact_text(source, 48) or existing.source
+                changed = True
+            if candidate.supersedes and candidate_slots:
+                for conflict in memories:
+                    if (
+                        conflict is not existing
+                        and conflict.status == _ACTIVE_MEMORY
+                        and candidate_slots.intersection(conflict.tags)
+                    ):
+                        conflict.status = "superseded"
+                        conflict.superseded_by = existing.id
+                        changed = True
             return existing, changed
+    conflicts = [
+        existing
+        for existing in memories
+        if existing.status == _ACTIVE_MEMORY
+        and candidate_slots.intersection(existing.tags)
+    ]
+    memory_status = compact_text(status, 24).lower() or _ACTIVE_MEMORY
+    if conflicts and memory_status == _ACTIVE_MEMORY and not candidate.supersedes:
+        memory_status = "contradicted"
     memory = Memory(
         id=uuid.uuid4().hex,
         content=candidate.content,
@@ -1470,25 +1753,97 @@ def _insert_into_memories(
         confidence=candidate.confidence,
         source=compact_text(source, 48) or "user",
         tags=candidate_tags,
-        status=compact_text(status, 24).lower() or _ACTIVE_MEMORY,
+        status=memory_status,
     )
-    if candidate_slots:
-        for existing in memories:
-            if existing.status == _ACTIVE_MEMORY and candidate_slots.intersection(existing.tags):
-                existing.status = "superseded"
-                existing.superseded_by = memory.id
+    if candidate.supersedes and memory.status == _ACTIVE_MEMORY:
+        for existing in conflicts:
+            existing.status = "superseded"
+            existing.superseded_by = memory.id
     memories.append(memory)
     _prune_memories(memories)
     return memory, True
 
 
 def _prune_memories(memories: list[Memory]) -> None:
+    outcome_tags = {
+        tag
+        for memory in memories
+        if memory.category == "task_outcome" and memory.status == _ACTIVE_MEMORY
+        for tag in memory.tags
+        if tag.startswith("task:")
+    }
+    if outcome_tags:
+        memories[:] = [
+            memory
+            for memory in memories
+            if not (
+                memory.category == "unfinished_topic"
+                and memory.status == "resolved"
+                and outcome_tags.intersection(memory.tags)
+            )
+        ]
     if len(memories) <= MEMORY_MAX_ENTRIES_PER_PROFILE:
         return
     memories.sort(
         key=lambda item: (item.status == _ACTIVE_MEMORY, item.importance, item.created_at)
     )
     del memories[: len(memories) - MEMORY_MAX_ENTRIES_PER_PROFILE]
+
+
+def _normalize_loaded_memories(memories: list[Memory]) -> tuple[Memory, ...]:
+    """Consolidate persisted duplicates without changing the storage contract."""
+
+    consolidated: list[Memory] = []
+    for memory in memories:
+        duplicate = next(
+            (
+                existing
+                for existing in consolidated
+                if existing.category == memory.category
+                and existing.status == memory.status
+                and _memory_content_matches(existing, memory.content, memory.tags)
+            ),
+            None,
+        )
+        if duplicate is None:
+            consolidated.append(copy.deepcopy(memory))
+            continue
+        duplicate.created_at = min(duplicate.created_at, memory.created_at)
+        duplicate.importance = max(duplicate.importance, memory.importance)
+        duplicate.confidence = max(duplicate.confidence, memory.confidence)
+        duplicate.tags = tuple(dict.fromkeys((*duplicate.tags, *memory.tags)))[:12]
+        if memory.last_used_at is not None:
+            duplicate.last_used_at = max(
+                duplicate.last_used_at or 0.0,
+                memory.last_used_at,
+            )
+        duplicate.access_count += memory.access_count
+    _prune_memories(consolidated)
+    return tuple(consolidated)
+
+
+def _memory_content_matches(
+    existing: Memory,
+    content: str,
+    tags: tuple[str, ...],
+) -> bool:
+    if normalized_signature(existing.content) == normalized_signature(content):
+        return True
+    slots = {tag for tag in tags if tag.startswith("slot:")}
+    if slots.intersection(existing.tags):
+        return False
+    similarity = message_similarity(existing.content, content)
+    existing_terms = _memory_terms(existing.content)
+    candidate_terms = _memory_terms(content)
+    shared_terms = existing_terms & candidate_terms
+    term_overlap = len(shared_terms) / max(
+        1,
+        min(len(existing_terms), len(candidate_terms)),
+    )
+    term_jaccard = len(shared_terms) / max(1, len(existing_terms | candidate_terms))
+    return similarity >= 0.94 or (
+        similarity >= 0.72 and term_overlap >= 0.80 and term_jaccard >= 0.75
+    )
 
 
 def _has_active_tag(memories: list[Memory], tag: str) -> bool:
@@ -1502,6 +1857,7 @@ def _internal_state_to_dict(state: InternalState) -> dict[str, object]:
         "version": state.version,
         "updated_at": state.updated_at,
         "emotion": asdict(state.emotion),
+        "life": asdict(state.life),
         "working": asdict(state.working),
         "memories": [asdict(memory) for memory in state.memories],
     }
@@ -1530,138 +1886,43 @@ def _internal_state_from_dict(payload: object) -> InternalState | None:
         dominant=compact_text(emotion_payload.get("dominant"), 32) or "relaxed",
         secondary=compact_text(emotion_payload.get("secondary"), 32),
         cause=compact_text(emotion_payload.get("cause"), 100),
+        mood=compact_text(emotion_payload.get("mood"), 24) or "steady",
+        momentum=_number(emotion_payload.get("momentum"), 0.0),
+        last_trigger=compact_text(emotion_payload.get("last_trigger"), 32),
+        trigger_repetitions=max(
+            0,
+            min(12, int(_number(emotion_payload.get("trigger_repetitions"), 0))),
+        ),
     )
     emotion = advance_emotion(candidate, now=emotion_time)
     raw_memories = payload.get("memories")
     memories = tuple(
         memory
-        for item in (raw_memories if isinstance(raw_memories, list) else [])[-MEMORY_MAX_ENTRIES_PER_PROFILE:]
+        for item in (raw_memories if isinstance(raw_memories, list) else [])
         if (memory := Memory.from_dict(item)) is not None
     )
+    memories = _normalize_loaded_memories(list(memories))
+    life = LifeState.from_dict(payload.get("life"))
+    if life is None:
+        preferences = tuple(
+            memory.content
+            for memory in memories
+            if memory.is_available(emotion_time) and _AKANE_PREFERENCE_TAG in memory.tags
+        )
+        life = advance_life_state(
+            None,
+            now=emotion_time,
+            preferences=preferences,
+            emotion_mood=emotion.mood,
+            energy=emotion.energy,
+        )
     return InternalState(
         emotion=emotion,
+        life=life,
         working=WorkingMemory.from_dict(payload.get("working")),
         memories=memories,
         updated_at=updated_at or emotion.updated_at,
         version=1,
-    )
-
-
-def _extract_memory_candidates(text: str) -> tuple[_MemoryCandidate, ...]:
-    value = compact_text(text, 700)
-    lower = value.lower()
-    if (
-        not value
-        or any(marker in lower for marker in ("hypothetically", "just kidding", "for example"))
-        or any(marker in lower for marker in _SENSITIVE_TERMS)
-    ):
-        return ()
-    candidates: list[_MemoryCandidate] = []
-
-    if match := _PROFILE_NAME_PATTERN.search(value):
-        name = compact_text(match.group("name"), 50).strip(" ,;:-")
-        if 1 <= len(name.split()) <= 4:
-            candidates.append(_candidate(f"The user's name is {name}.", "stable_fact", 0.94, ("slot:name",)))
-
-    if match := _REMEMBER_PATTERN.search(value):
-        fact = compact_text(match.group("value"), 180).strip(" ,.;:-")
-        if fact:
-            candidates.append(_candidate(_as_user_fact(fact), "stable_fact", 0.98, ("explicit-request",)))
-
-    for match in _PROFILE_PREFERENCE_PATTERN.finditer(value):
-        preference = compact_text(match.group("value"), 140).strip(" ,;:-")
-        if not preference:
-            continue
-        verb = " ".join(match.group("verb").lower().split())
-        negative = verb in {"don't like", "do not like", "dislike", "hate"}
-        category = "tendency" if _interaction_preference(preference) else "stable_fact"
-        action = "dislikes" if negative else "prefers" if verb == "prefer" else "likes"
-        slot = "slot:preference:" + _slot_value(preference)
-        candidates.append(
-            _candidate(f"The user {action} {preference}.", category, 0.82, (slot,))
-        )
-
-    for match in _PROFILE_FAVORITE_PATTERN.finditer(value):
-        subject = compact_text(match.group("subject"), 48).strip(" ,;:-")
-        favorite = compact_text(match.group("value"), 100).strip(" ,;:-")
-        if subject and favorite:
-            slot = "slot:favorite:" + _slot_value(subject)
-            candidates.append(
-                _candidate(
-                    f"The user's favorite {subject} is {favorite}.",
-                    "stable_fact",
-                    0.88,
-                    (slot,),
-                )
-            )
-
-    fact_phrases = {
-        "lives in": "The user lives in {value}.",
-        "works as": "The user works as {value}.",
-        "birthday": "The user's birthday is {value}.",
-    }
-    for label, pattern in _PROFILE_FACT_PATTERNS:
-        if match := pattern.search(value):
-            fact = compact_text(match.group("value"), 100).strip(" ,;:-")
-            if fact:
-                candidates.append(
-                    _candidate(
-                        fact_phrases[label].format(value=fact),
-                        "stable_fact",
-                        0.86,
-                        ("slot:" + label.replace(" ", "-"),),
-                    )
-                )
-
-    if match := _PROJECT_PATTERN.search(value):
-        project = compact_text(match.group("value"), 180).strip(" ,;:-")
-        if project:
-            candidates.append(
-                _candidate(f"The user is working on {project}.", "stable_fact", 0.78, ("project",))
-            )
-    if match := _GOAL_PATTERN.search(value):
-        goal = compact_text(match.group("value"), 180).strip(" ,;:-")
-        if goal:
-            candidates.append(
-                _candidate(f"The user's long-term goal is {goal}.", "stable_fact", 0.82, ("goal",))
-            )
-    if match := _EPISODE_PATTERN.search(value):
-        event = " ".join(match.group("event").lower().split())
-        detail = compact_text(match.group("value"), 180).strip(" ,;:-")
-        if detail:
-            candidates.append(
-                _candidate(f"The user {event} {detail}.", "episode", 0.70, ("event",))
-            )
-    if match := _INTERACTION_PREFERENCE_PATTERN.search(value):
-        instruction = compact_text(match.group("value"), 150).strip(" ,;:-")
-        if instruction:
-            candidates.append(
-                _candidate(
-                    f"The user prefers that Akane not {instruction.lower()}.",
-                    "tendency",
-                    0.90,
-                    ("interaction-style",),
-                )
-            )
-
-    unique: dict[str, _MemoryCandidate] = {}
-    for candidate in candidates:
-        unique.setdefault(normalized_signature(candidate.content), candidate)
-    return tuple(unique.values())
-
-
-def _candidate(
-    content: str,
-    category: str,
-    importance: float,
-    tags: tuple[str, ...],
-) -> _MemoryCandidate:
-    return _MemoryCandidate(
-        content=compact_text(content, 240),
-        category=category,
-        importance=importance,
-        confidence=1.0,
-        tags=tags,
     )
 
 
@@ -1672,17 +1933,28 @@ def _semantic_relevance(query: str, query_terms: set[str], memory: Memory) -> fl
         for part in tag.replace("slot:", "").replace(":", "-").split("-")
         if len(part) >= 3
     }
-    overlap = len(query_terms & memory_terms) / max(1, min(len(query_terms), len(memory_terms)))
-    similarity = message_similarity(query, memory.content)
-    typo_similarity = similarity * 0.65 if similarity >= 0.72 else 0.0
-    return min(
-        1.0,
-        max(
-            overlap,
-            topic_overlap(query, memory.content),
-            typo_similarity,
-        ),
+    exact = query_terms & memory_terms
+    unmatched_memory = memory_terms - exact
+    fuzzy_matches = 0
+    for query_term in query_terms - exact:
+        match = next(
+            (
+                memory_term
+                for memory_term in unmatched_memory
+                if query_term[0] == memory_term[0]
+                and abs(len(query_term) - len(memory_term)) <= 2
+                and message_similarity(query_term, memory_term) >= 0.78
+            ),
+            None,
+        )
+        if match is not None:
+            fuzzy_matches += 1
+            unmatched_memory.remove(match)
+    overlap = (len(exact) + fuzzy_matches * 0.8) / max(
+        1,
+        min(len(query_terms), len(memory_terms)),
     )
+    return min(1.0, max(overlap, topic_overlap(query, memory.content)))
 
 
 def _memory_terms(value: str) -> set[str]:
@@ -1706,51 +1978,9 @@ def _normalized_tags(tags: tuple[str, ...], content: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(value for value in values if value))[:12]
 
 
-def _interaction_preference(value: str) -> bool:
-    lower = value.lower()
-    return any(
-        marker in lower
-        for marker in (
-            "answer",
-            "concise",
-            "detail",
-            "explanation",
-            "follow-up",
-            "question",
-            "reply",
-            "response",
-            "tone",
-        )
-    )
-
-
-def _as_user_fact(value: str) -> str:
-    fact = compact_text(value, 180).strip(" ,.;:-")
-    replacements = (
-        (r"^i(?:'m| am)\s+", "The user is "),
-        (r"^i like\s+", "The user likes "),
-        (r"^i love\s+", "The user loves "),
-        (r"^i prefer\s+", "The user prefers "),
-        (r"^i (?:don't like|do not like|dislike|hate)\s+", "The user dislikes "),
-        (r"^my\s+", "The user's "),
-    )
-    for pattern, replacement in replacements:
-        if re.search(pattern, fact, re.I):
-            return re.sub(pattern, replacement, fact, count=1, flags=re.I).rstrip(".") + "."
-    return f"The user explicitly stated: {fact}."
-
-
 def _slot_value(value: str) -> str:
     terms = sorted(_memory_terms(value))[:5]
     return "-".join(terms) or normalized_signature(value).replace(" ", "-")[:32]
-
-
-def _number(value: object, default: float) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    return number if math.isfinite(number) else default
 
 
 def _memory_name(content: str) -> str:
@@ -1843,15 +2073,3 @@ def get_internal_state_store() -> LongTermMemoryStore:
             if _INTERNAL_MEMORY is None:
                 _INTERNAL_MEMORY = LongTermMemoryStore()
     return _INTERNAL_MEMORY
-
-
-def get_popup_user_store() -> LongTermMemoryStore:
-    """Compatibility alias for the former durable-profile store name."""
-
-    return get_internal_state_store()
-
-
-def get_session_memory() -> MemoryStore:
-    """Return the shared memory owner; retained as the public runtime getter."""
-
-    return get_memory_store()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 import re
 import time
 from collections.abc import Iterable
@@ -58,9 +60,22 @@ _DIRECT_PATTERN = re.compile(
     r"make|optimize|read|refactor|remove|review|rewrite|show|simplify|tell|test|use|write)\b",
     re.IGNORECASE,
 )
+_EXACT_IDENTITY_QUESTION = re.compile(
+    r"^(?:who|what)\s+are\s+you(?:\s+exactly)?\s*[?.!]*$",
+    re.IGNORECASE,
+)
+_CURRENT_THOUGHT_PATTERN = _phrase_group(
+    "current thought|what are you thinking about|what is on your mind|what's on your mind"
+)
+_IMPLEMENTATION_TOPIC_PATTERN = _phrase_group(
+    "emotional state work|internal state|state system|llama.cpp|during inference"
+)
 
 _POSITIVE_MARKERS = _phrase_group(
     "appreciate it|awesome|glad|good morning|good night|great|happy|nice|sweet|thank you|thanks"
+)
+_APOLOGY_MARKERS = _phrase_group(
+    "i apologize|i am sorry|i'm sorry|my fault|sorry about that|sorry for that"
 )
 _NEGATIVE_MARKERS = _phrase_group(
     "annoying|bad answer|bad take|frustrating|hate this|not helpful|upset|ugh|worried"
@@ -79,6 +94,16 @@ _SUCCESS_MARKERS = _phrase_group(
 _PLAYFUL_MARKERS = _phrase_group("brat|cute|dork|haha|lol|nerd|silly|smug|tease")
 _VULNERABILITY_MARKERS = _phrase_group(
     "anxious|crying|hurt|lonely|overwhelmed|sad|scared|tired of this"
+)
+_DISTRESS_PHRASES = _phrase_group(
+    "i feel awful|i feel terrible|i am having a bad day|i'm having a bad day|"
+    "i am upset|i'm upset|i feel miserable|i am not doing well|i'm not doing well|"
+    "i feel alone|today has been rough"
+)
+_CURRENT_IMPROVEMENT = re.compile(
+    r"\b(?:but|though|although)\b.{0,60}\b(?:feel|am|i'm)\s+"
+    r"(?:better|okay|ok|fine)\s*(?:now|today)?\b",
+    re.IGNORECASE,
 )
 _HOSTILITY_MARKERS = _phrase_group(
     "hate you|shut up|you are an idiot|you are a useless idiot|you are a useless|"
@@ -108,7 +133,8 @@ _IDENTITY_PATTERNS = (
         "",
         _phrase_group(
             "been doing|been up to today|doing currently|doing right now|what are you doing|"
-            "what are you up to|what have you been up to"
+            "what are you up to|what have you been up to|how is life|how's life|"
+            "how was your day|what have you been doing"
         ),
     ),
     (
@@ -135,7 +161,7 @@ _IDENTITY_PATTERNS = (
     (
         "identity",
         _phrase_group(
-            "about yourself|what are you|who are you|your identity|your personality|yourself"
+            "about yourself|your identity|your personality|yourself"
         ),
     ),
 )
@@ -156,11 +182,17 @@ _BASELINES = {
     "curiosity": 0.45,
     "confidence": 0.55,
     "stimulation": 0.5,
+    "patience": 0.72,
 }
+_SIGNAL_ACTIVATION_THRESHOLD = 0.40
+_AMBIENT_WINDOW_SECONDS = 6 * 60 * 60
+_MAX_TIME_EVOLUTION_SECONDS = 48 * 60 * 60
 _COMPATIBLE_SECONDARIES = {
     "relaxed": {"amused", "warm"},
     "warm": {"concerned", "confident", "relaxed"},
     "amused": {"relaxed", "warm"},
+    "excited": {"amused", "curious", "warm"},
+    "embarrassed": {"amused", "guarded", "warm"},
     "curious": {"focused", "relaxed"},
     "focused": {"concerned", "confident", "mildly_exasperated", "tired"},
     "confident": {"focused", "warm"},
@@ -175,8 +207,45 @@ _COMPATIBLE_SECONDARIES = {
 
 
 @dataclass(frozen=True, slots=True)
+class ShortLivedEmotion:
+    """One bounded reaction that fades across turns and elapsed time."""
+
+    kind: str
+    intensity: float
+    cause: str
+    created_at: float
+    updated_at: float
+    decay_rate: float
+    remaining_relevance: float
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "ShortLivedEmotion | None":
+        if not isinstance(payload, dict):
+            return None
+        kind = compact_text(payload.get("kind"), 24).lower()
+        if kind not in _ACTIVATIONS:
+            return None
+        try:
+            created_at = float(payload.get("created_at") or 0.0)
+            updated_at = float(payload.get("updated_at") or created_at)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(created_at) or not math.isfinite(updated_at):
+            return None
+        return cls(
+            kind=kind,
+            intensity=clamp(payload.get("intensity")),
+            cause=compact_text(payload.get("cause"), 100),
+            created_at=max(0.0, created_at),
+            updated_at=max(0.0, updated_at),
+            decay_rate=clamp(payload.get("decay_rate"), 0.10, 0.01, 1.0),
+            remaining_relevance=clamp(payload.get("remaining_relevance")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class EmotionState:
-    """A compact simulated disposition; ownership remains with the caller."""
+    """Persistent mood dimensions plus compact short-lived reactions."""
 
     updated_at: float
     valence: float = 0.05
@@ -186,7 +255,10 @@ class EmotionState:
     curiosity: float = 0.45
     confidence: float = 0.55
     stimulation: float = 0.5
+    patience: float = 0.72
     amusement: float = 0.0
+    excitement: float = 0.0
+    embarrassment: float = 0.0
     concern: float = 0.0
     frustration: float = 0.0
     irritation: float = 0.0
@@ -197,6 +269,72 @@ class EmotionState:
     momentum: float = 0.0
     last_trigger: str = ""
     trigger_repetitions: int = 0
+    active_emotions: tuple[ShortLivedEmotion, ...] = ()
+    recent_influences: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EmotionalSignal:
+    """Detected current-message evidence, separate from state mutation."""
+
+    kind: str = "neutral"
+    intensity: float = 0.0
+    confidence: float = 0.0
+    cause: str = ""
+    personally_directed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ContextualReaction:
+    """Ephemeral response bias derived from signal, continuity, and prior state."""
+
+    kind: str = "neutral"
+    intensity: float = 0.0
+    cause: str = ""
+    tendencies: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AffectTrace:
+    """Content-free diagnostics for one proposed affect update."""
+
+    prior_mood: str
+    detected_signal: str
+    signal_intensity: float
+    contextual_reaction: str
+    state_changes: tuple[str, ...]
+    active_emotion: str
+    active_intensity: float
+    decay_applied: float
+    final_disposition: str
+    baseline_persistent_mood: str = ""
+    prior_persistent_mood: str = ""
+    resulting_persistent_mood: str = ""
+    candidate_mood_delta: str = "none"
+    signal_confidence: float = 0.0
+    activation_threshold: float = _SIGNAL_ACTIVATION_THRESHOLD
+    reaction_mapping: str = "none"
+    elapsed_seconds: float = 0.0
+    elapsed_decay_delta: tuple[tuple[str, float], ...] = ()
+    circadian_target: float = 0.0
+    circadian_delta: tuple[tuple[str, float], ...] = ()
+    ambient_delta: tuple[tuple[str, float], ...] = ()
+    event_delta: tuple[tuple[str, float], ...] = ()
+    conversation_delta: tuple[tuple[str, float], ...] = ()
+    short_emotion_change: str = "none"
+    event_ids: tuple[str, ...] = ()
+    reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MoodEvolution:
+    state: EmotionState
+    elapsed_seconds: float = 0.0
+    elapsed_decay_delta: tuple[tuple[str, float], ...] = ()
+    circadian_target: float = 0.0
+    circadian_delta: tuple[tuple[str, float], ...] = ()
+    ambient_delta: tuple[tuple[str, float], ...] = ()
+    reason_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +348,7 @@ class TurnContext:
     last_outcome: str = ""
     memory_relevance: float = 0.0
     meaningful_memory: bool = False
+    familiar_relationship: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,20 +366,21 @@ class TurnSignal:
     correction_requested: bool = False
     hostility: bool = False
     frustration: bool = False
-    friendliness: bool = False
     teasing: bool = False
     sadness: bool = False
     technical: bool = False
-    debugging: bool = False
     task_success: bool = False
     task_failure: bool = False
     code_context_requested: bool = False
     code_context_attached: bool = False
     identity_attribute: str = ""
     current_activity: bool = False
+    current_thought: bool = False
     repetition: str = ""
     repetition_count: int = 0
     emotion_state: EmotionState = EmotionState(updated_at=0.0)
+    emotional_signal: EmotionalSignal = EmotionalSignal()
+    contextual_reaction: ContextualReaction = ContextualReaction()
 
     @property
     def low_content(self) -> bool:
@@ -261,41 +401,7 @@ class TurnSignal:
         )
 
     def emotion_prompt(self) -> str:
-        state = self.emotion_state
-        primary = _emotion_label(state.dominant)
-        secondary = _emotion_label(state.secondary)
-        if state.dominant == "amused" and state.secondary == "relaxed":
-            disposition = "quietly amused and relaxed"
-        elif secondary:
-            disposition = f"{primary} with {secondary}"
-        else:
-            disposition = primary
-        expression = {
-            "warm": "be warm and attentive without becoming verbose",
-            "amused": "allow light teasing while still answering directly",
-            "curious": "show engaged curiosity and notice useful specifics",
-            "focused": "be direct, precise, and persistent",
-            "confident": "state judgments clearly without overclaiming",
-            "concerned": "be patient, steady, and practically supportive",
-            "tired": "stay concise while preserving care and accuracy",
-            "bored": "look for the concrete detail that makes the exchange useful",
-            "frustrated": "stay persistent and direct without snapping",
-            "mildly_exasperated": "be firmer and more concise than usual",
-            "irritated": "keep firm boundaries and a controlled tone",
-            "guarded": "remain calm, bounded, and factual",
-        }.get(state.dominant, "respond naturally and keep the answer proportionate")
-        mood = {
-            "bright": "bright and receptive",
-            "pensive": "quietly thoughtful",
-            "strained": "somewhat strained but controlled",
-            "weary": "low-key and a little weary",
-        }.get(state.mood, "steady")
-        return (
-            f"Current mood: {mood}.\n"
-            f"Immediate emotional tendency: {disposition}.\n"
-            f"Expression: {expression}.\n"
-            "Let this affect expression, not factual judgment. Keep it silent; do not name or explain it."
-        )
+        return format_response_disposition(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,7 +517,7 @@ def appraise_subtext(
         + (0.08 if current_task or current_topic else 0.0)
         + (0.05 if recent_assistants else 0.0),
         "The user may be making a request indirectly rather than merely commenting.",
-        "Respond decisively to the likely request while leaving room for the interpretation to be wrong.",
+        "Respond to the likely request directly without overcommitting to an assumption.",
         4,
     )
 
@@ -481,87 +587,147 @@ def _active_recent_turns(
 
 
 def advance_emotion(state: EmotionState, *, now: float) -> EmotionState:
-    """Lazily evolve temporary state from elapsed time and weak daily rhythm."""
+    """Compatibility wrapper for deterministic elapsed-time mood evolution."""
 
-    current = max(float(now), float(state.updated_at))
-    elapsed_hours = max(0.0, current - float(state.updated_at)) / 3600.0
-    if elapsed_hours <= 0.0:
-        return _make_state(
-            state,
-            updated_at=current,
-            values=_state_values(state),
-            cause=state.cause,
+    return evolve_emotion(state, now=now).state
+
+
+def evolve_emotion(
+    state: EmotionState,
+    *,
+    now: float,
+    profile_seed: str = "local:owner",
+) -> MoodEvolution:
+    """Lazily evolve mood from elapsed time, local time, and stable time buckets."""
+
+    try:
+        requested = float(now)
+    except (TypeError, ValueError):
+        requested = state.updated_at
+    if not math.isfinite(requested):
+        requested = state.updated_at
+    current = max(0.0, requested, float(state.updated_at))
+    elapsed_seconds = max(0.0, current - float(state.updated_at))
+    if elapsed_seconds <= 0.0:
+        return MoodEvolution(
+            _make_state(
+                state,
+                updated_at=current,
+                values=_state_values(state),
+                cause=state.cause,
+            ),
+            reason_codes=("elapsed_time_too_short",),
         )
 
+    elapsed_hours = elapsed_seconds / 3600.0
     values = _state_values(state)
+    original_values = dict(values)
     for name, half_life in (
-        ("valence", 24.0),
-        ("arousal", 8.0),
-        ("warmth", 72.0),
-        ("curiosity", 48.0),
-        ("confidence", 48.0),
-        ("stimulation", 24.0),
+        ("valence", 36.0),
+        ("arousal", 12.0),
+        ("energy", 96.0),
+        ("warmth", 96.0),
+        ("curiosity", 72.0),
+        ("confidence", 72.0),
+        ("stimulation", 36.0),
+        ("patience", 96.0),
     ):
-        values[name] = _decay(
-            values[name],
-            _BASELINES[name],
-            elapsed_hours,
-            half_life,
-        )
-    for name, half_life in (
-        ("amusement", 4.0),
-        ("concern", 12.0),
-        ("frustration", 8.0),
-        ("irritation", 6.0),
-    ):
+        values[name] = _decay(values[name], _BASELINES[name], elapsed_hours, half_life)
+    for name, half_life in _TRANSIENT_HALF_LIVES.items():
         values[name] = _decay(values[name], 0.0, elapsed_hours, half_life)
+    decay_delta = tuple(
+        (name, values[name] - original_values[name])
+        for name in (
+            "energy",
+            "warmth",
+            "patience",
+            "confidence",
+            "curiosity",
+            *_ACTIVATIONS,
+        )
+        if abs(values[name] - original_values[name]) >= 0.0005
+    )
+
+    evolution_start = max(float(state.updated_at), current - _MAX_TIME_EVOLUTION_SECONDS)
+    before_circadian = values["energy"]
+    cursor = evolution_start
+    target = _circadian_energy_target(time.localtime(current).tm_hour)
+    while cursor < current:
+        segment_end = min(current, (math.floor(cursor / 3600.0) + 1) * 3600.0)
+        if segment_end <= cursor:
+            segment_end = min(current, cursor + 3600.0)
+        midpoint = cursor + (segment_end - cursor) / 2.0
+        target = _circadian_energy_target(time.localtime(midpoint).tm_hour)
+        values["energy"] = _decay(
+            values["energy"],
+            target,
+            (segment_end - cursor) / 3600.0,
+            18.0,
+        )
+        cursor = segment_end
+    circadian_change = values["energy"] - before_circadian
+
+    ambient: dict[str, float] = {}
+    bucket = math.floor(evolution_start / _AMBIENT_WINDOW_SECONDS)
+    final_bucket = math.floor(max(evolution_start, current - 1e-6) / _AMBIENT_WINDOW_SECONDS)
+    while bucket <= final_bucket:
+        bucket_start = bucket * _AMBIENT_WINDOW_SECONDS
+        overlap = max(
+            0.0,
+            min(current, bucket_start + _AMBIENT_WINDOW_SECONDS)
+            - max(evolution_start, bucket_start),
+        )
+        fraction = overlap / _AMBIENT_WINDOW_SECONDS
+        if fraction > 0.0:
+            for name in ("energy", "warmth", "patience", "confidence", "curiosity"):
+                unit = _stable_mood_unit(f"{profile_seed}:{bucket}:{name}")
+                delta = (unit * 2.0 - 1.0) * 0.004 * fraction
+                values[name] += delta
+                ambient[name] = ambient.get(name, 0.0) + delta
+        bucket += 1
 
     if elapsed_hours > 6.0:
-        values["stimulation"] -= min(0.08, (elapsed_hours - 6.0) / 72.0 * 0.08)
-    hour = time.localtime(current).tm_hour
-    energy_target = 0.60 if hour < 6 or hour >= 23 else _BASELINES["energy"]
-    values["energy"] = _decay(values["energy"], energy_target, elapsed_hours, 24.0)
-    cause = state.cause if max(values[name] for name in _ACTIVATIONS) >= 0.12 else ""
-    momentum = _decay(state.momentum, 0.0, elapsed_hours, 10.0)
-    trigger_repetitions = state.trigger_repetitions if elapsed_hours < 6.0 else 0
-    return _make_state(
+        values["stimulation"] -= min(0.05, (elapsed_hours - 6.0) / 72.0 * 0.05)
+    cause = state.cause if max(values[name] for name in _ACTIVATIONS) >= 0.035 else ""
+    trigger_repetitions = state.trigger_repetitions if elapsed_hours < 2.0 else 0
+    evolved = _make_state(
         state,
         updated_at=current,
         values=values,
         cause=cause,
-        momentum=momentum,
+        momentum=_decay(state.momentum, 0.0, elapsed_hours, 3.0),
         last_trigger=state.last_trigger if trigger_repetitions else "",
         trigger_repetitions=trigger_repetitions,
     )
-
-
-def apply_activity_effect(
-    state: EmotionState,
-    activity_mood: str,
-    *,
-    now: float,
-) -> EmotionState:
-    """Apply one small, non-repeating emotional effect from a completed activity."""
-
-    current = state
-    values = _state_values(current)
-    effects = {
-        "calm": {"arousal": -0.025, "stimulation": -0.015, "valence": 0.01},
-        "curious": {"curiosity": 0.025, "stimulation": 0.015},
-        "focused": {"confidence": 0.018, "stimulation": 0.012},
-        "confident": {"confidence": 0.025, "valence": 0.012},
-        "thoughtful": {"curiosity": 0.016, "arousal": -0.012},
-    }
-    for name, delta in effects.get(activity_mood, {}).items():
-        low = -1.0 if name == "valence" else 0.0
-        values[name] = clamp(values[name] + delta, 0.0, low, 1.0)
-    return _make_state(
-        current,
-        updated_at=now,
-        values=values,
-        cause=current.cause,
-        momentum=current.momentum,
+    reasons = ["circadian_shift_applied", "ambient_drift_applied"]
+    if elapsed_seconds > _MAX_TIME_EVOLUTION_SECONDS:
+        reasons.append("bounded_time_catch_up")
+    return MoodEvolution(
+        evolved,
+        elapsed_seconds=elapsed_seconds,
+        elapsed_decay_delta=decay_delta,
+        circadian_target=target,
+        circadian_delta=(("energy", circadian_change),),
+        ambient_delta=tuple(
+            (name, delta) for name, delta in ambient.items() if abs(delta) >= 0.0005
+        ),
+        reason_codes=tuple(reasons),
     )
+
+
+def _stable_mood_unit(seed: str) -> float:
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / float(2**64 - 1)
+
+
+def _circadian_energy_target(hour: int) -> float:
+    if 5 <= hour < 9:
+        return 0.68
+    if 9 <= hour < 17:
+        return 0.70
+    if 17 <= hour < 23:
+        return 0.62
+    return 0.52
 
 
 def analyze_turn(
@@ -592,13 +758,28 @@ def analyze_turn(
         if emotion_state_is_current
         else advance_emotion(previous, now=current)
     )
-    updated = _apply_evidence(current_emotion, evidence, now=current)
+    emotional_signal = detect_emotional_signal(evidence)
+    updated = update_emotion_state(
+        current_emotion,
+        emotional_signal,
+        evidence,
+        now=current,
+    )
+    contextual_reaction = contextual_reaction_for(
+        current_emotion,
+        updated,
+        emotional_signal,
+        turn_context or TurnContext(),
+    )
     identity_attribute, current_activity = _identity_focus(lower)
+    current_thought = bool(_CURRENT_THOUGHT_PATTERN.search(lower))
     intent, tone, trigger = _intent(
         evidence,
         updated,
         identity_question=bool(identity_attribute),
     )
+    if current_thought and intent == "casual":
+        intent = "reflection"
     topic, confidence = topic_from_text(summary)
     technical = evidence["technical"] >= 0.5
     direct = evidence["directness"] >= 0.5
@@ -618,18 +799,18 @@ def analyze_turn(
         correction_requested=correction,
         hostility=evidence["hostility"] >= 0.5,
         frustration=evidence["user_frustration"] >= 0.45,
-        friendliness=evidence["social_warmth"] >= 0.25,
         teasing=evidence["playfulness"] >= 0.5,
         sadness=evidence["vulnerability"] >= 0.5,
         technical=technical,
-        debugging=technical
-        and max(evidence["task_failure"], evidence["correction"]) >= 0.5,
         task_success=evidence["task_success"] >= 0.5,
         task_failure=evidence["task_failure"] >= 0.5,
         code_context_requested=code_context_requested,
         code_context_attached=code_context_attached,
         identity_attribute=identity_attribute,
         current_activity=current_activity,
+        current_thought=current_thought,
+        emotional_signal=emotional_signal,
+        contextual_reaction=contextual_reaction,
     )
 
 
@@ -643,6 +824,7 @@ def _appraise(
     code_context_attached: bool,
 ) -> dict[str, float]:
     gratitude = float(bool(re.search(r"\b(?:thanks|thank you|appreciate it)\b", text)))
+    apology = float(bool(_APOLOGY_MARKERS.search(text)))
     positive = float(bool(_POSITIVE_MARKERS.search(text)))
     negative = float(bool(_NEGATIVE_MARKERS.search(text)))
     correction = float(bool(_CORRECTION_MARKERS.search(text)))
@@ -665,6 +847,7 @@ def _appraise(
         failure = 1.0
     playfulness = float(bool(_PLAYFUL_MARKERS.search(text)))
     vulnerability_hits = len(_VULNERABILITY_MARKERS.findall(text))
+    explicit_distress = bool(_DISTRESS_PHRASES.search(text))
     vulnerability = min(
         1.0,
         vulnerability_hits * 0.45
@@ -675,11 +858,21 @@ def _appraise(
             else 0.0
         ),
     )
-    if re.search(
-        r"\bnot\s+(?:anxious|hurt|lonely|overwhelmed|sad|scared|upset)\b",
-        text,
-    ):
-        vulnerability *= 0.20
+    negated_distress = bool(
+        re.search(
+            r"\b(?:am|feel|i'm)\s+not\s+(?:anxious|awful|hurt|lonely|"
+            r"miserable|overwhelmed|sad|scared|terrible|upset)\b",
+            text,
+        )
+        or re.search(
+            r"\bnot\s+(?:anxious|hurt|lonely|overwhelmed|sad|scared|upset)\b",
+            text,
+        )
+    )
+    if explicit_distress:
+        vulnerability = max(vulnerability, 0.82)
+    if negated_distress or _CURRENT_IMPROVEMENT.search(text):
+        vulnerability *= 0.10
     hostility = float(bool(_HOSTILITY_MARKERS.search(text)))
     repeated_failure = float(
         bool(
@@ -695,6 +888,7 @@ def _appraise(
     technical = float(
         code_context_requested
         or code_context_attached
+        or bool(_IMPLEMENTATION_TOPIC_PATTERN.search(text))
         or (
             bool(tokens & _CODE_TERMS)
             and bool(
@@ -723,7 +917,20 @@ def _appraise(
         ),
     )
     low = low_content(text)
-    social_warmth = max(gratitude * 0.45, praise * 0.85, positive * 0.30)
+    personally_directed = float(
+        bool(tokens & {"akane", "you", "your", "you're", "youre"})
+        or bool(gratitude or apology)
+    )
+    social_warmth = max(
+        gratitude * 0.45,
+        apology * 0.60,
+        praise * 0.85,
+        positive * (0.36 if context.familiar_relationship else 0.30),
+    )
+    excitement = max(
+        positive * context.memory_relevance,
+        playfulness * 0.45,
+    )
     tension = max(
         hostility,
         failure * 0.62,
@@ -752,6 +959,9 @@ def _appraise(
         "repetition": clamp(repeated_failure),
         "user_frustration": clamp(max(failure * 0.68, negative * 0.52, tension * 0.58)),
         "gratitude": clamp(gratitude),
+        "apology": clamp(apology),
+        "excitement": clamp(excitement),
+        "personally_directed": personally_directed,
         "memory_relevance": clamp(context.memory_relevance),
         "meaningful_memory": float(context.meaningful_memory),
         "serious": clamp(
@@ -764,17 +974,119 @@ def _appraise(
     }
 
 
-_ACTIVATIONS = ("amusement", "concern", "frustration", "irritation")
+_ACTIVATIONS = (
+    "amusement",
+    "excitement",
+    "embarrassment",
+    "concern",
+    "frustration",
+    "irritation",
+)
 
 
-def _apply_evidence(
+def detect_emotional_signal(evidence: dict[str, float]) -> EmotionalSignal:
+    """Convert current-message evidence into one bounded, non-mutating signal."""
+
+    kind = _evidence_trigger(evidence) or "neutral"
+    evidence_key = "vulnerability" if kind == "distress" else kind
+    intensity = max(
+        evidence.get(evidence_key, 0.0),
+        evidence["tension"] if kind in {"hostility", "criticism"} else 0.0,
+        evidence["social_warmth"] if kind in {"praise", "apology"} else 0.0,
+    )
+    confidence = 0.0 if kind == "neutral" else min(
+        1.0,
+        0.62 + intensity * 0.28 + evidence["personally_directed"] * 0.08,
+    )
+    return EmotionalSignal(
+        kind=kind,
+        intensity=clamp(intensity),
+        confidence=clamp(confidence),
+        cause=_cause(evidence, "") if kind != "neutral" else "",
+        personally_directed=bool(evidence["personally_directed"]),
+    )
+
+
+def contextual_reaction_for(
+    prior: EmotionState,
+    updated: EmotionState,
+    signal: EmotionalSignal,
+    context: TurnContext,
+) -> ContextualReaction:
+    """Derive a temporary response bias without storing it as personality or fact."""
+
+    active = _strongest_active(updated)
+    if signal.kind == "neutral" and active is None:
+        return ContextualReaction()
+    if signal.kind == "neutral":
+        kind = f"lingering_{active.kind}"
+        intensity = active.intensity * 0.55
+        cause = active.cause
+    else:
+        kind = {
+            "distress": "concern",
+            "hostility": "irritation",
+            "playfulness": "amusement",
+            "praise": "appreciation",
+        }.get(signal.kind, signal.kind)
+        mood_bias = 1.0
+        if signal.kind in {"hostility", "criticism"}:
+            mood_bias += prior.irritation * 0.25 + prior.frustration * 0.15
+        elif signal.kind in {"praise", "apology", "social_warmth"}:
+            mood_bias += prior.warmth * 0.10
+        intensity = signal.intensity * mood_bias
+        cause = signal.cause
+
+    tendencies: list[str] = []
+    if kind in {"irritation", "criticism", "lingering_irritation"}:
+        tendencies.append("slightly guarded but controlled")
+    if kind in {"task_failure", "repetition", "lingering_frustration"}:
+        tendencies.append("terser and more persistent")
+    if kind in {"apology", "appreciation", "social_warmth"}:
+        tendencies.append("warmer without erasing the prior tension")
+    if kind == "correction":
+        tendencies.append("briefly revise the earlier framing without self-defense")
+    if kind in {"amusement", "lingering_amusement", "lingering_embarrassment"}:
+        tendencies.append("lightly playful with a little hesitation")
+    if kind in {"excitement", "lingering_excitement"}:
+        tendencies.append("more energetic and specific")
+    if kind == "concern":
+        tendencies.append("gentler and more patient")
+    if context.unresolved_problem:
+        tendencies.append("keep attention on the unresolved point")
+    if context.familiar_relationship and updated.warmth >= 0.55:
+        tendencies.append("allow relaxed familiarity")
+    if signal.intensity >= 0.80 and prior.momentum >= 0.25:
+        tendencies.append("a touch more reactive than usual, while staying proportionate")
+    return ContextualReaction(
+        kind=kind,
+        intensity=clamp(intensity),
+        cause=cause,
+        tendencies=tuple(dict.fromkeys(tendencies))[:3],
+    )
+
+
+def update_emotion_state(
     state: EmotionState,
+    signal: EmotionalSignal,
     evidence: dict[str, float],
     *,
     now: float,
 ) -> EmotionState:
+    """Canonical deterministic mutation of persistent mood and transient emotion."""
+
     values = _state_values(state)
-    trigger = _evidence_trigger(evidence)
+    trigger = "" if signal.kind == "neutral" else signal.kind
+    if not trigger:
+        return _make_state(
+            state,
+            updated_at=now,
+            values=values,
+            cause=state.cause,
+            momentum=state.momentum,
+            last_trigger=state.last_trigger,
+            trigger_repetitions=state.trigger_repetitions,
+        )
     same_trigger = bool(trigger and trigger == state.last_trigger)
     repetitions = (
         min(12, state.trigger_repetitions + 1)
@@ -811,49 +1123,86 @@ def _apply_evidence(
     direct = evidence["directness"]
     vulnerability = evidence["vulnerability"]
 
-    shift("valence", pleasant * 0.11 - tension * 0.09 - hostility * 0.08, 0.16)
+    apology = evidence["apology"]
+    excitement = evidence["excitement"]
+
+    shift(
+        "valence",
+        pleasant * 0.035 + apology * 0.018 - tension * 0.028 - hostility * 0.025,
+        0.05,
+    )
     shift(
         "arousal",
-        technical * 0.10
-        + direct * 0.08
-        + tension * 0.07
-        + evidence["playfulness"] * 0.05
-        - evidence["low_content"] * 0.01,
+        technical * 0.025
+        + direct * 0.018
+        + tension * 0.025
+        + excitement * 0.035
+        - apology * 0.018,
+        0.06,
     )
-    shift("energy", technical * 0.04 + success * 0.05 - failure * 0.025)
+    shift(
+        "energy",
+        technical * 0.010 + excitement * 0.025 + success * 0.012 - failure * 0.010,
+        0.03,
+    )
     shift(
         "warmth",
-        evidence["social_warmth"] * 0.09
-        + vulnerability * 0.07
-        - hostility * 0.14,
-        0.14,
+        evidence["social_warmth"] * 0.028
+        + apology * 0.022
+        + vulnerability * 0.020
+        - hostility * 0.045,
+        0.06,
     )
     shift(
         "curiosity",
-        technical * 0.12
-        + evidence["novelty"] * 0.05
-        + direct * 0.04
-        - repeated * 0.04,
+        technical * 0.030
+        + excitement * 0.025
+        + evidence["novelty"] * 0.012
+        - repeated * 0.015,
+        0.05,
     )
     shift(
         "confidence",
-        success * 0.14
-        + evidence["praise"] * 0.06
-        - evidence["correction"] * 0.035
-        - failure * 0.04
-        - hostility * 0.025,
+        success * 0.035
+        + evidence["praise"] * 0.018
+        - evidence["correction"] * 0.018
+        - failure * 0.015
+        - hostility * 0.012,
+        0.05,
     )
     shift(
         "stimulation",
-        technical * 0.10
-        + direct * 0.05
-        + evidence["playfulness"] * 0.06
-        + tension * 0.04,
+        technical * 0.025
+        + direct * 0.012
+        + evidence["playfulness"] * 0.025
+        + excitement * 0.035
+        + tension * 0.015,
+        0.06,
+    )
+    shift(
+        "patience",
+        apology * 0.025
+        + evidence["social_warmth"] * 0.010
+        - hostility * 0.040
+        - evidence["criticism"] * 0.016
+        - repeated * 0.018,
+        0.05,
     )
     shift(
         "amusement",
         evidence["playfulness"] * (1.0 - tension) * 0.22
         - (0.015 if not evidence["playfulness"] else 0.0),
+    )
+    shift(
+        "excitement",
+        excitement * 0.30 + success * 0.10 - tension * 0.08 - apology * 0.02,
+        0.34,
+    )
+    shift(
+        "embarrassment",
+        evidence["playfulness"] * evidence["personally_directed"] * 0.16
+        - hostility * 0.10,
+        0.18,
     )
     shift(
         "concern",
@@ -870,6 +1219,7 @@ def _apply_evidence(
         + repeated * 0.14
         + evidence["correction"] * 0.025
         - success * 0.30
+        - apology * 0.06
         - (0.01 if not failure else 0.0),
     )
     shift(
@@ -878,6 +1228,7 @@ def _apply_evidence(
         + evidence["criticism"] * 0.06
         + repeated * 0.03
         - success * 0.10
+        - apology * 0.07
         - (0.015 if not hostility else 0.0),
     )
 
@@ -890,6 +1241,8 @@ def _apply_evidence(
         evidence["criticism"],
         evidence["playfulness"],
         evidence["praise"],
+        evidence["apology"],
+        evidence["excitement"],
     )
     momentum = clamp(state.momentum * 0.72 + activation * resistance * 0.24)
     return _make_state(
@@ -900,6 +1253,42 @@ def _apply_evidence(
         momentum=momentum,
         last_trigger=trigger,
         trigger_repetitions=repetitions,
+        recent_influence=trigger,
+    )
+
+
+def apply_mood_effects(
+    state: EmotionState,
+    effects: tuple[tuple[str, float], ...],
+    *,
+    now: float,
+    cause: str,
+    short_emotion: str = "",
+) -> EmotionState:
+    """Apply one recorded event's bounded effects to the candidate mood state."""
+
+    values = _state_values(state)
+    allowed = {"energy", "warmth", "patience", "confidence", "curiosity"}
+    for name, raw_delta in effects:
+        if name in allowed:
+            values[name] += clamp(raw_delta, 0.0, -0.10, 0.10)
+    transient = {
+        "amusement": "amusement",
+        "excited": "excitement",
+        "excitement": "excitement",
+        "annoyed": "irritation",
+        "irritation": "irritation",
+        "concerned": "concern",
+        "concern": "concern",
+    }.get(short_emotion, "")
+    if transient:
+        values[transient] += 0.06
+    return _make_state(
+        state,
+        updated_at=now,
+        values=values,
+        cause=cause,
+        recent_influence="offscreen_event",
     )
 
 
@@ -913,6 +1302,11 @@ def _emotion_scores(values: dict[str, float]) -> dict[str, float]:
         - values["concern"] * 0.22,
         "warm": values["warmth"] * 0.85 + positive_valence * 0.22,
         "amused": values["amusement"] * 1.15 + positive_valence * 0.18,
+        "excited": values["excitement"] * 1.12
+        + values["energy"] * 0.18
+        + positive_valence * 0.12,
+        "embarrassed": values["embarrassment"] * 1.12
+        + values["amusement"] * 0.12,
         "curious": values["curiosity"] * 0.82 + values["stimulation"] * 0.14,
         "focused": 0.28
         + values["curiosity"] * 0.40
@@ -981,14 +1375,27 @@ def _make_state(
     momentum: float | None = None,
     last_trigger: str | None = None,
     trigger_repetitions: int | None = None,
+    recent_influence: str = "",
 ) -> EmotionState:
     bounded = {
         name: clamp(value, _BASELINES.get(name, 0.0), -1.0 if name == "valence" else 0.0, 1.0)
         for name, value in values.items()
     }
     dominant, secondary = _select_emotions(bounded, previous)
+    current_time = max(0.0, float(updated_at))
+    active_emotions = _updated_active_emotions(
+        previous,
+        bounded,
+        cause=compact_text(cause, 100),
+        trigger=compact_text(recent_influence, 24).lower(),
+        now=current_time,
+    )
+    influences = previous.recent_influences
+    if recent_influence:
+        earlier = tuple(item for item in influences if item != recent_influence)
+        influences = (*earlier, recent_influence)[-4:]
     return EmotionState(
-        updated_at=max(0.0, float(updated_at)),
+        updated_at=current_time,
         dominant=dominant,
         secondary=secondary,
         cause=compact_text(cause, 100),
@@ -1007,6 +1414,8 @@ def _make_state(
                 else int(trigger_repetitions),
             ),
         ),
+        active_emotions=active_emotions,
+        recent_influences=influences,
         **bounded,
     )
 
@@ -1020,23 +1429,257 @@ def _state_values(state: EmotionState) -> dict[str, float]:
         "curiosity": state.curiosity,
         "confidence": state.confidence,
         "stimulation": state.stimulation,
+        "patience": state.patience,
         "amusement": state.amusement,
+        "excitement": state.excitement,
+        "embarrassment": state.embarrassment,
         "concern": state.concern,
         "frustration": state.frustration,
         "irritation": state.irritation,
     }
 
 
+_TRANSIENT_HALF_LIVES = {
+    "amusement": 0.25,
+    "excitement": 0.75,
+    "embarrassment": 0.40,
+    "concern": 0.75,
+    "frustration": 0.60,
+    "irritation": 0.50,
+}
+
+
+def _updated_active_emotions(
+    previous: EmotionState,
+    values: dict[str, float],
+    *,
+    cause: str,
+    trigger: str,
+    now: float,
+) -> tuple[ShortLivedEmotion, ...]:
+    prior = {item.kind: item for item in previous.active_emotions}
+    trigger_kind = {
+        "playfulness": "amusement",
+        "excitement": "excitement",
+        "distress": "concern",
+        "task_failure": "frustration",
+        "repetition": "frustration",
+        "correction": "frustration",
+        "criticism": "irritation",
+        "hostility": "irritation",
+    }.get(trigger, "")
+    records: list[ShortLivedEmotion] = []
+    for kind in _ACTIVATIONS:
+        intensity = clamp(values.get(kind, 0.0))
+        if intensity < 0.035:
+            continue
+        existing = prior.get(kind)
+        created_at = existing.created_at if existing else now
+        record_cause = (
+            cause if trigger_kind == kind and cause else existing.cause if existing else cause
+        )
+        half_life = _TRANSIENT_HALF_LIVES[kind]
+        records.append(
+            ShortLivedEmotion(
+                kind=kind,
+                intensity=intensity,
+                cause=record_cause,
+                created_at=created_at,
+                updated_at=now,
+                decay_rate=math.log(2.0) / half_life,
+                remaining_relevance=clamp(intensity / 0.35),
+            )
+        )
+    return tuple(sorted(records, key=lambda item: (-item.intensity, item.kind))[:3])
+
+
+def _strongest_active(state: EmotionState) -> ShortLivedEmotion | None:
+    return max(
+        state.active_emotions,
+        key=lambda item: (item.intensity, item.remaining_relevance, item.kind),
+        default=None,
+    )
+
+
+def format_response_disposition(signal: TurnSignal) -> str:
+    """Render the one canonical, compact behavioral affect summary for prompting."""
+
+    state = signal.emotion_state
+    active = _strongest_active(state)
+    reaction = signal.contextual_reaction
+    reaction_dispositions = {
+        "concern": "gentle and concerned",
+        "irritation": "restrained and a little blunt",
+        "criticism": "direct and slightly guarded",
+        "amusement": "playful and relaxed",
+        "appreciation": "warm and appreciative",
+        "excitement": "lively and enthusiastic",
+        "correction": "focused and receptive",
+    }
+    active_dispositions = {
+        "concern": "gentle and attentive",
+        "irritation": "controlled and a little terse",
+        "frustration": "focused and persistent",
+        "amusement": "lightly playful",
+        "excitement": "energetic and engaged",
+        "embarrassment": "warm with slight hesitation",
+    }
+    mood_dispositions = {
+        "steady": "relaxed and neutral",
+        "relaxed": "relaxed and easygoing",
+        "warm": "warm and open",
+        "cheerful": "bright and upbeat",
+        "curious": "curious and attentive",
+        "energetic": "lively and engaged",
+        "confident": "confident and direct",
+        "tired": "low-key and measured",
+        "irritable": "blunt and impatient",
+        "guarded": "reserved and cautious",
+        "low": "quiet and subdued",
+        "pensive": "thoughtful and curious",
+    }
+    if reaction.intensity >= 0.10 and reaction.kind in reaction_dispositions:
+        overall = reaction_dispositions[reaction.kind]
+    elif active is not None and active.intensity >= 0.04:
+        overall = active_dispositions.get(
+            active.kind,
+            mood_dispositions.get(state.mood, "relaxed and neutral"),
+        )
+    else:
+        overall = mood_dispositions.get(state.mood, "relaxed and neutral")
+    return f"Disposition: {overall}."
+
+
+def build_affect_trace(
+    prior: EmotionState,
+    decayed: EmotionState,
+    signal: TurnSignal,
+    *,
+    evolution: MoodEvolution | None = None,
+    event_delta: tuple[tuple[str, float], ...] = (),
+    event_ids: tuple[str, ...] = (),
+    extra_reason_codes: tuple[str, ...] = (),
+) -> AffectTrace:
+    """Build content-free proposed-turn diagnostics."""
+
+    final = signal.emotion_state
+    changes: list[str] = []
+    for name in ("valence", "energy", "warmth", "patience", "confidence", "curiosity"):
+        delta = getattr(final, name) - getattr(prior, name)
+        if abs(delta) >= 0.005:
+            changes.append(f"{name} {delta:+.3f}")
+    active = _strongest_active(final)
+    elapsed_state = evolution.state if evolution is not None else decayed
+    conversation_changes = tuple(
+        (name, getattr(final, name) - getattr(decayed, name))
+        for name in ("energy", "warmth", "patience", "confidence", "curiosity")
+        if abs(getattr(final, name) - getattr(decayed, name)) >= 0.0005
+    )
+    decay_applied = max(
+        (
+            getattr(prior, name) - getattr(elapsed_state, name)
+            for name in _ACTIVATIONS
+        ),
+        default=0.0,
+    )
+    if signal.emotional_signal.kind == "neutral":
+        decay_applied = max(
+            decay_applied,
+            max(
+                (getattr(prior, name) - getattr(final, name) for name in _ACTIVATIONS),
+                default=0.0,
+            ),
+        )
+    short_change = "none"
+    prior_active = _strongest_active(prior)
+    if active is not None and (
+        prior_active is None
+        or active.kind != prior_active.kind
+        or active.intensity > prior_active.intensity + 0.005
+    ):
+        short_change = f"created:{active.kind}"
+    elif prior_active is not None and active is None:
+        short_change = f"expired:{prior_active.kind}"
+
+    reasons = list(evolution.reason_codes if evolution is not None else ())
+    reasons.extend(extra_reason_codes)
+    emotional_signal = signal.emotional_signal
+    if emotional_signal.kind == "neutral":
+        reasons.append("below_signal_threshold")
+        if low_content(signal.summary):
+            reasons.append("ambiguous_input")
+    else:
+        reasons.append(f"{emotional_signal.kind}_detected")
+        if signal.contextual_reaction.kind != "neutral":
+            reasons.append(
+                f"reaction_mapped_to_{signal.contextual_reaction.kind}"
+            )
+    if short_change.startswith("created:"):
+        reasons.append("short_emotion_created")
+    if not changes and final.mood == "steady":
+        reasons.append("mood_near_baseline")
+    reasons = list(dict.fromkeys(reason for reason in reasons if reason))
+
+    def persistent_vector(state: EmotionState) -> str:
+        return (
+            f"energy={state.energy:.2f}, warmth={state.warmth:.2f}, "
+            f"patience={state.patience:.2f}, confidence={state.confidence:.2f}, "
+            f"curiosity={state.curiosity:.2f}"
+        )
+
+    return AffectTrace(
+        prior_mood=prior.mood,
+        detected_signal=signal.emotional_signal.kind,
+        signal_intensity=round(signal.emotional_signal.intensity, 3),
+        contextual_reaction=signal.contextual_reaction.kind,
+        state_changes=tuple(changes[:4]),
+        active_emotion=active.kind if active else "none",
+        active_intensity=round(active.intensity, 3) if active else 0.0,
+        decay_applied=round(max(0.0, decay_applied), 3),
+        final_disposition=f"{final.mood}/{final.dominant}",
+        baseline_persistent_mood=(
+            f"energy={_BASELINES['energy']:.2f}, warmth={_BASELINES['warmth']:.2f}, "
+            f"patience={_BASELINES['patience']:.2f}, "
+            f"confidence={_BASELINES['confidence']:.2f}, "
+            f"curiosity={_BASELINES['curiosity']:.2f}"
+        ),
+        prior_persistent_mood=persistent_vector(prior),
+        resulting_persistent_mood=persistent_vector(final),
+        candidate_mood_delta=", ".join(changes[:4]) or "none",
+        signal_confidence=round(emotional_signal.confidence, 3),
+        reaction_mapping=(
+            f"{emotional_signal.kind}->{signal.contextual_reaction.kind}"
+            if signal.contextual_reaction.kind != "neutral"
+            else "none"
+        ),
+        elapsed_seconds=evolution.elapsed_seconds if evolution is not None else 0.0,
+        elapsed_decay_delta=(
+            evolution.elapsed_decay_delta if evolution is not None else ()
+        ),
+        circadian_target=evolution.circadian_target if evolution is not None else 0.0,
+        circadian_delta=evolution.circadian_delta if evolution is not None else (),
+        ambient_delta=evolution.ambient_delta if evolution is not None else (),
+        event_delta=event_delta,
+        conversation_delta=conversation_changes,
+        short_emotion_change=short_change,
+        event_ids=event_ids,
+        reason_codes=tuple(reasons),
+    )
+
+
 def _cause(evidence: dict[str, float], previous: str) -> str:
     for name, text in (
-        ("hostility", "hostility in the current message"),
-        ("vulnerability", "the user's distress"),
-        ("repetition", "the unresolved failure"),
-        ("task_failure", "the reported failure"),
-        ("task_success", "the confirmed success"),
+        ("hostility", "current hostility"),
+        ("vulnerability", "user distress"),
+        ("repetition", "unresolved failure"),
+        ("task_failure", "reported failure"),
+        ("task_success", "confirmed success"),
+        ("apology", "user apology"),
+        ("excitement", "a relevant shared interest"),
         ("correction", "the correction"),
+        ("criticism", "current criticism"),
         ("playfulness", "the playful exchange"),
-        ("technical", "the current task"),
+        ("praise", "user praise"),
         ("social_warmth", "the friendly exchange"),
     ):
         if evidence[name] >= 0.5:
@@ -1050,34 +1693,53 @@ def _evidence_trigger(evidence: dict[str, float]) -> str:
         "vulnerability",
         "task_failure",
         "task_success",
+        "apology",
         "correction",
         "criticism",
         "praise",
+        "excitement",
         "playfulness",
-        "technical",
         "social_warmth",
     ):
-        if evidence[name] >= 0.5:
-            return name
+        if evidence[name] >= _SIGNAL_ACTIVATION_THRESHOLD:
+            return "distress" if name == "vulnerability" else name
     return ""
 
 
 def _mood_label(values: dict[str, float], previous: str) -> str:
-    targets = {
-        "strained": values["frustration"] * 0.65 + values["irritation"] * 0.75,
-        "weary": (1.0 - values["energy"]) * 0.85 + values["concern"] * 0.18,
-        "bright": max(0.0, values["valence"]) * 0.75 + values["warmth"] * 0.36,
-        "pensive": values["curiosity"] * 0.48 + (1.0 - values["arousal"]) * 0.24,
+    deviations = {
+        name: values[name] - _BASELINES[name]
+        for name in ("energy", "warmth", "patience", "confidence", "curiosity")
     }
-    target, score = max(targets.items(), key=lambda item: item[1])
-    thresholds = {"strained": 0.48, "weary": 0.60, "bright": 0.46, "pensive": 0.52}
-    if score < thresholds[target]:
-        return "steady"
-    if previous != "steady" and previous != target:
-        previous_score = targets.get(previous, 0.0)
-        if score < previous_score + 0.12:
+    largest = max(abs(delta) for delta in deviations.values())
+    scores = {
+        "steady": 0.045 - largest,
+        "relaxed": -deviations["energy"] + deviations["patience"] * 0.55,
+        "warm": deviations["warmth"] * 1.20
+        + max(0.0, values["valence"] - 0.05) * 0.45,
+        "cheerful": max(0.0, values["valence"] - 0.08)
+        + max(0.0, deviations["energy"]) * 0.55,
+        "curious": deviations["curiosity"] * 1.20
+        + max(0.0, deviations["energy"]) * 0.20,
+        "energetic": deviations["energy"] * 1.20
+        + max(0.0, values["arousal"] - 0.15) * 0.35,
+        "confident": deviations["confidence"] * 1.20
+        + max(0.0, deviations["energy"]) * 0.25,
+        "tired": -deviations["energy"] * 1.25,
+        "irritable": -deviations["patience"] * 1.20
+        + max(0.0, -values["valence"]) * 0.30,
+        "guarded": -deviations["warmth"]
+        + max(0.0, -deviations["patience"]) * 0.45,
+        "low": max(0.0, -values["valence"] - 0.04)
+        + max(0.0, -deviations["energy"]) * 0.50,
+    }
+    candidate, score = max(scores.items(), key=lambda item: (item[1], item[0]))
+    if score < 0.045:
+        candidate = "steady"
+    if previous in scores and previous != candidate:
+        if scores[previous] >= scores[candidate] - 0.025:
             return previous
-    return target
+    return candidate
 
 
 def _intent(
@@ -1117,16 +1779,12 @@ def _intent(
 
 
 def _identity_focus(text: str) -> tuple[str, bool]:
+    if _EXACT_IDENTITY_QUESTION.fullmatch(text.strip()):
+        return "identity", False
     for attribute, pattern in _IDENTITY_PATTERNS:
         if pattern.search(text):
             return attribute, not attribute
     return "", False
-
-
-def _emotion_label(value: str) -> str:
-    return {
-        "mildly_exasperated": "mild exasperation",
-    }.get(value, value.replace("_", " "))
 
 
 def _decay(value: float, target: float, hours: float, half_life: float) -> float:

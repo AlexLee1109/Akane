@@ -151,6 +151,32 @@ def _friendly_load_error(exc: Exception, model_path: Path) -> Exception:
     return exc
 
 
+def _resolved_chat_formatter(llm):
+    """Resolve the formatter used by llama.cpp's active chat-completion handler.
+
+    The installed binding wraps its embedded Jinja template formatter in a handler
+    closure. Resolving that exact object preserves its role markers, special-token
+    behavior, and generation prefix without duplicating a model-specific template.
+    Custom handlers are deliberately treated as unavailable rather than guessed.
+    """
+
+    try:
+        from llama_cpp import llama_chat_format
+
+        handler = (
+            llm.chat_handler
+            or llm._chat_handlers.get(llm.chat_format)
+            or llama_chat_format.get_chat_completion_handler(llm.chat_format)
+        )
+        for cell in handler.__closure__ or ():
+            value = cell.cell_contents
+            if isinstance(value, llama_chat_format.Jinja2ChatFormatter):
+                return value
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
 class ModelManager:
     _instance: "ModelManager | None" = None
     _instance_lock = threading.Lock()
@@ -344,13 +370,50 @@ class ModelManager:
             tokens = original(*args, **kwargs)
             if timing is not None:
                 timing.prompt_tokenization_seconds += time.perf_counter() - started_at
-                try:
-                    timing.prompt_tokens += len(tokens)
-                except TypeError:
-                    pass
+                if timing.prompt_tokens == 0:
+                    try:
+                        timing.prompt_tokens = len(tokens)
+                    except TypeError:
+                        pass
             return tokens
 
         llm.tokenize = timed_tokenize
+
+    def count_prompt_tokens(self, messages: list[dict[str, str]]):
+        """Count the exact prompt produced by the active llama.cpp chat formatter.
+
+        A labeled unavailable result lets the canonical builder retain its
+        conservative estimate when a binding uses an opaque/custom chat handler.
+        """
+
+        from app.core.prompt import PromptTokenCount
+
+        with self.inference() as llm:
+            self._configure_completion_capabilities(llm)
+            if self._disable_thinking:
+                return PromptTokenCount(
+                    None,
+                    False,
+                    "estimated_chat_template_options_not_exposed",
+                )
+            formatter = _resolved_chat_formatter(llm)
+            if formatter is None:
+                return PromptTokenCount(
+                    None,
+                    False,
+                    "estimated_chat_handler_formatter_not_exposed",
+                )
+            rendered = formatter(messages=messages)
+            tokens = llm.tokenize(
+                rendered.prompt.encode("utf-8"),
+                add_bos=not rendered.added_special,
+                special=True,
+            )
+            return PromptTokenCount(
+                len(tokens),
+                True,
+                "exact_llama_cpp_active_chat_formatter",
+            )
 
     def _start_timing(
         self,

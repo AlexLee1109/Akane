@@ -26,8 +26,8 @@ _RECENT_EVENT_IDS: deque[int] = deque()
 _RECENT_EVENT_SET: set[int] = set()
 _RAW_MENTION = re.compile(r"<@!?\d+>|<@&\d+>|<#\d+>")
 _CUSTOM_EMOJI = re.compile(r"<a?:([A-Za-z0-9_]+):\d+>")
-_UNPROMPTED_PROMPT = """[AUTONOMOUS DISCORD POST]
-Write one short, natural, unprompted thought as Akane. Keep it one to three sentences. Let the supplied current internal state, persistent life state, and Akane-owned memory guide what is actually on her mind; use a specific thought, reaction, or opinion instead of generic atmosphere. Do not pretend this is a reply or address a specific person.
+_UNPROMPTED_PROMPT = """[UNPROMPTED DISCORD POST]
+Write one short, natural, unprompted thought as Akane. Keep it one to three sentences. Continue from a supplied concrete interest, recent concern, or activity when one is relevant; use a specific thought, reaction, or opinion instead of generic atmosphere. Do not pretend this is a reply or address a specific person.
 Do not mention timers, schedules, automation, Discord, silence, or that the chat is quiet. Do not ask for attention. Do not include @everyone, @here, a role mention, or a user mention. Return only the completed message."""
 
 
@@ -250,7 +250,9 @@ def _chunks(text: str) -> list[str]:
         return []
     chunks: list[str] = []
     while len(text) > _DISCORD_MESSAGE_LIMIT:
-        cut = text.rfind("\n", 0, _DISCORD_MESSAGE_LIMIT)
+        cut = text.rfind("\n\n", 0, _DISCORD_MESSAGE_LIMIT)
+        if cut < 400:
+            cut = text.rfind("\n", 0, _DISCORD_MESSAGE_LIMIT)
         if cut < 400:
             cut = text.rfind(" ", 0, _DISCORD_MESSAGE_LIMIT)
         if cut < 400:

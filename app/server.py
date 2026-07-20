@@ -28,6 +28,7 @@ from app.core.memory import get_internal_state_store, get_memory_store
 from app.core.model_loader import ModelManager
 from app.core.reply_pipeline import (
     GenerationEvent,
+    commit_reply,
     debug_state_report,
     generate_reply,
     prepare_reply,
@@ -40,7 +41,6 @@ from app.core.session import (
     GenerationQueueFullError,
     cancel_all_generations,
     cancel_generation,
-    commit_turn,
     finish_turn,
     forget_profile,
     normalize_chat_input,
@@ -163,10 +163,11 @@ def _generate_reply(chat: ChatRequestData) -> str:
         item,
         skip_memory=chat.skip_memory,
         skip_if_busy=chat.skip_if_busy,
+        exact_tokens=direct_reply is None,
     )
     if direct_reply is not None:
         try:
-            commit_turn(prepared, direct_reply)
+            commit_reply(prepared, direct_reply)
             return direct_reply
         finally:
             finish_turn(prepared)
@@ -207,6 +208,7 @@ def _stream_chat_events(chat: ChatRequestData):
             item,
             skip_memory=chat.skip_memory,
             skip_if_busy=chat.skip_if_busy,
+            exact_tokens=False,
         )
         try:
             yield _json_line(
@@ -221,7 +223,7 @@ def _stream_chat_events(chat: ChatRequestData):
                 item.conversation_id,
                 item.profile_id,
             )
-            commit_turn(prepared, direct_reply)
+            commit_reply(prepared, direct_reply)
             yield _event_json(
                 GenerationEvent("done", prepared.generation_id, reply=direct_reply),
                 item.conversation_id,
@@ -287,9 +289,13 @@ def _event_json(event: GenerationEvent, conversation_id: str, profile_id: str) -
 
 def handle_builtin_command(chat_input: ChatInput) -> dict | None:
     text = chat_input.text
-    if text == _DEBUG_STATE_COMMAND:
+    if text in {_DEBUG_STATE_COMMAND, f"{_DEBUG_STATE_COMMAND} verbose"}:
         return {
-            "reply": debug_state_report(chat_input.conversation_id, chat_input.profile_id),
+            "reply": debug_state_report(
+                chat_input.conversation_id,
+                chat_input.profile_id,
+                verbose=text.endswith(" verbose"),
+            ),
             "ephemeral": True,
         }
     if text in {"/reset_chat", "/clear"}:

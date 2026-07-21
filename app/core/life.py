@@ -398,15 +398,6 @@ _ACTIVITY_CATALOG = (
         ("enjoyed the quiet", "felt slightly bored", "felt more settled", "felt neutral about it"),
     ),
 )
-_SPEC_BY_TYPE = {spec.activity_type: spec for spec in _ACTIVITY_CATALOG}
-
-
-def advance_life_state(state: LifeState | None, *, now: float) -> LifeState:
-    """Compatibility wrapper for deterministic lazy life evolution."""
-
-    return evolve_life_state(state, now=now).state
-
-
 def evolve_life_state(
     state: LifeState | None,
     *,
@@ -1207,7 +1198,6 @@ def life_evolution_debug(evolution: LifeEvolution | None) -> dict[str, object]:
         ),
         "current_interaction": _debug_activity(state.interaction),
         "background_activity": _debug_activity(state.activity),
-        "current_activity": _debug_activity(state.activity),
         "recent_completed_activity": _debug_activity(
             recent_activity(state, now=state.last_processed_at, scope="profile")
         ),

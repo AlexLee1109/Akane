@@ -336,7 +336,6 @@ class EmotionalSignal:
     intensity: float = 0.0
     confidence: float = 0.0
     cause: str = ""
-    personally_directed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,7 +345,6 @@ class ContextualReaction:
     kind: str = "neutral"
     intensity: float = 0.0
     cause: str = ""
-    tendencies: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,8 +453,6 @@ class TurnSignal:
     identity_attribute: str = ""
     current_activity: bool = False
     current_thought: bool = False
-    repetition: str = ""
-    repetition_count: int = 0
     emotion_state: EmotionState = EmotionState(updated_at=0.0)
     emotional_signal: EmotionalSignal = EmotionalSignal()
     contextual_reaction: ContextualReaction = ContextualReaction()
@@ -1036,7 +1032,6 @@ def detect_emotional_signal(evidence: dict[str, float]) -> EmotionalSignal:
         intensity=clamp(intensity),
         confidence=clamp(confidence),
         cause=_cause(evidence, "") if kind != "neutral" else "",
-        personally_directed=bool(evidence["personally_directed"]),
     )
 
 
@@ -1073,34 +1068,10 @@ def contextual_reaction_for(
         intensity = signal.intensity * mood_bias
         cause = signal.cause
 
-    tendencies: list[str] = []
-    if kind in {"irritation", "criticism", "lingering_irritation"}:
-        tendencies.append("slightly guarded but controlled")
-    if kind in {"task_failure", "repetition", "lingering_frustration"}:
-        tendencies.append("terser and more persistent")
-    if kind in {"apology", "appreciation", "social_warmth"}:
-        tendencies.append("warmer without erasing the prior tension")
-    if kind == "correction":
-        tendencies.append("briefly revise the earlier framing without self-defense")
-    if kind in {"amusement", "lingering_amusement", "lingering_embarrassment"}:
-        tendencies.append("lightly playful with a little hesitation")
-    if kind in {"excitement", "lingering_excitement"}:
-        tendencies.append("more energetic and specific")
-    if kind in {"satisfaction", "relief"}:
-        tendencies.append("briefly recognize the completed work")
-    if kind == "concern":
-        tendencies.append("gentler and more patient")
-    if context.unresolved_problem and not context.completion_resolves_thread:
-        tendencies.append("keep attention on the unresolved point")
-    if context.familiar_relationship and updated.warmth >= 0.55:
-        tendencies.append("allow relaxed familiarity")
-    if signal.intensity >= 0.80 and prior.momentum >= 0.25:
-        tendencies.append("a touch more reactive than usual, while staying proportionate")
     return ContextualReaction(
         kind=kind,
         intensity=clamp(intensity),
         cause=cause,
-        tendencies=tuple(dict.fromkeys(tendencies))[:3],
     )
 
 

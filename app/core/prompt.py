@@ -53,13 +53,6 @@ class TrimmedPromptSource:
 
 
 @dataclass(frozen=True, slots=True)
-class TurnGuidance:
-    """Structured per-turn behavior selected before prompt rendering."""
-
-    style_directives: tuple[tuple[str, str], ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
 class PromptContext:
     behavioral_summary: str = ""
     relationship: str = ""
@@ -181,10 +174,11 @@ def build_prompt_plan(
         0,
         LLAMA_CONTEXT_WINDOW - MAX_TOKENS - _ESTIMATED_TEMPLATE_MARGIN,
     )
-    selected, pressure_trimmed = _trim_to_estimated_limit(selected, conservative_limit)
+    selected, pressure_trimmed, messages, estimated = _trim_to_estimated_limit(
+        selected,
+        conservative_limit,
+    )
     trimmed.extend(pressure_trimmed)
-    messages = _render_messages(selected)
-    estimated = _estimate_messages(messages)
 
     rendered_tokens: int | None = None
     counting_method = "estimated_content_with_template_margin"
@@ -193,14 +187,15 @@ def build_prompt_plan(
         counting_method = count.method
         if count.exact and count.tokens is not None:
             rendered_tokens = count.tokens
-            selected, exact_trimmed, messages, rendered_tokens = _trim_to_exact_limit(
-                selected,
-                token_counter,
-                rendered_tokens,
-                LLAMA_CONTEXT_WINDOW - MAX_TOKENS,
-            )
-            trimmed.extend(exact_trimmed)
-            estimated = _estimate_messages(messages)
+            if rendered_tokens > LLAMA_CONTEXT_WINDOW - MAX_TOKENS:
+                selected, exact_trimmed, messages, rendered_tokens = _trim_to_exact_limit(
+                    selected,
+                    token_counter,
+                    rendered_tokens,
+                    LLAMA_CONTEXT_WINDOW - MAX_TOKENS,
+                )
+                trimmed.extend(exact_trimmed)
+                estimated = _estimate_messages(messages)
         else:
             counting_method = count.method or counting_method
 
@@ -428,10 +423,17 @@ def _apply_source_budgets(
 def _trim_to_estimated_limit(
     sources: list[PromptSource],
     limit: int,
-) -> tuple[list[PromptSource], list[TrimmedPromptSource]]:
+) -> tuple[
+    list[PromptSource],
+    list[TrimmedPromptSource],
+    list[dict[str, str]],
+    int,
+]:
     selected = list(sources)
     trimmed: list[TrimmedPromptSource] = []
-    while _estimate_messages(_render_messages(selected)) > limit:
+    messages = _render_messages(selected)
+    estimated = _estimate_messages(messages)
+    while estimated > limit:
         removed = _remove_lowest_priority(selected)
         if removed is None:
             raise RuntimeError(
@@ -445,7 +447,9 @@ def _trim_to_estimated_limit(
                 "estimated_context_pressure",
             )
         )
-    return selected, trimmed
+        messages = _render_messages(selected)
+        estimated = _estimate_messages(messages)
+    return selected, trimmed, messages, estimated
 
 
 def _trim_to_exact_limit(
@@ -456,7 +460,7 @@ def _trim_to_exact_limit(
 ) -> tuple[list[PromptSource], list[TrimmedPromptSource], list[dict[str, str]], int]:
     selected = list(sources)
     trimmed: list[TrimmedPromptSource] = []
-    messages = _render_messages(selected)
+    messages: list[dict[str, str]] = []
     tokens = current_tokens
     while tokens > limit:
         removed = _remove_lowest_priority(selected)
@@ -548,16 +552,6 @@ def _estimate_messages(messages: list[dict[str, str]]) -> int:
 def _section(label: str, *parts: object) -> str:
     cleaned = [text for part in parts if (text := str(part or "").strip())]
     return f"[{label}]\n" + "\n".join(cleaned) if cleaned else ""
-
-
-def format_turn_guidance(guidance: TurnGuidance | None) -> str:
-    if guidance is None:
-        return ""
-    return "\n".join(
-        f"{category}: {value}"
-        for category, value in guidance.style_directives
-        if category and value
-    )
 
 
 def _clip_tokens(value: str, budget: int) -> str:

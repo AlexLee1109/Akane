@@ -1387,7 +1387,7 @@ def process_internal_turn(
         scope=activity_scope,
     )
 
-    memory_decisions: list[dict[str, object]] = []
+    memory_decisions: list[str] = []
     source_reference = f"chat:{compact_text(activity_scope, 80)}:{current:.6f}"
     candidates = (
         ()
@@ -1457,7 +1457,6 @@ def process_internal_turn(
     appraisal_query = " ".join(
         part for part in query_parts if part
     )
-    retrieval_trace: list[dict[str, object]] = []
     recalled = (
         _retrieve_memories(
             retrieval_memories,
@@ -1466,7 +1465,6 @@ def process_internal_turn(
             retrieval_config,
             working,
             scope=activity_scope,
-            trace=retrieval_trace,
         )
         if include_memory
         else ()
@@ -1513,18 +1511,6 @@ def process_internal_turn(
         task = semantic_event.subject or task
     if signal.task_failure and not task:
         task = topic
-    similarity = message_similarity(working.last_user_summary, signal.summary)
-    if working.last_user_summary and similarity >= 0.78:
-        signal = replace(
-            signal,
-            repetition=(
-                "exact"
-                if normalized_signature(working.last_user_summary)
-                == normalized_signature(signal.summary)
-                else "near"
-            ),
-            repetition_count=max(1, working.repeated_topic_count),
-        )
     signal = signal.with_context(
         topic=topic,
         task=task,
@@ -1602,27 +1588,31 @@ def process_internal_turn(
     if (signal.task_failure or signal.task_success) and not needs_memory_mutation:
         memories = copy.deepcopy(list(previous.memories))
     task_tag = "task:" + _slot_value(task) if task else ""
-    if semantic_event.confirmed_completion:
+    explicit_completion = semantic_event.confirmed_completion
+    if explicit_completion or (
+        signal.task_success and task and working.unresolved_problem
+    ):
         for memory in memories:
-            if (
-                memory.status != _ACTIVE_MEMORY
-                or memory.id not in completion_matches
-                or _memory_kind(memory) not in {"working", "open_thread"}
-            ):
+            if memory.status != _ACTIVE_MEMORY:
+                continue
+            if explicit_completion:
+                matches_completion = bool(
+                    memory.id in completion_matches
+                    and _memory_kind(memory) in {"working", "open_thread"}
+                )
+            else:
+                matches_completion = bool(
+                    task_tag in memory.tags
+                    or memory.category == "unfinished_topic"
+                    and topic_overlap(memory.content, task) >= 0.45
+                )
+            if not matches_completion:
                 continue
             memory.status = "resolved"
             if _memory_kind(memory) == "open_thread":
                 memory.thread_status = "resolved"
             memory.updated_at = current
-            memory_decisions.append(
-                {
-                    "kind": _memory_kind(memory),
-                    "canonical_key": memory.canonical_key,
-                    "decision": "resolved",
-                    "related_thread": memory.id,
-                    "source_authority": _memory_source_type(memory),
-                }
-            )
+            memory_decisions.append("resolved")
     if signal.task_failure and task and not _has_active_tag(memories, task_tag):
         _insert_into_memories(
             memories,
@@ -1645,31 +1635,6 @@ def process_internal_turn(
             trace=memory_decisions,
         )
     elif signal.task_success and task:
-        explicit_completion = semantic_event.confirmed_completion
-        for memory in memories:
-            legacy_match = bool(
-                not explicit_completion
-                and working.unresolved_problem
-                and (
-                    task_tag in memory.tags
-                    or memory.category == "unfinished_topic"
-                    and topic_overlap(memory.content, task) >= 0.45
-                )
-            )
-            if memory.status == _ACTIVE_MEMORY and legacy_match:
-                memory.status = "resolved"
-                if _memory_kind(memory) == "open_thread":
-                    memory.thread_status = "resolved"
-                memory.updated_at = current
-                memory_decisions.append(
-                    {
-                        "kind": _memory_kind(memory),
-                        "canonical_key": memory.canonical_key,
-                        "decision": "resolved",
-                        "related_thread": memory.id,
-                        "source_authority": _memory_source_type(memory),
-                    }
-                )
         persist_outcome = bool(
             explicit_completion and completion_meaningful
             or not explicit_completion and working.unresolved_problem
@@ -1744,12 +1709,12 @@ def process_internal_turn(
             max(0.0, current - latest_activity.updated_at) if latest_activity else 0.0
         ),
         memory_trace=_memory_trace(
-            memories,
             used_memories,
             memory_decisions,
-            retrieval_trace,
             current,
             memory_uses,
+            considered_memories=retrieval_memories,
+            scope=activity_scope,
         ),
         memory_uses=memory_uses,
     )
@@ -2080,7 +2045,10 @@ class LongTermMemoryStore:
         }
 
     def public_internal_state(self, profile_id: str = "local:owner") -> dict[str, object]:
-        return self.public_state_snapshot(self.internal_state(profile_id))
+        key = _key(profile_id, "local:owner")
+        with self._lock:
+            state = self._states.get(key) or new_internal_state(0.0)
+            return self.public_state_snapshot(state)
 
     @staticmethod
     def public_state_snapshot(state: InternalState) -> dict[str, object]:
@@ -2317,7 +2285,7 @@ def format_relevant_memories(
     )
     if not selected:
         return ""
-    lines = [_memory_prompt_line(memory) for memory in selected]
+    lines = [memory.content for memory in selected]
     return (
         _MEMORY_PROMPT_INTRO
         + "\n"
@@ -2437,10 +2405,6 @@ def akane_preference_answer(memory: Memory | None) -> str:
     return memory.content[len(prefix) :] if memory.content.startswith(prefix) else memory.content
 
 
-def _memory_prompt_line(memory: Memory) -> str:
-    return memory.content
-
-
 def _continues_working_topic(
     user_text: str,
     signal: TurnSignal,
@@ -2476,41 +2440,26 @@ def _retrieve_memories(
     working: WorkingMemory,
     *,
     scope: str = "profile",
-    trace: list[dict[str, object]] | None = None,
 ) -> tuple[Memory, ...]:
     query_text = compact_text(query, 700)
     query_terms = _memory_terms(query_text)
     if not query_text or not query_terms:
         return ()
-    ranked: list[tuple[float, Memory, dict[str, object]]] = []
+    ranked: list[tuple[float, Memory]] = []
     for memory in memories:
         if not memory.is_available(now) or not _scope_matches(memory.scope, scope):
             continue
         kind = _memory_kind(memory)
         source = _memory_source_type(memory)
-        factor = {
-            "memory_id": memory.id,
-            "kind": kind,
-            "source_authority": source,
-            "scope": memory.scope,
-            "selected": False,
-            "use": "none",
-        }
         if source in {
             "conversation_summary",
             "generated_assistant",
             "speculative_inference",
         }:
-            factor["omission_reason"] = "unsupported_source"
-            if trace is not None:
-                trace.append(factor)
             continue
         if kind in {"profile", "self", "relationship", "correction"} and _authority(
             source
         ) < _SOURCE_AUTHORITY["trusted_memory"]:
-            factor["omission_reason"] = "insufficient_source_authority"
-            if trace is not None:
-                trace.append(factor)
             continue
         relevance = _semantic_relevance(query_text, query_terms, memory)
         continuity_bonus = 0.0
@@ -2535,9 +2484,6 @@ def _retrieve_memories(
             and continuity_bonus <= 0.0
             and not global_correction
         ):
-            factor.update(relevance=round(relevance, 3), omission_reason="irrelevant")
-            if trace is not None:
-                trace.append(factor)
             continue
         age_days = max(0.0, now - (memory.updated_at or memory.created_at)) / 86_400.0
         recency = 1.0 / (1.0 + age_days / 90.0)
@@ -2558,63 +2504,41 @@ def _retrieve_memories(
             - _recent_use(memory, now) * config.repetition_penalty
             - min(1.0, max(0.0, age_days - 365.0) / 365.0) * config.staleness_penalty
         )
-        factor.update(relevance=round(relevance, 3), score=round(score, 3))
         if score >= config.min_score:
-            ranked.append((score, memory, factor))
-        else:
-            factor["omission_reason"] = "below_threshold"
-            if trace is not None:
-                trace.append(factor)
+            ranked.append((score, memory))
     ranked.sort(key=lambda item: (item[0], item[1].created_at, item[1].id), reverse=True)
     selected: list[Memory] = []
     used_tokens = estimate_tokens(_MEMORY_PROMPT_INTRO) + estimate_tokens(_MEMORY_PROMPT_OUTRO) + 4
-    for _score, memory, factor in ranked:
-        cost = estimate_tokens(_memory_prompt_line(memory)) + 1
+    for _score, memory in ranked:
+        cost = estimate_tokens(memory.content) + 1
         if used_tokens + cost > config.context_tokens:
-            factor["omission_reason"] = "token_budget"
-            if trace is not None:
-                trace.append(factor)
             continue
         selected.append(copy.deepcopy(memory))
-        if trace is not None:
-            factor["selected"] = True
-            trace.append(factor)
         used_tokens += cost
         if len(selected) >= config.max_results:
             break
-    if trace is not None and len(selected) >= config.max_results:
-        selected_ids = {memory.id for memory in selected}
-        traced_ids = {str(item.get("memory_id") or "") for item in trace}
-        for _score, memory, factor in ranked:
-            if memory.id in selected_ids or memory.id in traced_ids:
-                continue
-            factor["omission_reason"] = "result_limit"
-            trace.append(factor)
     return tuple(selected)
 
 
 def _memory_trace(
-    memories: list[Memory],
     recalled: tuple[Memory, ...],
-    decisions: list[dict[str, object]],
-    retrieval_factors: list[dict[str, object]],
+    decisions: list[str],
     now: float,
     memory_uses: tuple[tuple[str, str], ...] = (),
+    *,
+    considered_memories: tuple[Memory, ...] = (),
+    scope: str = "profile",
 ) -> dict[str, object]:
     retrieved_by_kind: dict[str, int] = {}
     for memory in recalled:
         kind = _memory_kind(memory)
         retrieved_by_kind[kind] = retrieved_by_kind.get(kind, 0) + 1
-    active = [memory for memory in memories if memory.is_available(now)]
-    use_by_id = dict(memory_uses)
-    traced = copy.deepcopy(retrieval_factors)
-    for item in traced:
-        memory_id = str(item.get("memory_id") or "")
-        item["use"] = use_by_id.get(memory_id, "none")
-        item["used"] = memory_id in use_by_id
     return {
         "retrieved_by_kind": retrieved_by_kind,
-        "records_considered": len(traced),
+        "records_considered": sum(
+            memory.is_available(now) and _scope_matches(memory.scope, scope)
+            for memory in considered_memories
+        ),
         "records_used": len(recalled),
         "memory_uses": memory_uses,
         "active_correction": next(
@@ -2629,13 +2553,8 @@ def _memory_trace(
             (memory.id for memory in recalled if _memory_kind(memory) == "self"),
             "",
         ),
-        "active_corrections": sum(_memory_kind(item) == "correction" for item in active),
-        "active_threads": sum(_memory_kind(item) == "open_thread" for item in active),
-        "candidate_writes": sum(item.get("decision") == "created" for item in decisions),
-        "candidate_updates": sum(item.get("decision") == "updated" for item in decisions),
-        "rejected_candidates": sum(item.get("decision") == "rejected" for item in decisions),
-        "decisions": tuple(copy.deepcopy(decisions)),
-        "retrieval_factors": tuple(traced),
+        "candidate_writes": decisions.count("created"),
+        "candidate_updates": decisions.count("updated"),
         "migration_version": LONG_TERM_MEMORY_SCHEMA_VERSION,
     }
 
@@ -2647,7 +2566,7 @@ def _insert_into_memories(
     source: str,
     created_at: float,
     status: str = _ACTIVE_MEMORY,
-    trace: list[dict[str, object]] | None = None,
+    trace: list[str] | None = None,
 ) -> tuple[Memory | None, bool]:
     candidate_tags = _normalized_tags(candidate.tags, candidate.content)
     source_type = _source_type(candidate.source_type or source)
@@ -2660,21 +2579,10 @@ def _insert_into_memories(
         canonical_key=canonical_key,
         scope=scope,
     )
-    allowed, rejection = _candidate_allowed(candidate)
-    detail: dict[str, object] = {
-        "kind": candidate.kind,
-        "category": candidate.category,
-        "canonical_key": canonical_key,
-        "source_authority": source_type,
-        "canonical_match": False,
-        "deduplication": "none",
-        "contradiction": "none",
-        "supersession": "none",
-    }
+    allowed, _ = _candidate_allowed(candidate)
     if not allowed:
-        detail.update({"decision": "rejected", "rejection_reason": rejection})
         if trace is not None:
-            trace.append(detail)
+            trace.append("rejected")
         return None, False
 
     if candidate.kind == "working":
@@ -2708,16 +2616,8 @@ def _insert_into_memories(
                 duplicate.status = "superseded"
                 duplicate.superseded_by = existing.id
                 duplicate.updated_at = max(duplicate.updated_at, created_at)
-            detail.update(
-                {
-                    "canonical_match": True,
-                    "deduplication": "canonical_working_update",
-                    "supersession": f"{max(0, len(active) - 1)} record(s)",
-                    "decision": "updated",
-                }
-            )
             if trace is not None:
-                trace.append(detail)
+                trace.append("updated")
             return existing, True
 
     for existing in memories:
@@ -2734,8 +2634,6 @@ def _insert_into_memories(
             continue
         if _memory_content_matches(existing, candidate.content, candidate_tags):
             changed = False
-            detail["canonical_match"] = existing.canonical_key == canonical_key
-            detail["deduplication"] = "merged_equivalent"
             new_evidence = tuple(
                 ref for ref in candidate.evidence_refs if ref not in existing.evidence_refs
             )
@@ -2767,9 +2665,8 @@ def _insert_into_memories(
                 changed = True
             if changed:
                 existing.updated_at = max(existing.updated_at, created_at)
-            detail["decision"] = "updated" if changed else "duplicate"
             if trace is not None:
-                trace.append(detail)
+                trace.append("updated" if changed else "duplicate")
             return existing, changed
 
     conflicts = [
@@ -2789,7 +2686,6 @@ def _insert_into_memories(
         memory_status = "archived"
     superseded: list[Memory] = []
     if conflicts and memory_status == _ACTIVE_MEMORY:
-        detail["canonical_match"] = True
         strongest = max(
             conflicts,
             key=lambda item: (
@@ -2800,15 +2696,8 @@ def _insert_into_memories(
         new_authority = _authority(source_type)
         old_authority = _authority(_memory_source_type(strongest))
         if new_authority < old_authority:
-            detail.update(
-                {
-                    "decision": "rejected",
-                    "contradiction": "lower_authority",
-                    "rejection_reason": "cannot_supersede_higher_authority",
-                }
-            )
             if trace is not None:
-                trace.append(detail)
+                trace.append("rejected")
             return None, False
         if new_authority > old_authority or (
             candidate.supersedes and new_authority >= old_authority
@@ -2818,13 +2707,11 @@ def _insert_into_memories(
                 for item in conflicts
                 if _authority(_memory_source_type(item)) <= new_authority
             ]
-            detail["contradiction"] = "supersede_lower_or_equal_authority"
         else:
             memory_status = "disputed"
             for existing in conflicts:
                 existing.status = "disputed"
                 existing.updated_at = max(existing.updated_at, created_at)
-            detail["contradiction"] = "unresolved_dispute"
     memory = Memory(
         id=uuid.uuid4().hex,
         content=candidate.content,
@@ -2855,12 +2742,10 @@ def _insert_into_memories(
             existing.status = "superseded"
             existing.superseded_by = memory.id
             existing.updated_at = max(existing.updated_at, created_at)
-        detail["supersession"] = f"{len(superseded)} record(s)"
     memories.append(memory)
     _prune_memories(memories)
-    detail["decision"] = "created" if memory.status == _ACTIVE_MEMORY else memory.status
     if trace is not None:
-        trace.append(detail)
+        trace.append("created" if memory.status == _ACTIVE_MEMORY else memory.status)
     return memory, True
 
 

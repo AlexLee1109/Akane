@@ -161,8 +161,9 @@ def validate_response_style(
         finding("prohibited question behavior", "question punctuation or interrogative syntax")
     if questions_prohibited and _INDIRECT_FOLLOW_UP.search(text):
         finding("indirect follow-up", "conversational request for more detail")
-    if _SERVICE_POSTURE.search(text):
-        finding("service posture", _SERVICE_POSTURE.search(text).group(0))
+    service_posture = _SERVICE_POSTURE.search(text)
+    if service_posture:
+        finding("service posture", service_posture.group(0))
     generic = _GENERIC_VALIDATION.search(text)
     if generic:
         request_terms = set(_normalized_words(request_context)) - _VALIDATION_STOPWORDS
@@ -173,10 +174,12 @@ def validate_response_style(
     supported_context = f"{request_context}\n{grounding_context}".lower()
     if assumption and assumption.group(0).lower() not in supported_context:
         finding("unsupported assumption", assumption.group(0))
-    if _INTERNAL_TERMS.search(text):
-        finding("internal terminology", _INTERNAL_TERMS.search(text).group(0))
-    if _ACCESS_CLAIM.search(text):
-        finding("unsupported access claim", _ACCESS_CLAIM.search(text).group(0))
+    internal_term = _INTERNAL_TERMS.search(text)
+    if internal_term:
+        finding("internal terminology", internal_term.group(0))
+    access_claim = _ACCESS_CLAIM.search(text)
+    if access_claim:
+        finding("unsupported access claim", access_claim.group(0))
 
     grounding_lower = str(grounding_context or "").lower()
     akane_grounding = "\n".join(
@@ -500,41 +503,12 @@ def debug_state_report(
     verbose: bool = False,
 ) -> str:
     conversation = str(conversation_id or "popup:default")
-    snapshot = session_state_snapshot(
-        conversation,
-        profile_id,
-        preview_time=True,
-    )
+    snapshot = session_state_snapshot(conversation, profile_id)
     memory = snapshot.get("memory") or {}
     akane = snapshot.get("akane") or {}
     emotion = akane.get("emotion") or {}
     with _METRICS_LOCK:
         metrics = dict(_METRICS.get(conversation, {}))
-    time_trace = snapshot.get("debug_time_trace")
-    preview_elapsed = (
-        float(time_trace.get("elapsed_seconds") or 0.0)
-        if isinstance(time_trace, dict)
-        else 0.0
-    )
-    use_time_preview = not metrics or preview_elapsed >= 30 * 60
-    if isinstance(time_trace, dict) and use_time_preview:
-        for name in (
-            "elapsed_seconds",
-            "elapsed_decay_delta",
-            "circadian_target",
-            "circadian_delta",
-            "ambient_delta",
-            "event_delta",
-            "event_ids",
-            "resulting_persistent_mood",
-        ):
-            metrics[name] = time_trace.get(name, metrics.get(name))
-        metrics["debug_time_candidate"] = bool(
-            snapshot.get("debug_time_candidate")
-        )
-    life_trace = snapshot.get("debug_life_trace")
-    if isinstance(life_trace, dict) and use_time_preview:
-        metrics["life_trace"] = life_trace
     prompt_debug = metrics.get("prompt_debug")
     prompt_debug = prompt_debug if isinstance(prompt_debug, dict) else {}
     versions = prompt_debug.get("persona_versions")
@@ -546,7 +520,7 @@ def debug_state_report(
     activity = akane.get("activity")
     activity = activity if isinstance(activity, dict) else {}
     activity_source = _debug_text(metrics.get("grounded_activity_source"), 32)
-    if use_time_preview or _debug_absent(activity_source):
+    if _debug_absent(activity_source):
         activity_source = _debug_text(activity.get("source"), 32)
     sources = prompt_debug.get("sources")
     sources = sources if isinstance(sources, (list, tuple)) else ()
@@ -681,39 +655,17 @@ def debug_state_report(
         (
             "",
             "Style Compiler",
-            f"  Baseline: {_debug_name(style.get('baseline_source'))}",
-            "  Final Dimensions: "
-            f"directness={_debug_name(style.get('directness'))}, "
-            f"warmth={_debug_name(style.get('warmth'))}, "
-            f"playfulness={_debug_name(style.get('playfulness'))}, "
-            f"bluntness={_debug_name(style.get('bluntness'))}, "
-            f"energy={_debug_name(style.get('energy'))}, "
-            f"openness={_debug_name(style.get('emotional_openness'))}, "
-            f"verbosity={_debug_name(style.get('verbosity'))}, "
-            f"humor={_debug_name(style.get('humor'))}",
-            "  Intention Adjustments: "
-            f"{_debug_items(style.get('intention_adjustments')) or 'None'}",
-            "  Affect Adjustments: "
-            f"{_debug_items(style.get('affect_adjustments')) or 'None'}",
-            "  Relationship Adjustments: "
-            f"{_debug_items(style.get('relationship_adjustments')) or 'None'}",
-            "  Mood Adjustments: "
-            f"{_debug_items(style.get('mood_adjustments')) or 'None'}",
-            f"  Teasing Gate: {_debug_name(style.get('teasing_gate'))}",
+            "  Directives: "
+            f"{_debug_style_directives(style.get('directives')) or 'None'}",
+            f"  Humor Policy: {_debug_name(style.get('humor'))}",
             f"  Question Gate: {_debug_name(style.get('question_gate'))}",
-            f"  Callback Gate: {_debug_name(style.get('callback_gate'))}",
-            f"  Grounded Detail Gate: {_debug_name(style.get('grounded_detail_gate'))}",
-            "  Grounding Constraints: "
-            f"{_debug_items(style.get('grounding_constraints')) or 'None'}",
-            "  Directive Categories: "
-            f"{_debug_style_categories(style.get('directives')) or 'None'}",
+            "  Validation Limits: "
+            f"{_debug_items(style.get('validation_limits')) or 'None'}",
             "  Validation Results: "
             f"{_debug_items(validation) or 'None'}",
         )
     )
     lines.extend(("", "Time Evolution", f"  Elapsed: {_debug_duration(elapsed)}"))
-    if metrics.get("debug_time_candidate"):
-        lines.append("  Candidate Status: Proposed, not committed")
     meaningful_time_change = bool(circadian_lines or ambient_lines or event_count)
     if meaningful_time_change:
         lines.append(
@@ -734,8 +686,6 @@ def debug_state_report(
             f"  User Signal: {_debug_name(signal_label)}",
             f"  Confidence: {signal_confidence:.2f}",
             f"  Activation Threshold: {activation_threshold:.2f}",
-            f"  Reaction: {reaction}",
-            f"  Short Emotion: {short_emotion}",
             f"  Applied: {_debug_bool(emotion_applied)}",
             "  Completion Appraisal: "
             f"{_debug_bool(metrics.get('completion_appraisal'))}",
@@ -924,15 +874,7 @@ def _remember_metrics(
         prepared.turn_context,
         "compiled_style",
         CompiledStyle(
-            "high",
-            "medium",
-            "medium",
-            "medium",
-            "medium",
-            "medium",
-            "low",
             "dry",
-            "concise",
             (("Goal", "acknowledge"), ("Length", "concise")),
         ),
     )
@@ -1351,7 +1293,7 @@ def _debug_internal_details(
     life = metrics.get("life_trace")
     life = life if isinstance(life, dict) else {}
     previous_life = life.get("previous_activity")
-    current_life = life.get("current_activity")
+    current_life = life.get("background_activity") or life.get("current_activity")
     memory_trace = metrics.get("memory_trace")
     memory_trace = memory_trace if isinstance(memory_trace, dict) else {}
     intention = metrics.get("response_intention")
@@ -1373,14 +1315,12 @@ def _debug_internal_details(
         "  Candidate Status: "
         + (
             "Proposed, not committed"
-            if metrics.get("debug_time_candidate") or not metrics.get("committed")
+            if not metrics.get("committed")
             else "Committed"
         ),
         "  Mood Baseline Vector: "
         f"{_debug_text(metrics.get('baseline_persistent_mood'), 160) or 'None'}",
         f"  Prior Mood: {_debug_name(metrics.get('prior_mood'))}",
-        "  Previous Persistent Vector: "
-        f"{_debug_text(metrics.get('prior_persistent_mood'), 160) or 'None'}",
         "  Persistent Mood Vector: "
         f"{_debug_text(metrics.get('prior_persistent_mood'), 160) or 'None'}",
         "  Resulting Persistent Vector: "
@@ -1452,10 +1392,6 @@ def _debug_internal_details(
         f"{float(life.get('last_processed_at') or 0.0):.3f}",
         "  Offscreen Next Opportunity: "
         f"{float(life.get('next_opportunity_at') or 0.0):.3f}",
-        "  Memory Candidate Decisions: "
-        f"{_debug_memory_decisions(memory_trace.get('decisions'))}",
-        "  Memory Retrieval Factors: "
-        f"{_debug_memory_retrieval(memory_trace.get('retrieval_factors'))}",
         "  Memory Migration Version: "
         f"{int(memory_trace.get('migration_version') or 0)}",
         "  Intention Direct Request: "
@@ -1472,10 +1408,8 @@ def _debug_internal_details(
         "  Style Directive Values: "
         f"{_debug_style_directives(style.get('directives')) or 'None'}",
         "  Style Resolved Gates: "
-        f"teasing={_debug_name(style.get('teasing_gate'))}; "
         f"question={_debug_name(style.get('question_gate'))}; "
-        f"callback={_debug_name(style.get('callback_gate'))}; "
-        f"detail={_debug_name(style.get('grounded_detail_gate'))}",
+        f"humor={_debug_name(style.get('humor'))}",
         "  Style Validation Limits: "
         f"{_debug_items(style.get('validation_limits')) or 'None'}",
         "  Raw Validation Results: "
@@ -1523,16 +1457,6 @@ def _debug_mapping(value: object) -> str:
     )
 
 
-def _debug_style_categories(value: object) -> str:
-    if not isinstance(value, (list, tuple)):
-        return ""
-    return ", ".join(
-        _debug_text(item[0], 24)
-        for item in value
-        if isinstance(item, (list, tuple)) and len(item) == 2
-    )
-
-
 def _debug_style_directives(value: object) -> str:
     if not isinstance(value, (list, tuple)):
         return ""
@@ -1541,49 +1465,3 @@ def _debug_style_directives(value: object) -> str:
         for item in value
         if isinstance(item, (list, tuple)) and len(item) == 2
     )
-
-
-def _debug_memory_decisions(value: object) -> str:
-    if not isinstance(value, (list, tuple)):
-        return "None"
-    rendered: list[str] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        parts = [
-            _debug_name(item.get("kind")),
-            _debug_name(item.get("source_authority")),
-            _debug_name(item.get("decision")),
-        ]
-        canonical_key = _debug_text(item.get("canonical_key"), 80)
-        if canonical_key:
-            parts.append(f"key={canonical_key}")
-        related_thread = _debug_text(item.get("related_thread"), 40)
-        if related_thread:
-            parts.append(f"thread={related_thread}")
-        for name in ("deduplication", "contradiction", "supersession", "rejection_reason"):
-            detail = _debug_text(item.get(name), 48)
-            if detail and detail != "none":
-                parts.append(_debug_name(detail))
-        rendered.append(" / ".join(parts))
-    return "; ".join(rendered) or "None"
-
-
-def _debug_memory_retrieval(value: object) -> str:
-    if not isinstance(value, (list, tuple)):
-        return "None"
-    rendered: list[str] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        decision = (
-            f"used as {_debug_name(item.get('use'))}"
-            if item.get("used")
-            else _debug_name(item.get("omission_reason")) or "retrieved but unused"
-        )
-        rendered.append(
-            f"{_debug_name(item.get('kind'))} / "
-            f"{_debug_name(item.get('source_authority'))} / "
-            f"{_debug_name(item.get('scope'))} / {decision}"
-        )
-    return "; ".join(rendered) or "None"

@@ -7,7 +7,7 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from app.core.config import (
@@ -17,7 +17,7 @@ from app.core.config import (
     MAX_TOKENS,
     PROMPT_DEBUG,
 )
-from app.core.life import format_life_state, life_evolution_debug
+from app.core.life import format_life_state
 from app.core.memory import (
     InternalTurnResult,
     LongTermMemoryStore,
@@ -37,9 +37,7 @@ from app.core.prompt import (
     PromptContext,
     PromptPlan,
     PromptTokenCount,
-    TurnGuidance,
     build_prompt_plan,
-    format_turn_guidance,
 )
 from app.core.signal import TurnSignal
 from app.core.utils import compact_text
@@ -113,7 +111,6 @@ class ChatInput:
     timestamp: float
     display_name: str = ""
     reply_context: str = ""
-    group_conversation: bool = False
     autonomous: bool = False
 
 
@@ -227,31 +224,10 @@ class ResponseIntention:
 class CompiledStyle:
     """Discrete delivery state compiled into bounded, non-dialogue directives."""
 
-    directness: str
-    warmth: str
-    playfulness: str
-    bluntness: str
-    energy: str
-    emotional_openness: str
-    verbosity: str
     humor: str
-    length: str
     directives: tuple[tuple[str, str], ...]
-    baseline_source: str = "Akane compiler baseline"
-    intention_adjustments: tuple[str, ...] = ()
-    affect_adjustments: tuple[str, ...] = ()
-    relationship_adjustments: tuple[str, ...] = ()
-    mood_adjustments: tuple[str, ...] = ()
-    grounding_constraints: tuple[str, ...] = ()
     validation_limits: tuple[int, int] = (0, 0)
-    teasing_gate: str = "closed"
     question_gate: str = "closed"
-    callback_gate: str = "closed"
-    grounded_detail_gate: str = "closed"
-
-    @property
-    def compiled_categories(self) -> tuple[str, ...]:
-        return tuple(category for category, _value in self.directives)
 
     def prompt_text(self) -> str:
         return "\n".join(f"{category}: {value}" for category, value in self.directives)
@@ -275,15 +251,7 @@ class CoordinatedTurnContext:
     initiative_worthwhile: bool = True
     response_intention: ResponseIntention = ResponseIntention("acknowledge")
     compiled_style: CompiledStyle = CompiledStyle(
-        "high",
-        "medium",
-        "medium",
-        "medium",
-        "medium",
-        "medium",
-        "low",
         "dry",
-        "concise",
         (("Goal", "acknowledge"), ("Length", "concise")),
     )
 
@@ -560,24 +528,11 @@ def compile_akane_style(
 ) -> CompiledStyle:
     """Compile existing turn state into one bounded model-visible style contract."""
 
-    style = {
-        "directness": "high",
-        "warmth": "medium",
-        "playfulness": "medium",
-        "bluntness": "medium",
-        "energy": "medium",
-        "emotional_openness": "medium",
-        "verbosity": "low",
-        "humor": "dry",
-    }
+    humor = "dry"
     correction = intention.correction_active
     callback_permission = intention.callback_permitted
     self_experience = intention.grounded_detail_permitted
 
-    intention_adjustments: list[str] = []
-    affect_adjustments: list[str] = []
-    relationship_adjustments: list[str] = []
-    mood_adjustments: list[str] = []
     grounding: list[str] = []
     avoid = [
         "service posture",
@@ -612,125 +567,41 @@ def compile_akane_style(
         grounding.append("available context only")
         avoid.append("access claims")
 
-    if primary == "answer":
-        style.update(playfulness="low", humor="none")
-        intention_adjustments.append("clarity and task completeness")
-    elif primary == "acknowledge":
-        style["verbosity"] = "low"
-        intention_adjustments.append("concise specific acknowledgment")
+    if primary == "acknowledge":
         grounding.append("stated update only")
         avoid.extend(("unsupported assumptions", "invented significance"))
         if not intention.question_permitted:
             avoid.append("questions")
     elif primary == "comfort":
-        style.update(
-            warmth="high",
-            playfulness="off",
-            bluntness="low",
-            energy="low",
-            emotional_openness="medium",
-            humor="none",
-        )
-        intention_adjustments.append("direct restrained comfort")
         avoid.extend(("generic validation", "formal support language"))
-    elif primary == "celebrate":
-        style.update(
-            warmth="high",
-            playfulness="medium",
-            energy="high",
-            emotional_openness="medium",
-        )
-        intention_adjustments.append("warm concise celebration")
     elif primary == "disagree":
-        style.update(
-            directness="high",
-            warmth="low",
-            playfulness="low",
-            bluntness="high",
-            humor="none",
-        )
-        intention_adjustments.append("clear controlled disagreement")
         avoid.append("excessive hedging")
     elif primary == "state opinion":
-        style["verbosity"] = "low"
-        intention_adjustments.append("direct evidence-calibrated opinion")
         avoid.append("false certainty")
-    elif primary == "share experience":
-        style["verbosity"] = "low"
-        intention_adjustments.append("concise grounded experience")
     elif primary == "continue thread":
-        intention_adjustments.append("focused topic continuity")
         avoid.append("full-history recap")
     elif primary == "reassure":
-        style.update(
-            warmth="high",
-            playfulness="off",
-            bluntness="low",
-            emotional_openness="medium",
-            humor="none",
-        )
-        intention_adjustments.append("evidence-bound reassurance")
         avoid.extend(("unsupported certainty", "formal support language"))
     elif primary == "set boundary":
-        style.update(
-            warmth="low",
-            playfulness="off",
-            bluntness="high",
-            energy="low",
-            humor="none",
-            verbosity="low",
-        )
-        intention_adjustments.append("firm controlled boundary")
         avoid.append("escalation")
-    else:
-        style.update(playfulness="off", humor="none", verbosity="low")
-        intention_adjustments.append("minimal natural completion")
-
+    if primary in {"answer", "comfort", "disagree", "reassure", "set boundary", "remain brief"}:
+        humor = "none"
     if intention.optional_behavior == "light dry humor":
-        style["humor"] = "dry"
-        intention_adjustments.append("dry humor permission")
-    elif intention.optional_behavior == "one natural question":
-        intention_adjustments.append("one relevant question permitted")
-    elif intention.optional_behavior == "brief callback":
-        intention_adjustments.append("one bounded callback")
-    elif intention.optional_behavior == "grounded personal detail":
-        intention_adjustments.append("one grounded personal detail")
+        humor = "dry"
 
     reaction = signal.contextual_reaction.kind
     if reaction == "concern":
-        style.update(
-            directness="high",
-            warmth="high",
-            playfulness="off",
-            bluntness="low",
-            energy="low",
-            humor="none",
-        )
-        affect_adjustments.append("current concern")
+        humor = "none"
     elif reaction in {"relief", "satisfaction", "pride", "appreciation"}:
-        style.update(energy="high", emotional_openness="medium")
         if familiar_relationship and intention.relationship_safe:
-            style["humor"] = "dry"
-        affect_adjustments.append("current relief or pride")
+            humor = "dry"
     elif reaction in {"amusement", "playfulness"}:
-        if intention.relationship_safe and not signal.technical:
-            style["playfulness"] = "high"
-            if familiar_relationship:
-                style["humor"] = "dry"
-        affect_adjustments.append("current amusement")
-    elif reaction in {"skepticism", "skeptical"}:
-        style.update(directness="high", bluntness="high", warmth="low")
-        affect_adjustments.append("current skepticism")
+        if intention.relationship_safe and not signal.technical and familiar_relationship:
+            humor = "dry"
     elif reaction in {"irritation", "criticism", "lingering_irritation"}:
-        style.update(playfulness="off", bluntness="high", warmth="low", humor="none")
-        affect_adjustments.append("composed irritation")
+        humor = "none"
     elif reaction in {"embarrassment", "lingering_embarrassment"}:
-        style["emotional_openness"] = "medium"
-        affect_adjustments.append("restrained embarrassment")
         avoid.extend(("exaggerated mannerisms", "forced hesitation"))
-    elif reaction in {"excitement", "lingering_excitement"}:
-        style.update(energy="high", emotional_openness="medium")
-        affect_adjustments.append("bounded excitement")
 
     active = (
         signal.emotion_state.active_emotions[0]
@@ -746,8 +617,7 @@ def compile_akane_style(
         or (active is not None and active.kind == "concern")
     )
     if serious:
-        style.update(playfulness="off", humor="none")
-        affect_adjustments.append("serious-context suppression")
+        humor = "none"
 
     tension = bool(
         signal.hostility
@@ -755,56 +625,17 @@ def compile_akane_style(
         or signal.emotion_state.frustration >= 0.45
     )
     if tension:
-        style.update(playfulness="off", warmth="low", humor="none")
-        relationship_adjustments.append("high tension restraint")
+        humor = "none"
         avoid.append("callbacks")
-    elif familiar_relationship:
-        relationship_adjustments.append("familiar casual register")
-        if not serious and not signal.technical and style["playfulness"] == "low":
-            style["playfulness"] = "medium"
-    if (
-        signal.emotion_state.warmth >= 0.65
-        and primary in {"acknowledge", "celebrate", "comfort", "reassure"}
-    ):
-        style["warmth"] = "high"
-        relationship_adjustments.append("available relationship warmth")
-    if active is not None:
-        if active.kind == "concern":
-            style.update(warmth="high", playfulness="off", bluntness="low", humor="none")
-        elif active.kind == "irritation" and not serious:
-            style.update(playfulness="off", bluntness="high", humor="none")
-        elif active.kind == "embarrassment":
-            style["emotional_openness"] = "medium"
-        elif active.kind == "excitement":
-            style.update(energy="high", emotional_openness="medium")
-        affect_adjustments.append(f"short emotion: {active.kind}")
+    if active is not None and active.kind in {"concern", "irritation"}:
+        humor = "none"
 
     mood = signal.emotion_state
-    if not serious and style["energy"] == "medium" and mood.energy < 0.35:
-        style["energy"] = "low"
-        mood_adjustments.append("low persistent energy")
-    if (
-        not serious
-        and mood.valence >= 0.25
-        and primary in {"acknowledge", "celebrate"}
-    ):
-        style["warmth"] = "high"
-        mood_adjustments.append("subtle positive mood")
     if not serious and mood.irritation >= 0.35:
-        style.update(playfulness="off", bluntness="high", humor="none")
-        mood_adjustments.append("negative high-arousal restraint")
+        humor = "none"
     if mood.patience < 0.35:
-        style["humor"] = "none"
-        mood_adjustments.append("low-composure humor suppression")
+        humor = "none"
 
-    final_teasing_open = bool(
-        signal.teasing
-        and intention.relationship_safe
-        and familiar_relationship
-        and not signal.technical
-        and not serious
-        and not tension
-    )
     final_callback_open = bool(
         callback_permission
         and familiar_relationship
@@ -815,10 +646,8 @@ def compile_akane_style(
     if not final_callback_open:
         avoid.append("callbacks")
 
-    if serious:
-        style.update(playfulness="off", humor="none")
     if serious or tension or signal.technical or primary == "answer":
-        style["humor"] = "none"
+        humor = "none"
 
     text = str(user_text or signal.summary or "")
     detailed = bool(_ELABORATION_REQUEST.search(text))
@@ -829,15 +658,12 @@ def compile_akane_style(
     elif detailed:
         length = "detailed as requested"
         limits = (0, 0)
-        style["verbosity"] = "high"
     elif intention.length == "task-complete" or primary in {"answer", "continue thread"} and task_complex:
         length = "task-complete"
         limits = (0, 0)
-        style["verbosity"] = "medium"
     else:
         length = "concise"
         limits = (1, 4)
-        style["verbosity"] = "low"
 
     situation = (
         "direct technical request"
@@ -910,36 +736,12 @@ def compile_akane_style(
         directives[avoid_index] = ("Avoid", "; ".join(values))
 
     return CompiledStyle(
-        directness=style["directness"],
-        warmth=style["warmth"],
-        playfulness=style["playfulness"],
-        bluntness=style["bluntness"],
-        energy=style["energy"],
-        emotional_openness=style["emotional_openness"],
-        verbosity=style["verbosity"],
-        humor=style["humor"],
-        length=length,
+        humor=humor,
         directives=tuple(directives),
-        intention_adjustments=tuple(dict.fromkeys(intention_adjustments)),
-        affect_adjustments=tuple(dict.fromkeys(affect_adjustments)),
-        relationship_adjustments=tuple(dict.fromkeys(relationship_adjustments)),
-        mood_adjustments=tuple(dict.fromkeys(mood_adjustments)),
-        grounding_constraints=tuple(dict.fromkeys(grounding)),
         validation_limits=limits,
-        teasing_gate="open" if final_teasing_open else "closed",
         question_gate=(
             "open"
             if intention.optional_behavior == "one natural question" and not serious
-            else "closed"
-        ),
-        callback_gate=(
-            "open"
-            if final_callback_open and intention.optional_behavior == "brief callback"
-            else "closed"
-        ),
-        grounded_detail_gate=(
-            "open"
-            if intention.optional_behavior == "grounded personal detail" and not serious
             else "closed"
         ),
     )
@@ -1061,10 +863,7 @@ class InternalStateCoordinator:
             familiar_relationship=familiar_relationship,
         )
 
-        guidance = format_turn_guidance(
-            _turn_guidance(compiled_style)
-        )
-        behavioral_summary = guidance
+        behavioral_summary = compiled_style.prompt_text()
 
         editor_context = code_context.prompt_text
         if code_context.requested and not code_context.connected:
@@ -1179,7 +978,6 @@ def normalize_chat_input(
     timestamp: object = 0.0,
     display_name: object = "",
     reply_context: object = "",
-    group_conversation: object = False,
     autonomous: object = False,
 ) -> ChatInput:
     message = str(text or "").strip()
@@ -1202,7 +1000,6 @@ def normalize_chat_input(
         timestamp=created_at,
         display_name=compact_text(display_name, 60),
         reply_context=compact_text(reply_context, 600),
-        group_conversation=bool(group_conversation),
         autonomous=bool(autonomous),
     )
 
@@ -1252,14 +1049,18 @@ def prepare_turn(
             token_counter=token_counter,
         )
         prompt_seconds = time.perf_counter() - prompt_started_at
-        submitted_text = "\n".join(message["content"] for message in prompt_plan.messages)
+        submitted_memory = "\n".join(
+            source.content
+            for source in prompt_plan.sources
+            if source.kind in {"retrieved_memory", "preference_continuity"}
+        )
         included_ids = tuple(
             memory_id
             for memory_id, content in zip(
                 turn_context.memory_context.memory_ids,
                 turn_context.memory_context.memory_contents,
             )
-            if content in submitted_text
+            if content in submitted_memory
         )
         turn_context = replace(
             turn_context,
@@ -1334,9 +1135,6 @@ def forget_profile(profile_id: str) -> None:
 def session_state_snapshot(
     conversation_id: str | None = None,
     profile_id: str | None = None,
-    *,
-    preview_time: bool = False,
-    now: float | None = None,
 ) -> dict[str, object]:
     conversation = compact_text(conversation_id, 120) or "popup:default"
     profile = compact_text(profile_id, 120) or "local:owner"
@@ -1347,23 +1145,6 @@ def session_state_snapshot(
         "popup_user": state_store.public_profile(profile),
         "active_generation_id": _SCHEDULER.active_generation_id(conversation),
     }
-    if preview_time:
-        candidate = state_store.preview_turn(
-            profile,
-            "",
-            now=time.time() if now is None else now,
-            include_memory=False,
-            autonomous=True,
-            activity_scope=conversation,
-        )
-        payload["akane"] = state_store.public_state_snapshot(candidate.state)
-        payload["debug_time_trace"] = (
-            asdict(candidate.affect_trace) if candidate.affect_trace else {}
-        )
-        payload["debug_life_trace"] = life_evolution_debug(
-            candidate.life_evolution
-        )
-        payload["debug_time_candidate"] = True
     return payload
 
 
@@ -1380,10 +1161,6 @@ def date_time_line() -> str:
 
 def timing_enabled() -> bool:
     return _TIMING_ENABLED
-
-
-def _turn_guidance(style: CompiledStyle) -> TurnGuidance:
-    return TurnGuidance(style_directives=style.directives)
 
 
 def _preference_continuity(content: str, change_allowed: bool) -> str:

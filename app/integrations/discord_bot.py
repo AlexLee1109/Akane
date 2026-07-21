@@ -165,7 +165,6 @@ def _payload(message, text: str) -> dict[str, object]:
         "timestamp": time.time(),
         "display_name": _display_name(message),
         "reply_context": _reply_context(message),
-        "group_conversation": not _is_dm(message),
     }
 
 
@@ -179,7 +178,6 @@ def _unprompted_payload(channel) -> dict[str, object]:
         "conversation_id": f"discord:guild:{guild_id}:channel:{channel_id}:autonomous",
         "source": "discord",
         "timestamp": time.time(),
-        "group_conversation": True,
         "autonomous": True,
         "skip_if_busy": True,
     }

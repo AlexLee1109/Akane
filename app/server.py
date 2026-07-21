@@ -110,7 +110,6 @@ def _parse_chat_request(payload: dict) -> ChatRequestData:
             timestamp=payload.get("timestamp", 0.0),
             display_name=payload.get("display_name", ""),
             reply_context=payload.get("reply_context", ""),
-            group_conversation=_coerce_bool(payload.get("group_conversation", False)),
             autonomous=_coerce_bool(payload.get("autonomous", False)),
         ),
         skip_memory=_coerce_bool(payload.get("skip_memory", False)),

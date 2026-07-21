@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 
 from app.core.utils import compact_text
 
-LIFE_STATE_VERSION = 4
+LIFE_STATE_VERSION = 5
 _DEFAULT_ACTIVITY_TTL_SECONDS = 24 * 60 * 60
 _OFFSCREEN_SOURCE = "offscreen_life"
 _LEGACY_OFFSCREEN_SOURCES = {"offscreen_schedule"}
@@ -36,7 +36,8 @@ _ACTIVITY_ALIASES = {
     "read_manga": "reading_manga",
     "played_game": "playing_game",
     "listened_music": "listening_music",
-    "browsed_interest": "browsing_interests",
+    "browsed_interest": "developing_opinion",
+    "browsing_interests": "developing_opinion",
     "rested": "resting",
     "bored_downtime": "quiet_downtime",
 }
@@ -228,6 +229,7 @@ class ActivityRecord:
 @dataclass(frozen=True, slots=True)
 class LifeState:
     activity: ActivityRecord | None = None
+    interaction: ActivityRecord | None = None
     recent_events: tuple[ActivityRecord, ...] = ()
     needs: LifeNeeds = LifeNeeds()
     activity_preferences: tuple[tuple[str, float], ...] = ()
@@ -248,6 +250,12 @@ class LifeState:
             and event.status in {"completed", "cancelled"}
         )[-_MAX_RECENT_ACTIVITIES:]
         activity = ActivityRecord.from_dict(payload.get("activity"))
+        interaction = ActivityRecord.from_dict(payload.get("interaction"))
+        if activity is not None and activity.activity_type == "conversation":
+            interaction = activity
+            activity = None
+        if interaction is not None and interaction.activity_type != "conversation":
+            interaction = None
         if activity is not None and activity.status != "active":
             events = _bounded_history([*events, activity])
             activity = None
@@ -255,6 +263,7 @@ class LifeState:
         if raw_version >= 3:
             return cls(
                 activity=activity,
+                interaction=interaction,
                 recent_events=events,
                 needs=LifeNeeds.from_dict(payload.get("needs")),
                 activity_preferences=_pairs(
@@ -265,7 +274,7 @@ class LifeState:
                 last_processed_at=_timestamp(payload.get("last_processed_at")),
                 next_opportunity_at=(
                     _timestamp(payload.get("next_opportunity_at"))
-                    if raw_version >= LIFE_STATE_VERSION
+                    if raw_version >= 4
                     else 0.0
                 ),
                 legacy_activity_discarded=bool(
@@ -278,6 +287,7 @@ class LifeState:
         )
         return cls(
             activity=activity,
+            interaction=interaction,
             legacy_activity_discarded=legacy_present,
         )
 
@@ -346,11 +356,18 @@ _ACTIVITY_CATALOG = (
         ("felt relaxed", "enjoyed the quiet", "felt more settled", "felt neutral about it"),
     ),
     _ActivitySpec(
-        "browsing_interests",
-        "looked through something related to her interests",
+        "developing_opinion",
+        "thought through one of her established interests",
         0.09,
         (10, 60),
-        ("found it interesting", "became curious", "felt neutral about it"),
+        ("formed a tentative opinion", "noticed a tradeoff", "became curious", "felt neutral about it"),
+    ),
+    _ActivitySpec(
+        "creative_brainstorming",
+        "developed a fictional concept",
+        0.07,
+        (15, 75),
+        ("focused on identity and belonging", "explored rivalry and trust", "kept the premise deliberately small"),
     ),
     _ActivitySpec(
         "relaxing",
@@ -434,6 +451,9 @@ def evolve_life_state(
     history = list(prior.recent_events)
     known_ids = {event.event_id for event in history}
     activity = prior.activity
+    interaction = prior.interaction
+    if interaction is not None and not interaction.is_active_for(current, "profile"):
+        interaction = None
     completed: list[ActivityRecord] = []
     generated: list[ActivityRecord] = []
     preference_changes: dict[str, float] = {}
@@ -543,6 +563,7 @@ def evolve_life_state(
 
     next_state = LifeState(
         activity=activity,
+        interaction=interaction,
         recent_events=_bounded_history(history),
         needs=needs,
         activity_preferences=tuple(sorted(preferences.items())),
@@ -577,49 +598,22 @@ def begin_conversation_activity(
     now: float,
     profile_seed: str,
 ) -> LifeEvolution:
-    """Make talking with Arcane current without overwriting higher authority."""
+    """Record the current interaction without erasing Akane's background life."""
 
     current = _timestamp(now, evolution.state.last_processed_at)
     state = evolution.state
-    activity = state.activity
-    authority = _activity_authority(activity)
-    if activity is not None and _AUTHORITY_RANKS[authority] > _AUTHORITY_RANKS["conversation"]:
-        return replace(
-            evolution,
-            authority_source=authority,
-            reason_codes=tuple(
-                dict.fromkeys((*evolution.reason_codes, "higher_authority_activity_preserved"))
-            ),
-        )
-    history = list(state.recent_events)
-    generated = list(evolution.generated_activities)
-    previous = activity or (
-        generated[-1] if generated else evolution.previous_activity
-    )
-    if activity is not None and activity.authority == "conversation":
-        conversation_reason = "conversation_activity_continued"
-        conversation = replace(
-            activity,
+    interaction = state.interaction
+    if interaction is not None and interaction.is_active_for(current, "profile"):
+        reason = "conversation_activity_continued"
+        interaction = replace(
+            interaction,
             updated_at=current,
             expires_at=current + _CONVERSATION_TTL_SECONDS,
         )
     else:
-        conversation_reason = "conversation_activity_started"
-        if activity is not None and activity.status == "active":
-            interrupted = replace(
-                activity,
-                status="cancelled",
-                updated_at=current,
-                completed_at=current,
-            )
-            history.append(interrupted)
-            generated = [
-                interrupted if item.event_id == interrupted.event_id else item
-                for item in generated
-            ]
-            previous = activity
+        reason = "conversation_activity_started"
         seed = f"offscreen-life:conversation:{profile_seed}:{current:.6f}"
-        conversation = ActivityRecord(
+        interaction = ActivityRecord(
             activity_type="conversation",
             source="conversation",
             description="talking with Arcane",
@@ -631,20 +625,15 @@ def begin_conversation_activity(
             authority="conversation",
             need_effects=(("social", -0.12),),
         )
-    next_state = replace(
-        state,
-        activity=conversation,
-        recent_events=_bounded_history(history),
-    )
     return replace(
         evolution,
-        state=next_state,
-        generated_activities=tuple(generated),
-        previous_activity=previous,
-        authority_source="conversation",
-        reason_codes=tuple(
-            dict.fromkeys((*evolution.reason_codes, conversation_reason))
+        state=replace(state, interaction=interaction),
+        authority_source=(
+            _activity_authority(state.activity)
+            if _activity_authority(state.activity) != "none"
+            else "conversation"
         ),
+        reason_codes=tuple(dict.fromkeys((*evolution.reason_codes, reason))),
     )
 
 
@@ -773,9 +762,9 @@ def _time_suitability(activity_type: str, hour: int) -> float:
     afternoon = 12 <= hour < 17
     evening = 17 <= hour < 23
     late = not (morning or afternoon or evening)
-    if morning and activity_type in {"quiet_downtime", "listening_music", "browsing_interests"}:
+    if morning and activity_type in {"quiet_downtime", "listening_music", "developing_opinion"}:
         return 0.08
-    if afternoon and activity_type in {"playing_game", "reading_manga", "browsing_interests"}:
+    if afternoon and activity_type in {"playing_game", "reading_manga", "developing_opinion", "creative_brainstorming"}:
         return 0.07
     if evening and activity_type in {"watching_anime", "playing_game", "listening_music"}:
         return 0.09
@@ -790,7 +779,7 @@ def _need_suitability(activity_type: str, needs: LifeNeeds) -> float:
     score = 0.0
     if activity_type in {"resting", "sleeping", "relaxing", "listening_music", "quiet_downtime"}:
         score += (1.0 - needs.energy) * 0.16
-    if activity_type in {"watching_anime", "reading_manga", "browsing_interests"}:
+    if activity_type in {"watching_anime", "reading_manga", "developing_opinion", "creative_brainstorming"}:
         score += needs.curiosity * 0.11
     if activity_type in {"playing_game", "watching_anime"}:
         score += (1.0 - needs.stimulation) * 0.12
@@ -805,7 +794,7 @@ def _mood_suitability(
 ) -> float:
     if activity_type in {"resting", "sleeping", "relaxing"}:
         return (1.0 - energy) * 0.08
-    if activity_type in {"watching_anime", "reading_manga", "browsing_interests"}:
+    if activity_type in {"watching_anime", "reading_manga", "developing_opinion", "creative_brainstorming"}:
         return curiosity * 0.05
     if activity_type == "playing_game":
         return energy * patience * 0.05
@@ -835,6 +824,19 @@ def _make_activity(
     )
     preference_delta = _preference_delta(spec.activity_type, reaction)
     authority = "quiet" if spec.activity_type == "quiet_downtime" else "simulated"
+    subject = ""
+    if spec.activity_type == "creative_brainstorming":
+        premises = (
+            "a guarded character learning to trust a rival",
+            "a quiet city shaped by forgotten promises",
+            "two competitors forced to protect the same secret",
+        )
+        subject = premises[
+            min(
+                len(premises) - 1,
+                int(_stable_unit(seed + ":premise") * len(premises)),
+            )
+        ]
     return ActivityRecord(
         activity_type=spec.activity_type,
         source=_OFFSCREEN_SOURCE,
@@ -844,6 +846,7 @@ def _make_activity(
         expires_at=started_at + duration,
         scope="profile",
         event_id=hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16],
+        subject=subject,
         reaction=reaction,
         authority=authority,
         mood_effects=mood_effects,
@@ -881,7 +884,7 @@ def _activity_effects(
         )
     if activity_type == "listening_music":
         return (("warmth", 0.01), ("patience", 0.01)), (("stimulation", 0.04),), ""
-    if activity_type == "browsing_interests":
+    if activity_type in {"developing_opinion", "creative_brainstorming"}:
         return (("curiosity", 0.015),), (("curiosity", -0.04), ("stimulation", 0.04)), ""
     if activity_type == "relaxing":
         return (("patience", 0.015),), (("energy", 0.03),), ""
@@ -1088,6 +1091,10 @@ _CATEGORY_QUERIES = {
     "playing_game": re.compile(r"\b(?:game|gaming)\b", re.IGNORECASE),
     "listening_music": re.compile(r"\b(?:music|song)\b", re.IGNORECASE),
 }
+_CREATIVE_QUERY = re.compile(
+    r"\b(?:creative idea|story idea|character idea|fictional concept|that idea|your idea)\b",
+    re.IGNORECASE,
+)
 
 
 def format_life_state(
@@ -1101,6 +1108,11 @@ def format_life_state(
 
     text = compact_text(query, 500)
     current = grounded_activity(state, now=now, scope=scope)
+    interaction = (
+        state.interaction
+        if state.interaction is not None and state.interaction.is_active_for(now, scope)
+        else None
+    )
     recent = [
         event
         for event in reversed(state.recent_events)
@@ -1117,7 +1129,13 @@ def format_life_state(
             else ""
         )
     if _CURRENT_QUERY.search(text):
-        parts = [f"Current activity: {_activity_fact(current)}."] if current else []
+        parts = (
+            [f"Current interaction: {_activity_fact(interaction)}."]
+            if interaction
+            else []
+        )
+        if current:
+            parts.append(f"Compatible background activity: {_activity_fact(current)}.")
         if recent:
             parts.append(f"Before that: {_activity_fact(recent[0], include_reaction=True)}.")
         return " ".join(parts)
@@ -1130,6 +1148,22 @@ def format_life_state(
             if earlier
             else f"Current activity: {_activity_fact(current)}."
             if current
+            else f"Current interaction: {_activity_fact(interaction)}."
+            if interaction
+            else ""
+        )
+    if _CREATIVE_QUERY.search(text):
+        creative = next(
+            (
+                event
+                for event in recent
+                if event.activity_type == "creative_brainstorming"
+            ),
+            current if current and current.activity_type == "creative_brainstorming" else None,
+        )
+        return (
+            f"Recorded creative event: {_activity_fact(creative, include_reaction=True)}."
+            if creative
             else ""
         )
     for activity_type, pattern in _CATEGORY_QUERIES.items():
@@ -1171,7 +1205,26 @@ def life_evolution_debug(evolution: LifeEvolution | None) -> dict[str, object]:
         "generated_activities": tuple(
             _debug_activity(activity) for activity in evolution.generated_activities
         ),
+        "current_interaction": _debug_activity(state.interaction),
+        "background_activity": _debug_activity(state.activity),
         "current_activity": _debug_activity(state.activity),
+        "recent_completed_activity": _debug_activity(
+            recent_activity(state, now=state.last_processed_at, scope="profile")
+        ),
+        "active_creative_event": _debug_activity(
+            next(
+                (
+                    event
+                    for event in reversed(state.recent_events)
+                    if event.activity_type == "creative_brainstorming"
+                    and event.status == "completed"
+                ),
+                state.activity
+                if state.activity is not None
+                and state.activity.activity_type == "creative_brainstorming"
+                else None,
+            )
+        ),
         "completed_count": len(evolution.new_events),
         "recent_reaction": (
             evolution.new_events[-1].reaction if evolution.new_events else ""
@@ -1209,6 +1262,7 @@ def _debug_activity(activity: ActivityRecord | None) -> dict[str, object]:
         "activity_type": activity.activity_type,
         "status": activity.status,
         "description": activity.description,
+        "subject": activity.subject,
         "source": activity.source,
         "authority": activity.authority,
         "started_at": activity.started_at,

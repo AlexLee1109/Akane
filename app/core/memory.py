@@ -47,6 +47,7 @@ from app.core.life import (
 from app.core.signal import (
     AffectTrace,
     EmotionState,
+    SemanticEvent,
     ShortLivedEmotion,
     TurnContext,
     TurnSignal,
@@ -57,12 +58,13 @@ from app.core.signal import (
     evolve_emotion,
     message_similarity,
     normalized_signature,
+    semantic_event_from_text,
     topic_overlap,
 )
 from app.core.utils import compact_text
 
 MEMORY_SCHEMA_VERSION = 2
-LONG_TERM_MEMORY_SCHEMA_VERSION = 5
+LONG_TERM_MEMORY_SCHEMA_VERSION = 6
 _MEMORY_PROMPT_INTRO = "A few past details may matter in this conversation:"
 _MEMORY_PROMPT_OUTRO = (
     "Use them only when they genuinely improve the reply, and do not overstate uncertain details."
@@ -123,6 +125,67 @@ _MEMORY_CATEGORIES = {
     "unfinished_topic",
 }
 _ACTIVE_MEMORY = "active"
+_MEMORY_KINDS = {
+    "working",
+    "profile",
+    "episode",
+    "relationship",
+    "self",
+    "correction",
+    "open_thread",
+}
+_MEMORY_STATUSES = {
+    _ACTIVE_MEMORY,
+    "superseded",
+    "disputed",
+    "resolved",
+    "expired",
+    "archived",
+}
+_THREAD_STATUSES = {
+    _ACTIVE_MEMORY,
+    "planned",
+    "blocked",
+    "resolved",
+    "abandoned",
+    "expired",
+}
+_SOURCE_AUTHORITY = {
+    "unknown": 0,
+    "speculative_inference": 1,
+    "generated_assistant": 2,
+    "conversation_summary": 3,
+    "deterministic_analysis": 4,
+    "trusted_memory": 5,
+    "confirmed_action": 6,
+    "recorded_offscreen": 7,
+    "verified_interface": 8,
+    "explicit_user": 9,
+}
+_ARCANE_ACTIVITY_KEY = "working:arcane-current-activity"
+_ARCANE_ACTIVITY_TTL_SECONDS = 6 * 60 * 60
+_COMPLETION_IMPORTANCE_TERMS = {
+    "api",
+    "bot",
+    "bug",
+    "build",
+    "code",
+    "coding",
+    "compiler",
+    "deployment",
+    "feature",
+    "implementation",
+    "issue",
+    "model",
+    "pipeline",
+    "project",
+    "repository",
+    "server",
+    "system",
+    "task",
+    "test",
+    "tests",
+}
 
 
 def estimate_tokens(value: object) -> int:
@@ -326,6 +389,14 @@ class Memory:
     status: str = _ACTIVE_MEMORY
     expires_at: float | None = None
     superseded_by: str | None = None
+    kind: str = ""
+    source_type: str = "unknown"
+    source_reference: str = ""
+    canonical_key: str = ""
+    scope: str = "profile"
+    updated_at: float = 0.0
+    evidence_refs: tuple[str, ...] = ()
+    thread_status: str = ""
 
     @classmethod
     def from_dict(cls, payload: object) -> "Memory | None":
@@ -350,6 +421,44 @@ class Memory:
             for item in (raw_tags if isinstance(raw_tags, (list, tuple)) else ())
             if (value := compact_text(item, 48).lower())
         )[:12]
+        source = compact_text(payload.get("source"), 48) or "unknown"
+        kind = _memory_kind_from_fields(
+            compact_text(payload.get("kind"), 24).lower(),
+            category,
+            tags,
+        )
+        source_type = _source_type(
+            compact_text(payload.get("source_type"), 32).lower() or source
+        )
+        status = compact_text(payload.get("status"), 24).lower() or _ACTIVE_MEMORY
+        if status == "contradicted":
+            status = "disputed"
+        if status not in _MEMORY_STATUSES:
+            status = "archived"
+        if kind in {"profile", "self", "relationship", "correction"} and source_type in {
+            "conversation_summary",
+            "generated_assistant",
+            "speculative_inference",
+        }:
+            status = "archived"
+        raw_evidence = payload.get("evidence_refs")
+        evidence_refs = tuple(
+            value
+            for item in (raw_evidence if isinstance(raw_evidence, (list, tuple)) else ())
+            if (value := compact_text(item, 100))
+        )[:12]
+        canonical_key = compact_text(payload.get("canonical_key"), 120).lower()
+        if not canonical_key:
+            canonical_key = _canonical_key(kind, category, tags, content)
+        thread_status = compact_text(payload.get("thread_status"), 24).lower()
+        if kind == "open_thread":
+            thread_status = thread_status or (
+                status if status in _THREAD_STATUSES else _ACTIVE_MEMORY
+            )
+            if thread_status not in _THREAD_STATUSES:
+                thread_status = "expired"
+        else:
+            thread_status = ""
         return cls(
             id=compact_text(payload.get("id"), 80) or uuid.uuid4().hex,
             content=content,
@@ -358,17 +467,32 @@ class Memory:
             last_used_at=last_used_at,
             importance=max(0.0, min(1.0, _number(payload.get("importance"), 0.5))),
             confidence=max(0.0, min(1.0, _number(payload.get("confidence"), 1.0))),
-            source=compact_text(payload.get("source"), 48) or "user",
+            source=source,
             access_count=access_count,
             tags=tags,
-            status=compact_text(payload.get("status"), 24).lower() or _ACTIVE_MEMORY,
+            status=status,
             expires_at=expires_at,
             superseded_by=compact_text(payload.get("superseded_by"), 80) or None,
+            kind=kind,
+            source_type=source_type,
+            source_reference=compact_text(payload.get("source_reference"), 100),
+            canonical_key=canonical_key,
+            scope=compact_text(payload.get("scope"), 120).lower() or "profile",
+            updated_at=max(
+                created_at,
+                _number(payload.get("updated_at"), created_at),
+            ),
+            evidence_refs=evidence_refs,
+            thread_status=thread_status,
         )
 
     def is_available(self, now: float) -> bool:
-        return self.status == _ACTIVE_MEMORY and not (
-            self.expires_at is not None and self.expires_at <= now
+        return (
+            self.status == _ACTIVE_MEMORY
+            and self.thread_status not in {"resolved", "abandoned", "expired"}
+            and not (
+                self.expires_at is not None and self.expires_at <= now
+            )
         )
 
 
@@ -403,16 +527,13 @@ class InternalTurnResult:
     state: InternalState
     signal: TurnSignal
     recalled_memories: tuple[Memory, ...]
-    prompt_context: str
     affect_trace: AffectTrace | None = None
     life_evolution: LifeEvolution | None = None
     working_context: WorkingMemory = WorkingMemory()
-    current_disposition: str = ""
-    current_thought_source: str = "none"
-    follow_up_tendency: str = "none"
-    turn_relevance_adjustment: float = 0.0
     grounded_activity_source: str = "none"
     grounded_activity_age_seconds: float = 0.0
+    memory_trace: dict[str, object] = field(default_factory=dict)
+    memory_uses: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,6 +559,14 @@ class _MemoryCandidate:
     confidence: float
     tags: tuple[str, ...]
     supersedes: bool = False
+    kind: str = "profile"
+    source_type: str = "explicit_user"
+    source_reference: str = ""
+    canonical_key: str = ""
+    scope: str = "profile"
+    expires_at: float | None = None
+    evidence_refs: tuple[str, ...] = ()
+    thread_status: str = ""
 
 
 _SENSITIVE_TERMS = (
@@ -506,6 +635,11 @@ _EXPLICIT_MEMORY_CORRECTION = re.compile(
 def _extract_memory_candidates(
     text: str,
     slot_value: Callable[[str], str],
+    *,
+    source_reference: str = "",
+    scope: str = "profile",
+    semantic_event: SemanticEvent | None = None,
+    now: float = 0.0,
 ) -> tuple[_MemoryCandidate, ...]:
     value = compact_text(text, 700)
     lower = value.lower()
@@ -516,6 +650,31 @@ def _extract_memory_candidates(
     ):
         return ()
     candidates: list[_MemoryCandidate] = []
+    event = semantic_event or SemanticEvent()
+
+    if (
+        event.event_type == "activity"
+        and event.actor in {"Arcane", "shared"}
+        and event.temporal_state == "current"
+        and event.status in {"ongoing", "started", "switched", "resumed", "paused"}
+        and event.subject
+    ):
+        label = "shared current activity" if event.actor == "shared" else "Arcane current activity"
+        candidates.append(
+            _MemoryCandidate(
+                content=f"{label}: {compact_text(event.subject, 170)} ({event.status}).",
+                category="unfinished_topic",
+                importance=0.58,
+                confidence=event.confidence,
+                tags=("arcane-current-activity", f"activity:{slot_value(event.subject)}"),
+                supersedes=True,
+                kind="working",
+                source_type="explicit_user",
+                canonical_key=_ARCANE_ACTIVITY_KEY,
+                scope=f"conversation:{compact_text(scope, 100).lower()}",
+                expires_at=max(0.0, now) + _ARCANE_ACTIVITY_TTL_SECONDS,
+            )
+        )
 
     if match := _PROFILE_NAME_PATTERN.search(value):
         name = compact_text(match.group("name"), 50).strip(" ,;:-")
@@ -563,7 +722,7 @@ def _extract_memory_candidates(
                     )
                 )
 
-    if match := _PROJECT_PATTERN.search(value):
+    if event.event_type != "activity" and (match := _PROJECT_PATTERN.search(value)):
         project = compact_text(match.group("value"), 180).strip(" ,;:-")
         if project:
             candidates.append(_candidate(f"The user is working on {project}.", "stable_fact", 0.78, ("project",)))
@@ -571,7 +730,7 @@ def _extract_memory_candidates(
         goal = compact_text(match.group("value"), 180).strip(" ,;:-")
         if goal:
             candidates.append(_candidate(f"The user's long-term goal is {goal}.", "stable_fact", 0.82, ("goal",)))
-    if match := _EPISODE_PATTERN.search(value):
+    if event.event_type != "completion" and (match := _EPISODE_PATTERN.search(value)):
         event = " ".join(match.group("event").lower().split())
         detail = compact_text(match.group("value"), 180).strip(" ,;:-")
         if detail:
@@ -580,7 +739,19 @@ def _extract_memory_candidates(
         instruction = compact_text(match.group("value"), 150).strip(" ,;:-")
         if instruction:
             candidates.append(
-                _candidate(f"The user prefers that Akane not {instruction.lower()}.", "tendency", 0.90, ("interaction-style",))
+                replace(
+                    _candidate(
+                        f"The user prefers that Akane not {instruction.lower()}.",
+                        "tendency",
+                        0.90,
+                        (
+                            "interaction-style",
+                            "slot:behavior:" + slot_value(instruction),
+                        ),
+                    ),
+                    kind="correction",
+                    supersedes=True,
+                )
             )
 
     unique: dict[str, _MemoryCandidate] = {}
@@ -591,7 +762,15 @@ def _extract_memory_candidates(
                 candidate,
                 confidence=max(0.90, candidate.confidence),
                 supersedes=True,
+                kind="correction",
             )
+        candidate = replace(
+            candidate,
+            source_reference=compact_text(source_reference, 100),
+            scope=scope,
+            evidence_refs=(compact_text(source_reference, 100),) if source_reference else (),
+            canonical_key=_candidate_key(candidate),
+        )
         unique.setdefault(normalized_signature(candidate.content), candidate)
     return tuple(unique.values())
 
@@ -603,12 +782,18 @@ def _candidate(
     tags: tuple[str, ...],
     confidence: float = 0.78,
 ) -> _MemoryCandidate:
+    kind = {
+        "episode": "episode",
+        "task_outcome": "episode",
+        "unfinished_topic": "open_thread",
+    }.get(category, "profile")
     return _MemoryCandidate(
         content=compact_text(content, 240),
         category=category,
         importance=importance,
         confidence=max(0.0, min(1.0, confidence)),
         tags=tags,
+        kind=kind,
     )
 
 
@@ -644,6 +829,121 @@ def _interaction_preference(value: str) -> bool:
             "tone",
         )
     )
+
+
+def _source_type(value: str) -> str:
+    source = compact_text(value, 48).lower().replace("-", "_")
+    if source in _SOURCE_AUTHORITY:
+        return source
+    if source in {
+        "user",
+        "explicit",
+        "chat:explicit_user",
+        "chat:correction",
+    } or source.startswith(("owner", "arcane", "user_explicit")):
+        return "explicit_user"
+    if source.startswith(("workspace", "vscode", "interface", "verified")):
+        return "verified_interface"
+    if source in {"offscreen_life", "offscreen_schedule"}:
+        return "recorded_offscreen"
+    if source.startswith(("confirmed", "application_action", "app_action")):
+        return "confirmed_action"
+    if source.startswith("trusted"):
+        return "trusted_memory"
+    if source.startswith(("chat:task_state", "deterministic")):
+        return "deterministic_analysis"
+    if "summary" in source:
+        return "generated_assistant" if "assistant" in source else "conversation_summary"
+    if source.startswith(("assistant", "generated")):
+        return "generated_assistant"
+    if source.startswith(("inferred", "speculative")):
+        return "speculative_inference"
+    return "unknown"
+
+
+def _memory_kind_from_fields(
+    kind: str,
+    category: str,
+    tags: tuple[str, ...],
+) -> str:
+    if kind in _MEMORY_KINDS:
+        return kind
+    if _AKANE_PREFERENCE_TAG in tags or "life-activity" in tags:
+        return "self"
+    return {
+        "episode": "episode",
+        "task_outcome": "episode",
+        "unfinished_topic": "open_thread",
+    }.get(category, "profile")
+
+
+def _memory_kind(memory: Memory) -> str:
+    return _memory_kind_from_fields(memory.kind, memory.category, memory.tags)
+
+
+def _memory_source_type(memory: Memory) -> str:
+    normalized = _source_type(memory.source_type)
+    return _source_type(memory.source) if normalized == "unknown" else normalized
+
+
+def _canonical_key(
+    kind: str,
+    category: str,
+    tags: tuple[str, ...],
+    content: str,
+) -> str:
+    slots = sorted(tag for tag in tags if tag.startswith(("slot:", "task:")))
+    if slots:
+        return compact_text(slots[0], 120).lower()
+    terms = "-".join(sorted(_memory_terms(content))[:8])
+    return compact_text(f"{kind or category}:{terms}", 120).lower()
+
+
+def _candidate_key(candidate: _MemoryCandidate) -> str:
+    return candidate.canonical_key or _canonical_key(
+        candidate.kind,
+        candidate.category,
+        candidate.tags,
+        candidate.content,
+    )
+
+
+def _authority(value: str) -> int:
+    return _SOURCE_AUTHORITY.get(_source_type(value), 0)
+
+
+def _scope_matches(memory_scope: str, requested_scope: str) -> bool:
+    stored = compact_text(memory_scope, 120).lower() or "profile"
+    requested = compact_text(requested_scope, 120).lower() or "profile"
+    if stored in {"global", "profile"}:
+        return True
+    return stored == requested or stored == f"conversation:{requested}"
+
+
+def _candidate_allowed(candidate: _MemoryCandidate) -> tuple[bool, str]:
+    source_type = _source_type(candidate.source_type)
+    kind = candidate.kind
+    if kind not in _MEMORY_KINDS:
+        return False, "unsupported_kind"
+    if source_type in {"generated_assistant", "speculative_inference"}:
+        return False, "untrusted_generated_or_speculative_source"
+    if kind in {"profile", "self", "relationship", "correction"} and _authority(
+        source_type
+    ) < _SOURCE_AUTHORITY["trusted_memory"]:
+        return False, "insufficient_source_authority"
+    if kind == "relationship" and not candidate.evidence_refs:
+        return False, "relationship_requires_evidence"
+    if kind == "self" and source_type not in {
+        "explicit_user",
+        "verified_interface",
+        "recorded_offscreen",
+        "confirmed_action",
+        "trusted_memory",
+    }:
+        return False, "self_memory_requires_grounded_source"
+    if kind == "working" and not candidate.expires_at:
+        return False, "working_memory_requires_expiration"
+    return True, ""
 
 
 class MemoryStore:
@@ -929,6 +1229,81 @@ def new_internal_state(now: float | None = None) -> InternalState:
     )
 
 
+def _semantic_memory_match(memory: Memory, event: SemanticEvent) -> bool:
+    if not event.subject:
+        return False
+    subject_terms = _memory_terms(event.subject)
+    memory_terms = _memory_terms(memory.content)
+    shared = subject_terms & memory_terms
+    return bool(shared) and (
+        len(shared) >= 2
+        or len(shared) / max(1, min(len(subject_terms), len(memory_terms))) >= 0.50
+        or topic_overlap(memory.content, event.subject) >= 0.38
+    )
+
+
+def _self_event_memory_content(event: ActivityRecord) -> str:
+    detail = compact_text(event.description, 150)
+    subject = compact_text(event.subject, 90)
+    if subject and subject.casefold() not in detail.casefold():
+        detail = f"{detail}: {subject}"
+    return f"Akane completed: {detail}."
+
+
+def _completion_context(
+    event: SemanticEvent,
+    memories: tuple[Memory, ...],
+    working: WorkingMemory,
+    *,
+    now: float,
+    scope: str,
+) -> tuple[bool, bool, tuple[str, ...]]:
+    if not event.confirmed_completion:
+        return False, False, ()
+    matches: list[Memory] = []
+    for memory in memories:
+        if not memory.is_available(now) or not _scope_matches(memory.scope, scope):
+            continue
+        kind = _memory_kind(memory)
+        if kind == "working" and memory.canonical_key == _ARCANE_ACTIVITY_KEY:
+            if _semantic_memory_match(memory, event):
+                matches.append(memory)
+        elif kind == "open_thread" and _semantic_memory_match(memory, event):
+            matches.append(memory)
+        elif kind in {"profile", "episode"} and _semantic_memory_match(memory, event):
+            matches.append(memory)
+
+    subject_terms = _memory_terms(event.subject)
+    explicitly_important = bool(subject_terms & _COMPLETION_IMPORTANCE_TERMS)
+    working_match = bool(
+        working.current_task
+        and topic_overlap(
+            working.current_task,
+            event.subject,
+        )
+        >= 0.32
+    )
+    continuity_match = bool(
+        (working.current_task or working.current_topic)
+        and topic_overlap(
+            " ".join((working.current_task, working.current_topic)),
+            event.subject,
+        )
+        >= 0.32
+    )
+    thread_match = working.unresolved_problem and continuity_match or any(
+        _memory_kind(memory) == "open_thread" for memory in matches
+    )
+    durable_match = any(_memory_kind(memory) != "working" for memory in matches)
+    meaningful = bool(
+        event.actor == "shared"
+        or explicitly_important
+        or working_match
+        or durable_match
+    )
+    return meaningful, thread_match, tuple(memory.id for memory in matches)
+
+
 def process_internal_turn(
     user_text: str,
     state: InternalState | None = None,
@@ -951,6 +1326,18 @@ def process_internal_turn(
     current = max(current, previous.updated_at, previous.emotion.updated_at)
     working = working_context or WorkingMemory()
     retrieval_config = retrieval or MemoryRetrievalConfig()
+    semantic_event = (
+        SemanticEvent() if autonomous else semantic_event_from_text(user_text)
+    )
+    completion_meaningful, completion_resolves_thread, completion_matches = (
+        _completion_context(
+            semantic_event,
+            previous.memories,
+            working,
+            now=current,
+            scope=activity_scope,
+        )
+    )
     autonomous_memories: list[Memory] = []
     for memory in previous.memories:
         if autonomous and _AKANE_PREFERENCE_TAG in memory.tags:
@@ -1000,9 +1387,66 @@ def process_internal_turn(
         scope=activity_scope,
     )
 
-    retrieval_memories = tuple(
-        memory for memory in previous.memories if "life-activity" not in memory.tags
+    memory_decisions: list[dict[str, object]] = []
+    source_reference = f"chat:{compact_text(activity_scope, 80)}:{current:.6f}"
+    candidates = (
+        ()
+        if autonomous
+        else _extract_memory_candidates(
+            user_text,
+            _slot_value,
+            source_reference=source_reference,
+            scope=activity_scope,
+            semantic_event=semantic_event,
+            now=current,
+        )
     )
+    grounded_candidates = [
+        _MemoryCandidate(
+            content=_self_event_memory_content(event),
+            category="episode",
+            importance=0.66,
+            confidence=event.confidence,
+            tags=("life-activity", f"activity:{event.activity_type}"),
+            kind="self",
+            source_type=_source_type(event.source),
+            source_reference=event.event_id,
+            canonical_key=f"self:event:{event.event_id}",
+            scope=event.scope or "profile",
+            evidence_refs=(event.event_id,),
+        )
+        for event in life_evolution.new_events
+        if event.status == "completed"
+        and event.activity_type not in {"conversation", "quiet_downtime"}
+        and event.event_id
+    ]
+    needs_memory_mutation = bool(
+        candidates
+        or grounded_candidates
+        or semantic_event.event_type in {"completion", "failure"}
+    )
+    memories = (
+        copy.deepcopy(list(previous.memories))
+        if needs_memory_mutation
+        else list(previous.memories)
+    )
+    for candidate in (*candidates, *grounded_candidates):
+        _insert_into_memories(
+            memories,
+            candidate,
+            source=(
+                "chat:correction"
+                if candidate.kind == "correction"
+                else candidate.source_type
+            ),
+            created_at=current,
+            trace=memory_decisions,
+        )
+
+    # Retrieval represents established state from before this message. Candidate
+    # writes remain available for commit, but are not echoed back as remembered
+    # history during the turn that created them.
+    retrieval_memories = previous.memories
     query_parts = (user_text, working.current_task)
     if autonomous:
         retrieval_memories = tuple(autonomous_memories)
@@ -1013,6 +1457,7 @@ def process_internal_turn(
     appraisal_query = " ".join(
         part for part in query_parts if part
     )
+    retrieval_trace: list[dict[str, object]] = []
     recalled = (
         _retrieve_memories(
             retrieval_memories,
@@ -1020,6 +1465,8 @@ def process_internal_turn(
             current,
             retrieval_config,
             working,
+            scope=activity_scope,
+            trace=retrieval_trace,
         )
         if include_memory
         else ()
@@ -1040,6 +1487,8 @@ def process_internal_turn(
             for memory in recalled
         ),
         familiar_relationship=familiar_relationship,
+        completion_meaningful=completion_meaningful,
+        completion_resolves_thread=completion_resolves_thread,
     )
     signal = analyze_turn(
         "" if autonomous else user_text,
@@ -1049,6 +1498,7 @@ def process_internal_turn(
         emotion_state_is_current=True,
         code_context_requested=code_context_requested,
         code_context_attached=code_context_attached,
+        semantic_event=semantic_event,
     )
     if autonomous:
         signal = replace(signal, emotion_state=event_emotion)
@@ -1059,6 +1509,8 @@ def process_internal_turn(
     )
     topic = working.current_topic if continuing and working.current_topic else signal.topic
     task = working.current_task if continuing and working.current_task else signal.task
+    if semantic_event.confirmed_completion and completion_meaningful:
+        task = semantic_event.subject or task
     if signal.task_failure and not task:
         task = topic
     similarity = message_similarity(working.last_user_summary, signal.summary)
@@ -1147,20 +1599,30 @@ def process_internal_turn(
         ),
         recent_events=tuple(events[-16:]),
     )
-    candidates = () if autonomous else _extract_memory_candidates(user_text, _slot_value)
-    memories = (
-        copy.deepcopy(list(previous.memories))
-        if candidates or signal.task_failure or signal.task_success
-        else list(previous.memories)
-    )
-    for candidate in candidates:
-        _insert_into_memories(
-            memories,
-            candidate,
-            source="chat:correction" if candidate.supersedes else "chat:explicit_user",
-            created_at=current,
-        )
+    if (signal.task_failure or signal.task_success) and not needs_memory_mutation:
+        memories = copy.deepcopy(list(previous.memories))
     task_tag = "task:" + _slot_value(task) if task else ""
+    if semantic_event.confirmed_completion:
+        for memory in memories:
+            if (
+                memory.status != _ACTIVE_MEMORY
+                or memory.id not in completion_matches
+                or _memory_kind(memory) not in {"working", "open_thread"}
+            ):
+                continue
+            memory.status = "resolved"
+            if _memory_kind(memory) == "open_thread":
+                memory.thread_status = "resolved"
+            memory.updated_at = current
+            memory_decisions.append(
+                {
+                    "kind": _memory_kind(memory),
+                    "canonical_key": memory.canonical_key,
+                    "decision": "resolved",
+                    "related_thread": memory.id,
+                    "source_authority": _memory_source_type(memory),
+                }
+            )
     if signal.task_failure and task and not _has_active_tag(memories, task_tag):
         _insert_into_memories(
             memories,
@@ -1170,29 +1632,80 @@ def process_internal_turn(
                 importance=0.72,
                 confidence=0.86,
                 tags=(task_tag, "unfinished"),
+                kind="open_thread",
+                source_type="deterministic_analysis",
+                source_reference=source_reference,
+                canonical_key=task_tag,
+                scope=f"conversation:{compact_text(activity_scope, 100).lower()}",
+                evidence_refs=(source_reference,),
+                thread_status=_ACTIVE_MEMORY,
             ),
             source="chat:task_state",
             created_at=current,
+            trace=memory_decisions,
         )
     elif signal.task_success and task:
+        explicit_completion = semantic_event.confirmed_completion
         for memory in memories:
-            if memory.status == _ACTIVE_MEMORY and (
-                task_tag in memory.tags or memory.category == "unfinished_topic"
-                and topic_overlap(memory.content, task) >= 0.45
-            ):
+            legacy_match = bool(
+                not explicit_completion
+                and working.unresolved_problem
+                and (
+                    task_tag in memory.tags
+                    or memory.category == "unfinished_topic"
+                    and topic_overlap(memory.content, task) >= 0.45
+                )
+            )
+            if memory.status == _ACTIVE_MEMORY and legacy_match:
                 memory.status = "resolved"
-        _insert_into_memories(
-            memories,
-            _MemoryCandidate(
-                content=f"The task was resolved: {compact_text(task, 160)}.",
-                category="task_outcome",
-                importance=0.68,
-                confidence=0.82,
-                tags=(task_tag, "resolved"),
-            ),
-            source="chat:task_state",
-            created_at=current,
+                if _memory_kind(memory) == "open_thread":
+                    memory.thread_status = "resolved"
+                memory.updated_at = current
+                memory_decisions.append(
+                    {
+                        "kind": _memory_kind(memory),
+                        "canonical_key": memory.canonical_key,
+                        "decision": "resolved",
+                        "related_thread": memory.id,
+                        "source_authority": _memory_source_type(memory),
+                    }
+                )
+        persist_outcome = bool(
+            explicit_completion and completion_meaningful
+            or not explicit_completion and working.unresolved_problem
         )
+        if persist_outcome:
+            outcome_subject = semantic_event.subject if explicit_completion else task
+            outcome_source = "explicit_user" if explicit_completion else "deterministic_analysis"
+            completion_prefix = {
+                "Arcane": "Arcane completed",
+                "shared": "The shared task was completed",
+            }.get(semantic_event.actor, "Completion reported")
+            _insert_into_memories(
+                memories,
+                _MemoryCandidate(
+                    content=(
+                        f"{completion_prefix}: {compact_text(outcome_subject, 160)}."
+                        if explicit_completion
+                        else f"The task was resolved: {compact_text(task, 160)}."
+                    ),
+                    category="task_outcome",
+                    importance=0.74 if completion_resolves_thread else 0.68,
+                    confidence=(
+                        semantic_event.confidence if explicit_completion else 0.82
+                    ),
+                    tags=(task_tag, "resolved"),
+                    kind="episode",
+                    source_type=outcome_source,
+                    source_reference=source_reference,
+                    canonical_key=f"outcome:{_slot_value(outcome_subject)}",
+                    scope=f"conversation:{compact_text(activity_scope, 100).lower()}",
+                    evidence_refs=(source_reference,),
+                ),
+                source=outcome_source,
+                created_at=current,
+                trace=memory_decisions,
+            )
 
     _prune_memories(memories)
     next_state = InternalState(
@@ -1202,19 +1715,19 @@ def process_internal_turn(
         updated_at=current,
         version=3,
     )
-    prompt_context, disposition, thought_source, follow_up = _internal_prompt_context(
+    memory_uses = _memory_use_decisions(
+        recalled,
         signal,
-        WorkingMemory() if autonomous else next_working,
-        thought_working=WorkingMemory() if autonomous else working,
+        next_working,
         activity=latest_activity,
-        recalled=recalled,
-        user_text=user_text,
+        familiar_relationship=familiar_relationship,
     )
+    used_memory_ids = {memory_id for memory_id, use in memory_uses if use != "none"}
+    used_memories = tuple(memory for memory in recalled if memory.id in used_memory_ids)
     return InternalTurnResult(
         state=next_state,
         signal=signal,
-        recalled_memories=recalled,
-        prompt_context=prompt_context,
+        recalled_memories=used_memories,
         affect_trace=build_affect_trace(
             previous.emotion,
             event_emotion,
@@ -1226,13 +1739,19 @@ def process_internal_turn(
         ),
         life_evolution=life_evolution,
         working_context=next_working,
-        current_disposition=disposition,
-        current_thought_source=thought_source,
-        follow_up_tendency=follow_up,
         grounded_activity_source=latest_activity.source if latest_activity else "none",
         grounded_activity_age_seconds=(
             max(0.0, current - latest_activity.updated_at) if latest_activity else 0.0
         ),
+        memory_trace=_memory_trace(
+            memories,
+            used_memories,
+            memory_decisions,
+            retrieval_trace,
+            current,
+            memory_uses,
+        ),
+        memory_uses=memory_uses,
     )
 
 
@@ -1337,6 +1856,7 @@ class LongTermMemoryStore:
         query: str,
         *,
         now: float | None = None,
+        scope: str = "profile",
     ) -> tuple[Memory, ...]:
         current = time.time() if now is None else float(now)
         with self._lock:
@@ -1349,6 +1869,7 @@ class LongTermMemoryStore:
                 current,
                 self._retrieval,
                 WorkingMemory(),
+                scope=scope,
             )
 
     def add_memory(
@@ -1363,14 +1884,42 @@ class LongTermMemoryStore:
         tags: tuple[str, ...] = (),
         status: str = _ACTIVE_MEMORY,
         created_at: float | None = None,
+        kind: str = "",
+        source_type: str = "",
+        source_reference: str = "",
+        canonical_key: str = "",
+        scope: str = "profile",
+        expires_at: float | None = None,
+        evidence_refs: tuple[str, ...] = (),
+        thread_status: str = "",
     ) -> Memory | None:
+        normalized_category = compact_text(category, 24).lower()
+        normalized_tags = tuple(tags)
+        normalized_kind = _memory_kind_from_fields(
+            compact_text(kind, 24).lower(),
+            normalized_category,
+            tuple(compact_text(tag, 48).lower() for tag in normalized_tags),
+        )
+        normalized_source_type = _source_type(source_type or source)
         candidate = _MemoryCandidate(
             content=compact_text(content, 240),
-            category=compact_text(category, 24).lower(),
+            category=normalized_category,
             importance=max(0.0, min(1.0, float(importance))),
             confidence=max(0.0, min(1.0, float(confidence))),
-            tags=tuple(tags),
+            tags=normalized_tags,
             supersedes=True,
+            kind=normalized_kind,
+            source_type=normalized_source_type,
+            source_reference=compact_text(source_reference, 100),
+            canonical_key=compact_text(canonical_key, 120).lower(),
+            scope=compact_text(scope, 120).lower() or "profile",
+            expires_at=(max(0.0, float(expires_at)) if expires_at is not None else None),
+            evidence_refs=tuple(
+                value
+                for item in evidence_refs
+                if (value := compact_text(item, 100))
+            )[:12],
+            thread_status=compact_text(thread_status, 24).lower(),
         )
         if not candidate.content or candidate.category not in _MEMORY_CATEGORIES:
             return None
@@ -1386,6 +1935,8 @@ class LongTermMemoryStore:
                 created_at=time.time() if created_at is None else float(created_at),
                 status=status,
             )
+            if memory is None:
+                return None
             if not changed:
                 return copy.deepcopy(memory)
             next_state = replace(
@@ -1432,17 +1983,41 @@ class LongTermMemoryStore:
                 reaction=reaction,
                 authority=authority,
             )
-            next_state = replace(
-                state,
-                life=life,
-                updated_at=max(state.updated_at, _number(now, state.updated_at)),
-            )
-            self._save_state(key, next_state, previous)
             activity = life.activity or (
                 life.recent_events[-1] if life.recent_events else None
             )
             if activity is None:
                 raise RuntimeError("Grounded activity was not recorded.")
+            memories = list(state.memories)
+            if (
+                activity.status == "completed"
+                and activity.activity_type not in {"conversation", "quiet_downtime"}
+            ):
+                _insert_into_memories(
+                    memories,
+                    _MemoryCandidate(
+                        content=_self_event_memory_content(activity),
+                        category="episode",
+                        importance=0.66,
+                        confidence=activity.confidence,
+                        tags=("life-activity", f"activity:{activity.activity_type}"),
+                        kind="self",
+                        source_type=_source_type(activity.source),
+                        source_reference=activity.event_id,
+                        canonical_key=f"self:event:{activity.event_id}",
+                        scope=activity.scope,
+                        evidence_refs=(activity.event_id,),
+                    ),
+                    source=activity.source,
+                    created_at=activity.completed_at or activity.updated_at,
+                )
+            next_state = replace(
+                state,
+                life=life,
+                memories=tuple(memories),
+                updated_at=max(state.updated_at, _number(now, state.updated_at)),
+            )
+            self._save_state(key, next_state, previous)
             return copy.deepcopy(activity)
 
     def restore_internal_state(self, profile_id: str, state: InternalState | None) -> None:
@@ -1475,12 +2050,19 @@ class LongTermMemoryStore:
         preferences: list[dict[str, object]] = []
         facts: list[dict[str, object]] = []
         episodes: list[dict[str, object]] = []
+        activities: dict[str, object] = {}
         for memory in active:
             item = {"content": memory.content, "category": memory.category}
             if "slot:name" in memory.tags:
                 user["name"] = _memory_name(memory.content)
             elif _AKANE_PREFERENCE_TAG in memory.tags:
                 continue
+            elif _memory_kind(memory) == "working":
+                activities["arcane_current"] = {
+                    **item,
+                    "expires_at": memory.expires_at or 0.0,
+                    "source": memory.source_type,
+                }
             elif memory.category == "tendency" or any(
                 tag.startswith("slot:preference:") for tag in memory.tags
             ):
@@ -1494,7 +2076,7 @@ class LongTermMemoryStore:
             "preferences": preferences,
             "facts": facts,
             "episodes": episodes,
-            "activities": {},
+            "activities": activities,
         }
 
     def public_internal_state(self, profile_id: str = "local:owner") -> dict[str, object]:
@@ -1505,10 +2087,41 @@ class LongTermMemoryStore:
         """Render one stored or read-only candidate state for diagnostics."""
 
         emotion = state.emotion
-        activity = state.life.activity or recent_activity(
+        recent = recent_activity(
             state.life,
             now=state.updated_at,
             scope="profile",
+        )
+        background = state.life.activity
+        interaction = state.life.interaction
+        activity = background or recent
+        creative = next(
+            (
+                event
+                for event in reversed(state.life.recent_events)
+                if event.activity_type == "creative_brainstorming"
+                and event.status == "completed"
+            ),
+            background
+            if background is not None
+            and background.activity_type == "creative_brainstorming"
+            else None,
+        )
+        available_memories = [
+            memory for memory in state.memories if memory.is_available(state.updated_at)
+        ]
+        arcane_activity = next(
+            (
+                memory
+                for memory in sorted(
+                    available_memories,
+                    key=lambda item: item.updated_at or item.created_at,
+                    reverse=True,
+                )
+                if _memory_kind(memory) == "working"
+                and memory.canonical_key == _ARCANE_ACTIVITY_KEY
+            ),
+            None,
         )
         return {
             "emotion": {
@@ -1546,6 +2159,18 @@ class LongTermMemoryStore:
                 "reaction": activity.reaction if activity else "",
                 "authority": activity.authority if activity else "none",
                 "recent_event_count": len(state.life.recent_events),
+                "current_interaction": (
+                    interaction.description if interaction is not None else ""
+                ),
+                "background_activity": (
+                    background.description if background is not None else ""
+                ),
+                "recent_completed_activity": (
+                    recent.description if recent is not None else ""
+                ),
+                "active_creative_event": (
+                    creative.subject or creative.description if creative is not None else ""
+                ),
             },
             "needs": {
                 "energy": round(state.life.needs.energy, 3),
@@ -1555,7 +2180,34 @@ class LongTermMemoryStore:
             },
             "activity_preferences": dict(state.life.activity_preferences),
             "next_activity_opportunity": state.life.next_opportunity_at,
-            "working": {},
+            "working": {
+                "arcane_current_activity": (
+                    {
+                        "content": arcane_activity.content,
+                        "status": arcane_activity.status,
+                        "source": arcane_activity.source_type,
+                        "canonical_key": arcane_activity.canonical_key,
+                        "expires_at": arcane_activity.expires_at or 0.0,
+                    }
+                    if arcane_activity is not None
+                    else {}
+                )
+            },
+            "memory_core": {
+                "active_corrections": sum(
+                    _memory_kind(memory) == "correction"
+                    for memory in available_memories
+                ),
+                "active_threads": sum(
+                    _memory_kind(memory) == "open_thread"
+                    for memory in available_memories
+                ),
+                "active_working": sum(
+                    _memory_kind(memory) == "working"
+                    for memory in available_memories
+                ),
+                "schema_version": LONG_TERM_MEMORY_SCHEMA_VERSION,
+            },
             "state_schema_version": state.version,
             "life_schema_version": state.life.version,
             "updated_at": state.updated_at,
@@ -1601,7 +2253,7 @@ class LongTermMemoryStore:
                         )
                     }
                 return
-            if schema not in {2, 3, 4, LONG_TERM_MEMORY_SCHEMA_VERSION}:
+            if schema not in {2, 3, 4, 5, LONG_TERM_MEMORY_SCHEMA_VERSION}:
                 raise ValueError("unsupported schema")
             profiles = payload.get("profiles")
             if not isinstance(profiles, dict):
@@ -1625,7 +2277,7 @@ class LongTermMemoryStore:
                             new_internal_state(current),
                             memories=loaded,
                         )
-                elif schema in {3, 4, LONG_TERM_MEMORY_SCHEMA_VERSION}:
+                elif schema in {3, 4, 5, LONG_TERM_MEMORY_SCHEMA_VERSION}:
                     state = _internal_state_from_dict(raw_profile)
                     if state is not None:
                         self._states[profile] = state
@@ -1651,10 +2303,21 @@ class LongTermMemoryStore:
         )
 
 
-def format_relevant_memories(memories: tuple[Memory, ...]) -> str:
+def format_relevant_memories(
+    memories: tuple[Memory, ...],
+    memory_uses: tuple[tuple[str, str], ...] = (),
+) -> str:
     if not memories:
         return ""
-    lines = [_memory_prompt_line(memory) for memory in memories]
+    used_ids = {memory_id for memory_id, use in memory_uses if use != "none"}
+    selected = (
+        tuple(memory for memory in memories if memory.id in used_ids)
+        if memory_uses
+        else memories
+    )
+    if not selected:
+        return ""
+    lines = [_memory_prompt_line(memory) for memory in selected]
     return (
         _MEMORY_PROMPT_INTRO
         + "\n"
@@ -1662,6 +2325,65 @@ def format_relevant_memories(memories: tuple[Memory, ...]) -> str:
         + "\n"
         + _MEMORY_PROMPT_OUTRO
     )
+
+
+def _memory_use_decisions(
+    memories: tuple[Memory, ...],
+    signal: TurnSignal,
+    working: WorkingMemory,
+    *,
+    activity: ActivityRecord | None = None,
+    familiar_relationship: bool = False,
+) -> tuple[tuple[str, str], ...]:
+    """Assign one compact use to each relevant record without rescoring it."""
+
+    decisions: list[tuple[str, str]] = []
+    direct_task = signal.intent in {"technical", "instruction"} or signal.technical
+    for memory in memories:
+        kind = _memory_kind(memory)
+        source = _memory_source_type(memory)
+        if source in {
+            "conversation_summary",
+            "generated_assistant",
+            "speculative_inference",
+            "unknown",
+        }:
+            continue
+        tags = set(memory.tags)
+        emotional = bool(
+            tags.intersection(
+                {
+                    "emotional",
+                    "distress",
+                    "user-distress",
+                    "conflict",
+                    "criticism",
+                    "praise",
+                }
+            )
+            or any(tag.startswith("emotion:") for tag in tags)
+        )
+        if kind == "correction":
+            use = "correction"
+        elif kind == "open_thread":
+            use = "thread"
+        elif kind == "self":
+            use = "self_experience"
+        elif kind == "relationship":
+            use = "relationship_context"
+        elif kind == "episode" and emotional:
+            use = "emotional_context"
+        elif kind == "episode" and familiar_relationship and not direct_task:
+            use = "callback"
+        elif kind in {"working", "episode", "profile"}:
+            use = "fact"
+        else:
+            continue
+        if use == "self_experience" and activity is not None:
+            if topic_overlap(memory.content, activity.description) < 0.20 and not signal.current_activity:
+                use = "fact"
+        decisions.append((memory.id, use))
+    return tuple(decisions)
 
 
 def preference_domain(text: str) -> str:
@@ -1716,8 +2438,6 @@ def akane_preference_answer(memory: Memory | None) -> str:
 
 
 def _memory_prompt_line(memory: Memory) -> str:
-    if memory.confidence < 0.72:
-        return f"A tentative earlier impression: {memory.content}"
     return memory.content
 
 
@@ -1748,139 +2468,83 @@ def _continues_working_topic(
     )
 
 
-_FOLLOW_UP_INVITATION = re.compile(
-    r"\b(?:any questions|ask me|continue (?:talking|the discussion)|"
-    r"talk (?:about|with me)|what do you think|want to discuss)\b",
-    re.I,
-)
-
-
-def _follow_up_guidance(
-    signal: TurnSignal,
-    working: WorkingMemory,
-    user_text: str,
-) -> tuple[str, str]:
-    if signal.low_content and working.unresolved_problem:
-        return "clarification", "Ask one focused question only if clarification is required."
-    if _FOLLOW_UP_INVITATION.search(user_text):
-        return "invited", "A context-specific question may continue this invited discussion."
-    if working.unresolved_problem and signal.intent in {"casual", "reflection"}:
-        return "unresolved", "A focused question may advance the unresolved topic."
-    return "none", "No automatic follow-up question."
-
-
-def _current_thought_guidance(
-    signal: TurnSignal,
-    working: WorkingMemory,
-    activity: ActivityRecord | None,
-    recalled: tuple[Memory, ...],
-) -> tuple[str, str]:
-    if activity is not None and activity.activity_type == "conversation":
-        activity = None
-    if not signal.current_thought:
-        return "none", ""
-    if working.unresolved_problem and (working.current_task or working.current_topic):
-        return (
-            "unresolved_conversation",
-            "Ground the current thought in the unresolved conversation thread.",
-        )
-    if working.current_topic or working.current_task:
-        return (
-            "conversation_topic",
-            "Ground the current thought in the active conversation topic visible in history.",
-        )
-    if activity is not None:
-        return (
-            "grounded_activity",
-            "Ground the current thought in the supplied known-activity context.",
-        )
-    if recalled:
-        return (
-            "relevant_memory",
-            "A relevant remembered topic is available in reference context.",
-        )
-    active = max(
-        signal.emotion_state.active_emotions,
-        key=lambda item: (item.intensity, item.kind),
-        default=None,
-    )
-    if active is not None and active.intensity >= 0.14:
-        return (
-            "active_emotion",
-            "Keep the current thought modest and connected to the active emotional influence.",
-        )
-    return (
-        "none",
-        "No grounded current thought is established; uncertainty is valid.",
-    )
-
-
-def _internal_prompt_context(
-    signal: TurnSignal,
-    working: WorkingMemory,
-    *,
-    thought_working: WorkingMemory | None = None,
-    activity: ActivityRecord | None,
-    recalled: tuple[Memory, ...],
-    user_text: str,
-) -> tuple[str, str, str, str]:
-    disposition = signal.emotion_prompt()
-    thought_source, thought_guidance = _current_thought_guidance(
-        signal,
-        thought_working or working,
-        activity,
-        recalled,
-    )
-    follow_up, question_guidance = _follow_up_guidance(signal, working, user_text)
-    parts = [disposition]
-    if (
-        signal.contextual_reaction.kind != "neutral"
-        and signal.contextual_reaction.intensity >= 0.10
-    ):
-        parts.append(f"Immediate reaction: {signal.contextual_reaction.kind}.")
-    if working.unresolved_problem:
-        parts.append("An unresolved conversation thread remains relevant.")
-    elif working.last_outcome == "technical_success":
-        parts.append("The earlier technical problem is resolved.")
-    if signal.current_activity:
-        parts.append(
-            "Use the supplied known-activity reference."
-            if activity is not None
-            else "No grounded recent activity is available; uncertainty is valid."
-        )
-    if thought_guidance:
-        parts.append(thought_guidance)
-    parts.append(question_guidance)
-    return "\n".join(parts), disposition, thought_source, follow_up
-
-
 def _retrieve_memories(
     memories: tuple[Memory, ...],
     query: str,
     now: float,
     config: MemoryRetrievalConfig,
     working: WorkingMemory,
+    *,
+    scope: str = "profile",
+    trace: list[dict[str, object]] | None = None,
 ) -> tuple[Memory, ...]:
     query_text = compact_text(query, 700)
     query_terms = _memory_terms(query_text)
     if not query_text or not query_terms:
         return ()
-    ranked: list[tuple[float, Memory]] = []
+    ranked: list[tuple[float, Memory, dict[str, object]]] = []
     for memory in memories:
-        if not memory.is_available(now):
+        if not memory.is_available(now) or not _scope_matches(memory.scope, scope):
+            continue
+        kind = _memory_kind(memory)
+        source = _memory_source_type(memory)
+        factor = {
+            "memory_id": memory.id,
+            "kind": kind,
+            "source_authority": source,
+            "scope": memory.scope,
+            "selected": False,
+            "use": "none",
+        }
+        if source in {
+            "conversation_summary",
+            "generated_assistant",
+            "speculative_inference",
+        }:
+            factor["omission_reason"] = "unsupported_source"
+            if trace is not None:
+                trace.append(factor)
+            continue
+        if kind in {"profile", "self", "relationship", "correction"} and _authority(
+            source
+        ) < _SOURCE_AUTHORITY["trusted_memory"]:
+            factor["omission_reason"] = "insufficient_source_authority"
+            if trace is not None:
+                trace.append(factor)
             continue
         relevance = _semantic_relevance(query_text, query_terms, memory)
         continuity_bonus = 0.0
-        if memory.category == "unfinished_topic" and working.current_task:
+        if kind == "open_thread" and working.current_task:
             continuity_bonus = max(
                 topic_overlap(memory.content, working.current_task),
-                _semantic_relevance(working.current_task, _memory_terms(working.current_task), memory),
+                _semantic_relevance(
+                    working.current_task,
+                    _memory_terms(working.current_task),
+                    memory,
+                ),
             ) * 0.30
-        if relevance < config.min_relevance and continuity_bonus <= 0.0:
+        global_correction = bool(
+            kind == "correction"
+            and (
+                "interaction-style" in memory.tags
+                or any(tag.startswith("slot:behavior:") for tag in memory.tags)
+            )
+        )
+        if (
+            relevance < config.min_relevance
+            and continuity_bonus <= 0.0
+            and not global_correction
+        ):
+            factor.update(relevance=round(relevance, 3), omission_reason="irrelevant")
+            if trace is not None:
+                trace.append(factor)
             continue
-        age_days = max(0.0, now - memory.created_at) / 86_400.0
+        age_days = max(0.0, now - (memory.updated_at or memory.created_at)) / 86_400.0
         recency = 1.0 / (1.0 + age_days / 90.0)
-        continuity = recency if memory.category in {"episode", "task_outcome"} else 0.0
+        continuity = recency if kind in {"episode", "open_thread"} else 0.0
+        kind_bonus = {"correction": 0.34, "open_thread": 0.22}.get(kind, 0.0)
+        scope_bonus = 0.12 if memory.scope not in {"global", "profile"} else 0.0
+        authority_bonus = _authority(_memory_source_type(memory)) / 9.0 * 0.12
         score = (
             relevance * config.relevance_weight
             + memory.importance * config.importance_weight
@@ -1888,23 +2552,92 @@ def _retrieve_memories(
             + recency * config.recency_weight
             + continuity * config.continuity_weight
             + continuity_bonus
+            + kind_bonus
+            + scope_bonus
+            + authority_bonus
             - _recent_use(memory, now) * config.repetition_penalty
             - min(1.0, max(0.0, age_days - 365.0) / 365.0) * config.staleness_penalty
         )
+        factor.update(relevance=round(relevance, 3), score=round(score, 3))
         if score >= config.min_score:
-            ranked.append((score, memory))
+            ranked.append((score, memory, factor))
+        else:
+            factor["omission_reason"] = "below_threshold"
+            if trace is not None:
+                trace.append(factor)
     ranked.sort(key=lambda item: (item[0], item[1].created_at, item[1].id), reverse=True)
     selected: list[Memory] = []
     used_tokens = estimate_tokens(_MEMORY_PROMPT_INTRO) + estimate_tokens(_MEMORY_PROMPT_OUTRO) + 4
-    for _score, memory in ranked:
+    for _score, memory, factor in ranked:
         cost = estimate_tokens(_memory_prompt_line(memory)) + 1
         if used_tokens + cost > config.context_tokens:
+            factor["omission_reason"] = "token_budget"
+            if trace is not None:
+                trace.append(factor)
             continue
         selected.append(copy.deepcopy(memory))
+        if trace is not None:
+            factor["selected"] = True
+            trace.append(factor)
         used_tokens += cost
         if len(selected) >= config.max_results:
             break
+    if trace is not None and len(selected) >= config.max_results:
+        selected_ids = {memory.id for memory in selected}
+        traced_ids = {str(item.get("memory_id") or "") for item in trace}
+        for _score, memory, factor in ranked:
+            if memory.id in selected_ids or memory.id in traced_ids:
+                continue
+            factor["omission_reason"] = "result_limit"
+            trace.append(factor)
     return tuple(selected)
+
+
+def _memory_trace(
+    memories: list[Memory],
+    recalled: tuple[Memory, ...],
+    decisions: list[dict[str, object]],
+    retrieval_factors: list[dict[str, object]],
+    now: float,
+    memory_uses: tuple[tuple[str, str], ...] = (),
+) -> dict[str, object]:
+    retrieved_by_kind: dict[str, int] = {}
+    for memory in recalled:
+        kind = _memory_kind(memory)
+        retrieved_by_kind[kind] = retrieved_by_kind.get(kind, 0) + 1
+    active = [memory for memory in memories if memory.is_available(now)]
+    use_by_id = dict(memory_uses)
+    traced = copy.deepcopy(retrieval_factors)
+    for item in traced:
+        memory_id = str(item.get("memory_id") or "")
+        item["use"] = use_by_id.get(memory_id, "none")
+        item["used"] = memory_id in use_by_id
+    return {
+        "retrieved_by_kind": retrieved_by_kind,
+        "records_considered": len(traced),
+        "records_used": len(recalled),
+        "memory_uses": memory_uses,
+        "active_correction": next(
+            (memory.id for memory in recalled if _memory_kind(memory) == "correction"),
+            "",
+        ),
+        "active_thread": next(
+            (memory.id for memory in recalled if _memory_kind(memory) == "open_thread"),
+            "",
+        ),
+        "grounded_self_event": next(
+            (memory.id for memory in recalled if _memory_kind(memory) == "self"),
+            "",
+        ),
+        "active_corrections": sum(_memory_kind(item) == "correction" for item in active),
+        "active_threads": sum(_memory_kind(item) == "open_thread" for item in active),
+        "candidate_writes": sum(item.get("decision") == "created" for item in decisions),
+        "candidate_updates": sum(item.get("decision") == "updated" for item in decisions),
+        "rejected_candidates": sum(item.get("decision") == "rejected" for item in decisions),
+        "decisions": tuple(copy.deepcopy(decisions)),
+        "retrieval_factors": tuple(traced),
+        "migration_version": LONG_TERM_MEMORY_SCHEMA_VERSION,
+    }
 
 
 def _insert_into_memories(
@@ -1914,47 +2647,184 @@ def _insert_into_memories(
     source: str,
     created_at: float,
     status: str = _ACTIVE_MEMORY,
-) -> tuple[Memory, bool]:
+    trace: list[dict[str, object]] | None = None,
+) -> tuple[Memory | None, bool]:
     candidate_tags = _normalized_tags(candidate.tags, candidate.content)
-    candidate_slots = {tag for tag in candidate_tags if tag.startswith("slot:")}
+    source_type = _source_type(candidate.source_type or source)
+    canonical_key = _candidate_key(replace(candidate, tags=candidate_tags))
+    scope = compact_text(candidate.scope, 120).lower() or "profile"
+    candidate = replace(
+        candidate,
+        tags=candidate_tags,
+        source_type=source_type,
+        canonical_key=canonical_key,
+        scope=scope,
+    )
+    allowed, rejection = _candidate_allowed(candidate)
+    detail: dict[str, object] = {
+        "kind": candidate.kind,
+        "category": candidate.category,
+        "canonical_key": canonical_key,
+        "source_authority": source_type,
+        "canonical_match": False,
+        "deduplication": "none",
+        "contradiction": "none",
+        "supersession": "none",
+    }
+    if not allowed:
+        detail.update({"decision": "rejected", "rejection_reason": rejection})
+        if trace is not None:
+            trace.append(detail)
+        return None, False
+
+    if candidate.kind == "working":
+        active = [
+            existing
+            for existing in memories
+            if existing.status == _ACTIVE_MEMORY
+            and _memory_kind(existing) == "working"
+            and existing.scope == scope
+            and existing.canonical_key == canonical_key
+        ]
+        if active:
+            existing = max(active, key=lambda item: item.updated_at or item.created_at)
+            existing.content = candidate.content
+            existing.category = candidate.category
+            existing.importance = candidate.importance
+            existing.confidence = candidate.confidence
+            existing.source = compact_text(source, 48) or existing.source
+            existing.tags = candidate_tags
+            existing.status = _ACTIVE_MEMORY
+            existing.expires_at = candidate.expires_at
+            existing.source_type = source_type
+            existing.source_reference = candidate.source_reference
+            existing.updated_at = max(existing.updated_at, created_at)
+            existing.evidence_refs = tuple(
+                dict.fromkeys((*existing.evidence_refs, *candidate.evidence_refs))
+            )[:12]
+            for duplicate in active:
+                if duplicate.id == existing.id:
+                    continue
+                duplicate.status = "superseded"
+                duplicate.superseded_by = existing.id
+                duplicate.updated_at = max(duplicate.updated_at, created_at)
+            detail.update(
+                {
+                    "canonical_match": True,
+                    "deduplication": "canonical_working_update",
+                    "supersession": f"{max(0, len(active) - 1)} record(s)",
+                    "decision": "updated",
+                }
+            )
+            if trace is not None:
+                trace.append(detail)
+            return existing, True
+
     for existing in memories:
-        if existing.category != candidate.category:
+        if (
+            existing.status != _ACTIVE_MEMORY
+            or _memory_kind(existing) != candidate.kind
+            or existing.scope != scope
+            or (
+                candidate.kind in {"profile", "relationship", "self", "correction"}
+                and existing.canonical_key
+                and existing.canonical_key != canonical_key
+            )
+        ):
             continue
         if _memory_content_matches(existing, candidate.content, candidate_tags):
             changed = False
+            detail["canonical_match"] = existing.canonical_key == canonical_key
+            detail["deduplication"] = "merged_equivalent"
+            new_evidence = tuple(
+                ref for ref in candidate.evidence_refs if ref not in existing.evidence_refs
+            )
             if candidate.importance > existing.importance:
                 existing.importance = candidate.importance
                 changed = True
-            reinforced = max(existing.confidence, candidate.confidence)
-            reinforced = min(0.98, reinforced + (1.0 - reinforced) * 0.20)
-            if reinforced > existing.confidence:
-                existing.confidence = reinforced
+            if (
+                new_evidence
+                or _authority(source_type) > _authority(_memory_source_type(existing))
+            ):
+                reinforced = max(existing.confidence, candidate.confidence)
+                reinforced = min(0.98, reinforced + (1.0 - reinforced) * 0.20)
+                if reinforced > existing.confidence:
+                    existing.confidence = reinforced
+                    changed = True
+                if _authority(source_type) > _authority(_memory_source_type(existing)):
+                    existing.source = compact_text(source, 48) or existing.source
+                    existing.source_type = source_type
+                    existing.source_reference = candidate.source_reference
+                    changed = True
+            evidence = tuple(
+                dict.fromkeys((*existing.evidence_refs, *candidate.evidence_refs))
+            )[:12]
+            if evidence != existing.evidence_refs:
+                existing.evidence_refs = evidence
                 changed = True
-            if candidate.supersedes and existing.status != _ACTIVE_MEMORY:
-                existing.status = _ACTIVE_MEMORY
-                existing.superseded_by = None
-                existing.source = compact_text(source, 48) or existing.source
+            if candidate.thread_status and candidate.thread_status != existing.thread_status:
+                existing.thread_status = candidate.thread_status
                 changed = True
-            if candidate.supersedes and candidate_slots:
-                for conflict in memories:
-                    if (
-                        conflict is not existing
-                        and conflict.status == _ACTIVE_MEMORY
-                        and candidate_slots.intersection(conflict.tags)
-                    ):
-                        conflict.status = "superseded"
-                        conflict.superseded_by = existing.id
-                        changed = True
+            if changed:
+                existing.updated_at = max(existing.updated_at, created_at)
+            detail["decision"] = "updated" if changed else "duplicate"
+            if trace is not None:
+                trace.append(detail)
             return existing, changed
+
     conflicts = [
         existing
         for existing in memories
         if existing.status == _ACTIVE_MEMORY
-        and candidate_slots.intersection(existing.tags)
+        and existing.scope == scope
+        and (existing.canonical_key or _canonical_key(
+            _memory_kind(existing), existing.category, existing.tags, existing.content
+        )) == canonical_key
+        and not _memory_content_matches(existing, candidate.content, candidate_tags)
     ]
     memory_status = compact_text(status, 24).lower() or _ACTIVE_MEMORY
-    if conflicts and memory_status == _ACTIVE_MEMORY and not candidate.supersedes:
-        memory_status = "contradicted"
+    if memory_status == "contradicted":
+        memory_status = "disputed"
+    if memory_status not in _MEMORY_STATUSES:
+        memory_status = "archived"
+    superseded: list[Memory] = []
+    if conflicts and memory_status == _ACTIVE_MEMORY:
+        detail["canonical_match"] = True
+        strongest = max(
+            conflicts,
+            key=lambda item: (
+                _authority(_memory_source_type(item)),
+                item.updated_at or item.created_at,
+            ),
+        )
+        new_authority = _authority(source_type)
+        old_authority = _authority(_memory_source_type(strongest))
+        if new_authority < old_authority:
+            detail.update(
+                {
+                    "decision": "rejected",
+                    "contradiction": "lower_authority",
+                    "rejection_reason": "cannot_supersede_higher_authority",
+                }
+            )
+            if trace is not None:
+                trace.append(detail)
+            return None, False
+        if new_authority > old_authority or (
+            candidate.supersedes and new_authority >= old_authority
+        ):
+            superseded = [
+                item
+                for item in conflicts
+                if _authority(_memory_source_type(item)) <= new_authority
+            ]
+            detail["contradiction"] = "supersede_lower_or_equal_authority"
+        else:
+            memory_status = "disputed"
+            for existing in conflicts:
+                existing.status = "disputed"
+                existing.updated_at = max(existing.updated_at, created_at)
+            detail["contradiction"] = "unresolved_dispute"
     memory = Memory(
         id=uuid.uuid4().hex,
         content=candidate.content,
@@ -1965,34 +2835,36 @@ def _insert_into_memories(
         source=compact_text(source, 48) or "user",
         tags=candidate_tags,
         status=memory_status,
+        expires_at=candidate.expires_at,
+        kind=candidate.kind,
+        source_type=source_type,
+        source_reference=candidate.source_reference,
+        canonical_key=canonical_key,
+        scope=scope,
+        updated_at=max(0.0, created_at),
+        evidence_refs=candidate.evidence_refs,
+        thread_status=(
+            candidate.thread_status
+            or (memory_status if memory_status in _THREAD_STATUSES else _ACTIVE_MEMORY)
+            if candidate.kind == "open_thread"
+            else ""
+        ),
     )
-    if candidate.supersedes and memory.status == _ACTIVE_MEMORY:
-        for existing in conflicts:
+    if superseded and memory.status == _ACTIVE_MEMORY:
+        for existing in superseded:
             existing.status = "superseded"
             existing.superseded_by = memory.id
+            existing.updated_at = max(existing.updated_at, created_at)
+        detail["supersession"] = f"{len(superseded)} record(s)"
     memories.append(memory)
     _prune_memories(memories)
+    detail["decision"] = "created" if memory.status == _ACTIVE_MEMORY else memory.status
+    if trace is not None:
+        trace.append(detail)
     return memory, True
 
 
 def _prune_memories(memories: list[Memory]) -> None:
-    outcome_tags = {
-        tag
-        for memory in memories
-        if memory.category == "task_outcome" and memory.status == _ACTIVE_MEMORY
-        for tag in memory.tags
-        if tag.startswith("task:")
-    }
-    if outcome_tags:
-        memories[:] = [
-            memory
-            for memory in memories
-            if not (
-                memory.category == "unfinished_topic"
-                and memory.status == "resolved"
-                and outcome_tags.intersection(memory.tags)
-            )
-        ]
     if len(memories) <= MEMORY_MAX_ENTRIES_PER_PROFILE:
         return
     memories.sort(
@@ -2010,8 +2882,10 @@ def _normalize_loaded_memories(memories: list[Memory]) -> tuple[Memory, ...]:
             (
                 existing
                 for existing in consolidated
-                if existing.category == memory.category
+                if _memory_kind(existing) == _memory_kind(memory)
                 and existing.status == memory.status
+                and existing.scope == memory.scope
+                and existing.canonical_key == memory.canonical_key
                 and _memory_content_matches(existing, memory.content, memory.tags)
             ),
             None,
@@ -2023,6 +2897,10 @@ def _normalize_loaded_memories(memories: list[Memory]) -> tuple[Memory, ...]:
         duplicate.importance = max(duplicate.importance, memory.importance)
         duplicate.confidence = max(duplicate.confidence, memory.confidence)
         duplicate.tags = tuple(dict.fromkeys((*duplicate.tags, *memory.tags)))[:12]
+        duplicate.evidence_refs = tuple(
+            dict.fromkeys((*duplicate.evidence_refs, *memory.evidence_refs))
+        )[:12]
+        duplicate.updated_at = max(duplicate.updated_at, memory.updated_at)
         if memory.last_used_at is not None:
             duplicate.last_used_at = max(
                 duplicate.last_used_at or 0.0,
@@ -2289,6 +3167,12 @@ def _migrate_legacy_profile(payload: dict[str, object]) -> list[Memory]:
             confidence=candidate.confidence,
             source="migrated:popup-user",
             tags=_normalized_tags(candidate.tags, candidate.content),
+            kind="profile",
+            source_type="unknown",
+            source_reference="",
+            canonical_key=_candidate_key(candidate),
+            scope="profile",
+            updated_at=created_at,
         )
         for candidate in candidates
     ]

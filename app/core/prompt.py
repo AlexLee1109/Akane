@@ -56,13 +56,7 @@ class TrimmedPromptSource:
 class TurnGuidance:
     """Structured per-turn behavior selected before prompt rendering."""
 
-    autonomous: bool = False
-    identity_attribute: str = ""
-    current_activity: bool = False
-    group_conversation: bool = False
-    criticism: bool = False
-    correction_requested: bool = False
-    repetition_level: int = 0
+    style_directives: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,10 +295,15 @@ def _prompt_sources(
     recent_count = len(context.recent_turns)
     for index, turn in enumerate(context.recent_turns):
         role = "assistant" if turn.role == "assistant" else "user"
+        content = (
+            f"[RECENT ASSISTANT MESSAGE — UNVERIFIED]\n{turn.content}"
+            if role == "assistant"
+            else turn.content
+        )
         _append_source(
             sources,
             f"recent_{role}",
-            turn.content,
+            content,
             role,
             PromptAuthority.HISTORICAL_EVIDENCE,
             False,
@@ -554,53 +553,11 @@ def _section(label: str, *parts: object) -> str:
 def format_turn_guidance(guidance: TurnGuidance | None) -> str:
     if guidance is None:
         return ""
-    if guidance.autonomous:
-        return (
-            "Unprompted thought: draw only from the supplied concrete interests, continuity, "
-            "and activity. Share one specific thought or opinion without addressing anyone "
-            "or inventing events."
-        )
-
-    parts: list[str] = []
-    if guidance.identity_attribute == "preferences":
-        parts.append(
-            "Use one or two relevant established preferences and their concrete reasons."
-        )
-    elif guidance.identity_attribute:
-        parts.append("Use the stable facts relevant to the question.")
-    if guidance.current_activity:
-        parts.append(
-            "Current activity: answer from the supplied recent activity and keep it concrete."
-        )
-    if guidance.group_conversation:
-        parts.append(
-            "Group chat: address this user; do not treat channel text as personal history."
-        )
-    if guidance.criticism:
-        parts.append(
-            "Correct the answer directly; do not analyze the criticism, do not defend the "
-            "prior answer, redirect, or promise future improvement."
-        )
-    elif guidance.correction_requested:
-        parts.append(
-            "Apply the correction in the answer without defending the prior framing."
-        )
-    if guidance.repetition_level == 1:
-        parts.append(
-            "Repeated request: answer fully with different wording; preserve the answer "
-            "and do not mention repetition."
-        )
-    elif guidance.repetition_level == 2:
-        parts.append(
-            "Repeated request: preserve the answer while varying wording, reason, or emphasis; "
-            "acknowledge the pattern only if natural."
-        )
-    elif guidance.repetition_level >= 3:
-        parts.append(
-            "Repeated request: still answer fully and preserve facts and preferences; mild "
-            "exasperation is allowed, never hostility or refusal."
-        )
-    return " ".join(parts)
+    return "\n".join(
+        f"{category}: {value}"
+        for category, value in guidance.style_directives
+        if category and value
+    )
 
 
 def _clip_tokens(value: str, budget: int) -> str:

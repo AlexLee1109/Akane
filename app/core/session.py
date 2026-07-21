@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 import uuid
@@ -20,10 +21,12 @@ from app.core.life import format_life_state, life_evolution_debug
 from app.core.memory import (
     InternalTurnResult,
     LongTermMemoryStore,
+    Memory,
     MemoryContext,
     MemoryStore,
     WorkingMemory,
     akane_preference_answer,
+    estimate_tokens,
     established_akane_preference,
     format_relevant_memories,
     get_internal_state_store,
@@ -38,11 +41,7 @@ from app.core.prompt import (
     build_prompt_plan,
     format_turn_guidance,
 )
-from app.core.signal import (
-    SubtextAppraisal,
-    TurnSignal,
-    appraise_subtext,
-)
+from app.core.signal import TurnSignal
 from app.core.utils import compact_text
 from app.integrations.vscode_context import CodeContext, code_context_for_message
 
@@ -65,6 +64,44 @@ class GenerationQueueFullError(RuntimeError):
 
 class GenerationCancelled(RuntimeError):
     pass
+
+
+_DIRECT_REQUEST = re.compile(
+    r"^(?:please\s+)?(?:can|could|would)\s+you\b|"
+    r"^(?:please\s+)?(?:answer|check|compare|describe|explain|find|fix|give|help|"
+    r"implement|list|read|review|show|summarize|tell|test|write)\b|"
+    r"^(?:are|can|did|do|does|has|have|how|is|may|should|was|were|what|when|"
+    r"where|which|who|why|will)\b",
+    re.IGNORECASE,
+)
+_OPINION_REQUEST = re.compile(
+    r"\b(?:do you (?:like|prefer)|favorite|what do you think|what's your opinion|"
+    r"what is your opinion|your take)\b",
+    re.IGNORECASE,
+)
+_REASSURANCE_REQUEST = re.compile(
+    r"\b(?:are you sure|is that okay|is it okay|will (?:i|it|this) be okay|"
+    r"will (?:i|it|this) be all right)\b",
+    re.IGNORECASE,
+)
+_CLOSING = re.compile(
+    r"^(?:bye|goodbye|good night|goodnight|got it|okay,? thanks|ok,? thanks|"
+    r"thanks|thank you)[.! ]*$",
+    re.IGNORECASE,
+)
+_SIMPLE_PRAISE = re.compile(
+    r"^(?:good job|great job|nice work|well done)[.! ]*$",
+    re.IGNORECASE,
+)
+_ELABORATION_REQUEST = re.compile(
+    r"\b(?:detailed|in depth|step by step|thorough|walk me through)\b",
+    re.IGNORECASE,
+)
+_CREATIVE_SELF_REQUEST = re.compile(
+    r"\b(?:that|your)\s+(?:(?:creative|story|character)\s+)?(?:idea|concept)\b",
+    re.IGNORECASE,
+)
+_STYLE_DIRECTIVE_TOKEN_BUDGET = 96
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,12 +205,64 @@ class GenerationScheduler:
 
 
 @dataclass(frozen=True, slots=True)
+class ResponseIntention:
+    """One deterministic response goal with at most one companion behavior."""
+
+    primary: str
+    optional_behavior: str = "none"
+    continuity: str = "none"
+    grounding: str = "not required"
+    length: str = "concise"
+    question_permitted: bool = False
+    callback_permitted: bool = False
+    grounded_detail_permitted: bool = False
+    suppression_reasons: tuple[str, ...] = ()
+    direct_request: bool = False
+    active_thread: bool = False
+    relationship_safe: bool = False
+    correction_active: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledStyle:
+    """Discrete delivery state compiled into bounded, non-dialogue directives."""
+
+    directness: str
+    warmth: str
+    playfulness: str
+    bluntness: str
+    energy: str
+    emotional_openness: str
+    verbosity: str
+    humor: str
+    length: str
+    directives: tuple[tuple[str, str], ...]
+    baseline_source: str = "Akane compiler baseline"
+    intention_adjustments: tuple[str, ...] = ()
+    affect_adjustments: tuple[str, ...] = ()
+    relationship_adjustments: tuple[str, ...] = ()
+    mood_adjustments: tuple[str, ...] = ()
+    grounding_constraints: tuple[str, ...] = ()
+    validation_limits: tuple[int, int] = (0, 0)
+    teasing_gate: str = "closed"
+    question_gate: str = "closed"
+    callback_gate: str = "closed"
+    grounded_detail_gate: str = "closed"
+
+    @property
+    def compiled_categories(self) -> tuple[str, ...]:
+        return tuple(category for category, _value in self.directives)
+
+    def prompt_text(self) -> str:
+        return "\n".join(f"{category}: {value}" for category, value in self.directives)
+
+
+@dataclass(frozen=True, slots=True)
 class CoordinatedTurnContext:
     """Immutable, prompt-ready view of one coordinated turn."""
 
     state_delta: InternalTurnResult
     memory_context: MemoryContext
-    subtext: SubtextAppraisal | None
     behavioral_summary: str
     relationship_context: str = ""
     preference_context: str = ""
@@ -184,10 +273,676 @@ class CoordinatedTurnContext:
     date_time: str = ""
     preference_anchor: str = ""
     initiative_worthwhile: bool = True
+    response_intention: ResponseIntention = ResponseIntention("acknowledge")
+    compiled_style: CompiledStyle = CompiledStyle(
+        "high",
+        "medium",
+        "medium",
+        "medium",
+        "medium",
+        "medium",
+        "low",
+        "dry",
+        "concise",
+        (("Goal", "acknowledge"), ("Length", "concise")),
+    )
 
     @property
     def signal(self) -> TurnSignal:
         return self.state_delta.signal
+
+
+def _question_is_permitted(
+    signal: TurnSignal,
+    primary: str,
+    text: str,
+    recent_turns: tuple[object, ...],
+    *,
+    correction_prohibits: bool,
+    serious: bool,
+    direct_request: bool,
+) -> bool:
+    if (
+        correction_prohibits
+        or serious
+        or direct_request
+        or primary in {"answer", "comfort", "disagree", "reassure", "set boundary", "remain brief"}
+        or signal.intent not in {"casual", "reflection", "teasing"}
+        or _CLOSING.fullmatch(text)
+    ):
+        return False
+    assistant_outputs = [
+        str(getattr(turn, "content", "") or "").strip()
+        for turn in recent_turns
+        if getattr(turn, "role", "") == "assistant"
+    ]
+    if assistant_outputs and assistant_outputs[-1].rstrip().endswith("?"):
+        return False
+    return sum(output.rstrip().endswith("?") for output in assistant_outputs[-4:]) < 2
+
+
+def select_response_intention(
+    signal: TurnSignal,
+    memories: tuple[Memory, ...] = (),
+    memory_uses: tuple[tuple[str, str], ...] = (),
+    *,
+    user_text: str = "",
+    familiar_relationship: bool = False,
+    has_grounded_activity: bool = False,
+    recent_turns: tuple[object, ...] = (),
+) -> ResponseIntention:
+    """Select one response purpose from already-computed, structured turn state."""
+
+    text = str(user_text or signal.summary or "").strip()
+    request_segments = tuple(
+        segment.strip() for segment in re.split(r"[.!?]+", text) if segment.strip()
+    )
+    explicit_request = bool(
+        "?" in text or any(_DIRECT_REQUEST.search(segment) for segment in request_segments)
+    )
+    arcane_activity_update = bool(
+        signal.semantic_event.event_type == "activity"
+        and signal.semantic_event.actor in {"Arcane", "shared"}
+        and signal.semantic_event.temporal_state == "current"
+    )
+    use_by_id = dict(memory_uses)
+    used_memories = tuple(memory for memory in memories if memory.id in use_by_id)
+    active_thread = "thread" in use_by_id.values()
+    trusted_experience = any(
+        use_by_id.get(memory.id) == "self_experience"
+        and memory.source_type
+        in {"explicit_user", "recorded_offscreen", "verified_interface", "trusted_memory"}
+        for memory in used_memories
+    )
+    correction_active = bool(
+        signal.correction_requested or "correction" in use_by_id.values()
+    )
+    opinion_requested = bool(
+        signal.identity_attribute == "preferences" or _OPINION_REQUEST.search(text)
+    )
+    creative_experience_requested = bool(_CREATIVE_SELF_REQUEST.search(text))
+    experience_requested = bool(
+        signal.current_activity or creative_experience_requested
+    )
+    reassurance_requested = bool(_REASSURANCE_REQUEST.search(text))
+    generic_request = bool(
+        not signal.low_content
+        and not opinion_requested
+        and not reassurance_requested
+        and (
+            (
+                not experience_requested
+                and (
+                    signal.intent
+                    in {"technical", "instruction", "correction", "criticism", "identity"}
+                    or signal.technical
+                    or signal.code_context_requested
+                    or explicit_request
+                )
+            )
+            or (experience_requested and not (trusted_experience or has_grounded_activity))
+        )
+        and (not arcane_activity_update or explicit_request)
+    )
+    boundary_crossed = bool(signal.hostility)
+    distress = bool(signal.sadness or signal.intent == "emotional_support")
+    # TurnSignal has no objection flag; honor an explicit structured trigger or reaction.
+    substantive_objection = bool(
+        signal.trigger == "substantive_objection"
+        or signal.contextual_reaction.kind == "disagreement"
+    )
+    grounded_experience = experience_requested and (
+        trusted_experience or has_grounded_activity
+    )
+    meaningful_success = bool(
+        signal.task_success
+        and not generic_request
+        and not (signal.praise and _SIMPLE_PRAISE.fullmatch(text))
+    )
+    supported_reassurance = bool(
+        reassurance_requested
+        or (
+            signal.contextual_reaction.kind == "concern"
+            and not distress
+            and not generic_request
+        )
+    )
+    closing = bool(_CLOSING.fullmatch(text))
+
+    candidates = (
+        ("set boundary", boundary_crossed),
+        ("comfort", distress),
+        ("answer", generic_request),
+        ("disagree", substantive_objection),
+        ("celebrate", meaningful_success),
+        ("share experience", grounded_experience),
+        ("continue thread", active_thread and not generic_request),
+        ("state opinion", opinion_requested),
+        ("reassure", supported_reassurance),
+        ("acknowledge", not closing),
+        ("remain brief", True),
+    )
+    eligible = tuple(name for name, matches in candidates if matches)
+    primary = eligible[0]
+
+    serious = bool(
+        primary in {"set boundary", "comfort", "disagree", "reassure"}
+        or signal.intent == "serious"
+        or signal.sadness
+        or signal.hostility
+    )
+    affect_kind = signal.contextual_reaction.kind
+    explicit_playfulness = bool(signal.teasing or signal.intent == "teasing")
+    affect_permits_playfulness = bool(
+        explicit_playfulness
+        or affect_kind in {"amusement", "playfulness", "lingering amusement"}
+    )
+    relationship_safe = bool(
+        not serious
+        and not signal.hostility
+        and not signal.sadness
+        and signal.emotion_state.irritation < 0.35
+        and signal.emotion_state.frustration < 0.45
+    )
+    teasing_allowed = bool(
+        relationship_safe
+        and familiar_relationship
+        and not signal.technical
+        and affect_permits_playfulness
+        and explicit_playfulness
+    )
+    callback_allowed = bool(
+        relationship_safe
+        and familiar_relationship
+        and "callback" in use_by_id.values()
+        and not signal.technical
+    )
+    no_question_correction = any(
+        use_by_id.get(memory.id) == "correction"
+        and re.search(r"\b(?:ask|question|follow-up)\b", memory.content, re.IGNORECASE)
+        for memory in used_memories
+    )
+    question_allowed = _question_is_permitted(
+        signal,
+        primary,
+        text,
+        recent_turns,
+        correction_prohibits=no_question_correction,
+        serious=serious,
+        direct_request=generic_request,
+    )
+
+    suppression: list[str] = []
+    if serious:
+        suppression.append("serious context")
+    if correction_active:
+        suppression.append("active correction")
+    if generic_request or signal.technical:
+        suppression.append("direct task")
+    if experience_requested and not grounded_experience:
+        suppression.append("grounding uncertainty")
+
+    optional_behavior = "none"
+    optional_suppressed = bool(
+        serious
+        or correction_active
+        or generic_request
+        or signal.technical
+        or primary in {"set boundary", "comfort", "disagree", "reassure", "remain brief"}
+    )
+    if not optional_suppressed:
+        if primary == "share experience" and grounded_experience:
+            optional_behavior = "grounded personal detail"
+        elif callback_allowed and primary in {"acknowledge", "celebrate", "continue thread"}:
+            optional_behavior = "brief callback"
+        elif primary == "state opinion":
+            optional_behavior = "brief opinion"
+        elif teasing_allowed or affect_kind in {"amusement", "playfulness", "lingering_amusement"}:
+            optional_behavior = "light dry humor"
+        elif question_allowed and signal.semantic_event.event_type == "activity":
+            optional_behavior = "one natural question"
+        elif primary in {"acknowledge", "celebrate", "continue thread"} and not signal.low_content:
+            optional_behavior = "relevant observation"
+
+    grounding = "not required"
+    if experience_requested:
+        if creative_experience_requested and grounded_experience:
+            grounding = "stored creative premise"
+        elif trusted_experience:
+            grounding = "trusted self-memory"
+        elif has_grounded_activity:
+            grounding = "recorded activity"
+        else:
+            grounding = "no invented activity"
+    elif correction_active:
+        grounding = "apply correction silently"
+
+    continuity = (
+        "active thread"
+        if active_thread
+        else "brief callback available"
+        if callback_allowed
+        else "emotional context"
+        if "emotional_context" in use_by_id.values()
+        else "none"
+    )
+    length = (
+        "minimal"
+        if primary == "remain brief"
+        else "task-complete"
+        if primary == "answer" and (signal.technical or len(text.split()) >= 24 or "\n" in text)
+        else "concise"
+    )
+
+    return ResponseIntention(
+        primary=primary,
+        optional_behavior=optional_behavior,
+        continuity=continuity,
+        grounding=grounding,
+        length=length,
+        question_permitted=question_allowed,
+        callback_permitted=callback_allowed,
+        grounded_detail_permitted=grounded_experience,
+        suppression_reasons=tuple(dict.fromkeys(suppression)),
+        direct_request=generic_request,
+        active_thread=active_thread,
+        relationship_safe=relationship_safe,
+        correction_active=correction_active,
+    )
+
+
+def compile_akane_style(
+    signal: TurnSignal,
+    intention: ResponseIntention,
+    *,
+    user_text: str = "",
+    familiar_relationship: bool = False,
+) -> CompiledStyle:
+    """Compile existing turn state into one bounded model-visible style contract."""
+
+    style = {
+        "directness": "high",
+        "warmth": "medium",
+        "playfulness": "medium",
+        "bluntness": "medium",
+        "energy": "medium",
+        "emotional_openness": "medium",
+        "verbosity": "low",
+        "humor": "dry",
+    }
+    correction = intention.correction_active
+    callback_permission = intention.callback_permitted
+    self_experience = intention.grounded_detail_permitted
+
+    intention_adjustments: list[str] = []
+    affect_adjustments: list[str] = []
+    relationship_adjustments: list[str] = []
+    mood_adjustments: list[str] = []
+    grounding: list[str] = []
+    avoid = [
+        "service posture",
+        "forced follow-up",
+        "generic validation",
+        "internal-state narration",
+        "excessive hedging",
+        "unnecessary offers",
+    ]
+    primary = intention.primary
+
+    if signal.identity_attribute:
+        grounding.append("stable identity facts")
+    if correction:
+        grounding.append("apply supplied correction silently")
+        avoid.append("correction commentary")
+    if intention.grounding == "stored creative premise":
+        grounding.extend(
+            (
+                "stored premise",
+                "bounded fictional elaboration",
+                "no external-research claim",
+            )
+        )
+        avoid.append("invented past activity")
+    elif primary == "share experience" or self_experience:
+        grounding.extend(("recorded details only", "uncertainty for gaps"))
+        avoid.append("invented specifics")
+    elif intention.grounding == "no invented activity":
+        grounding.append("no unrecorded activity claim")
+    if signal.code_context_requested and not signal.code_context_attached:
+        grounding.append("available context only")
+        avoid.append("access claims")
+
+    if primary == "answer":
+        style.update(playfulness="low", humor="none")
+        intention_adjustments.append("clarity and task completeness")
+    elif primary == "acknowledge":
+        style["verbosity"] = "low"
+        intention_adjustments.append("concise specific acknowledgment")
+        grounding.append("stated update only")
+        avoid.extend(("unsupported assumptions", "invented significance"))
+        if not intention.question_permitted:
+            avoid.append("questions")
+    elif primary == "comfort":
+        style.update(
+            warmth="high",
+            playfulness="off",
+            bluntness="low",
+            energy="low",
+            emotional_openness="medium",
+            humor="none",
+        )
+        intention_adjustments.append("direct restrained comfort")
+        avoid.extend(("generic validation", "formal support language"))
+    elif primary == "celebrate":
+        style.update(
+            warmth="high",
+            playfulness="medium",
+            energy="high",
+            emotional_openness="medium",
+        )
+        intention_adjustments.append("warm concise celebration")
+    elif primary == "disagree":
+        style.update(
+            directness="high",
+            warmth="low",
+            playfulness="low",
+            bluntness="high",
+            humor="none",
+        )
+        intention_adjustments.append("clear controlled disagreement")
+        avoid.append("excessive hedging")
+    elif primary == "state opinion":
+        style["verbosity"] = "low"
+        intention_adjustments.append("direct evidence-calibrated opinion")
+        avoid.append("false certainty")
+    elif primary == "share experience":
+        style["verbosity"] = "low"
+        intention_adjustments.append("concise grounded experience")
+    elif primary == "continue thread":
+        intention_adjustments.append("focused topic continuity")
+        avoid.append("full-history recap")
+    elif primary == "reassure":
+        style.update(
+            warmth="high",
+            playfulness="off",
+            bluntness="low",
+            emotional_openness="medium",
+            humor="none",
+        )
+        intention_adjustments.append("evidence-bound reassurance")
+        avoid.extend(("unsupported certainty", "formal support language"))
+    elif primary == "set boundary":
+        style.update(
+            warmth="low",
+            playfulness="off",
+            bluntness="high",
+            energy="low",
+            humor="none",
+            verbosity="low",
+        )
+        intention_adjustments.append("firm controlled boundary")
+        avoid.append("escalation")
+    else:
+        style.update(playfulness="off", humor="none", verbosity="low")
+        intention_adjustments.append("minimal natural completion")
+
+    if intention.optional_behavior == "light dry humor":
+        style["humor"] = "dry"
+        intention_adjustments.append("dry humor permission")
+    elif intention.optional_behavior == "one natural question":
+        intention_adjustments.append("one relevant question permitted")
+    elif intention.optional_behavior == "brief callback":
+        intention_adjustments.append("one bounded callback")
+    elif intention.optional_behavior == "grounded personal detail":
+        intention_adjustments.append("one grounded personal detail")
+
+    reaction = signal.contextual_reaction.kind
+    if reaction == "concern":
+        style.update(
+            directness="high",
+            warmth="high",
+            playfulness="off",
+            bluntness="low",
+            energy="low",
+            humor="none",
+        )
+        affect_adjustments.append("current concern")
+    elif reaction in {"relief", "satisfaction", "pride", "appreciation"}:
+        style.update(energy="high", emotional_openness="medium")
+        if familiar_relationship and intention.relationship_safe:
+            style["humor"] = "dry"
+        affect_adjustments.append("current relief or pride")
+    elif reaction in {"amusement", "playfulness"}:
+        if intention.relationship_safe and not signal.technical:
+            style["playfulness"] = "high"
+            if familiar_relationship:
+                style["humor"] = "dry"
+        affect_adjustments.append("current amusement")
+    elif reaction in {"skepticism", "skeptical"}:
+        style.update(directness="high", bluntness="high", warmth="low")
+        affect_adjustments.append("current skepticism")
+    elif reaction in {"irritation", "criticism", "lingering_irritation"}:
+        style.update(playfulness="off", bluntness="high", warmth="low", humor="none")
+        affect_adjustments.append("composed irritation")
+    elif reaction in {"embarrassment", "lingering_embarrassment"}:
+        style["emotional_openness"] = "medium"
+        affect_adjustments.append("restrained embarrassment")
+        avoid.extend(("exaggerated mannerisms", "forced hesitation"))
+    elif reaction in {"excitement", "lingering_excitement"}:
+        style.update(energy="high", emotional_openness="medium")
+        affect_adjustments.append("bounded excitement")
+
+    active = (
+        signal.emotion_state.active_emotions[0]
+        if signal.emotion_state.active_emotions
+        else None
+    )
+    serious = bool(
+        primary in {"comfort", "disagree", "reassure", "set boundary"}
+        or signal.intent == "serious"
+        or signal.sadness
+        or signal.hostility
+        or reaction == "concern"
+        or (active is not None and active.kind == "concern")
+    )
+    if serious:
+        style.update(playfulness="off", humor="none")
+        affect_adjustments.append("serious-context suppression")
+
+    tension = bool(
+        signal.hostility
+        or signal.emotion_state.irritation >= 0.35
+        or signal.emotion_state.frustration >= 0.45
+    )
+    if tension:
+        style.update(playfulness="off", warmth="low", humor="none")
+        relationship_adjustments.append("high tension restraint")
+        avoid.append("callbacks")
+    elif familiar_relationship:
+        relationship_adjustments.append("familiar casual register")
+        if not serious and not signal.technical and style["playfulness"] == "low":
+            style["playfulness"] = "medium"
+    if (
+        signal.emotion_state.warmth >= 0.65
+        and primary in {"acknowledge", "celebrate", "comfort", "reassure"}
+    ):
+        style["warmth"] = "high"
+        relationship_adjustments.append("available relationship warmth")
+    if active is not None:
+        if active.kind == "concern":
+            style.update(warmth="high", playfulness="off", bluntness="low", humor="none")
+        elif active.kind == "irritation" and not serious:
+            style.update(playfulness="off", bluntness="high", humor="none")
+        elif active.kind == "embarrassment":
+            style["emotional_openness"] = "medium"
+        elif active.kind == "excitement":
+            style.update(energy="high", emotional_openness="medium")
+        affect_adjustments.append(f"short emotion: {active.kind}")
+
+    mood = signal.emotion_state
+    if not serious and style["energy"] == "medium" and mood.energy < 0.35:
+        style["energy"] = "low"
+        mood_adjustments.append("low persistent energy")
+    if (
+        not serious
+        and mood.valence >= 0.25
+        and primary in {"acknowledge", "celebrate"}
+    ):
+        style["warmth"] = "high"
+        mood_adjustments.append("subtle positive mood")
+    if not serious and mood.irritation >= 0.35:
+        style.update(playfulness="off", bluntness="high", humor="none")
+        mood_adjustments.append("negative high-arousal restraint")
+    if mood.patience < 0.35:
+        style["humor"] = "none"
+        mood_adjustments.append("low-composure humor suppression")
+
+    final_teasing_open = bool(
+        signal.teasing
+        and intention.relationship_safe
+        and familiar_relationship
+        and not signal.technical
+        and not serious
+        and not tension
+    )
+    final_callback_open = bool(
+        callback_permission
+        and familiar_relationship
+        and not serious
+        and not tension
+        and not signal.technical
+    )
+    if not final_callback_open:
+        avoid.append("callbacks")
+
+    if serious:
+        style.update(playfulness="off", humor="none")
+    if serious or tension or signal.technical or primary == "answer":
+        style["humor"] = "none"
+
+    text = str(user_text or signal.summary or "")
+    detailed = bool(_ELABORATION_REQUEST.search(text))
+    task_complex = bool(signal.technical or len(text.split()) >= 24 or "\n" in text)
+    if primary == "remain brief":
+        length = intention.length
+        limits = (1, 1)
+    elif detailed:
+        length = "detailed as requested"
+        limits = (0, 0)
+        style["verbosity"] = "high"
+    elif intention.length == "task-complete" or primary in {"answer", "continue thread"} and task_complex:
+        length = "task-complete"
+        limits = (0, 0)
+        style["verbosity"] = "medium"
+    else:
+        length = "concise"
+        limits = (1, 4)
+        style["verbosity"] = "low"
+
+    situation = (
+        "direct technical request"
+        if signal.technical
+        else "creative follow-up"
+        if intention.grounding == "stored creative premise"
+        else "direct request"
+        if intention.direct_request
+        else "Akane activity question"
+        if signal.current_activity
+        else "user completion"
+        if signal.semantic_event.confirmed_completion
+        else "emotional disclosure"
+        if signal.sadness
+        else "active topic continuation"
+        if intention.active_thread
+        else "casual update"
+    )
+    reaction_guidance = (
+        "serious and restrained"
+        if serious
+        else reaction.replace("_", " ")
+        if reaction not in {"", "neutral"}
+        else "natural companion participation"
+    )
+    directives: list[tuple[str, str]] = [
+        ("Situation", situation),
+        ("Reaction", reaction_guidance),
+        ("Goal", primary),
+    ]
+    if intention.optional_behavior != "none":
+        directives.append(("Optional", intention.optional_behavior))
+    if intention.continuity != "none":
+        directives.append(("Continuity", intention.continuity))
+    if grounding:
+        directives.append(("Grounding", "; ".join(dict.fromkeys(grounding))))
+    directives.append(("Length", length))
+    directives.append(("Avoid", "; ".join(dict.fromkeys(avoid))))
+    directives = [(category, value) for category, value in directives if value]
+    while estimate_tokens(
+        "\n".join(f"{category}: {value}" for category, value in directives)
+    ) > _STYLE_DIRECTIVE_TOKEN_BUDGET:
+        avoid_index = next(
+            (index for index, item in enumerate(directives) if item[0] == "Avoid"),
+            -1,
+        )
+        if avoid_index < 0:
+            break
+        values = directives[avoid_index][1].split("; ")
+        if len(values) <= 2:
+            break
+        removable = next(
+            (
+                value
+                for value in (
+                    "unnecessary offers",
+                    "excessive hedging",
+                    "internal-state narration",
+                    "forced follow-up",
+                    "callbacks",
+                    "generic validation",
+                )
+                if value in values
+            ),
+            "",
+        )
+        if not removable:
+            break
+        values.remove(removable)
+        directives[avoid_index] = ("Avoid", "; ".join(values))
+
+    return CompiledStyle(
+        directness=style["directness"],
+        warmth=style["warmth"],
+        playfulness=style["playfulness"],
+        bluntness=style["bluntness"],
+        energy=style["energy"],
+        emotional_openness=style["emotional_openness"],
+        verbosity=style["verbosity"],
+        humor=style["humor"],
+        length=length,
+        directives=tuple(directives),
+        intention_adjustments=tuple(dict.fromkeys(intention_adjustments)),
+        affect_adjustments=tuple(dict.fromkeys(affect_adjustments)),
+        relationship_adjustments=tuple(dict.fromkeys(relationship_adjustments)),
+        mood_adjustments=tuple(dict.fromkeys(mood_adjustments)),
+        grounding_constraints=tuple(dict.fromkeys(grounding)),
+        validation_limits=limits,
+        teasing_gate="open" if final_teasing_open else "closed",
+        question_gate=(
+            "open"
+            if intention.optional_behavior == "one natural question" and not serious
+            else "closed"
+        ),
+        callback_gate=(
+            "open"
+            if final_callback_open and intention.optional_behavior == "brief callback"
+            else "closed"
+        ),
+        grounded_detail_gate=(
+            "open"
+            if intention.optional_behavior == "grounded personal detail" and not serious
+            else "closed"
+        ),
+    )
 
 
 class InternalStateCoordinator:
@@ -219,6 +974,7 @@ class InternalStateCoordinator:
             query=chat.text,
             include_memory=not skip_memory and not chat.autonomous,
         )
+        familiar_relationship = bool(memory_context.recent_turns)
         conversation_working = WorkingMemory(
             current_topic=memory_context.current_topic,
             current_task=memory_context.current_task,
@@ -234,7 +990,7 @@ class InternalStateCoordinator:
             code_context_requested=code_context.requested,
             code_context_attached=bool(code_context.prompt_text),
             autonomous=chat.autonomous,
-            familiar_relationship=bool(memory_context.recent_turns),
+            familiar_relationship=familiar_relationship,
             working_context=conversation_working,
             activity_scope=chat.conversation_id,
         )
@@ -248,15 +1004,6 @@ class InternalStateCoordinator:
             memory_context = MemoryContext("", ())
 
         working = state_delta.working_context
-        subtext = None if chat.autonomous or stable_identity else appraise_subtext(
-            chat.text,
-            signal,
-            memory_context.recent_turns,
-            current_topic=working.current_topic,
-            current_task=working.current_task,
-            unresolved_problem=working.unresolved_problem,
-            now=chat.timestamp,
-        )
         preference_memory = (
             established_akane_preference(
                 state_delta.state.memories,
@@ -273,7 +1020,11 @@ class InternalStateCoordinator:
         preference_anchor = (
             "" if preference_change_allowed else akane_preference_answer(preference_memory)
         )
-        selected_memories = [] if stable_identity else list(state_delta.recalled_memories)
+        selected_memories = (
+            []
+            if stable_identity
+            else list(state_delta.recalled_memories)
+        )
         if preference_memory is not None and all(
             memory.id != preference_memory.id for memory in selected_memories
         ):
@@ -283,30 +1034,37 @@ class InternalStateCoordinator:
             for memory in selected_memories
             if preference_memory is None or memory.id != preference_memory.id
         )
+        memory_context_text = format_relevant_memories(
+            relevant_memories,
+            state_delta.memory_uses,
+        )
         memory_context = replace(
             memory_context,
             memory_ids=tuple(memory.id for memory in selected_memories),
-            memory_contents=tuple(memory.content for memory in selected_memories),
+            memory_contents=tuple(
+                compact_text(memory.content, 120) for memory in selected_memories
+            ),
+        )
+        response_intention = select_response_intention(
+            signal,
+            state_delta.recalled_memories,
+            state_delta.memory_uses,
+            user_text=chat.text,
+            familiar_relationship=familiar_relationship,
+            has_grounded_activity=state_delta.grounded_activity_source != "none",
+            recent_turns=memory_context.recent_turns,
+        )
+        compiled_style = compile_akane_style(
+            signal,
+            response_intention,
+            user_text=chat.text,
+            familiar_relationship=familiar_relationship,
         )
 
         guidance = format_turn_guidance(
-            _turn_guidance(
-                signal,
-                chat,
-                has_grounded_activity=state_delta.grounded_activity_source != "none",
-            )
+            _turn_guidance(compiled_style)
         )
-        guidance_parts = [guidance]
-        if not stable_identity:
-            guidance_parts.extend(
-                (
-                    state_delta.prompt_context,
-                    subtext.behavioral_effect if subtext else "",
-                )
-            )
-        behavioral_summary = "\n".join(
-            value for part in guidance_parts if (value := str(part or "").strip())
-        )
+        behavioral_summary = guidance
 
         editor_context = code_context.prompt_text
         if code_context.requested and not code_context.connected:
@@ -315,7 +1073,7 @@ class InternalStateCoordinator:
             )
         initiative_worthwhile = not chat.autonomous or any(
             (
-                bool(state_delta.recalled_memories),
+                bool(selected_memories),
                 bool(working.unresolved_problem),
                 bool(preference_memory),
             )
@@ -323,7 +1081,6 @@ class InternalStateCoordinator:
         return CoordinatedTurnContext(
             state_delta=state_delta,
             memory_context=memory_context,
-            subtext=subtext,
             behavioral_summary=behavioral_summary,
             relationship_context="" if stable_identity else memory_context.relationship,
             preference_context=(
@@ -335,7 +1092,7 @@ class InternalStateCoordinator:
                 )
             ),
             relevant_memories=(
-                "" if stable_identity else format_relevant_memories(relevant_memories)
+                "" if stable_identity else memory_context_text
             ),
             life_context=(
                 format_life_state(
@@ -351,6 +1108,8 @@ class InternalStateCoordinator:
             date_time=date_time_line() if _time_context_relevant(chat.text) else "",
             preference_anchor=preference_anchor,
             initiative_worthwhile=initiative_worthwhile,
+            response_intention=response_intention,
+            compiled_style=compiled_style,
         )
 
     def commit_completed_turn(
@@ -623,42 +1382,8 @@ def timing_enabled() -> bool:
     return _TIMING_ENABLED
 
 
-def _turn_guidance(
-    signal: TurnSignal,
-    chat: ChatInput,
-    *,
-    has_grounded_activity: bool = False,
-) -> TurnGuidance | None:
-    repetition_level = 0
-    if signal.repetition:
-        if signal.repetition_count >= 5:
-            repetition_level = 3
-        elif signal.repetition_count >= 3:
-            repetition_level = 2
-        else:
-            repetition_level = 1
-    group_conversation = (
-        chat.source == "discord" and chat.group_conversation and not chat.autonomous
-    )
-    if not (
-        chat.autonomous
-        or signal.identity_attribute
-        or signal.current_activity
-        or group_conversation
-        or signal.criticism
-        or signal.correction_requested
-        or repetition_level
-    ):
-        return None
-    return TurnGuidance(
-        autonomous=chat.autonomous,
-        identity_attribute=signal.identity_attribute,
-        current_activity=signal.current_activity and has_grounded_activity,
-        group_conversation=group_conversation,
-        criticism=signal.criticism,
-        correction_requested=signal.correction_requested,
-        repetition_level=repetition_level,
-    )
+def _turn_guidance(style: CompiledStyle) -> TurnGuidance:
+    return TurnGuidance(style_directives=style.directives)
 
 
 def _preference_continuity(content: str, change_allowed: bool) -> str:

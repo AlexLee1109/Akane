@@ -6,7 +6,6 @@ import hashlib
 import math
 import re
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 
@@ -70,7 +69,76 @@ _CURRENT_THOUGHT_PATTERN = _phrase_group(
 _IMPLEMENTATION_TOPIC_PATTERN = _phrase_group(
     "emotional state work|internal state|state system|llama.cpp|during inference"
 )
-
+_ACTIVITY_UPDATE = re.compile(
+    r"\b(?P<actor>i|we)(?:(?:'m)|\s+(?:am|are))?\s+"
+    r"(?P<time>currently\s+|still\s+|now\s+)?"
+    r"(?P<action>watching|working\s+on|coding|playing|reading|studying)"
+    r"(?:\s+(?P<subject>[^\n.!?;]{1,160}))?",
+    re.IGNORECASE,
+)
+_ACTIVITY_TRANSITION = re.compile(
+    r"\b(?P<actor>i|we)\s+(?P<transition>started|began|paused|resumed|switched\s+to)\s+"
+    r"(?P<subject>[^\n.!?;]{2,160})",
+    re.IGNORECASE,
+)
+_PAST_ACTIVITY = re.compile(
+    r"\b(?P<actor>i|we)\s+(?P<action>watched|played|read|studied|coded|worked\s+on)\s+"
+    r"(?P<subject>[^\n.!?;]{2,160})",
+    re.IGNORECASE,
+)
+_COMPLETION_ACTION = re.compile(
+    r"\b(?P<actor>i|we)\s+(?P<verb>completed|finished|fixed|solved|shipped|wrapped\s+up)\s+"
+    r"(?P<subject>[^\n.!?;]{2,180})",
+    re.IGNORECASE,
+)
+_DONE_ACTION = re.compile(
+    r"\b(?P<actor>i|we)(?:(?:'m)|\s+(?:am|are))?\s+done\s+(?:with\s+)?"
+    r"(?P<subject>[^\n.!?;]{2,180})",
+    re.IGNORECASE,
+)
+_QUALIFIED_COMPLETION_ACTION = re.compile(
+    r"\b(?P<actor>i|we)\s+(?:(?:have(?:n't)?|has(?:n't)?|had|did(?:n't)?|am|are)\s+)?"
+    r"(?:(?:not|never|almost|nearly|partially|partly)\s+)?"
+    r"(?P<verb>complete(?:d)?|finish(?:ed)?|fix(?:ed)?|solve(?:d)?|ship(?:ped)?|wrapped\s+up)\s+"
+    r"(?P<subject>[^\n.!?;]{2,180})",
+    re.IGNORECASE,
+)
+_COMPLETION_PREDICATE = re.compile(
+    r"\b(?P<subject>[^\n.!?;]{2,160}?)\s+(?:is|are)\s+"
+    r"(?P<status>completed|complete|done|fixed|solved|passing|working\s+now)\b",
+    re.IGNORECASE,
+)
+_QUALIFIED_COMPLETION_PREDICATE = re.compile(
+    r"\b(?P<subject>[^\n.!?;]{2,160}?)\s+(?:is|are|was|were)\s+"
+    r"(?P<qualifier>not|never|almost|nearly|partially|partly|not\s+quite)\s+"
+    r"(?P<status>completed|complete|done|fixed|solved|passing|working)\b",
+    re.IGNORECASE,
+)
+_COMPLETION_NEGATION = re.compile(
+    r"\b(?:did\s+not|didn't|have\s+not|haven't|has\s+not|hasn't|is\s+not|isn't|"
+    r"not|never)\b[^\n.!?;]{0,45}\b(?:complete|completed|done|finish|finished|fixed|"
+    r"passing|shipped|solved|working)\b|"
+    r"\b(?:complete|completed|done|finish|finished|fixed|passing|shipped|solved|working)\b"
+    r"[^\n.!?;]{0,20}\bnot\b",
+    re.IGNORECASE,
+)
+_PARTIAL_COMPLETION = re.compile(
+    r"\b(?:almost|nearly|partially|partly|not\s+quite)\b[^\n.!?;]{0,50}"
+    r"\b(?:complete|completed|done|finish|finished|fixed|passing|shipped|solved)\b|"
+    r"\b(?:almost|nearly|partially|partly)\s+done\b",
+    re.IGNORECASE,
+)
+_FALSE_COMPLETION = re.compile(
+    r"\bthought\b[^\n.!?;]{0,70}\b(?:complete|completed|done|fixed|solved|working)\b"
+    r"[^\n.!?;]{0,70}\b(?:but|yet)\b[^\n.!?;]{0,35}"
+    r"\b(?:broke|broken|failed|failing|not\s+working|still\s+broken)\b",
+    re.IGNORECASE,
+)
+_FAILURE_STATE = re.compile(
+    r"\b(?P<subject>[^\n.!?;]{2,160}?)\s+(?:is|are|was|were)\s+"
+    r"(?P<status>still\s+broken|broken|failing|not\s+working|failed)\b",
+    re.IGNORECASE,
+)
 _POSITIVE_MARKERS = _phrase_group(
     "appreciate it|awesome|glad|good morning|good night|great|happy|nice|sweet|thank you|thanks"
 )
@@ -109,19 +177,6 @@ _HOSTILITY_MARKERS = _phrase_group(
     "hate you|shut up|you are an idiot|you are a useless idiot|you are a useless|"
     "you are stupid|you are useless|you idiot|you're an idiot|you're a useless idiot|"
     "you're a useless|you're stupid|you're useless"
-)
-_INDIRECT_REQUEST_MARKERS = _phrase_group(
-    "any chance you could|could you maybe|do you think you could|i wonder if you could|"
-    "it would be helpful if|it would be nice if|maybe you could|perhaps you could|"
-    "would you mind"
-)
-_EXPLICIT_DISCLOSURE = re.compile(
-    r"\b(?:i am|i feel|i have been feeling|i'm|i've been feeling)\b",
-    re.IGNORECASE,
-)
-_CORRECTION_REFERENCE = _phrase_group(
-    "but you said|i asked for|i meant|not what i asked|that's not what|that is not what|"
-    "you said|your last answer"
 )
 _CRITICISM_MARKERS = _phrase_group(
     "bad answer|bad take|just answer|not helpful|sounds like a chatbot|stop analyzing|"
@@ -349,6 +404,30 @@ class TurnContext:
     memory_relevance: float = 0.0
     meaningful_memory: bool = False
     familiar_relationship: bool = False
+    completion_meaningful: bool = False
+    completion_resolves_thread: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticEvent:
+    """Canonical, lossless-enough event semantics for one explicit user statement."""
+
+    subject: str = ""
+    event_type: str = "none"
+    status: str = "none"
+    actor: str = "unknown"
+    target: str = ""
+    temporal_state: str = "none"
+    negated: bool = False
+    confidence: float = 0.0
+
+    @property
+    def confirmed_completion(self) -> bool:
+        return (
+            self.event_type == "completion"
+            and self.status == "completed"
+            and not self.negated
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +460,7 @@ class TurnSignal:
     emotion_state: EmotionState = EmotionState(updated_at=0.0)
     emotional_signal: EmotionalSignal = EmotionalSignal()
     contextual_reaction: ContextualReaction = ContextualReaction()
+    semantic_event: SemanticEvent = SemanticEvent()
 
     @property
     def low_content(self) -> bool:
@@ -402,188 +482,6 @@ class TurnSignal:
 
     def emotion_prompt(self) -> str:
         return format_response_disposition(self)
-
-
-@dataclass(frozen=True, slots=True)
-class SubtextAppraisal:
-    """One ephemeral, uncertain interpretation used only for response shaping."""
-
-    kind: str
-    summary: str
-    confidence: float
-    behavioral_effect: str
-
-
-def appraise_subtext(
-    user_text: str,
-    signal: TurnSignal,
-    recent_turns: Iterable[object] | None,
-    *,
-    current_topic: str = "",
-    current_task: str = "",
-    unresolved_problem: bool = False,
-    now: float | None = None,
-) -> SubtextAppraisal | None:
-    """Infer one bounded conversational hypothesis from combined evidence."""
-
-    current = time.time() if now is None else max(0.0, float(now))
-    recent = _active_recent_turns(recent_turns, now=current)[-12:]
-    recent_users = [content for role, content in recent if role == "user"]
-    recent_assistants = [content for role, content in recent if role == "assistant"]
-    candidates: list[tuple[float, int, str, str, str]] = []
-
-    def candidate(
-        kind: str,
-        score: float,
-        summary: str,
-        behavioral_effect: str,
-        priority: int,
-    ) -> None:
-        if score >= 0.60:
-            candidates.append(
-                (
-                    clamp(score),
-                    priority,
-                    kind,
-                    compact_text(summary, 180),
-                    compact_text(behavioral_effect, 180),
-                )
-            )
-
-    similar_users = [
-        content for content in recent_users if message_similarity(content, user_text) >= 0.74
-    ]
-    repeated_turns = len(similar_users) + 1
-    repeated_assistant_pairs = sum(
-        message_similarity(left, right) >= 0.82
-        for left, right in zip(recent_assistants, recent_assistants[1:])
-    )
-    if repeated_turns >= 3:
-        repetition_score = 0.60 + min(0.22, (repeated_turns - 3) * 0.07)
-        repetition_score += min(0.08, repeated_assistant_pairs * 0.04)
-        stalled = repeated_assistant_pairs > 0
-        candidate(
-            "repeated_pattern",
-            repetition_score,
-            (
-                "The user may be checking consistency or signaling that earlier replies "
-                "did not resolve the point."
-                if stalled
-                else "The user may be emphasizing the same point or checking whether the answer changes."
-            ),
-            (
-                "Answer more directly and concisely; lightly recognize the established pattern "
-                "only if natural, while remaining patient and non-dismissive."
-                if repeated_turns >= 5
-                else "Stay patient and answer directly. Change wording, structure, reason, or "
-                "emphasis without changing established facts or preferences, and do not force "
-                "acknowledgment of repetition."
-            ),
-            3,
-        )
-
-    prior_failures = sum(bool(_FAILURE_MARKERS.search(content)) for content in recent_users[-6:])
-    failure_context = bool(current_task or current_topic or signal.technical)
-    candidate(
-        "unresolved_failure",
-        0.38
-        + (0.10 if signal.task_failure else 0.0)
-        + (0.18 if prior_failures else 0.0)
-        + (0.08 if unresolved_problem and prior_failures else 0.0)
-        + (0.04 if failure_context and prior_failures else 0.0),
-        "The user may be indicating that the earlier approach still has not solved the task.",
-        "Acknowledge the prior failure briefly, simplify where useful, and give a concrete next step instead of repeating the same advice.",
-        0,
-    )
-
-    correction_reference = bool(_CORRECTION_REFERENCE.search(user_text))
-    candidate(
-        "correction",
-        0.43
-        + (0.12 if signal.correction_requested else 0.0)
-        + (0.09 if recent_assistants else 0.0)
-        + (0.08 if correction_reference else 0.0),
-        "The user may be redirecting the conversation toward a corrected understanding.",
-        "Prioritize the correction, avoid defending the earlier answer, and confirm the revised target through the answer itself.",
-        1,
-    )
-
-    indirect_hits = len(_INDIRECT_REQUEST_MARKERS.findall(user_text))
-    candidate(
-        "indirect_request",
-        0.42
-        + min(0.18, indirect_hits * 0.12)
-        + (0.08 if "?" in user_text else 0.0)
-        + (0.08 if current_task or current_topic else 0.0)
-        + (0.05 if recent_assistants else 0.0),
-        "The user may be making a request indirectly rather than merely commenting.",
-        "Respond to the likely request directly without overcommitting to an assumption.",
-        4,
-    )
-
-    disclosed = bool(_EXPLICIT_DISCLOSURE.search(user_text))
-    disclosed_vulnerability = bool(_VULNERABILITY_MARKERS.search(user_text))
-    candidate(
-        "emotional_disclosure",
-        0.48
-        + (0.14 if disclosed and (signal.sadness or disclosed_vulnerability) else 0.0)
-        + (0.07 if recent_assistants else 0.0),
-        "The user may want their disclosed experience acknowledged before advice or problem-solving.",
-        "Lead with measured warmth and acknowledgment; do not diagnose, overinterpret, or claim certainty about their feelings.",
-        2,
-    )
-
-    prior_warmth = any(_POSITIVE_MARKERS.search(content) for content in recent_users[-4:])
-    candidate(
-        "tone_shift",
-        0.46
-        + (0.10 if signal.criticism or signal.frustration else 0.0)
-        + (0.09 if prior_warmth else 0.0)
-        + (0.06 if recent_assistants else 0.0),
-        "The user's tone may have shifted because the conversation is not meeting their need.",
-        "Increase caution and directness, acknowledge the concern without assigning a motive, and avoid repeating the same framing.",
-        5,
-    )
-
-    if not candidates:
-        return None
-    score, _priority, kind, summary, effect = sorted(
-        candidates,
-        key=lambda item: (-item[0], item[1], item[2]),
-    )[0]
-    return SubtextAppraisal(kind, summary, score, effect)
-
-
-def _active_recent_turns(
-    recent_turns: Iterable[object] | None,
-    *,
-    now: float,
-) -> list[tuple[str, str]]:
-    active: list[tuple[str, str]] = []
-    for turn in tuple(recent_turns or ())[-12:]:
-        role = str(
-            turn.get("role", "") if isinstance(turn, dict) else getattr(turn, "role", "")
-        )
-        content = str(
-            turn.get("content", turn.get("text", ""))
-            if isinstance(turn, dict)
-            else getattr(turn, "content", "")
-        ).strip()
-        raw_timestamp = (
-            turn.get("timestamp", 0.0)
-            if isinstance(turn, dict)
-            else getattr(turn, "timestamp", 0.0)
-        )
-        try:
-            timestamp = max(0.0, float(raw_timestamp or 0.0))
-        except (TypeError, ValueError):
-            timestamp = 0.0
-        if not content or role not in {"user", "assistant"}:
-            continue
-        if timestamp and now > timestamp and now - timestamp > 6 * 3600:
-            continue
-        active.append((role, content))
-    return active
 
 
 def advance_emotion(state: EmotionState, *, now: float) -> EmotionState:
@@ -730,6 +628,131 @@ def _circadian_energy_target(hour: int) -> float:
     return 0.52
 
 
+def semantic_event_from_text(user_text: str) -> SemanticEvent:
+    """Normalize one explicit activity or outcome without discarding its verb."""
+
+    text = compact_text(user_text, 240)
+    if not text:
+        return SemanticEvent()
+
+    def actor_of(match: re.Match[str] | None) -> str:
+        if match is None:
+            return "unknown"
+        return "shared" if match.groupdict().get("actor", "").casefold() == "we" else "Arcane"
+
+    def clean(value: str, *, limit: int = 180) -> str:
+        normalized = compact_text(value, limit).strip(" ,:-")
+        return re.sub(r"^(?:the|a|an)\s+", "", normalized, flags=re.IGNORECASE)
+
+    completion = (
+        _COMPLETION_ACTION.search(text)
+        or _DONE_ACTION.search(text)
+        or _QUALIFIED_COMPLETION_ACTION.search(text)
+    )
+    predicate = (
+        _COMPLETION_PREDICATE.search(text)
+        or _QUALIFIED_COMPLETION_PREDICATE.search(text)
+    )
+    false_completion = bool(_FALSE_COMPLETION.search(text))
+    partial = bool(_PARTIAL_COMPLETION.search(text))
+    negated = bool(_COMPLETION_NEGATION.search(text))
+    if completion is not None or predicate is not None or false_completion:
+        match = completion or predicate
+        subject = clean(match.groupdict().get("subject", "")) if match else "it"
+        if false_completion:
+            status = "failed"
+        elif partial:
+            status = "partial"
+        elif negated:
+            status = "not_completed"
+        else:
+            status = "completed"
+        return SemanticEvent(
+            subject=subject,
+            event_type="completion",
+            status=status,
+            actor=(
+                actor_of(completion)
+                if completion is not None
+                else "Arcane" if re.search(r"\bI\b", text, re.IGNORECASE) else "unknown"
+            ),
+            target=subject,
+            temporal_state="past" if status == "completed" else "current",
+            negated=negated or false_completion,
+            confidence=0.96,
+        )
+
+    transition = _ACTIVITY_TRANSITION.search(text)
+    if transition is not None:
+        transition_kind = transition.group("transition").casefold()
+        raw_subject = clean(transition.group("subject"))
+        status = {
+            "paused": "paused",
+            "started": "started",
+            "began": "started",
+            "resumed": "resumed",
+            "switched to": "switched",
+        }.get(transition_kind, "ongoing")
+        return SemanticEvent(
+            subject=raw_subject,
+            event_type="activity",
+            status=status,
+            actor=actor_of(transition),
+            target=raw_subject,
+            temporal_state="current",
+            confidence=0.94,
+        )
+
+    activity = _ACTIVITY_UPDATE.search(text)
+    if activity is not None:
+        action = re.sub(r"\s+", " ", activity.group("action").casefold())
+        target = clean(activity.group("subject") or "")
+        subject = clean(f"{action} {target}")
+        return SemanticEvent(
+            subject=subject,
+            event_type="activity",
+            status="ongoing",
+            actor=actor_of(activity),
+            target=target,
+            temporal_state="current",
+            confidence=0.95,
+        )
+
+    past_activity = _PAST_ACTIVITY.search(text)
+    if past_activity is not None:
+        action = re.sub(r"\s+", " ", past_activity.group("action").casefold())
+        target = clean(past_activity.group("subject"))
+        return SemanticEvent(
+            subject=clean(f"{action} {target}"),
+            event_type="activity",
+            status="completed",
+            actor=actor_of(past_activity),
+            target=target,
+            temporal_state="past",
+            confidence=0.92,
+        )
+
+    failure = _FAILURE_STATE.search(text)
+    if failure is not None:
+        subject = clean(failure.group("subject"))
+        if re.search(r"\bwe\b", text, re.IGNORECASE):
+            actor = "shared"
+        elif re.search(r"\b(?:I|my)\b", text, re.IGNORECASE):
+            actor = "Arcane"
+        else:
+            actor = "unknown"
+        return SemanticEvent(
+            subject=subject,
+            event_type="failure",
+            status="failed",
+            actor=actor,
+            target=subject,
+            temporal_state="current",
+            confidence=0.90,
+        )
+    return SemanticEvent()
+
+
 def analyze_turn(
     user_text: str,
     *,
@@ -739,15 +762,18 @@ def analyze_turn(
     emotion_state_is_current: bool = False,
     code_context_requested: bool = False,
     code_context_attached: bool = False,
+    semantic_event: SemanticEvent | None = None,
 ) -> TurnSignal:
     summary = compact_text(user_text, _SUMMARY_CHARS)
     lower = summary.casefold()
     tokens = words(lower)
+    event = semantic_event or semantic_event_from_text(summary)
     evidence = _appraise(
         summary,
         lower,
         tokens,
         turn_context=turn_context,
+        semantic_event=event,
         code_context_requested=code_context_requested,
         code_context_attached=code_context_attached,
     )
@@ -811,6 +837,7 @@ def analyze_turn(
         current_thought=current_thought,
         emotional_signal=emotional_signal,
         contextual_reaction=contextual_reaction,
+        semantic_event=event,
     )
 
 
@@ -820,6 +847,7 @@ def _appraise(
     tokens: set[str],
     *,
     turn_context: TurnContext | None,
+    semantic_event: SemanticEvent,
     code_context_requested: bool,
     code_context_attached: bool,
 ) -> dict[str, float]:
@@ -831,6 +859,14 @@ def _appraise(
     failure = float(bool(_FAILURE_MARKERS.search(text)))
     success = float(bool(_SUCCESS_MARKERS.search(text)))
     context = turn_context or TurnContext()
+    if semantic_event.confirmed_completion and context.completion_meaningful:
+        success = 1.0
+    elif semantic_event.event_type == "completion" and (
+        semantic_event.negated or semantic_event.status in {"partial", "not_completed", "failed"}
+    ):
+        success = 0.0
+    if semantic_event.status == "failed":
+        failure = 1.0
     contextual_reference = bool(
         context.unresolved_problem
         and (
@@ -908,13 +944,10 @@ def _appraise(
         bool(_CRITICISM_MARKERS.search(text))
         or (correction and bool(tokens & {"answer", "response", "you"}))
     )
-    praise = max(
-        success,
-        float(
-            positive
-            and not gratitude
-            and bool(tokens & {"answer", "job", "work", "you"})
-        ),
+    praise = float(
+        positive
+        and not gratitude
+        and bool(tokens & {"answer", "job", "work", "you"})
     )
     low = low_content(text)
     personally_directed = float(
@@ -1028,6 +1061,9 @@ def contextual_reaction_for(
             "hostility": "irritation",
             "playfulness": "amusement",
             "praise": "appreciation",
+            "task_success": (
+                "relief" if context.completion_resolves_thread else "satisfaction"
+            ),
         }.get(signal.kind, signal.kind)
         mood_bias = 1.0
         if signal.kind in {"hostility", "criticism"}:
@@ -1050,9 +1086,11 @@ def contextual_reaction_for(
         tendencies.append("lightly playful with a little hesitation")
     if kind in {"excitement", "lingering_excitement"}:
         tendencies.append("more energetic and specific")
+    if kind in {"satisfaction", "relief"}:
+        tendencies.append("briefly recognize the completed work")
     if kind == "concern":
         tendencies.append("gentler and more patient")
-    if context.unresolved_problem:
+    if context.unresolved_problem and not context.completion_resolves_thread:
         tendencies.append("keep attention on the unresolved point")
     if context.familiar_relationship and updated.warmth >= 0.55:
         tendencies.append("allow relaxed familiarity")
@@ -1513,6 +1551,8 @@ def format_response_disposition(signal: TurnSignal) -> str:
         "criticism": "direct and slightly guarded",
         "amusement": "playful and relaxed",
         "appreciation": "warm and appreciative",
+        "satisfaction": "quietly pleased and specific",
+        "relief": "relieved and encouraging",
         "excitement": "lively and enthusiastic",
         "correction": "focused and receptive",
     }

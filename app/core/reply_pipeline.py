@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
+from app.core.character import load_character_profile
 from app.core.config import PROMPT_DEBUG, STREAM_CHUNK_CHARS, STREAM_FLUSH_SECONDS
 from app.core.life import life_evolution_debug
 from app.core.model_loader import (
@@ -16,10 +18,13 @@ from app.core.model_loader import (
 )
 from app.core.memory import estimate_tokens
 from app.core.prompt import describe_model_input
+from app.core.utils import compact_text
 from app.core.session import (
     ChatInput,
+    CompiledStyle,
     GenerationCancelled,
     GenerationQueueFullError,
+    ResponseIntention,
     TurnPreparation,
     commit_turn,
     finish_turn,
@@ -31,6 +36,65 @@ from app.core.session import (
 _MAX_METRICS = 64
 _METRICS: dict[str, dict[str, object]] = {}
 _METRICS_LOCK = threading.Lock()
+_SERVICE_POSTURE = re.compile(
+    r"\b(?:anything else|feel free to|happy to help|how can i help|let me know if)\b",
+    re.IGNORECASE,
+)
+_GENERIC_VALIDATION = re.compile(
+    r"\b(?:your feelings are valid|it is understandable that|i understand how you feel|"
+    r"that(?:'s| is) (?:always )?(?:great|nice|good|wonderful)|that makes sense)\b",
+    re.IGNORECASE,
+)
+_DIRECT_QUESTION = re.compile(
+    r"(?:^|[.!]\s+)(?:are|can|could|did|do|does|has|have|how|is|may|should|"
+    r"was|were|what|when|where|which|who|why|will|would|tell me|explain|"
+    r"elaborate|describe|identify|name)\b|\?",
+    re.IGNORECASE,
+)
+_INDIRECT_FOLLOW_UP = re.compile(
+    r"\b(?:i(?:'m| am) curious (?:about|how|what|which|who|why)|i(?:'d| would) like "
+    r"to know|i wonder(?:ed|ing)? (?:how|what|whether|which|who|why)|care to "
+    r"elaborate|go on|say more|tell me more|walk me through it)\b",
+    re.IGNORECASE,
+)
+_UNSUPPORTED_ASSUMPTION = re.compile(
+    r"\b(?:you must (?:feel|be)|you(?:'re| are) (?:clearly|obviously|probably) "
+    r"(?:excited|happy|proud|relieved|sad|upset)|i know (?:how )?you feel|"
+    r"that (?:must have been|was obviously) (?:hard|difficult|easy)|"
+    r"after all (?:that|your) (?:hard )?work|this (?:clearly )?means a lot to you|"
+    r"that(?:'s| is) (?:a )?(?:huge|major|important) milestone|"
+    r"(?:the|your|that) (?:project|system|implementation|code|compiler) "
+    r"(?:is|looks|sounds) (?:ambitious|complex|elegant|impressive|solid)|"
+    r"you(?:'ve| have) been (?:coding|playing|reading|studying|working) "
+    r"(?:all|for)\b)\b",
+    re.IGNORECASE,
+)
+_PERSONAL_EXPERIENCE_CLAIM = re.compile(
+    r"\bi\s+(?:remember|have experienced|went through|felt the same|"
+    r"know what (?:that|this) is like)\b",
+    re.IGNORECASE,
+)
+_INTERNAL_TERMS = re.compile(
+    r"\b(?:affect core|dynamic guidance|persistent mood|response intention|"
+    r"style compiler|system prompt|my internal state|my memory system|my response "
+    r"selection|my prompt processing|processing data|analyzing inputs|monitoring|"
+    r"waiting for requests|running calculations)\b",
+    re.IGNORECASE,
+)
+_ACTIVITY_CLAIM = re.compile(
+    r"\bi\s+(?:(?:am|was|have been)\s+)?(?:coding|playing|played|reading|studying|"
+    r"watched|watching|working on|visited|went to)\b",
+    re.IGNORECASE,
+)
+_TITLE_CLAIM = re.compile(
+    r"\b[Ii]\s+(?:(?:am|was|have been)\s+)?(?:playing|played|reading|watched|watching)\s+"
+    r"([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*){0,4})",
+)
+_ACCESS_CLAIM = re.compile(
+    r"\bi\s+(?:browsed|checked|looked up|searched)\s+(?:online|the internet|the web)\b",
+    re.IGNORECASE,
+)
+_LAUGHTER = re.compile(r"(?:\b(?:haha|hehe|lol|lmao)\b|[😂🤣])", re.IGNORECASE)
 _DEBUG_SOURCE_LABELS = {
     "identity": "Identity",
     "soul": "Soul",
@@ -59,6 +123,187 @@ class GenerationEvent:
     text: str = ""
     reply: str = ""
     metadata: dict[str, object] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResponseValidation:
+    """Read-only behavioral findings for one completed response."""
+
+    violations: tuple[str, ...] = ()
+    evidence: tuple[tuple[str, str], ...] = ()
+
+
+def validate_response_style(
+    reply: str,
+    style: CompiledStyle,
+    intention: ResponseIntention,
+    *,
+    grounding_context: str = "",
+    recent_outputs: tuple[str, ...] = (),
+    persona_text: str = "",
+    request_context: str = "",
+) -> ResponseValidation:
+    """Report deterministic style and grounding risks without rewriting output."""
+
+    text = str(reply or "").strip()
+    violations: list[str] = []
+    evidence: list[tuple[str, str]] = []
+
+    def finding(category: str, detail: str) -> None:
+        violations.append(category)
+        evidence.append((category, compact_text(detail, 120)))
+
+    question_count = text.count("?")
+    questions_prohibited = style.question_gate != "open"
+    if question_count > 1:
+        finding("excessive questions", f"{question_count} question marks")
+    if questions_prohibited and _DIRECT_QUESTION.search(text):
+        finding("prohibited question behavior", "question punctuation or interrogative syntax")
+    if questions_prohibited and _INDIRECT_FOLLOW_UP.search(text):
+        finding("indirect follow-up", "conversational request for more detail")
+    if _SERVICE_POSTURE.search(text):
+        finding("service posture", _SERVICE_POSTURE.search(text).group(0))
+    generic = _GENERIC_VALIDATION.search(text)
+    if generic:
+        request_terms = set(_normalized_words(request_context)) - _VALIDATION_STOPWORDS
+        response_terms = set(_normalized_words(text)) - _VALIDATION_STOPWORDS
+        if not request_terms or not request_terms & response_terms:
+            finding("generic validation", generic.group(0))
+    assumption = _UNSUPPORTED_ASSUMPTION.search(text)
+    supported_context = f"{request_context}\n{grounding_context}".lower()
+    if assumption and assumption.group(0).lower() not in supported_context:
+        finding("unsupported assumption", assumption.group(0))
+    if _INTERNAL_TERMS.search(text):
+        finding("internal terminology", _INTERNAL_TERMS.search(text).group(0))
+    if _ACCESS_CLAIM.search(text):
+        finding("unsupported access claim", _ACCESS_CLAIM.search(text).group(0))
+
+    grounding_lower = str(grounding_context or "").lower()
+    akane_grounding = "\n".join(
+        line
+        for line in grounding_lower.splitlines()
+        if "arcane current activity" not in line
+        and "current user activity" not in line
+    )
+    activity = _ACTIVITY_CLAIM.search(text)
+    if activity:
+        fragment = re.split(r"[.!?\n]", text[activity.start() :], maxsplit=1)[0]
+        claim_terms = set(_normalized_words(fragment)) - {
+            "a",
+            "am",
+            "an",
+            "been",
+            "coding",
+            "i",
+            "on",
+            "played",
+            "playing",
+            "read",
+            "reading",
+            "studying",
+            "the",
+            "to",
+            "visited",
+            "was",
+            "watched",
+            "watching",
+            "went",
+            "working",
+        }
+        grounding_terms = set(_normalized_words(akane_grounding))
+        if not akane_grounding.strip() or (
+            claim_terms and claim_terms.isdisjoint(grounding_terms)
+        ):
+            finding("unrecorded activity", fragment)
+    title = _TITLE_CLAIM.search(text)
+    if title and title.group(1).lower() not in akane_grounding:
+        finding("unrecorded title", title.group(1))
+    personal_experience = _PERSONAL_EXPERIENCE_CLAIM.search(text)
+    if personal_experience:
+        fragment = re.split(
+            r"[.!?\n]",
+            text[personal_experience.start() :],
+            maxsplit=1,
+        )[0]
+        claim_terms = set(_normalized_words(fragment)) - _VALIDATION_STOPWORDS - {
+            "experienced", "felt", "know", "like", "remember", "same", "through", "went"
+        }
+        grounding_terms = set(_normalized_words(akane_grounding))
+        if not akane_grounding.strip() or (
+            claim_terms and claim_terms.isdisjoint(grounding_terms)
+        ):
+            finding("unsupported personal experience", fragment)
+
+    paragraph_limit, sentence_limit = style.validation_limits
+    paragraphs = [value for value in re.split(r"\n\s*\n", text) if value.strip()]
+    sentences = re.findall(r"[^.!?\n]+[.!?]+(?:\s|$)|[^.!?\n]+$", text)
+    if paragraph_limit and len(paragraphs) > paragraph_limit:
+        finding("paragraph-limit violation", f"{len(paragraphs)} paragraphs")
+    if sentence_limit and len(sentences) > sentence_limit:
+        finding("sentence-limit violation", f"{len(sentences)} sentences")
+    if style.humor == "none" and _LAUGHTER.search(text):
+        finding(
+            "serious-context style violation"
+            if intention.primary in {"comfort", "disagree", "reassure", "set boundary"}
+            else "style-intention mismatch",
+            "laughter while humor is disabled",
+        )
+
+    if _has_phrase_overlap(text, style.prompt_text(), span=3):
+        finding("copied compiler wording", "three-word compiler overlap")
+    if persona_text and _has_phrase_overlap(text, persona_text, span=8):
+        finding("phrase overlap with Identity or Soul", "eight-word persona overlap")
+
+    opening = _edge_words(text, first=True)
+    closing = _edge_words(text, first=False)
+    for prior in recent_outputs:
+        if opening and opening == _edge_words(prior, first=True):
+            finding("repeated opening", "same four-word opening")
+            break
+    for prior in recent_outputs:
+        if closing and closing == _edge_words(prior, first=False):
+            finding("recurring closing phrase", "same four-word closing")
+            break
+    if text.rstrip().endswith("?") and any(
+        str(prior or "").rstrip().endswith("?") for prior in recent_outputs[-2:]
+    ):
+        finding("repeated question ending", "recent response also ended with a question")
+    unique_violations = tuple(dict.fromkeys(violations))
+    unique_evidence = tuple(dict.fromkeys(evidence))
+    return ResponseValidation(unique_violations, unique_evidence)
+
+
+_VALIDATION_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "for", "from",
+    "i", "in", "is", "it", "my", "of", "on", "that", "the", "this", "to",
+    "was", "we", "with", "you", "your",
+}
+
+
+def _normalized_words(value: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[a-z0-9']+", str(value or "").lower()))
+
+
+def _has_phrase_overlap(left: str, right: str, *, span: int) -> bool:
+    left_words = _normalized_words(left)
+    right_words = _normalized_words(right)
+    if len(left_words) < span or len(right_words) < span:
+        return False
+    right_windows = {
+        right_words[index : index + span]
+        for index in range(len(right_words) - span + 1)
+    }
+    return any(
+        left_words[index : index + span] in right_windows
+        for index in range(len(left_words) - span + 1)
+    )
+
+
+def _edge_words(value: str, *, first: bool) -> tuple[str, ...]:
+    words = _normalized_words(value)
+    if len(words) < 4:
+        return ()
+    return words[:4] if first else words[-4:]
 
 
 def prepare_reply(
@@ -105,8 +350,34 @@ def commit_reply(
 ) -> None:
     """Commit a completed deterministic or generated reply and record diagnostics."""
 
+    profile = load_character_profile()
+    validation = validate_response_style(
+        reply,
+        prepared.turn_context.compiled_style,
+        prepared.turn_context.response_intention,
+        grounding_context="\n".join(
+            value
+            for value in (
+                prepared.turn_context.life_context,
+                prepared.turn_context.relevant_memories,
+            )
+            if value
+        ),
+        recent_outputs=tuple(
+            turn.content
+            for turn in prepared.memory_context.recent_turns
+            if turn.role == "assistant"
+        ),
+        persona_text=f"{profile.identity}\n{profile.soul}",
+        request_context=prepared.chat_input.text,
+    )
     commit_turn(prepared, reply)
-    _remember_metrics(prepared, committed=True, timing=timing)
+    _remember_metrics(
+        prepared,
+        committed=True,
+        timing=timing,
+        validation=validation,
+    )
 
 
 def _reply_events(prepared: TurnPreparation, *, emit_deltas: bool):
@@ -321,8 +592,6 @@ def debug_state_report(
         activity_source == "offscreen_schedule"
         or _debug_text(activity.get("status"), 24).lower() == "completed"
     )
-    thought = _debug_name(metrics.get("current_thought_source"))
-    follow_up = _debug_name(metrics.get("follow_up_tendency"))
     elapsed = float(metrics.get("elapsed_seconds") or 0.0)
     circadian_lines = _debug_delta_lines(metrics.get("circadian_delta"))
     ambient_lines = _debug_delta_lines(metrics.get("ambient_delta"))
@@ -339,10 +608,34 @@ def debug_state_report(
     life_metrics = life_metrics if isinstance(life_metrics, dict) else {}
     previous_life = life_metrics.get("previous_activity")
     previous_life = previous_life if isinstance(previous_life, dict) else {}
-    current_life = life_metrics.get("current_activity")
-    current_life = current_life if isinstance(current_life, dict) else {}
+    interaction_life = life_metrics.get("current_interaction")
+    interaction_life = interaction_life if isinstance(interaction_life, dict) else {}
+    background_life = life_metrics.get("background_activity")
+    background_life = background_life if isinstance(background_life, dict) else {}
+    recent_life = life_metrics.get("recent_completed_activity")
+    recent_life = recent_life if isinstance(recent_life, dict) else {}
+    creative_life = life_metrics.get("active_creative_event")
+    creative_life = creative_life if isinstance(creative_life, dict) else {}
+    recorded_life = background_life or recent_life or creative_life
+    interaction_present = bool(
+        interaction_life.get("description") or activity.get("current_interaction")
+    )
     life_need_changes = _debug_delta_lines(life_metrics.get("need_changes"))
     life_mood_effects = _debug_delta_lines(life_metrics.get("mood_effects"))
+    memory_trace = metrics.get("memory_trace")
+    memory_trace = memory_trace if isinstance(memory_trace, dict) else {}
+    stored_working = akane.get("working")
+    stored_working = stored_working if isinstance(stored_working, dict) else {}
+    arcane_activity = stored_working.get("arcane_current_activity")
+    arcane_activity = arcane_activity if isinstance(arcane_activity, dict) else {}
+    intention = metrics.get("response_intention")
+    intention = intention if isinstance(intention, dict) else {}
+    style = metrics.get("style_compiler")
+    style = style if isinstance(style, dict) else {}
+    validation = metrics.get("validation_results")
+    validation = validation if isinstance(validation, (list, tuple)) else ()
+    semantic_event = metrics.get("semantic_event")
+    semantic_event = semantic_event if isinstance(semantic_event, dict) else {}
     lines = [
         "Akane Debug",
         "",
@@ -350,6 +643,11 @@ def debug_state_report(
         f"  Interface: {interface}",
         f"  Intent: {_debug_name(memory.get('recent_intent'))}",
         f"  Focus: {_debug_quoted(focus)}",
+        f"  Subject: {_debug_quoted(semantic_event.get('subject'))}",
+        f"  Event: {_debug_name(semantic_event.get('event_type'))}",
+        f"  Status: {_debug_name(semantic_event.get('status'))}",
+        f"  Actor: {_debug_name(semantic_event.get('actor'))}",
+        f"  Negated: {_debug_bool(semantic_event.get('negated'))}",
         f"  State Committed: {_debug_bool(metrics.get('committed'))}",
         "",
         "Response State",
@@ -363,6 +661,56 @@ def debug_state_report(
         lines.extend(f"    - {change}" for change in mood_changes)
     else:
         lines.append("  Mood Changes: None")
+    lines.extend(
+        (
+            "",
+            "Companion Planning",
+            f"  Primary: {_debug_name(intention.get('primary'))}",
+            f"  Optional Behavior: {_debug_name(intention.get('optional_behavior'))}",
+            f"  Continuity: {_debug_name(intention.get('continuity'))}",
+            f"  Grounding: {_debug_name(intention.get('grounding'))}",
+            f"  Question Permitted: {_debug_bool(intention.get('question_permitted'))}",
+            f"  Callback Permitted: {_debug_bool(intention.get('callback_permitted'))}",
+            "  Grounded Detail Permitted: "
+            f"{_debug_bool(intention.get('grounded_detail_permitted'))}",
+            "  Suppression Reasons: "
+            f"{_debug_items(intention.get('suppression_reasons')) or 'None'}",
+        )
+    )
+    lines.extend(
+        (
+            "",
+            "Style Compiler",
+            f"  Baseline: {_debug_name(style.get('baseline_source'))}",
+            "  Final Dimensions: "
+            f"directness={_debug_name(style.get('directness'))}, "
+            f"warmth={_debug_name(style.get('warmth'))}, "
+            f"playfulness={_debug_name(style.get('playfulness'))}, "
+            f"bluntness={_debug_name(style.get('bluntness'))}, "
+            f"energy={_debug_name(style.get('energy'))}, "
+            f"openness={_debug_name(style.get('emotional_openness'))}, "
+            f"verbosity={_debug_name(style.get('verbosity'))}, "
+            f"humor={_debug_name(style.get('humor'))}",
+            "  Intention Adjustments: "
+            f"{_debug_items(style.get('intention_adjustments')) or 'None'}",
+            "  Affect Adjustments: "
+            f"{_debug_items(style.get('affect_adjustments')) or 'None'}",
+            "  Relationship Adjustments: "
+            f"{_debug_items(style.get('relationship_adjustments')) or 'None'}",
+            "  Mood Adjustments: "
+            f"{_debug_items(style.get('mood_adjustments')) or 'None'}",
+            f"  Teasing Gate: {_debug_name(style.get('teasing_gate'))}",
+            f"  Question Gate: {_debug_name(style.get('question_gate'))}",
+            f"  Callback Gate: {_debug_name(style.get('callback_gate'))}",
+            f"  Grounded Detail Gate: {_debug_name(style.get('grounded_detail_gate'))}",
+            "  Grounding Constraints: "
+            f"{_debug_items(style.get('grounding_constraints')) or 'None'}",
+            "  Directive Categories: "
+            f"{_debug_style_categories(style.get('directives')) or 'None'}",
+            "  Validation Results: "
+            f"{_debug_items(validation) or 'None'}",
+        )
+    )
     lines.extend(("", "Time Evolution", f"  Elapsed: {_debug_duration(elapsed)}"))
     if metrics.get("debug_time_candidate"):
         lines.append("  Candidate Status: Proposed, not committed")
@@ -389,6 +737,33 @@ def debug_state_report(
             f"  Reaction: {reaction}",
             f"  Short Emotion: {short_emotion}",
             f"  Applied: {_debug_bool(emotion_applied)}",
+            "  Completion Appraisal: "
+            f"{_debug_bool(metrics.get('completion_appraisal'))}",
+        )
+    )
+    lines.extend(
+        (
+            "",
+            "Memory",
+            f"  Records Considered: {int(memory_trace.get('records_considered') or 0)}",
+            f"  Records Used: {int(memory_trace.get('records_used') or 0)}",
+            "  Kinds Used: "
+            f"{_debug_mapping(memory_trace.get('retrieved_by_kind')) or 'None'}",
+            "  Use Decisions: "
+            f"{_debug_pairs_text(memory_trace.get('memory_uses'))}",
+            "  Active Correction: "
+            f"{_debug_text(memory_trace.get('active_correction'), 48) or 'None'}",
+            "  Active Thread: "
+            f"{_debug_text(memory_trace.get('active_thread'), 48) or 'None'}",
+            "  Grounded Self Event: "
+            f"{_debug_text(memory_trace.get('grounded_self_event'), 48) or 'None'}",
+            "  Arcane Current Activity: "
+            f"{_debug_text(arcane_activity.get('content'), 140) or 'None'}",
+            "  Candidate Writes: "
+            f"{int(memory_trace.get('candidate_writes') or 0)}",
+            "  Candidate Updates: "
+            f"{int(memory_trace.get('candidate_updates') or 0)}",
+            f"  Commit Status: {_debug_name(memory_trace.get('commit_result'))}",
         )
     )
     lines.extend(
@@ -397,10 +772,27 @@ def debug_state_report(
             "Offscreen Life",
             "  Elapsed Since Update: "
             f"{_debug_duration(life_metrics.get('elapsed_seconds'))}",
-            "  Previous Activity: "
+            "  Current Interaction: "
+            f"{_debug_activity_description(life_metrics.get('current_interaction'))}",
+            "  Background Activity: "
+            f"{_debug_activity_description(life_metrics.get('background_activity'))}",
+            "  Recent Completed Activity: "
+            f"{_debug_activity_description(life_metrics.get('recent_completed_activity'))}",
+            "  Active Creative Event: "
+            f"{_debug_activity_description(life_metrics.get('active_creative_event'))}",
+            "  Event Source: "
+            f"{_debug_name(recorded_life.get('source'))}",
+            "  Grounded Details: "
+            + (
+                "Available"
+                if any(
+                    recorded_life.get(name)
+                    for name in ("description", "subject", "reaction")
+                )
+                else "None"
+            ),
+            "  Previous Background Activity: "
             f"{_debug_activity_description(previous_life)}",
-            "  Current Activity: "
-            f"{_debug_activity_description(current_life)}",
             "  Completed Activities: "
             f"{int(life_metrics.get('completed_count') or 0)}",
             "  Recent Reaction: "
@@ -418,6 +810,16 @@ def debug_state_report(
         (
             "",
             "Grounding",
+            "  Permitted Self Claims: "
+            + (
+                "Recorded activity details"
+                if activity_present
+                else "Current interaction only"
+                if interaction_present
+                else "None"
+            ),
+            "  Prohibited Self Claims: Invented activity, history, title, or external access",
+            "  External Access: Not permitted unless verified context is supplied",
             "  Current Activity: "
             + (
                 activity_description or "Grounded activity available"
@@ -442,8 +844,6 @@ def debug_state_report(
         )
     lines.extend(
         (
-            f"  Current Thought: {thought}",
-            f"  Follow-up: {follow_up}",
             "",
             "Prompt",
             "  Included:",
@@ -510,10 +910,36 @@ def _remember_metrics(
     *,
     committed: bool,
     timing: InferenceTiming | None = None,
+    validation: ResponseValidation | None = None,
 ) -> None:
     turn = prepared.internal_turn
     trace = turn.affect_trace
     life_trace = life_evolution_debug(getattr(turn, "life_evolution", None))
+    response_intention = getattr(
+        prepared.turn_context,
+        "response_intention",
+        ResponseIntention("acknowledge"),
+    )
+    compiled_style = getattr(
+        prepared.turn_context,
+        "compiled_style",
+        CompiledStyle(
+            "high",
+            "medium",
+            "medium",
+            "medium",
+            "medium",
+            "medium",
+            "low",
+            "dry",
+            "concise",
+            (("Goal", "acknowledge"), ("Length", "concise")),
+        ),
+    )
+    memory_trace = dict(getattr(turn, "memory_trace", {}) or {})
+    memory_trace["commit_result"] = "committed" if committed else "proposed"
+    signal = getattr(turn, "signal", None)
+    semantic_event = getattr(signal, "semantic_event", None)
     with _METRICS_LOCK:
         _METRICS[prepared.session_id] = {
             "estimated_prompt_tokens": prepared.prompt_plan.estimated_tokens,
@@ -568,15 +994,16 @@ def _remember_metrics(
                 else (("state_not_committed",) if not committed else ())
             ),
             "life_trace": life_trace,
-            "final_disposition": (
-                turn.current_disposition
-                or (trace.final_disposition if trace else "")
-            ),
-            "turn_relevance_adjustment": turn.turn_relevance_adjustment,
+            "semantic_event": asdict(semantic_event) if semantic_event is not None else {},
+            "completion_appraisal": bool(getattr(signal, "task_success", False)),
+            "memory_trace": memory_trace,
+            "response_intention": asdict(response_intention),
+            "style_compiler": asdict(compiled_style),
+            "validation_results": validation.violations if validation else (),
+            "validation_evidence": validation.evidence if validation else (),
+            "final_disposition": trace.final_disposition if trace else "",
             "grounded_activity_source": turn.grounded_activity_source,
             "grounded_activity_age_seconds": turn.grounded_activity_age_seconds,
-            "current_thought_source": turn.current_thought_source,
-            "follow_up_tendency": turn.follow_up_tendency,
             "dynamic_state_tokens": estimate_tokens(
                 prepared.turn_context.behavioral_summary
             ),
@@ -835,7 +1262,11 @@ def _debug_pairs_text(value: object) -> str:
     pairs = []
     for item in value:
         if isinstance(item, (list, tuple)) and len(item) == 2:
-            pairs.append(f"{_debug_name(item[0])}={float(item[1]):.3f}")
+            try:
+                rendered = f"{float(item[1]):.3f}"
+            except (TypeError, ValueError):
+                rendered = _debug_name(item[1])
+            pairs.append(f"{_debug_name(item[0])}={rendered}")
     return ", ".join(pairs) or "None"
 
 
@@ -921,6 +1352,20 @@ def _debug_internal_details(
     life = life if isinstance(life, dict) else {}
     previous_life = life.get("previous_activity")
     current_life = life.get("current_activity")
+    memory_trace = metrics.get("memory_trace")
+    memory_trace = memory_trace if isinstance(memory_trace, dict) else {}
+    intention = metrics.get("response_intention")
+    intention = intention if isinstance(intention, dict) else {}
+    style = metrics.get("style_compiler")
+    style = style if isinstance(style, dict) else {}
+    validation = metrics.get("validation_results")
+    validation = validation if isinstance(validation, (list, tuple)) else ()
+    validation_evidence = metrics.get("validation_evidence")
+    validation_evidence = (
+        validation_evidence if isinstance(validation_evidence, (list, tuple)) else ()
+    )
+    semantic_event = metrics.get("semantic_event")
+    semantic_event = semantic_event if isinstance(semantic_event, dict) else {}
     return (
         "",
         "Internal Details",
@@ -952,6 +1397,15 @@ def _debug_internal_details(
         f"{_debug_delta_text(metrics.get('conversation_delta'))}",
         "  Detected Signal: "
         f"{_debug_text(metrics.get('detected_signal'), 80) or 'None'}",
+        "  Semantic Event: "
+        f"subject={_debug_text(semantic_event.get('subject'), 100) or 'None'}; "
+        f"type={_debug_name(semantic_event.get('event_type'))}; "
+        f"status={_debug_name(semantic_event.get('status'))}; "
+        f"actor={_debug_name(semantic_event.get('actor'))}; "
+        f"target={_debug_text(semantic_event.get('target'), 100) or 'None'}; "
+        f"temporal={_debug_name(semantic_event.get('temporal_state'))}; "
+        f"negated={_debug_bool(semantic_event.get('negated'))}; "
+        f"confidence={float(semantic_event.get('confidence') or 0.0):.3f}",
         f"  Signal Confidence: {float(metrics.get('signal_confidence') or 0.0):.3f}",
         "  Activation Threshold: "
         f"{float(metrics.get('activation_threshold') or 0.0):.3f}",
@@ -968,8 +1422,6 @@ def _debug_internal_details(
         f"  Decay Amount: {float(metrics.get('decay_applied') or 0.0):.3f}",
         f"  Event IDs: {_debug_items(metrics.get('event_ids')) or 'None'}",
         f"  Reason Codes: {_debug_items(metrics.get('reason_codes')) or 'None'}",
-        "  Relevance Adjustment: "
-        f"{float(metrics.get('turn_relevance_adjustment') or 0.0):.3f}",
         "  Dynamic State Tokens: "
         f"{int(metrics.get('dynamic_state_tokens') or 0)}",
         "  Offscreen Previous Activity: "
@@ -1000,6 +1452,36 @@ def _debug_internal_details(
         f"{float(life.get('last_processed_at') or 0.0):.3f}",
         "  Offscreen Next Opportunity: "
         f"{float(life.get('next_opportunity_at') or 0.0):.3f}",
+        "  Memory Candidate Decisions: "
+        f"{_debug_memory_decisions(memory_trace.get('decisions'))}",
+        "  Memory Retrieval Factors: "
+        f"{_debug_memory_retrieval(memory_trace.get('retrieval_factors'))}",
+        "  Memory Migration Version: "
+        f"{int(memory_trace.get('migration_version') or 0)}",
+        "  Intention Direct Request: "
+        f"{_debug_bool(intention.get('direct_request'))}",
+        "  Intention Active Thread: "
+        f"{_debug_bool(intention.get('active_thread'))}",
+        "  Intention Relationship Safe: "
+        f"{_debug_bool(intention.get('relationship_safe'))}",
+        "  Intention Prompt Representation: "
+        f"Goal={_debug_name(intention.get('primary'))}; "
+        f"Optional={_debug_name(intention.get('optional_behavior'))}; "
+        f"Continuity={_debug_name(intention.get('continuity'))}; "
+        f"Grounding={_debug_name(intention.get('grounding'))}",
+        "  Style Directive Values: "
+        f"{_debug_style_directives(style.get('directives')) or 'None'}",
+        "  Style Resolved Gates: "
+        f"teasing={_debug_name(style.get('teasing_gate'))}; "
+        f"question={_debug_name(style.get('question_gate'))}; "
+        f"callback={_debug_name(style.get('callback_gate'))}; "
+        f"detail={_debug_name(style.get('grounded_detail_gate'))}",
+        "  Style Validation Limits: "
+        f"{_debug_items(style.get('validation_limits')) or 'None'}",
+        "  Raw Validation Results: "
+        f"{_debug_items(validation) or 'None'}",
+        "  Validation Evidence: "
+        f"{_debug_style_directives(validation_evidence) or 'None'}",
         "  State Schema Version: "
         f"{int(metrics.get('state_schema_version') or akane.get('state_schema_version') or 0)}",
         "  Prompt Builder Version: "
@@ -1039,3 +1521,69 @@ def _debug_mapping(value: object) -> str:
         f"{_debug_text(key, 32)}={_debug_text(item, 32)}"
         for key, item in value.items()
     )
+
+
+def _debug_style_categories(value: object) -> str:
+    if not isinstance(value, (list, tuple)):
+        return ""
+    return ", ".join(
+        _debug_text(item[0], 24)
+        for item in value
+        if isinstance(item, (list, tuple)) and len(item) == 2
+    )
+
+
+def _debug_style_directives(value: object) -> str:
+    if not isinstance(value, (list, tuple)):
+        return ""
+    return "; ".join(
+        f"{_debug_text(item[0], 24)}={_debug_text(item[1], 100)}"
+        for item in value
+        if isinstance(item, (list, tuple)) and len(item) == 2
+    )
+
+
+def _debug_memory_decisions(value: object) -> str:
+    if not isinstance(value, (list, tuple)):
+        return "None"
+    rendered: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        parts = [
+            _debug_name(item.get("kind")),
+            _debug_name(item.get("source_authority")),
+            _debug_name(item.get("decision")),
+        ]
+        canonical_key = _debug_text(item.get("canonical_key"), 80)
+        if canonical_key:
+            parts.append(f"key={canonical_key}")
+        related_thread = _debug_text(item.get("related_thread"), 40)
+        if related_thread:
+            parts.append(f"thread={related_thread}")
+        for name in ("deduplication", "contradiction", "supersession", "rejection_reason"):
+            detail = _debug_text(item.get(name), 48)
+            if detail and detail != "none":
+                parts.append(_debug_name(detail))
+        rendered.append(" / ".join(parts))
+    return "; ".join(rendered) or "None"
+
+
+def _debug_memory_retrieval(value: object) -> str:
+    if not isinstance(value, (list, tuple)):
+        return "None"
+    rendered: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        decision = (
+            f"used as {_debug_name(item.get('use'))}"
+            if item.get("used")
+            else _debug_name(item.get("omission_reason")) or "retrieved but unused"
+        )
+        rendered.append(
+            f"{_debug_name(item.get('kind'))} / "
+            f"{_debug_name(item.get('source_authority'))} / "
+            f"{_debug_name(item.get('scope'))} / {decision}"
+        )
+    return "; ".join(rendered) or "None"

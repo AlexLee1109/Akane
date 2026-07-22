@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 
 from app.core.utils import compact_text
 
-LIFE_STATE_VERSION = 5
+LIFE_STATE_VERSION = 6
 _DEFAULT_ACTIVITY_TTL_SECONDS = 24 * 60 * 60
 _OFFSCREEN_SOURCE = "offscreen_life"
 _LEGACY_OFFSCREEN_SOURCES = {"offscreen_schedule"}
@@ -19,6 +19,7 @@ _ACTIVITY_STATUSES = {"active", "completed", "cancelled"}
 _MAX_RECENT_ACTIVITIES = 20
 _MAX_COMPLETED_PER_ADVANCE = 4
 _MAX_SELECTION_ATTEMPTS = 8
+_VERY_SHORT_IDLE_SECONDS = 60
 _MIN_OPPORTUNITY_DELAY = 30 * 60
 _MAX_OPPORTUNITY_DELAY = 2 * 60 * 60
 _MAX_NEED_ELAPSED = 48 * 60 * 60
@@ -236,7 +237,6 @@ class LifeState:
     last_processed_at: float = 0.0
     next_opportunity_at: float = 0.0
     version: int = LIFE_STATE_VERSION
-    legacy_activity_discarded: bool = False
 
     @classmethod
     def from_dict(cls, payload: object) -> "LifeState":
@@ -277,18 +277,10 @@ class LifeState:
                     if raw_version >= 4
                     else 0.0
                 ),
-                legacy_activity_discarded=bool(
-                    payload.get("legacy_activity_discarded")
-                ),
             )
-        legacy_present = bool(
-            compact_text(payload.get("current_activity"), 120)
-            or compact_text(payload.get("activity_detail"), 240)
-        )
         return cls(
             activity=activity,
             interaction=interaction,
-            legacy_activity_discarded=legacy_present,
         )
 
 
@@ -296,19 +288,6 @@ class LifeState:
 class LifeEvolution:
     state: LifeState
     new_events: tuple[ActivityRecord, ...] = ()
-    generated_activities: tuple[ActivityRecord, ...] = ()
-    previous_activity: ActivityRecord | None = None
-    elapsed_seconds: float = 0.0
-    needs_before: LifeNeeds = LifeNeeds()
-    needs_after: LifeNeeds = LifeNeeds()
-    need_changes: tuple[tuple[str, float], ...] = ()
-    preference_changes: tuple[tuple[str, float], ...] = ()
-    selection_bucket: int = 0
-    selection_candidates: tuple[tuple[str, float], ...] = ()
-    repetition_penalties: tuple[tuple[str, float], ...] = ()
-    cooldowns: tuple[str, ...] = ()
-    reason_no_activity: str = ""
-    authority_source: str = "none"
     reason_codes: tuple[str, ...] = ()
 
 
@@ -322,80 +301,14 @@ class _ActivitySpec:
 
 
 _ACTIVITY_CATALOG = (
-    _ActivitySpec(
-        "watching_anime",
-        "watched some anime",
-        0.10,
-        (20, 60),
-        ("enjoyed it", "found it interesting", "liked the atmosphere", "felt neutral about it"),
-    ),
-    _ActivitySpec(
-        "reading_manga",
-        "read manga for a while",
-        0.08,
-        (15, 60),
-        (
-            "became curious about what happens next",
-            "liked the characters",
-            "enjoyed the pace",
-            "felt neutral about it",
-        ),
-    ),
-    _ActivitySpec(
-        "playing_game",
-        "played a game",
-        0.09,
-        (30, 120),
-        ("had fun", "felt competitive", "made some progress", "became mildly frustrated"),
-    ),
-    _ActivitySpec(
-        "listening_music",
-        "listened to music",
-        0.11,
-        (15, 90),
-        ("felt relaxed", "enjoyed the quiet", "felt more settled", "felt neutral about it"),
-    ),
-    _ActivitySpec(
-        "developing_opinion",
-        "thought through one of her established interests",
-        0.09,
-        (10, 60),
-        ("formed a tentative opinion", "noticed a tradeoff", "became curious", "felt neutral about it"),
-    ),
-    _ActivitySpec(
-        "creative_brainstorming",
-        "developed a fictional concept",
-        0.07,
-        (15, 75),
-        ("focused on identity and belonging", "explored rivalry and trust", "kept the premise deliberately small"),
-    ),
-    _ActivitySpec(
-        "relaxing",
-        "relaxed for a while",
-        0.12,
-        (20, 120),
-        ("felt relaxed", "felt more settled", "enjoyed the quiet"),
-    ),
-    _ActivitySpec(
-        "resting",
-        "rested",
-        0.10,
-        (30, 180),
-        ("felt more settled", "felt relaxed", "felt neutral about it"),
-    ),
-    _ActivitySpec(
-        "sleeping",
-        "slept",
-        0.08,
-        (180, 480),
-        ("felt more rested", "felt neutral about it"),
-    ),
+    # The scheduler has no access to media, files, the web, or a physical body.
+    # Its only autonomous candidate is therefore a bounded neutral idle period.
     _ActivitySpec(
         "quiet_downtime",
-        "had some quiet downtime",
+        "spent some quiet time without a substantial activity",
         0.30,
         (20, 180),
-        ("enjoyed the quiet", "felt slightly bored", "felt more settled", "felt neutral about it"),
+        ("felt neutral about it", "felt more settled", "felt slightly bored"),
     ),
 )
 def evolve_life_state(
@@ -420,10 +333,6 @@ def evolve_life_state(
         )
         return LifeEvolution(
             initialized,
-            needs_before=prior.needs,
-            needs_after=prior.needs,
-            authority_source=_activity_authority(prior.activity),
-            reason_no_activity="event_window_initialized",
             reason_codes=("event_window_initialized",),
         )
 
@@ -436,8 +345,7 @@ def evolve_life_state(
         completion_limit = 3
     else:
         completion_limit = _MAX_COMPLETED_PER_ADVANCE
-    needs_before = prior.needs
-    needs = _advance_needs(needs_before, elapsed)
+    needs = _advance_needs(prior.needs, elapsed)
     preferences = dict(prior.activity_preferences)
     history = list(prior.recent_events)
     known_ids = {event.event_id for event in history}
@@ -446,8 +354,6 @@ def evolve_life_state(
     if interaction is not None and not interaction.is_active_for(current, "profile"):
         interaction = None
     completed: list[ActivityRecord] = []
-    generated: list[ActivityRecord] = []
-    preference_changes: dict[str, float] = {}
     reasons: list[str] = []
     finished_existing: ActivityRecord | None = None
 
@@ -458,16 +364,14 @@ def evolve_life_state(
             activity = None
             if finished.event_id not in known_ids:
                 completed.append(finished)
-                generated.append(finished)
                 history.append(finished)
                 known_ids.add(finished.event_id)
                 needs = _apply_need_effects(needs, finished.need_effects)
-                _apply_preference_effects(
-                    preferences,
-                    preference_changes,
-                    finished.preference_effects,
-                )
+                _apply_preference_effects(preferences, finished.preference_effects)
                 reasons.append("activity_completed")
+        elif current > activity.updated_at:
+            activity = replace(activity, updated_at=current)
+            reasons.append("activity_advanced")
 
     next_opportunity = prior.next_opportunity_at or _next_opportunity(
         profile_seed,
@@ -482,12 +386,7 @@ def evolve_life_state(
         )
     if elapsed > 12 * 60 * 60:
         next_opportunity = max(next_opportunity, current - 12 * 60 * 60)
-    last_candidates: tuple[tuple[str, float], ...] = ()
-    last_penalties: tuple[tuple[str, float], ...] = ()
-    last_cooldowns: tuple[str, ...] = ()
-    last_bucket = int(next_opportunity // _MIN_OPPORTUNITY_DELAY)
     attempts = 0
-    reason_no_activity = ""
 
     while (
         activity is None
@@ -496,8 +395,7 @@ def evolve_life_state(
         and attempts < _MAX_SELECTION_ATTEMPTS
     ):
         attempts += 1
-        last_bucket = int(next_opportunity // _MIN_OPPORTUNITY_DELAY)
-        selection = _select_activity(
+        spec = _select_activity(
             profile_seed=profile_seed,
             opportunity_at=next_opportunity,
             needs=needs,
@@ -507,26 +405,18 @@ def evolve_life_state(
             mood_curiosity=mood_curiosity,
             mood_patience=mood_patience,
         )
-        spec, last_candidates, last_penalties, last_cooldowns = selection
         if spec is None:
-            reason_no_activity = "quiet_opportunity_skipped"
             next_opportunity = _next_opportunity(profile_seed, next_opportunity, None)
             continue
         selected = _make_activity(profile_seed, spec, next_opportunity)
-        generated.append(selected)
         if selected.expires_at <= current:
             finished = _finish_activity(selected, selected.expires_at)
-            generated[-1] = finished
             if finished.event_id not in known_ids:
                 completed.append(finished)
                 history.append(finished)
                 known_ids.add(finished.event_id)
                 needs = _apply_need_effects(needs, finished.need_effects)
-                _apply_preference_effects(
-                    preferences,
-                    preference_changes,
-                    finished.preference_effects,
-                )
+                _apply_preference_effects(preferences, finished.preference_effects)
             next_opportunity = _next_opportunity(
                 profile_seed,
                 finished.completed_at,
@@ -544,11 +434,6 @@ def evolve_life_state(
         reasons.append("bounded_selection_attempts")
     if not completed and activity is None:
         reasons.append("quiet_window")
-        reason_no_activity = reason_no_activity or (
-            "elapsed_time_too_short"
-            if elapsed < _MIN_OPPORTUNITY_DELAY
-            else "no_activity_selected"
-        )
     if completed:
         reasons.append("offscreen_activity_completed")
 
@@ -561,24 +446,10 @@ def evolve_life_state(
         last_processed_at=current,
         next_opportunity_at=max(current, next_opportunity),
         version=LIFE_STATE_VERSION,
-        legacy_activity_discarded=prior.legacy_activity_discarded,
     )
     return LifeEvolution(
         state=next_state,
         new_events=tuple(completed),
-        generated_activities=tuple(generated),
-        previous_activity=prior.activity,
-        elapsed_seconds=elapsed,
-        needs_before=needs_before,
-        needs_after=needs,
-        need_changes=_value_changes(needs_before, needs),
-        preference_changes=tuple(sorted(preference_changes.items())),
-        selection_bucket=last_bucket,
-        selection_candidates=last_candidates,
-        repetition_penalties=last_penalties,
-        cooldowns=last_cooldowns,
-        reason_no_activity=reason_no_activity,
-        authority_source=_activity_authority(activity),
         reason_codes=tuple(dict.fromkeys(reasons)),
     )
 
@@ -619,11 +490,6 @@ def begin_conversation_activity(
     return replace(
         evolution,
         state=replace(state, interaction=interaction),
-        authority_source=(
-            _activity_authority(state.activity)
-            if _activity_authority(state.activity) != "none"
-            else "conversation"
-        ),
         reason_codes=tuple(dict.fromkeys((*evolution.reason_codes, reason))),
     )
 
@@ -656,22 +522,12 @@ def _apply_need_effects(
 
 def _apply_preference_effects(
     preferences: dict[str, float],
-    changes: dict[str, float],
     effects: tuple[tuple[str, float], ...],
 ) -> None:
     for name, delta in effects:
         previous = preferences.get(name, 0.0)
         current = _bounded(previous + delta, -0.15, 0.15)
         preferences[name] = current
-        changes[name] = changes.get(name, 0.0) + current - previous
-
-
-def _value_changes(before: LifeNeeds, after: LifeNeeds) -> tuple[tuple[str, float], ...]:
-    return tuple(
-        (name, getattr(after, name) - getattr(before, name))
-        for name in ("energy", "social", "curiosity", "stimulation")
-        if abs(getattr(after, name) - getattr(before, name)) >= 0.0005
-    )
 
 
 def _stable_unit(seed: str) -> float:
@@ -702,16 +558,9 @@ def _select_activity(
     mood_energy: float,
     mood_curiosity: float,
     mood_patience: float,
-) -> tuple[
-    _ActivitySpec | None,
-    tuple[tuple[str, float], ...],
-    tuple[tuple[str, float], ...],
-    tuple[str, ...],
-]:
+) -> _ActivitySpec | None:
     hour = time.localtime(opportunity_at).tm_hour
     recent_types = [event.activity_type for event in history[-6:] if event.status == "completed"]
-    penalties: dict[str, float] = {}
-    cooldowns: list[str] = []
     weighted: list[tuple[_ActivitySpec | None, float]] = [(None, 0.22)]
     for spec in _ACTIVITY_CATALOG:
         score = spec.base_weight + preferences.get(spec.activity_type, 0.0)
@@ -727,9 +576,6 @@ def _select_activity(
         penalty = repetitions * 0.045
         if recent_types and recent_types[-1] == spec.activity_type:
             penalty += 0.12
-            cooldowns.append(spec.activity_type)
-        if penalty:
-            penalties[spec.activity_type] = penalty
         weighted.append((spec, max(0.005, score - penalty)))
     total = sum(weight for _spec, weight in weighted)
     seed = f"offscreen-life:selection:{profile_seed}:{opportunity_at:.6f}"
@@ -741,11 +587,7 @@ def _select_activity(
         if target <= cursor:
             chosen = spec
             break
-    candidates = tuple(
-        ((spec.activity_type if spec else "no_activity"), round(weight, 6))
-        for spec, weight in weighted
-    )
-    return chosen, candidates, tuple(sorted(penalties.items())), tuple(cooldowns)
+    return chosen
 
 
 def _time_suitability(activity_type: str, hour: int) -> float:
@@ -1073,7 +915,9 @@ _CURRENT_QUERY = re.compile(
     re.IGNORECASE,
 )
 _EARLIER_QUERY = re.compile(
-    r"\b(?:what did you do|what have you been doing|been up to|how was your day|how's life)\b",
+    r"\b(?:what did you do|what were you doing|what have you been doing|been up to|how was your day|how's life|"
+    r"anything happen|time alone|did you work on anything|what happened since|"
+    r"what have you been thinking about)\b",
     re.IGNORECASE,
 )
 _CATEGORY_QUERIES = {
@@ -1139,9 +983,10 @@ def format_life_state(
             if earlier
             else f"Current activity: {_activity_fact(current)}."
             if current
-            else f"Current interaction: {_activity_fact(interaction)}."
-            if interaction
-            else ""
+            else (
+                "Offscreen status: no meaningful activity was established during "
+                "the gap; answer naturally without inventing an activity."
+            )
         )
     if _CREATIVE_QUERY.search(text):
         creative = next(
@@ -1191,11 +1036,6 @@ def life_evolution_debug(evolution: LifeEvolution | None) -> dict[str, object]:
         return {}
     state = evolution.state
     return {
-        "elapsed_seconds": evolution.elapsed_seconds,
-        "previous_activity": _debug_activity(evolution.previous_activity),
-        "generated_activities": tuple(
-            _debug_activity(activity) for activity in evolution.generated_activities
-        ),
         "current_interaction": _debug_activity(state.interaction),
         "background_activity": _debug_activity(state.activity),
         "recent_completed_activity": _debug_activity(
@@ -1215,35 +1055,17 @@ def life_evolution_debug(evolution: LifeEvolution | None) -> dict[str, object]:
                 else None,
             )
         ),
-        "completed_count": len(evolution.new_events),
+        "completed_this_advance": len(evolution.new_events),
         "recent_reaction": (
             evolution.new_events[-1].reaction if evolution.new_events else ""
         ),
         "mood_effects": tuple(
             effect for event in evolution.new_events for effect in event.mood_effects
         ),
-        "need_changes": evolution.need_changes,
-        "needs_before": {
-            name: getattr(evolution.needs_before, name)
-            for name in ("energy", "social", "curiosity", "stimulation")
-        },
-        "needs_after": {
-            name: getattr(evolution.needs_after, name)
-            for name in ("energy", "social", "curiosity", "stimulation")
-        },
-        "preference_changes": evolution.preference_changes,
-        "selection_bucket": evolution.selection_bucket,
-        "selection_candidates": evolution.selection_candidates,
-        "repetition_penalties": evolution.repetition_penalties,
-        "cooldowns": evolution.cooldowns,
-        "reason_no_activity": evolution.reason_no_activity,
-        "authority_source": evolution.authority_source,
         "last_processed_at": state.last_processed_at,
         "next_opportunity_at": state.next_opportunity_at,
         "reason_codes": evolution.reason_codes,
     }
-
-
 def _debug_activity(activity: ActivityRecord | None) -> dict[str, object]:
     if activity is None:
         return {}

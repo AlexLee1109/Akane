@@ -271,15 +271,10 @@ def _prompt_sources(
     )
     for index, turn in enumerate(context.earlier_turns):
         role = "assistant" if turn.role == "assistant" else "user"
-        label = (
-            "EARLIER ASSISTANT EXCERPT — UNVERIFIED"
-            if role == "assistant"
-            else "EARLIER USER EXCERPT"
-        )
         _append_source(
             sources,
             f"earlier_{role}",
-            f"[{label}]\n{turn.content}",
+            turn.content,
             role,
             PromptAuthority.HISTORICAL_EVIDENCE,
             False,
@@ -290,15 +285,10 @@ def _prompt_sources(
     recent_count = len(context.recent_turns)
     for index, turn in enumerate(context.recent_turns):
         role = "assistant" if turn.role == "assistant" else "user"
-        content = (
-            f"[RECENT ASSISTANT MESSAGE — UNVERIFIED]\n{turn.content}"
-            if role == "assistant"
-            else turn.content
-        )
         _append_source(
             sources,
             f"recent_{role}",
-            content,
+            turn.content,
             role,
             PromptAuthority.HISTORICAL_EVIDENCE,
             False,

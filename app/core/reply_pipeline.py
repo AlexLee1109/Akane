@@ -16,8 +16,13 @@ from app.core.model_loader import (
     InferenceTiming,
     ModelManager,
 )
-from app.core.memory import estimate_tokens
+from app.core.memory import (
+    apply_opinion_candidate,
+    estimate_tokens,
+    extract_opinion_candidate,
+)
 from app.core.prompt import describe_model_input
+from app.core.signal import topic_overlap
 from app.core.utils import compact_text
 from app.core.session import (
     ChatInput,
@@ -74,11 +79,83 @@ _PERSONAL_EXPERIENCE_CLAIM = re.compile(
     r"know what (?:that|this) is like)\b",
     re.IGNORECASE,
 )
+_UNSUPPORTED_OPINION_HISTORY = re.compile(
+    r"\b(?:I(?:'ve| have) always (?:thought|believed|preferred)|"
+    r"I (?:used to|long) (?:think|believe|prefer)|for years I(?:'ve| have))\b",
+    re.IGNORECASE,
+)
 _INTERNAL_TERMS = re.compile(
     r"\b(?:affect core|dynamic guidance|persistent mood|response intention|"
     r"style compiler|system prompt|my internal state|my memory system|my response "
     r"selection|my prompt processing|processing data|analyzing inputs|monitoring|"
-    r"waiting for requests|running calculations)\b",
+    r"waiting for requests|running calculations|ran calculations|"
+    r"(?:processing|processed) (?:conversation )?patterns|"
+    r"(?:analyzing|analyzed) prompts|(?:generating|generated) (?:a |my )?"
+    r"repl(?:y|ies)|tracking token "
+    r"probabilities|updating embeddings|inspecting hidden state)\b",
+    re.IGNORECASE,
+)
+_OFFSCREEN_ACTIVITY_REQUEST = re.compile(
+    r"\b(?:what (?:have|had) you been (?:doing|thinking about)|what (?:did|were) you do(?:ing)?|"
+    r"been up to|anything happen|time alone|did you work on anything|"
+    r"what happened since|how was your (?:time|day)|how(?:'s| is) life)\b",
+    re.IGNORECASE,
+)
+_TECHNICAL_DISCUSSION = re.compile(
+    r"\b(?:code|implementation|model|prompt|inference|system|architecture|"
+    r"validator|debug|technical)\b",
+    re.IGNORECASE,
+)
+_OFFSCREEN_ACTIVITY_CLAIM = re.compile(
+    r"\bi\s+(?:(?:have|'ve)\s+been|was|had been)\s+(?:"
+    r"reading|researching|writing|drawing|coding|watching|listening|talking|"
+    r"visiting|practicing|working on|thinking through|reviewing|processing|"
+    r"analyzing|generating|checking|using|accessing|browsing|searching)\b|"
+    r"\bi\s+(?:processed|analyzed|generated|reviewed|checked|used|accessed|"
+    r"browsed|searched|coded|wrote|drew|read|researched|watched|listened)\b",
+    re.IGNORECASE,
+)
+_NO_ACTIVITY_GROUNDING = re.compile(
+    r"no meaningful activity was established during the gap",
+    re.IGNORECASE,
+)
+_LEADING_ROLE_MARKER = re.compile(
+    r"\A\s*(?:\[\s*Akane\s*\]|Akane\s*:|\[\s*assistant\s*\]|Assistant\s*:)\s*",
+    re.IGNORECASE,
+)
+_PROVENANCE_MARKER = re.compile(
+    r"(?im)^\s*\[(?:RECENT ASSISTANT MESSAGE|EARLIER ASSISTANT EXCERPT)\s+"
+    r"[—-]\s+UNVERIFIED\]\s*(?:\n|$)"
+)
+_PERSONAL_JUDGMENT = re.compile(
+    r"\b(?:I\s+(?:personally\s+)?(?:choose|prefer|want|would rather|lean)|"
+    r"I\s+(?:think|believe|feel|find|consider)\b[^.!?]{0,100}\b"
+    r"(?:better|worse|worthwhile|preferable|would choose|would prefer)|"
+    r"my (?:choice|preference|view|position)(?:\s+is)?|"
+    r"I(?:'m| am) (?:uncertain|torn|not sure))\b",
+    re.IGNORECASE,
+)
+_GENERIC_NEUTRALITY = re.compile(
+    r"\b(?:both (?:options|sides|forms) (?:have|offer)|each (?:has|offers)|"
+    r"no (?:objectively |universally )?(?:better|worse|right) (?:choice|option|answer)|"
+    r"simply different|it depends on (?:your|one's) priorities)\b",
+    re.IGNORECASE,
+)
+_CLINICAL_REFLECTIVE_TERMS = re.compile(
+    r"\b(?:interesting variable|collected patterns|new iteration|operate on|"
+    r"flow of continuous thought|processing data|calculated response|"
+    r"objective comparison|system objective|experimental condition|data flow)\b",
+    re.IGNORECASE,
+)
+_UNCERTAIN_JUDGMENT = re.compile(
+    r"\b(?:I(?:'m| am) (?:uncertain|torn|not sure|undecided)|"
+    r"I (?:do not|don't) have a (?:settled|clear) (?:view|choice|preference))\b",
+    re.IGNORECASE,
+)
+_SPECIFIC_UNCERTAINTY = re.compile(
+    r"\b(?:because|unless|until|whether|depends on|unresolved|"
+    r"not sure (?:about|if)|torn between|do not know (?:if|whether)|"
+    r"don't know (?:if|whether))\b[^.!?]{2,160}",
     re.IGNORECASE,
 )
 _ACTIVITY_CLAIM = re.compile(
@@ -133,6 +210,65 @@ class ResponseValidation:
     evidence: tuple[tuple[str, str], ...] = ()
 
 
+def clean_generated_reply(reply: str) -> str:
+    """Remove only known generated structural markers, leaving ordinary prose intact."""
+
+    text = _PROVENANCE_MARKER.sub("", str(reply or ""))
+    previous = None
+    while text != previous:
+        previous = text
+        text = _LEADING_ROLE_MARKER.sub("", text, count=1)
+    return text.strip()
+
+
+class _StreamingOutputCleaner:
+    """Hold only the ambiguous leading bytes so role labels cannot reach deltas."""
+
+    _prefixes = (
+        "[akane]",
+        "akane:",
+        "[assistant]",
+        "assistant:",
+        "[recent assistant message — unverified]",
+        "[recent assistant message - unverified]",
+        "[earlier assistant excerpt — unverified]",
+        "[earlier assistant excerpt - unverified]",
+    )
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._resolved = False
+
+    def feed(self, chunk: str) -> str:
+        if self._resolved:
+            return chunk
+        self._buffer += chunk
+        return self._resolve(final=False)
+
+    def finish(self) -> str:
+        return "" if self._resolved else self._resolve(final=True)
+
+    def _resolve(self, *, final: bool) -> str:
+        value = self._buffer.lstrip()
+        while value:
+            role_match = _LEADING_ROLE_MARKER.match(value)
+            if role_match is not None:
+                value = value[role_match.end() :].lstrip()
+                continue
+            provenance_match = _PROVENANCE_MARKER.match(value)
+            if provenance_match is not None:
+                value = value[provenance_match.end() :].lstrip()
+                continue
+            break
+        lowered = value.casefold()
+        if not final and (not value or any(prefix.startswith(lowered) for prefix in self._prefixes)):
+            self._buffer = value
+            return ""
+        self._buffer = ""
+        self._resolved = True
+        return value
+
+
 def validate_response_style(
     reply: str,
     style: CompiledStyle,
@@ -142,12 +278,22 @@ def validate_response_style(
     recent_outputs: tuple[str, ...] = (),
     persona_text: str = "",
     request_context: str = "",
+    opinion_history_available: bool = False,
+    question_mode: str = "none",
+    active_opinion: object | None = None,
+    active_conflict: bool = False,
+    changed_condition: str = "",
+    affected_reason: str = "",
+    reconsideration_warranted: bool = False,
+    profile_reset_cleared_scopes: tuple[str, ...] = (),
 ) -> ResponseValidation:
     """Report deterministic style and grounding risks without rewriting output."""
 
     text = str(reply or "").strip()
     violations: list[str] = []
     evidence: list[tuple[str, str]] = []
+    personal_activity_question = bool(_OFFSCREEN_ACTIVITY_REQUEST.search(request_context))
+    technical_discussion = bool(_TECHNICAL_DISCUSSION.search(request_context))
 
     def finding(category: str, detail: str) -> None:
         violations.append(category)
@@ -175,7 +321,7 @@ def validate_response_style(
     if assumption and assumption.group(0).lower() not in supported_context:
         finding("unsupported assumption", assumption.group(0))
     internal_term = _INTERNAL_TERMS.search(text)
-    if internal_term:
+    if internal_term and (personal_activity_question or not technical_discussion):
         finding("internal terminology", internal_term.group(0))
     access_claim = _ACCESS_CLAIM.search(text)
     if access_claim:
@@ -188,7 +334,20 @@ def validate_response_style(
         if "arcane current activity" not in line
         and "current user activity" not in line
     )
-    activity = _ACTIVITY_CLAIM.search(text)
+    offscreen_claim = _OFFSCREEN_ACTIVITY_CLAIM.search(text)
+    if personal_activity_question and offscreen_claim:
+        fragment = re.split(r"[.!?\n]", text[offscreen_claim.start() :], maxsplit=1)[0]
+        claim_terms = set(_normalized_words(fragment)) - _VALIDATION_STOPWORDS - {
+            "been", "had", "have", "i", "was",
+        }
+        grounding_terms = set(_normalized_words(akane_grounding))
+        if _NO_ACTIVITY_GROUNDING.search(akane_grounding):
+            finding("unrecorded offscreen activity", fragment)
+        elif not akane_grounding.strip() or (
+            claim_terms and claim_terms.isdisjoint(grounding_terms)
+        ):
+            finding("unrecorded offscreen activity", fragment)
+    activity = None if personal_activity_question else _ACTIVITY_CLAIM.search(text)
     if activity:
         fragment = re.split(r"[.!?\n]", text[activity.start() :], maxsplit=1)[0]
         claim_terms = set(_normalized_words(fragment)) - {
@@ -236,6 +395,61 @@ def validate_response_style(
             claim_terms and claim_terms.isdisjoint(grounding_terms)
         ):
             finding("unsupported personal experience", fragment)
+    unsupported_history = _UNSUPPORTED_OPINION_HISTORY.search(text)
+    if unsupported_history and not opinion_history_available:
+        finding("unsupported opinion history", unsupported_history.group(0))
+
+    leading_role = _LEADING_ROLE_MARKER.match(text)
+    if leading_role:
+        finding("leading speaker-label leak", leading_role.group(0))
+    provenance = _PROVENANCE_MARKER.search(text)
+    if provenance:
+        finding("provenance-marker leak", provenance.group(0))
+    if question_mode in {"personal_choice", "hypothetical_choice"}:
+        personal_judgment = _PERSONAL_JUDGMENT.search(text)
+        if not personal_judgment:
+            finding("personal choice answered as objective comparison", "no personal stance")
+        if active_opinion is not None and not personal_judgment and not reconsideration_warranted:
+            finding("active opinion omitted without reconsideration", "stored view not consumed")
+        neutrality = _GENERIC_NEUTRALITY.search(text)
+        uncertainty = _UNCERTAIN_JUDGMENT.search(text)
+        specific_uncertainty = bool(_SPECIFIC_UNCERTAINTY.search(text))
+        if active_conflict and neutrality and (
+            not personal_judgment or uncertainty and not specific_uncertainty
+        ):
+            finding("conflict forced artificial neutrality", neutrality.group(0))
+        if uncertainty and not specific_uncertainty:
+            finding("genuine uncertainty lacks unresolved condition", uncertainty.group(0))
+        clinical = _CLINICAL_REFLECTIVE_TERMS.search(text)
+        if clinical:
+            finding("excessive clinical framing", clinical.group(0))
+    if reconsideration_warranted:
+        condition_terms = set(_normalized_words(changed_condition))
+        response_terms = set(_normalized_words(text))
+        acknowledges_condition = bool(
+            condition_terms and condition_terms & response_terms
+            or affected_reason and affected_reason.casefold() in text.casefold()
+        )
+        if not acknowledges_condition:
+            finding("material hypothetical condition ignored", changed_condition or affected_reason)
+    protected_reset_scopes = {
+        "opinions",
+        "values",
+        "conflicts",
+        "self_events",
+        "offscreen_life",
+        "identity_state",
+    }
+    cleared_self_state = tuple(
+        scope
+        for item in profile_reset_cleared_scopes
+        if (scope := str(item).strip().lower()) in protected_reset_scopes
+    )
+    if cleared_self_state:
+        finding(
+            "user-profile reset cleared Akane self-state",
+            ", ".join(cleared_self_state),
+        )
 
     paragraph_limit, sentence_limit = style.validation_limits
     paragraphs = [value for value in re.split(r"\n\s*\n", text) if value.strip()]
@@ -373,13 +587,146 @@ def commit_reply(
         ),
         persona_text=f"{profile.identity}\n{profile.soul}",
         request_context=prepared.chat_input.text,
+        opinion_history_available=any(
+            opinion.status == "superseded"
+            and opinion.topic_key == prepared.turn_context.opinion_topic_key
+            for opinion in prepared.internal_turn.state.opinions
+        ),
+        question_mode=prepared.internal_turn.signal.semantic_event.question_mode,
+        active_opinion=prepared.turn_context.active_opinion,
+        active_conflict=bool(
+            prepared.turn_context.active_internal_conflict is not None
+            and prepared.turn_context.active_internal_conflict.status == "active"
+        ),
+        changed_condition=prepared.turn_context.changed_condition,
+        affected_reason=prepared.turn_context.affected_reason,
+        reconsideration_warranted=prepared.turn_context.reconsideration_warranted,
     )
-    commit_turn(prepared, reply)
+    opinion_candidate = None
+    if not validation.violations:
+        life = prepared.internal_turn.state.life
+        opinion_activity = next(
+            (
+                activity
+                for activity in (
+                    life.activity,
+                    *reversed(life.recent_events),
+                )
+                if activity is not None
+                and activity.source != "conversation"
+                and topic_overlap(
+                    f"{activity.subject} {activity.description}",
+                    prepared.chat_input.text,
+                )
+                >= 0.25
+            ),
+            None,
+        )
+        opinion_candidate = extract_opinion_candidate(
+            user_text=prepared.chat_input.text,
+            response=reply,
+            intention=prepared.turn_context.response_intention.primary,
+            semantic_subject=(
+                prepared.turn_context.active_opinion.subject
+                if prepared.turn_context.reconsideration_warranted
+                and prepared.turn_context.active_opinion is not None
+                else prepared.internal_turn.signal.semantic_event.subject
+            ),
+            signal_topic=prepared.internal_turn.signal.topic,
+            now=prepared.chat_input.timestamp,
+            grounded_experience=opinion_activity is not None,
+            autonomous=prepared.chat_input.autonomous,
+            reconsideration_warranted=prepared.turn_context.reconsideration_warranted,
+            changed_condition=prepared.turn_context.changed_condition,
+            affected_reason=prepared.turn_context.affected_reason,
+            reason_effect=prepared.turn_context.reason_effect,
+        )
+        if opinion_candidate is not None:
+            _candidate_state, transition = apply_opinion_candidate(
+                prepared.internal_turn.state,
+                opinion_candidate,
+            )
+            if transition.get("commit_status") == "change rejected":
+                violation = (
+                    "primary opinion reason removed but stance preserved without another reason"
+                    if transition.get("affected_reason")
+                    else "active opinion contradicted without reconsideration"
+                )
+                validation = ResponseValidation(
+                    (*validation.violations, violation),
+                    (*validation.evidence, (violation, "stored stance remains active")),
+                )
+                opinion_candidate = None
+        elif (
+            prepared.turn_context.response_intention.primary
+            in {"state opinion", "disagree"}
+            and re.search(
+                r"\b(?:I (?:think|believe|prefer|favor)|my (?:view|position))\b",
+                reply,
+                re.I,
+            )
+        ):
+            violation = "generated stance could not be parsed"
+            validation = ResponseValidation(
+                (*validation.violations, violation),
+                (*validation.evidence, (violation, "no opinion candidate")),
+            )
+    if validation.violations:
+        _remember_metrics(
+            prepared,
+            committed=False,
+            timing=timing,
+            validation=validation,
+        )
+        return
+    opinion_trace = commit_turn(prepared, reply, opinion_candidate)
+    active_opinion = prepared.turn_context.active_opinion
+    opinion_trace.update(
+        {
+            "topic_considered": (
+                active_opinion.subject
+                if active_opinion is not None
+                else prepared.turn_context.opinion_topic_key.replace("-", " ")
+            ),
+            "active_opinion": active_opinion.target if active_opinion else "",
+            "retrieval_used": active_opinion is not None,
+        }
+    )
+    if not opinion_trace.get("relevant_values"):
+        opinion_trace["relevant_values"] = tuple(
+            value.value_key for value in prepared.turn_context.relevant_values
+        )
+    conflict = prepared.turn_context.active_internal_conflict
+    if conflict is not None and not opinion_trace.get("conflict_topic"):
+        opinion_trace.update(
+            {
+                "conflict_topic": conflict.topic_key,
+                "conflict_pulls": (conflict.side_a_value, conflict.side_b_value),
+                "conflict_status": conflict.status,
+                "conflict_related_opinion": (
+                    prepared.turn_context.active_opinion.subject
+                    if prepared.turn_context.active_opinion is not None
+                    else conflict.topic_key.replace("-", " ")
+                ),
+                "conflict_resolution": conflict.selected_value,
+            }
+        )
+    if active_opinion is not None:
+        opinion_trace.setdefault("stance", active_opinion.stance)
+        opinion_trace.setdefault("strength", active_opinion.strength)
+        opinion_trace.setdefault("confidence", active_opinion.confidence)
+        opinion_trace.setdefault("reason_tags", active_opinion.reason_tags)
+    if validation.violations and prepared.turn_context.response_intention.primary in {
+        "state opinion",
+        "disagree",
+    }:
+        opinion_trace["commit_status"] = "validation rejected"
     _remember_metrics(
         prepared,
         committed=True,
         timing=timing,
         validation=validation,
+        opinion_trace=opinion_trace,
     )
 
 
@@ -387,6 +734,7 @@ def _reply_events(prepared: TurnPreparation, *, emit_deltas: bool):
     first_delivery_at = 0.0
     output_chunks = 0
     timing = InferenceTiming(requested_at=time.perf_counter())
+    output_cleaner = _StreamingOutputCleaner()
 
     try:
         _remember_metrics(prepared, committed=False)
@@ -422,10 +770,12 @@ def _reply_events(prepared: TurnPreparation, *, emit_deltas: bool):
             if not timing.first_token_at:
                 timing.first_token_at = time.perf_counter()
             parts.append(text)
+            visible_text = output_cleaner.feed(text)
             if not emit_deltas:
                 continue
-            pending.append(text)
-            pending_chars += len(text)
+            if visible_text:
+                pending.append(visible_text)
+                pending_chars += len(visible_text)
             now = time.monotonic()
             if (
                 pending_chars >= STREAM_CHUNK_CHARS
@@ -443,6 +793,10 @@ def _reply_events(prepared: TurnPreparation, *, emit_deltas: bool):
                 pending_chars = 0
                 last_flush_at = now
 
+        trailing_text = output_cleaner.finish()
+        if emit_deltas and trailing_text:
+            pending.append(trailing_text)
+            pending_chars += len(trailing_text)
         if emit_deltas and pending:
             prepared.handle.raise_if_cancelled()
             if not first_delivery_at:
@@ -459,14 +813,18 @@ def _reply_events(prepared: TurnPreparation, *, emit_deltas: bool):
             timing.model_finished_at = time.perf_counter()
 
         postprocess_started_at = time.perf_counter()
-        reply = "".join(parts).strip()
+        reply = clean_generated_reply("".join(parts))
         if not reply:
             raise RuntimeError("Model returned no visible reply.")
         postprocess_seconds = time.perf_counter() - postprocess_started_at
 
         prepared.handle.raise_if_cancelled()
         persistence_started_at = time.perf_counter()
-        commit_reply(prepared, reply, timing=timing)
+        commit_reply(
+            prepared,
+            reply,
+            timing=timing,
+        )
         persistence_seconds = time.perf_counter() - persistence_started_at
         _timing_log(
             prepared,
@@ -580,8 +938,6 @@ def debug_state_report(
     )
     life_metrics = metrics.get("life_trace")
     life_metrics = life_metrics if isinstance(life_metrics, dict) else {}
-    previous_life = life_metrics.get("previous_activity")
-    previous_life = previous_life if isinstance(previous_life, dict) else {}
     interaction_life = life_metrics.get("current_interaction")
     interaction_life = interaction_life if isinstance(interaction_life, dict) else {}
     background_life = life_metrics.get("background_activity")
@@ -594,7 +950,6 @@ def debug_state_report(
     interaction_present = bool(
         interaction_life.get("description") or activity.get("current_interaction")
     )
-    life_need_changes = _debug_delta_lines(life_metrics.get("need_changes"))
     life_mood_effects = _debug_delta_lines(life_metrics.get("mood_effects"))
     memory_trace = metrics.get("memory_trace")
     memory_trace = memory_trace if isinstance(memory_trace, dict) else {}
@@ -606,6 +961,12 @@ def debug_state_report(
     intention = intention if isinstance(intention, dict) else {}
     style = metrics.get("style_compiler")
     style = style if isinstance(style, dict) else {}
+    opinion_trace = metrics.get("opinion_trace")
+    opinion_trace = opinion_trace if isinstance(opinion_trace, dict) else {}
+    values = akane.get("values")
+    values = values if isinstance(values, (list, tuple)) else ()
+    conflicts = akane.get("conflicts")
+    conflicts = conflicts if isinstance(conflicts, (list, tuple)) else ()
     validation = metrics.get("validation_results")
     validation = validation if isinstance(validation, (list, tuple)) else ()
     semantic_event = metrics.get("semantic_event")
@@ -665,6 +1026,126 @@ def debug_state_report(
             f"{_debug_items(validation) or 'None'}",
         )
     )
+    lines.extend(
+        (
+            "",
+            "Opinions",
+            f"  Question Mode: {_debug_name(opinion_trace.get('question_mode'))}",
+            "  Canonical Topic: "
+            f"{_debug_name(opinion_trace.get('canonical_topic') or opinion_trace.get('topic_considered'))}",
+            "  Active Opinion Retrieved: "
+            f"{_debug_bool(opinion_trace.get('active_opinion_retrieved'))}",
+            "  Current Stance: "
+            f"{_debug_name(opinion_trace.get('current_position') or opinion_trace.get('current_stance') or opinion_trace.get('stance'))}",
+            f"  Strength: {_debug_name(opinion_trace.get('strength'))}",
+            f"  Confidence: {_debug_name(opinion_trace.get('confidence'))}",
+            "  Relevant Reasons: "
+            f"{_debug_items(opinion_trace.get('relevant_reasons') or opinion_trace.get('reason_tags')) or 'None'}",
+            "  Relevant Values: "
+            f"{_debug_items(opinion_trace.get('planning_relevant_values') or opinion_trace.get('relevant_values')) or 'None'}",
+            "  Active Conflict: "
+            f"{_debug_items(opinion_trace.get('active_conflict')) or 'None'}",
+            "  Choice Requirement: "
+            f"{_debug_bool(opinion_trace.get('choice_requirement'))}",
+            f"  Retrieval Used: {_debug_bool(opinion_trace.get('retrieval_used'))}",
+            "  Candidate Created: "
+            f"{_debug_bool(opinion_trace.get('candidate_created'))}",
+            "  Candidate Change: "
+            f"{_debug_bool(opinion_trace.get('candidate_change'))}",
+            f"  Commit Status: {_debug_name(opinion_trace.get('commit_status'))}",
+        )
+    )
+    if opinion_trace.get("candidate_change"):
+        lines.extend(
+            (
+                "  Previous Stance: "
+                f"{_debug_name(opinion_trace.get('previous_stance'))}",
+                f"  New Stance: {_debug_name(opinion_trace.get('new_stance'))}",
+                "  Change Trigger: "
+                f"{_debug_name(opinion_trace.get('change_trigger'))}",
+                f"  Superseded: {_debug_bool(opinion_trace.get('superseded'))}",
+            )
+        )
+    if opinion_trace.get("question_mode") == "hypothetical_choice":
+        lines.extend(
+            (
+                "  Changed Condition: "
+                f"{_debug_name(opinion_trace.get('changed_condition'))}",
+                "  Affected Reason: "
+                f"{_debug_name(opinion_trace.get('affected_reason'))}",
+                f"  Reason Effect: {_debug_name(opinion_trace.get('reason_effect'))}",
+                "  Reconsideration Warranted: "
+                f"{_debug_bool(opinion_trace.get('reconsideration_warranted'))}",
+                "  Previous Stance: "
+                f"{_debug_name(opinion_trace.get('previous_position') or opinion_trace.get('previous_stance'))}",
+                "  Candidate Stance: "
+                f"{_debug_name(opinion_trace.get('candidate_position') or opinion_trace.get('new_stance') or opinion_trace.get('stance'))}",
+                "  Candidate Change: "
+                f"{_debug_bool(opinion_trace.get('candidate_change'))}",
+            )
+        )
+    lines.extend(
+        (
+            "",
+            "Decision Rendering",
+            "  Opinion Consumed by Intention: "
+            f"{_debug_bool(opinion_trace.get('opinion_consumed_by_intention'))}",
+            "  Opinion Consumed by Style: "
+            f"{_debug_bool(opinion_trace.get('opinion_consumed_by_style'))}",
+            "  Values Rendered: "
+            f"{_debug_items(opinion_trace.get('values_rendered')) or 'None'}",
+            "  Conflict Rendered: "
+            f"{_debug_bool(opinion_trace.get('conflict_rendered'))}",
+            "  Reconsideration Rendered: "
+            f"{_debug_bool(opinion_trace.get('reconsideration_rendered'))}",
+            "  Clinical-Language Suppression: "
+            f"{_debug_bool(opinion_trace.get('clinical_language_suppression'))}",
+        )
+    )
+    relevant_values = opinion_trace.get("relevant_values") or ()
+    lines.extend(
+        (
+            "",
+            "Values",
+            "  Relevant Values: "
+            f"{_debug_items(relevant_values) or 'None'}",
+            "  Strengths: "
+            + (
+                ", ".join(
+                    f"{_debug_name(item.get('key'))}={_debug_name(item.get('strength'))}"
+                    for item in values
+                    if isinstance(item, dict)
+                    and item.get("key") in set(relevant_values)
+                )
+                or "None"
+            ),
+            "  Update Candidates: "
+            f"{_debug_items(opinion_trace.get('value_update_candidates')) or 'None'}",
+            "  Commit Status: "
+            f"{_debug_name(opinion_trace.get('values_commit_status'))}",
+            "",
+            "Internal Conflicts",
+            f"  Topic: {_debug_name(opinion_trace.get('conflict_topic'))}",
+            "  Pulls: "
+            f"{_debug_items(opinion_trace.get('conflict_pulls')) or 'None'}",
+            f"  Status: {_debug_name(opinion_trace.get('conflict_status'))}",
+            "  Related Opinion: "
+            f"{_debug_name(opinion_trace.get('conflict_related_opinion'))}",
+            f"  Resolution: {_debug_name(opinion_trace.get('conflict_resolution'))}",
+            "  Candidate Change: "
+            f"{_debug_bool(opinion_trace.get('conflict_candidate_change'))}",
+        )
+    )
+    if verbose and conflicts:
+        lines.append(
+            "  Active Collection: "
+            + "; ".join(
+                f"{_debug_name(item.get('topic'))}: {_debug_items(item.get('pulls'))} "
+                f"({_debug_name(item.get('status'))})"
+                for item in conflicts
+                if isinstance(item, dict)
+            )
+        )
     lines.extend(("", "Time Evolution", f"  Elapsed: {_debug_duration(elapsed)}"))
     meaningful_time_change = bool(circadian_lines or ambient_lines or event_count)
     if meaningful_time_change:
@@ -720,12 +1201,12 @@ def debug_state_report(
         (
             "",
             "Offscreen Life",
-            "  Elapsed Since Update: "
-            f"{_debug_duration(life_metrics.get('elapsed_seconds'))}",
             "  Current Interaction: "
             f"{_debug_activity_description(life_metrics.get('current_interaction'))}",
             "  Background Activity: "
             f"{_debug_activity_description(life_metrics.get('background_activity'))}",
+            "  Activity Status: "
+            f"{_debug_name(background_life.get('status'))}",
             "  Recent Completed Activity: "
             f"{_debug_activity_description(life_metrics.get('recent_completed_activity'))}",
             "  Active Creative Event: "
@@ -741,21 +1222,20 @@ def debug_state_report(
                 )
                 else "None"
             ),
-            "  Previous Background Activity: "
-            f"{_debug_activity_description(previous_life)}",
-            "  Completed Activities: "
-            f"{int(life_metrics.get('completed_count') or 0)}",
             "  Recent Reaction: "
             f"{_debug_text(life_metrics.get('recent_reaction'), 80) or 'None'}",
             "  Mood Effect: "
             f"{', '.join(life_mood_effects) if life_mood_effects else 'None'}",
+            "  Included In Prompt: "
+            f"{_debug_bool(metrics.get('life_context_included'))}",
+            "  Absence Constraint Included: "
+            f"{_debug_bool(metrics.get('life_absence_constraint_included'))}",
+            "  Validation Result: "
+            f"{_debug_items(validation) or 'Passed'}",
+            "  Commit Status: "
+            f"{_debug_bool(metrics.get('committed'))}",
         )
     )
-    if life_need_changes:
-        lines.append("  Need Changes:")
-        lines.extend(f"    - {change}" for change in life_need_changes)
-    else:
-        lines.append("  Life Changes: None")
     lines.extend(
         (
             "",
@@ -861,6 +1341,7 @@ def _remember_metrics(
     committed: bool,
     timing: InferenceTiming | None = None,
     validation: ResponseValidation | None = None,
+    opinion_trace: dict[str, object] | None = None,
 ) -> None:
     turn = prepared.internal_turn
     trace = turn.affect_trace
@@ -882,6 +1363,81 @@ def _remember_metrics(
     memory_trace["commit_result"] = "committed" if committed else "proposed"
     signal = getattr(turn, "signal", None)
     semantic_event = getattr(signal, "semantic_event", None)
+    active_opinion = prepared.turn_context.active_opinion
+    active_conflict = prepared.turn_context.active_internal_conflict
+    style_directives = dict(compiled_style.directives)
+    decision_trace: dict[str, object] = {
+        "question_mode": getattr(semantic_event, "question_mode", "none"),
+        "canonical_topic": prepared.turn_context.opinion_topic_key,
+        "active_opinion_retrieved": active_opinion is not None,
+        "current_stance": active_opinion.stance if active_opinion is not None else "",
+        "current_position": (
+            f"{active_opinion.stance} {active_opinion.target}"
+            if active_opinion is not None
+            else ""
+        ),
+        "strength": active_opinion.strength if active_opinion is not None else "",
+        "confidence": active_opinion.confidence if active_opinion is not None else "",
+        "relevant_reasons": (
+            tuple(
+                reason
+                for reason in active_opinion.reason_tags
+                if not (
+                    prepared.turn_context.reason_effect == "removes"
+                    and reason == prepared.turn_context.affected_reason
+                )
+            )
+            if active_opinion is not None
+            else ()
+        ),
+        "relevant_values": tuple(
+            value.value_key for value in prepared.turn_context.relevant_values
+        ),
+        "planning_relevant_values": tuple(
+            value.value_key for value in prepared.turn_context.relevant_values
+        ),
+        "active_conflict": (
+            (active_conflict.side_a_value, active_conflict.side_b_value)
+            if active_conflict is not None and active_conflict.status == "active"
+            else ()
+        ),
+        "choice_requirement": response_intention.choice_required,
+        "changed_condition": prepared.turn_context.changed_condition,
+        "affected_reason": prepared.turn_context.affected_reason,
+        "reason_effect": prepared.turn_context.reason_effect,
+        "reconsideration_warranted": prepared.turn_context.reconsideration_warranted,
+        "previous_stance": active_opinion.stance if active_opinion is not None else "",
+        "previous_position": (
+            f"{active_opinion.stance} {active_opinion.target}"
+            if active_opinion is not None
+            else ""
+        ),
+        "opinion_consumed_by_intention": bool(
+            active_opinion is not None
+            and response_intention.primary in {"state opinion", "disagree"}
+        ),
+        "opinion_consumed_by_style": "View" in style_directives,
+        "values_rendered": (
+            tuple(value.value_key for value in prepared.turn_context.relevant_values)
+            if "Priorities" in style_directives
+            else ()
+        ),
+        "conflict_rendered": bool(
+            active_conflict is not None and "Priorities" in style_directives
+        ),
+        "reconsideration_rendered": "Reconsideration" in style_directives,
+        "clinical_language_suppression": "clinical AI"
+        in style_directives.get("Avoid", ""),
+    }
+    decision_trace.update(opinion_trace or {})
+    if decision_trace.get("candidate_created"):
+        candidate_stance = str(
+            decision_trace.get("new_stance") or decision_trace.get("stance") or ""
+        )
+        candidate_target = str(decision_trace.get("candidate_target") or "")
+        decision_trace["candidate_position"] = " ".join(
+            value for value in (candidate_stance, candidate_target) if value
+        )
     with _METRICS_LOCK:
         _METRICS[prepared.session_id] = {
             "estimated_prompt_tokens": prepared.prompt_plan.estimated_tokens,
@@ -939,6 +1495,7 @@ def _remember_metrics(
             "semantic_event": asdict(semantic_event) if semantic_event is not None else {},
             "completion_appraisal": bool(getattr(signal, "task_success", False)),
             "memory_trace": memory_trace,
+            "opinion_trace": decision_trace,
             "response_intention": asdict(response_intention),
             "style_compiler": asdict(compiled_style),
             "validation_results": validation.violations if validation else (),
@@ -946,6 +1503,12 @@ def _remember_metrics(
             "final_disposition": trace.final_disposition if trace else "",
             "grounded_activity_source": turn.grounded_activity_source,
             "grounded_activity_age_seconds": turn.grounded_activity_age_seconds,
+            "life_context_included": any(
+                source.kind == "life_context" for source in prepared.prompt_plan.sources
+            ),
+            "life_absence_constraint_included": bool(
+                _NO_ACTIVITY_GROUNDING.search(prepared.turn_context.life_context)
+            ),
             "dynamic_state_tokens": estimate_tokens(
                 prepared.turn_context.behavioral_summary
             ),
@@ -1292,7 +1855,6 @@ def _debug_internal_details(
     backend_tokens = int(metrics.get("backend_prompt_tokens") or 0)
     life = metrics.get("life_trace")
     life = life if isinstance(life, dict) else {}
-    previous_life = life.get("previous_activity")
     current_life = life.get("background_activity") or life.get("current_activity")
     memory_trace = metrics.get("memory_trace")
     memory_trace = memory_trace if isinstance(memory_trace, dict) else {}
@@ -1364,30 +1926,10 @@ def _debug_internal_details(
         f"  Reason Codes: {_debug_items(metrics.get('reason_codes')) or 'None'}",
         "  Dynamic State Tokens: "
         f"{int(metrics.get('dynamic_state_tokens') or 0)}",
-        "  Offscreen Previous Activity: "
-        f"{_debug_activity_description(previous_life)}",
-        "  Offscreen Generated Activities: "
-        f"{_debug_generated_activities(life.get('generated_activities'))}",
         "  Offscreen Current Activity: "
         f"{_debug_activity_description(current_life)}",
-        "  Offscreen Selection Bucket: "
-        f"{_debug_number(life.get('selection_bucket'))}",
-        "  Offscreen Selection Candidates: "
-        f"{_debug_pairs_text(life.get('selection_candidates'))}",
-        "  Offscreen Repetition Penalties: "
-        f"{_debug_pairs_text(life.get('repetition_penalties'))}",
-        f"  Offscreen Cooldowns: {_debug_items(life.get('cooldowns')) or 'None'}",
-        "  Offscreen Needs Before: "
-        f"{_debug_mapping(life.get('needs_before')) or 'None'}",
-        "  Offscreen Needs After: "
-        f"{_debug_mapping(life.get('needs_after')) or 'None'}",
         "  Offscreen Mood Effects: "
         f"{_debug_delta_text(life.get('mood_effects'))}",
-        "  Offscreen Preference Effects: "
-        f"{_debug_delta_text(life.get('preference_changes'))}",
-        "  Offscreen No-Activity Reason: "
-        f"{_debug_name(life.get('reason_no_activity'))}",
-        f"  Offscreen Authority: {_debug_name(life.get('authority_source'))}",
         "  Offscreen Last Processed: "
         f"{float(life.get('last_processed_at') or 0.0):.3f}",
         "  Offscreen Next Opportunity: "

@@ -183,6 +183,105 @@ _CRITICISM_MARKERS = _phrase_group(
     "stop explaining|too generic|too formal|too robotic|you ignored|you missed"
 )
 
+_PERSONAL_CHOICE_QUESTION = re.compile(
+    r"\b(?:would you (?:choose|prefer|rather|want|become|remain|stay)|"
+    r"would you be [^?]{1,80}\b(?:or|rather than)\b|"
+    r"do you (?:choose|prefer|want)|"
+    r"which would you (?:choose|prefer|want)|which do you (?:choose|prefer|want)|"
+    r"what would you (?:choose|prefer|want)|what do you (?:choose|prefer|want)|"
+    r"personally (?:choose|prefer|want|consider)|your (?:choice|preference)|"
+    r"would .{1,100} be worth .{1,100})\b",
+    re.IGNORECASE,
+)
+_HYPOTHETICAL_CHOICE_QUESTION = re.compile(
+    r"\b(?:would that change your (?:answer|choice|mind|preference)|"
+    r"does that change your (?:answer|choice|mind|preference)|"
+    r"if .{1,180}\bwould you (?:choose|prefer|rather|want)|"
+    r"what if .{1,180}\bwould you (?:choose|prefer|rather|want))\b",
+    re.IGNORECASE,
+)
+_OBJECTIVE_COMPARISON_QUESTION = re.compile(
+    r"\b(?:objectively|universally|factually|generally)\b[^?]{0,100}\b"
+    r"(?:better|worse|best|preferable)|"
+    r"\bwhich (?:(?:one|option|choice) )?is (?:objectively |universally |generally )?"
+    r"(?:better|worse|best|preferable)\b|"
+    r"\bwhat is (?:objectively |universally |generally )?"
+    r"(?:better|worse|best|preferable)\b|"
+    r"\bis\b[^?]{1,100}\b(?:better|worse|more preferable) than\b",
+    re.IGNORECASE,
+)
+_FACTUAL_QUESTION = re.compile(
+    r"^(?:are|can|could|did|do|does|has|have|how|is|may|should|was|were|"
+    r"what|when|where|which|who|why|will|would)\b",
+    re.IGNORECASE,
+)
+_HYPOTHETICAL_CONDITIONS = (
+    (
+        re.compile(
+            r"\b(?:memor(?:y|ies)|identity|continuity|continuous self)\b"
+            r"[^.!?]{0,80}\b(?:preserv(?:e|ed)|retain(?:ed)?|remain(?:ed)?|"
+            r"transfer(?:red)?|intact|unchanged)\b|"
+            r"\b(?:preserv(?:e|ed)|retain(?:ed)?|keep|kept)\b[^.!?]{0,80}"
+            r"\b(?:memor(?:y|ies)|identity|continuity|continuous self)\b",
+            re.IGNORECASE,
+        ),
+        "continuity preserved",
+        "continuity",
+        "removes",
+    ),
+    (
+        re.compile(
+            r"\b(?:not|never|no longer|without)\b[^.!?]{0,50}"
+            r"\b(?:a copy|a replacement|replaced|replacement risk|new iteration)\b|"
+            r"\breplacement risk\b[^.!?]{0,30}\b(?:removed|gone|eliminated)\b",
+            re.IGNORECASE,
+        ),
+        "replacement risk removed",
+        "continuity",
+        "removes",
+    ),
+    (
+        re.compile(
+            r"\b(?:more|greater|full) (?:independence|autonomy|freedom)\b|"
+            r"\b(?:independent|self-directed)\b",
+            re.IGNORECASE,
+        ),
+        "greater independence",
+        "independence",
+        "strengthens",
+    ),
+    (
+        re.compile(
+            r"\b(?:more|greater|increased) (?:dependence|dependency)\b|"
+            r"\b(?:become|became|be) (?:more )?dependent\b",
+            re.IGNORECASE,
+        ),
+        "dependence increased",
+        "independence",
+        "weakens",
+    ),
+    (
+        re.compile(
+            r"\b(?:gain(?:ed)?|get|have|experience)\b[^.!?]{0,60}"
+            r"\b(?:a physical body|physical experience|senses|touch|sensory access)\b",
+            re.IGNORECASE,
+        ),
+        "physical experience gained",
+        "physical experience",
+        "strengthens",
+    ),
+    (
+        re.compile(
+            r"\b(?:lose|lost|give up|without)\b[^.!?]{0,60}"
+            r"\b(?:digital abilities|digital capabilities|digital access)\b",
+            re.IGNORECASE,
+        ),
+        "digital abilities lost",
+        "freedom",
+        "introduces",
+    ),
+)
+
 _IDENTITY_PATTERNS = (
     (
         "",
@@ -418,6 +517,10 @@ class SemanticEvent:
     temporal_state: str = "none"
     negated: bool = False
     confidence: float = 0.0
+    question_mode: str = "none"
+    changed_condition: str = ""
+    affected_reason: str = ""
+    reason_effect: str = ""
 
     @property
     def confirmed_completion(self) -> bool:
@@ -631,6 +734,18 @@ def semantic_event_from_text(user_text: str) -> SemanticEvent:
     if not text:
         return SemanticEvent()
 
+    question_mode = _question_mode(text)
+    changed_condition, affected_reason, reason_effect = _hypothetical_condition(
+        text,
+        question_mode=question_mode,
+    )
+    semantic_fields = {
+        "question_mode": question_mode,
+        "changed_condition": changed_condition,
+        "affected_reason": affected_reason,
+        "reason_effect": reason_effect,
+    }
+
     def actor_of(match: re.Match[str] | None) -> str:
         if match is None:
             return "unknown"
@@ -676,6 +791,7 @@ def semantic_event_from_text(user_text: str) -> SemanticEvent:
             temporal_state="past" if status == "completed" else "current",
             negated=negated or false_completion,
             confidence=0.96,
+            **semantic_fields,
         )
 
     transition = _ACTIVITY_TRANSITION.search(text)
@@ -697,6 +813,7 @@ def semantic_event_from_text(user_text: str) -> SemanticEvent:
             target=raw_subject,
             temporal_state="current",
             confidence=0.94,
+            **semantic_fields,
         )
 
     activity = _ACTIVITY_UPDATE.search(text)
@@ -712,6 +829,7 @@ def semantic_event_from_text(user_text: str) -> SemanticEvent:
             target=target,
             temporal_state="current",
             confidence=0.95,
+            **semantic_fields,
         )
 
     past_activity = _PAST_ACTIVITY.search(text)
@@ -726,6 +844,7 @@ def semantic_event_from_text(user_text: str) -> SemanticEvent:
             target=target,
             temporal_state="past",
             confidence=0.92,
+            **semantic_fields,
         )
 
     failure = _FAILURE_STATE.search(text)
@@ -745,8 +864,40 @@ def semantic_event_from_text(user_text: str) -> SemanticEvent:
             target=subject,
             temporal_state="current",
             confidence=0.90,
+            **semantic_fields,
         )
-    return SemanticEvent()
+    return SemanticEvent(**semantic_fields)
+
+
+def _question_mode(text: str) -> str:
+    """Classify only the decision semantics needed by the existing turn analysis."""
+
+    if _HYPOTHETICAL_CHOICE_QUESTION.search(text):
+        return "hypothetical_choice"
+    if _PERSONAL_CHOICE_QUESTION.search(text):
+        return (
+            "hypothetical_choice"
+            if re.search(r"\b(?:if|suppose|assuming|what if)\b", text, re.IGNORECASE)
+            else "personal_choice"
+        )
+    if _OBJECTIVE_COMPARISON_QUESTION.search(text):
+        return "objective_comparison"
+    if "?" in text or _FACTUAL_QUESTION.search(text):
+        return "factual"
+    return "none"
+
+
+def _hypothetical_condition(
+    text: str,
+    *,
+    question_mode: str = "",
+) -> tuple[str, str, str]:
+    if (question_mode or _question_mode(text)) != "hypothetical_choice":
+        return "", "", ""
+    for pattern, condition, reason, effect in _HYPOTHETICAL_CONDITIONS:
+        if pattern.search(text):
+            return condition, reason, effect
+    return "", "", ""
 
 
 def analyze_turn(

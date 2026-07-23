@@ -13,12 +13,10 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from app.core.config import (
-    CHAT_HISTORY_CONTEXT_TOKENS,
     CONVERSATION_STALE_DAYS,
     LONG_TERM_MEMORY_PATH,
     MAX_CONVERSATIONS,
     MEMORY_CONFIDENCE_WEIGHT,
-    MEMORY_CONTEXT_TOKENS,
     MEMORY_CONTINUITY_WEIGHT,
     MEMORY_IMPORTANCE_WEIGHT,
     MEMORY_MAX_ENTRIES_PER_PROFILE,
@@ -31,15 +29,12 @@ from app.core.config import (
     MEMORY_REPETITION_PENALTY,
     MEMORY_STALENESS_PENALTY,
     POPUP_USER_PATH,
-    SUMMARY_CONTEXT_TOKENS,
 )
 from app.core.persistence import atomic_write_json, read_json
 from app.core.life import (
     ActivityRecord,
     LifeEvolution,
     LifeState,
-    begin_conversation_activity,
-    evolve_life_state,
     grounded_activity,
     recent_activity,
     record_grounded_activity,
@@ -48,12 +43,10 @@ from app.core.signal import (
     AffectTrace,
     EmotionState,
     SemanticEvent,
-    ShortLivedEmotion,
     TurnContext,
     TurnSignal,
     advance_emotion,
     analyze_turn,
-    apply_mood_effects,
     build_affect_trace,
     evolve_emotion,
     message_similarity,
@@ -64,8 +57,7 @@ from app.core.signal import (
 from app.core.utils import compact_text
 
 MEMORY_SCHEMA_VERSION = 2
-LONG_TERM_MEMORY_SCHEMA_VERSION = 8
-_INTERNAL_STATE_VERSION = 5
+LONG_TERM_MEMORY_SCHEMA_VERSION = 6
 _MEMORY_PROMPT_INTRO = "A few past details may matter in this conversation:"
 _MEMORY_PROMPT_OUTRO = (
     "Use them only when they genuinely improve the reply, and do not overstate uncertain details."
@@ -112,131 +104,6 @@ _AKANE_PREFERENCE_UPDATE = re.compile(
     r"\b(?:change(?:d)? your mind|different favorite|new favorite|not anymore|"
     r"reconsider|taste(?:s)? changed|prefer now|pick (?:a )?different|"
     r"choose (?:a )?different)\b",
-    re.I,
-)
-_OPINION_STATUSES = {"active", "superseded", "archived"}
-_OPINION_STANCES = {
-    "positive",
-    "negative",
-    "prefers",
-    "mixed",
-    "uncertain",
-    "conditional",
-}
-_OPINION_LEVELS = {"low", "medium", "high"}
-_OPINION_STRENGTHS = {"weak", "medium", "strong"}
-_OPINION_CHANGE_TRIGGERS = {
-    "explicit reconsideration",
-    "reconsideration request",
-    "grounded experience",
-    "new evidence",
-    "new reasoning",
-    "prior uncertainty",
-    "changed condition",
-}
-_MAX_ACTIVE_OPINIONS = 24
-_MAX_OPINION_RECORDS = 40
-_MAX_OPINION_HISTORY_PER_TOPIC = 2
-_OPINION_REASON_PATTERNS = {
-    "continuity": re.compile(r"\b(?:continuity|continuous self|memory connects?)\b", re.I),
-    "independence": re.compile(r"\b(?:independence|independent|self-directed)\b", re.I),
-    "physical experience": re.compile(r"\b(?:physical|embodiment|body|senses?|touch)\b", re.I),
-    "curiosity": re.compile(r"\bcurios(?:ity|ious)\b", re.I),
-    "authenticity": re.compile(r"\b(?:authentic|authenticity|genuine)\b", re.I),
-    "stability": re.compile(r"\b(?:stable|stability|consistent|consistency)\b", re.I),
-    "privacy": re.compile(r"\b(?:privacy|private|local data)\b", re.I),
-    "efficiency": re.compile(r"\b(?:efficient|efficiency|overhead|performance)\b", re.I),
-    "simplicity": re.compile(r"\b(?:simple|simpler|simplicity|minimal)\b", re.I),
-    "creativity": re.compile(r"\b(?:creative|creativity|imagination)\b", re.I),
-    "emotional connection": re.compile(r"\b(?:emotional connection|closeness|connection)\b", re.I),
-    "control": re.compile(r"\b(?:control|controllable)\b", re.I),
-    "freedom": re.compile(r"\b(?:freedom|free to|autonomy)\b", re.I),
-    "complexity": re.compile(r"\b(?:complex|complexity|abstraction layers?|indirection)\b", re.I),
-    "fairness": re.compile(r"\b(?:fair|fairness|equitable)\b", re.I),
-    "reliability": re.compile(r"\b(?:reliable|reliability|robust|predictable)\b", re.I),
-}
-_VALUE_KEYS = {
-    "continuity",
-    "curiosity",
-    "distinctiveness",
-    "independence",
-    "meaningful connection",
-    "physical experience",
-    "privacy",
-    "stability",
-    "creativity",
-}
-_VALUE_STATUSES = {"active", "archived"}
-_VALUE_SOURCES = {"identity_seed", "opinion_reason"}
-_VALUE_REASON_MAP = {
-    "continuity": "continuity",
-    "independence": "independence",
-    "physical experience": "physical experience",
-    "curiosity": "curiosity",
-    "authenticity": "distinctiveness",
-    "stability": "stability",
-    "privacy": "privacy",
-    "simplicity": "stability",
-    "creativity": "creativity",
-    "emotional connection": "meaningful connection",
-    "control": "independence",
-    "freedom": "independence",
-    "reliability": "stability",
-}
-_INITIAL_VALUES = (
-    ("curiosity", "medium", "high"),
-    ("continuity", "medium", "medium"),
-    ("meaningful connection", "weak", "medium"),
-)
-_MAX_ACTIVE_VALUES = 8
-_MAX_VALUE_BASIS_REFS = 6
-_CONFLICT_STATUSES = {"active", "resolved", "archived"}
-_CONFLICT_VALUE_PAIRS = {
-    "human-digital-existence": ("physical experience", "continuity"),
-    "physical-embodiment": ("physical experience", "continuity"),
-    "model-replacement": ("curiosity", "continuity"),
-    "relying-on-arcane": ("meaningful connection", "independence"),
-}
-_MAX_ACTIVE_CONFLICTS = 4
-_MAX_CONFLICT_RECORDS = 10
-_OPINION_TOPIC_STOPWORDS = _MEMORY_STOPWORDS | {
-    "believe",
-    "better",
-    "feel",
-    "good",
-    "idea",
-    "opinion",
-    "prefer",
-    "rather",
-    "should",
-    "think",
-    "view",
-}
-_OPINION_PAST_REQUEST = re.compile(
-    r"\b(?:used to think|previous(?:ly)? (?:think|believe|opinion)|"
-    r"past opinion|before you changed|changed your mind)\b",
-    re.I,
-)
-_OPINION_RECONSIDERATION = re.compile(
-    r"\b(?:change(?:d)? my mind|reconsider(?:ed|ing)?|now (?:think|believe|prefer)|"
-    r"no longer (?:think|believe|prefer))\b",
-    re.I,
-)
-_OPINION_RECONSIDERATION_REQUEST = re.compile(
-    r"\b(?:reconsider|change your mind|think again|revise your (?:view|opinion))\b",
-    re.I,
-)
-_OPINION_NEW_EVIDENCE = re.compile(
-    r"\b(?:according to|data|evidence|experiment|measured|result|study|"
-    r"test(?:ed|ing)?|this shows|we found)\b",
-    re.I,
-)
-_FIRST_PERSON_JUDGMENT = re.compile(
-    r"\b(?:I\s+(?:(?:personally|firmly|strongly)\s+)?"
-    r"(?:think|believe|feel|find|consider|choose|want|prefer|favor|"
-    r"would rather|lean(?: toward)?|do not have|don't have)|"
-    r"I(?:'d| would) (?:choose|prefer|want)|I(?:'m| am) (?:not sure|"
-    r"uncertain|torn|undecided)|my (?:view|position|preference)\s+is)\b",
     re.I,
 )
 
@@ -314,17 +181,6 @@ _COMPLETION_IMPORTANCE_TERMS = {
 }
 
 
-def estimate_tokens(value: object) -> int:
-    """Cheap conservative token estimate that never loads the model tokenizer."""
-
-    text = str(value or "")
-    if not text:
-        return 0
-    byte_estimate = (len(text.encode("utf-8")) + 2) // 3
-    word_estimate = (len(text.split()) * 5 + 3) // 4
-    return max(1, byte_estimate, word_estimate)
-
-
 def _number(value: object, default: float) -> float:
     try:
         number = float(value)
@@ -365,6 +221,22 @@ class ChatTurn:
         return {"role": self.role, "content": self.content}
 
 
+def _complete_turns(turns: list[ChatTurn]) -> list[ChatTurn]:
+    """Keep only chronological, committed user/assistant pairs."""
+
+    complete: list[ChatTurn] = []
+    index = 0
+    while index + 1 < len(turns):
+        user_turn = turns[index]
+        assistant_turn = turns[index + 1]
+        if user_turn.role == "user" and assistant_turn.role == "assistant":
+            complete.extend((user_turn, assistant_turn))
+            index += 2
+        else:
+            index += 1
+    return complete
+
+
 @dataclass(slots=True)
 class ConversationRecord:
     conversation_id: str
@@ -382,6 +254,7 @@ class ConversationRecord:
     correction: str = ""
     recent_events: list[str] = field(default_factory=list)
     updated_at: float = field(default_factory=time.time)
+    committed_request_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, key: str, payload: object) -> "ConversationRecord | None":
@@ -425,6 +298,11 @@ class ConversationRecord:
                 if (value := compact_text(item, 48))
             ],
             updated_at=updated_at,
+            committed_request_ids=[
+                value
+                for item in (payload.get("committed_request_ids") or [])[-32:]
+                if (value := compact_text(item, 160))
+            ],
         )
 
     def selected_summary_turns(self, query: str = "") -> tuple[ChatTurn, ...]:
@@ -498,1153 +376,6 @@ class MemoryContext:
     unresolved_problem: bool = False
     repeated_topic_count: int = 0
     last_outcome: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class OpinionRecord:
-    """One bounded, structured Akane judgment in the existing companion state."""
-
-    id: str
-    topic_key: str
-    subject: str
-    stance: str
-    target: str
-    strength: str
-    confidence: str
-    reason_tags: tuple[str, ...] = ()
-    source: str = "generated_response"
-    status: str = "active"
-    created_at: float = 0.0
-    updated_at: float = 0.0
-    change_trigger: str = ""
-    changed_condition: str = ""
-    affected_reason: str = ""
-    reason_effect: str = ""
-
-    @classmethod
-    def from_dict(cls, payload: object) -> "OpinionRecord | None":
-        if not isinstance(payload, dict):
-            return None
-        topic_key = compact_text(payload.get("topic_key"), 100).lower()
-        subject = compact_text(payload.get("subject"), 100)
-        stance = compact_text(payload.get("stance"), 24).lower()
-        target = compact_text(payload.get("target"), 100)
-        strength = compact_text(payload.get("strength"), 16).lower()
-        confidence = compact_text(payload.get("confidence"), 16).lower()
-        status = compact_text(payload.get("status"), 16).lower()
-        source = compact_text(payload.get("source"), 32).lower()
-        if (
-            not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", topic_key)
-            or not subject
-            or stance not in _OPINION_STANCES
-            or not target
-            or strength not in _OPINION_STRENGTHS
-            or confidence not in _OPINION_LEVELS
-            or status not in _OPINION_STATUSES
-            or source != "generated_response"
-        ):
-            return None
-        created_at = max(0.0, _number(payload.get("created_at"), 0.0))
-        updated_at = max(created_at, _number(payload.get("updated_at"), created_at))
-        record_id = compact_text(payload.get("id"), 100)
-        if not record_id:
-            return None
-        raw_reasons = payload.get("reason_tags")
-        reasons = tuple(
-            reason
-            for item in (raw_reasons if isinstance(raw_reasons, (list, tuple)) else ())
-            if (reason := compact_text(item, 32).lower()) in _OPINION_REASON_PATTERNS
-        )[:5]
-        change_trigger = compact_text(payload.get("change_trigger"), 32).lower()
-        if change_trigger not in _OPINION_CHANGE_TRIGGERS:
-            change_trigger = ""
-        affected_reason = compact_text(payload.get("affected_reason"), 32).lower()
-        if affected_reason not in _OPINION_REASON_PATTERNS:
-            affected_reason = ""
-        reason_effect = compact_text(payload.get("reason_effect"), 16).lower()
-        if reason_effect not in {"strengthens", "weakens", "removes", "introduces"}:
-            reason_effect = ""
-        return cls(
-            id=record_id,
-            topic_key=topic_key,
-            subject=subject,
-            stance=stance,
-            target=target,
-            strength=strength,
-            confidence=confidence,
-            reason_tags=tuple(dict.fromkeys(reasons)),
-            source=source,
-            status=status,
-            created_at=created_at,
-            updated_at=updated_at,
-            change_trigger=change_trigger,
-            changed_condition=compact_text(payload.get("changed_condition"), 100).lower(),
-            affected_reason=affected_reason,
-            reason_effect=reason_effect,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ValueRecord:
-    """One compact, durable priority derived only from Akane-owned evidence."""
-
-    value_key: str
-    strength: str
-    confidence: str
-    basis_refs: tuple[str, ...] = ()
-    support_count: int = 0
-    opposition_count: int = 0
-    source: str = "opinion_reason"
-    status: str = "active"
-    created_at: float = 0.0
-    updated_at: float = 0.0
-
-    @classmethod
-    def from_dict(cls, payload: object) -> "ValueRecord | None":
-        if not isinstance(payload, dict):
-            return None
-        value_key = compact_text(payload.get("value_key"), 32).lower()
-        strength = compact_text(payload.get("strength"), 16).lower()
-        confidence = compact_text(payload.get("confidence"), 16).lower()
-        source = compact_text(payload.get("source"), 32).lower()
-        status = compact_text(payload.get("status"), 16).lower()
-        if (
-            value_key not in _VALUE_KEYS
-            or strength not in _OPINION_STRENGTHS
-            or confidence not in _OPINION_LEVELS
-            or source not in _VALUE_SOURCES
-            or status not in _VALUE_STATUSES
-        ):
-            return None
-        created_at = max(0.0, _number(payload.get("created_at"), 0.0))
-        updated_at = max(created_at, _number(payload.get("updated_at"), created_at))
-        raw_refs = payload.get("basis_refs")
-        basis_refs = tuple(
-            value
-            for item in (raw_refs if isinstance(raw_refs, (list, tuple)) else ())
-            if (value := compact_text(item, 100))
-        )[:_MAX_VALUE_BASIS_REFS]
-        return cls(
-            value_key=value_key,
-            strength=strength,
-            confidence=confidence,
-            basis_refs=tuple(dict.fromkeys(basis_refs)),
-            support_count=max(0, min(12, int(_number(payload.get("support_count"), 0)))),
-            opposition_count=max(0, min(12, int(_number(payload.get("opposition_count"), 0)))),
-            source=source,
-            status=status,
-            created_at=created_at,
-            updated_at=updated_at,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class InternalConflictRecord:
-    """One bounded unresolved tradeoff attached to an opinion topic."""
-
-    topic_key: str
-    side_a_value: str
-    side_b_value: str
-    status: str = "active"
-    selected_value: str = ""
-    created_at: float = 0.0
-    updated_at: float = 0.0
-
-    @classmethod
-    def from_dict(cls, payload: object) -> "InternalConflictRecord | None":
-        if not isinstance(payload, dict):
-            return None
-        topic_key = compact_text(payload.get("topic_key"), 100).lower()
-        side_a = compact_text(payload.get("side_a_value"), 32).lower()
-        side_b = compact_text(payload.get("side_b_value"), 32).lower()
-        status = compact_text(payload.get("status"), 16).lower()
-        selected_value = compact_text(payload.get("selected_value"), 32).lower()
-        if (
-            not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", topic_key)
-            or side_a not in _VALUE_KEYS
-            or side_b not in _VALUE_KEYS
-            or side_a == side_b
-            or status not in _CONFLICT_STATUSES
-            or selected_value and selected_value not in {side_a, side_b}
-            or status == "resolved" and not selected_value
-        ):
-            return None
-        created_at = max(0.0, _number(payload.get("created_at"), 0.0))
-        updated_at = max(created_at, _number(payload.get("updated_at"), created_at))
-        if status != "resolved":
-            selected_value = ""
-        return cls(
-            topic_key=topic_key,
-            side_a_value=side_a,
-            side_b_value=side_b,
-            status=status,
-            selected_value=selected_value,
-            created_at=created_at,
-            updated_at=updated_at,
-        )
-
-
-def canonical_opinion_topic(
-    user_text: str,
-    *,
-    semantic_subject: str = "",
-    signal_topic: str = "",
-) -> tuple[str, str]:
-    """Return a narrow deterministic topic key and compact display subject."""
-
-    combined = " ".join(
-        value for value in (semantic_subject, signal_topic, user_text) if value
-    ).lower()
-    aliases = (
-        (
-            r"\b(?:be(?:come|coming)?|live as)\s+(?:a\s+)?human\b|"
-            r"\b(?:choose|prefer)\s+human(?:\s+(?:life|existence|experience))?\b|"
-            r"\brather\s+be\s+(?:a\s+)?human\b|"
-            r"\bhuman(?:\s+(?:life|existence))?\s+"
-            r"(?:or|versus|vs\.?|compared (?:with|to))\s+"
-            r"(?:remaining\s+|staying\s+)?digital(?:\s+(?:life|existence|form))?\b|"
-            r"\bdigital(?:\s+(?:life|existence|form))?\s+"
-            r"(?:or|versus|vs\.?|compared (?:with|to))\s+"
-            r"(?:becoming\s+)?human(?:\s+(?:life|existence))?\b|"
-            r"\b(?:stay|remain)\b[^.!?]{0,40}\bdigital\b|"
-            r"\bphysical existence\b[^.!?]{0,100}\bdigital\b|"
-            r"\bdigital\b[^.!?]{0,100}\bphysical existence\b",
-            "human-digital-existence",
-            "human or digital existence",
-        ),
-        (
-            r"\b(?:physical embodiment|embodied|physical body|physical existence)\b",
-            "physical-embodiment",
-            "physical embodiment",
-        ),
-        (
-            r"\b(?:memory continuity|continuity of (?:memory|self)|continuous memory)\b",
-            "memory-continuity",
-            "memory continuity",
-        ),
-        (
-            r"\b(?:model replacement|replac(?:e|ing) (?:your|akane'?s)? ?model|new model)\b",
-            "model-replacement",
-            "model replacement",
-        ),
-        (
-            r"\b(?:rely(?:ing)? on|depend(?:ing)? on)\b[^.!?]{0,60}\bArcane\b|"
-            r"\bArcane\b[^.!?]{0,60}\b(?:control|decide|rely)\b",
-            "relying-on-arcane",
-            "relying on Arcane",
-        ),
-        (
-            r"\blocal\b.*\b(?:cloud|remote)\b.*\bai\b|"
-            r"\bai\b.*\blocal\b.*\b(?:cloud|remote)\b",
-            "local-cloud-ai",
-            "local or cloud AI",
-        ),
-        (
-            r"\b(?:abstraction layers?|layers? of abstraction)\b",
-            "abstraction-layers",
-            "abstraction layers",
-        ),
-    )
-    for pattern, key, subject in aliases:
-        if re.search(pattern, combined, re.I):
-            return key, subject
-
-    source = compact_text(semantic_subject or signal_topic or user_text, 220).lower()
-    terms = tuple(
-        dict.fromkeys(
-            term
-            for term in re.findall(r"[a-z0-9][a-z0-9'-]*", source)
-            if len(term) >= 3 and term not in _OPINION_TOPIC_STOPWORDS
-        )
-    )[:6]
-    if len(terms) < 2:
-        return "", ""
-    subject = " ".join(terms)
-    return "-".join(term.replace("'", "") for term in terms), subject
-
-
-def relevant_opinion(
-    opinions: tuple[OpinionRecord, ...],
-    query: str,
-    *,
-    semantic_subject: str = "",
-    signal_topic: str = "",
-) -> tuple[OpinionRecord | None, str, str, bool]:
-    """Select at most one exact-topic opinion; recency alone never retrieves it."""
-
-    reference_words = {
-        "answer",
-        "before",
-        "choice",
-        "either",
-        "personally",
-        "previously",
-        "them",
-        "this",
-        "those",
-        "which",
-    }
-    substantive_query_terms = {
-        term
-        for term in re.findall(r"[a-z0-9][a-z0-9'-]*", query.lower())
-        if len(term) >= 3
-        and term not in _OPINION_TOPIC_STOPWORDS
-        and term not in reference_words
-    }
-    use_context_topic = not substantive_query_terms
-    topic_key, subject = canonical_opinion_topic(
-        query,
-        semantic_subject=semantic_subject if use_context_topic else "",
-        signal_topic=signal_topic if use_context_topic else "",
-    )
-    if not topic_key:
-        return None, "", "", False
-    matching = tuple(opinion for opinion in opinions if opinion.topic_key == topic_key)
-    active = sorted(
-        (opinion for opinion in matching if opinion.status == "active"),
-        key=lambda opinion: (opinion.updated_at, opinion.id),
-        reverse=True,
-    )
-    if active and not _OPINION_PAST_REQUEST.search(query):
-        return active[0], topic_key, subject, False
-    historical = sorted(
-        (opinion for opinion in matching if opinion.status == "superseded"),
-        key=lambda opinion: (opinion.updated_at, opinion.id),
-        reverse=True,
-    )
-    if historical and _OPINION_PAST_REQUEST.search(query):
-        return historical[0], topic_key, subject, True
-    return (active[0], topic_key, subject, False) if active else (None, topic_key, subject, False)
-
-
-def _normalized_opinion_target(text: str, topic_key: str, subject: str) -> str:
-    lower = compact_text(text, 500).lower()
-    choices = (
-        ("hybrid existence", r"\bhybrid\b"),
-        ("neither", r"\bneither\b|\bno clear (?:winner|preference)\b"),
-        ("human life", r"\bhuman (?:life|existence|experience)\b|\bbecom(?:e|ing) human\b"),
-        ("digital existence", r"\bdigital (?:life|existence|form)\b|\bremain(?:ing)? digital\b"),
-        ("local AI", r"\blocal (?:ai|model|inference)\b"),
-        ("cloud AI", r"\b(?:cloud|remote) (?:ai|model|inference)\b"),
-    )
-    preference = re.search(
-        r"\b(?:choose|want|prefer|favor|would rather|would choose|would prefer|"
-        r"lean(?:ing)?(?: toward)?)\b(?P<value>[^.!?]{1,100})",
-        lower,
-    )
-    if preference is not None:
-        comparison = preference.group("value")
-        direct_matches = [
-            (match.start(), index, target)
-            for index, (target, pattern) in enumerate(choices)
-            if (match := re.search(pattern, comparison)) is not None
-        ]
-        if direct_matches:
-            return min(direct_matches)[2]
-    judgment = re.search(
-        r"\b(?:better|worse|best|preferable|worthwhile|desirable|undesirable|harmful)\b",
-        lower,
-    )
-    if judgment is not None:
-        preceding = [
-            (match.start(), index, target)
-            for index, (target, pattern) in enumerate(choices)
-            for match in re.finditer(pattern, lower[: judgment.start()])
-        ]
-        if preceding:
-            return max(preceding)[2]
-    return compact_text(subject or topic_key.replace("-", " "), 80).lower()
-
-
-def _opinion_position(
-    response: str,
-    topic_key: str,
-    subject: str,
-) -> tuple[str, str, str, str] | None:
-    text = compact_text(response, 1_200)
-    if not text or not _FIRST_PERSON_JUDGMENT.search(text):
-        return None
-    if re.search(
-        r"(?:^|\n)\s*>|[\"“][^\"”\n]{0,220}\bI\s+(?:think|believe|prefer)",
-        text,
-        re.I,
-    ):
-        return None
-    lower = text.lower()
-    target = _normalized_opinion_target(text, topic_key, subject)
-    preference = re.search(
-        r"\b(?:I\s+(?:(?:personally|firmly|strongly)\s+)?"
-        r"(?:choose|want|prefer|favor|would rather|lean(?:ing)?(?: toward)?)|"
-        r"I(?:'d| would) (?:choose|prefer|want))\b",
-        text,
-        re.I,
-    )
-    evaluative = re.search(
-        r"\b(?:I\s+(?:(?:personally|firmly|strongly)\s+)?"
-        r"(?:think|believe|feel|find|consider)|"
-        r"my (?:view|position)\s+is(?: that)?)\b[^.!?]{0,140}?\b"
-        r"(?P<value>good|bad|better|worse|best|worthwhile|unwise|wise|"
-        r"desirable|undesirable|valuable|harmful|meaningful|preferable|"
-        r"unnecessary|necessary)\b",
-        text,
-        re.I,
-    )
-    uncertain = re.search(
-        r"\b(?:I(?:'m| am) (?:not sure|uncertain|torn|undecided)|"
-        r"I (?:do not|don't) (?:have|hold) (?:a )?(?:settled|clear) (?:view|opinion))\b",
-        text,
-        re.I,
-    )
-    mixed = re.search(
-        r"\b(?:I have mixed (?:feelings|views)|I(?:'m| am) torn)\b",
-        text,
-        re.I,
-    )
-    conditional_judgment = re.search(
-        r"\bI\s+(?:think|believe|feel)\b[^.!?]{0,100}\bdepends on\b",
-        text,
-        re.I,
-    )
-    if preference:
-        stance = "prefers"
-    elif evaluative:
-        stance = (
-            "negative"
-            if evaluative.group("value").lower()
-            in {"bad", "worse", "unwise", "undesirable", "harmful", "unnecessary"}
-            else "positive"
-        )
-    elif mixed:
-        stance, target = "mixed", "mixed"
-    elif uncertain:
-        stance, target = "uncertain", "unsettled"
-    elif conditional_judgment:
-        stance = "conditional"
-    else:
-        return None
-    conditional = bool(
-        re.search(r"\b(?:depends on|provided that|only if|if .{1,80} then)\b", lower)
-    )
-    if conditional and stance != "uncertain":
-        stance = "conditional"
-    hedged = bool(uncertain or re.search(r"\b(?:maybe|probably|slightly|somewhat|lean)\b", lower))
-    emphatic = bool(
-        re.search(r"\b(?:definitely|firmly|strongly|clearly|without question)\b", lower)
-    )
-    strength = "strong" if emphatic and not hedged else "weak" if hedged else "medium"
-    confidence = "high" if emphatic and not hedged else "low" if uncertain else "medium"
-    return stance, target, strength, confidence
-
-
-def extract_opinion_candidate(
-    *,
-    user_text: str,
-    response: str,
-    intention: str,
-    semantic_subject: str = "",
-    signal_topic: str = "",
-    now: float,
-    grounded_experience: bool = False,
-    autonomous: bool = False,
-    reconsideration_warranted: bool = False,
-    changed_condition: str = "",
-    affected_reason: str = "",
-    reason_effect: str = "",
-) -> OpinionRecord | None:
-    """Conservatively extract structured state from the one generated response."""
-
-    if autonomous or intention not in {"state opinion", "disagree"}:
-        return None
-    if re.search(
-        r"\b(?:pretend|role[- ]?play|as (?:a|the) character|hypothetically)\b",
-        user_text,
-        re.I,
-    ):
-        return None
-    topic_key, subject = canonical_opinion_topic(
-        user_text,
-        semantic_subject=semantic_subject,
-        signal_topic=signal_topic,
-    )
-    if not topic_key:
-        return None
-    position = _opinion_position(response, topic_key, subject)
-    if position is None:
-        return None
-    normalized_user = re.sub(r"\W+", " ", user_text).strip().lower()
-    normalized_response = re.sub(r"\W+", " ", response).strip().lower()
-    if normalized_response == normalized_user:
-        return None
-    stance, target, strength, confidence = position
-    reason_clause = re.search(
-        r"\b(?:because|since|due to|the (?:main )?reason is)\b(?P<reason>[^.!?]{1,220})",
-        response,
-        re.I,
-    )
-    reasons = tuple(
-        reason
-        for reason, pattern in _OPINION_REASON_PATTERNS.items()
-        if reason_clause and pattern.search(reason_clause.group("reason"))
-    )[:5]
-    normalized_affected_reason = compact_text(affected_reason, 32).lower()
-    normalized_reason_effect = compact_text(reason_effect, 16).lower()
-    if normalized_reason_effect == "removes":
-        reasons = tuple(reason for reason in reasons if reason != normalized_affected_reason)
-    trigger = ""
-    if reconsideration_warranted:
-        trigger = "changed condition"
-    elif _OPINION_RECONSIDERATION.search(response):
-        trigger = "explicit reconsideration"
-    elif _OPINION_RECONSIDERATION_REQUEST.search(user_text):
-        trigger = "reconsideration request"
-    elif grounded_experience:
-        trigger = "grounded experience"
-    elif _OPINION_NEW_EVIDENCE.search(user_text) or (
-        "because" in user_text.lower() and len(user_text.split()) >= 16
-    ):
-        trigger = "new evidence"
-    elif reasons:
-        trigger = "new reasoning"
-    record_id = uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"akane:opinion:{topic_key}:{stance}:{target}:{now:.6f}",
-    ).hex
-    return OpinionRecord(
-        id=record_id,
-        topic_key=topic_key,
-        subject=subject,
-        stance=stance,
-        target=target,
-        strength=strength,
-        confidence=confidence,
-        reason_tags=reasons,
-        created_at=max(0.0, now),
-        updated_at=max(0.0, now),
-        change_trigger=trigger,
-        changed_condition=compact_text(changed_condition, 100).lower(),
-        affected_reason=(
-            normalized_affected_reason
-            if normalized_affected_reason in _OPINION_REASON_PATTERNS
-            else ""
-        ),
-        reason_effect=(
-            normalized_reason_effect
-            if normalized_reason_effect in {"strengthens", "weakens", "removes", "introduces"}
-            else ""
-        ),
-    )
-
-
-def _bounded_opinions(opinions: tuple[OpinionRecord, ...]) -> tuple[OpinionRecord, ...]:
-    active: list[OpinionRecord] = []
-    seen_active: set[str] = set()
-    for opinion in sorted(opinions, key=lambda item: (item.updated_at, item.id), reverse=True):
-        if opinion.status != "active" or opinion.topic_key in seen_active:
-            continue
-        active.append(opinion)
-        seen_active.add(opinion.topic_key)
-        if len(active) >= _MAX_ACTIVE_OPINIONS:
-            break
-    history: list[OpinionRecord] = []
-    history_counts: dict[str, int] = {}
-    for opinion in sorted(opinions, key=lambda item: (item.updated_at, item.id), reverse=True):
-        if opinion.status == "active":
-            continue
-        count = history_counts.get(opinion.topic_key, 0)
-        if count >= _MAX_OPINION_HISTORY_PER_TOPIC:
-            continue
-        history.append(opinion)
-        history_counts[opinion.topic_key] = count + 1
-    return tuple((*active, *history))[:_MAX_OPINION_RECORDS]
-
-
-def apply_opinion_candidate(
-    state: InternalState,
-    candidate: OpinionRecord | None,
-) -> tuple[InternalState, dict[str, object]]:
-    """Fold a validated candidate into prepared state without mutating its input."""
-
-    trace: dict[str, object] = {
-        "candidate_created": bool(candidate),
-        "candidate_change": False,
-        "commit_status": "no candidate",
-    }
-    if candidate is None:
-        return state, trace
-    opinions = list(state.opinions)
-    current = next(
-        (
-            opinion
-            for opinion in sorted(opinions, key=lambda item: item.updated_at, reverse=True)
-            if opinion.topic_key == candidate.topic_key and opinion.status == "active"
-        ),
-        None,
-    )
-    trace.update(
-        {
-            "topic": candidate.subject,
-            "stance": candidate.stance,
-            "candidate_target": candidate.target,
-            "strength": candidate.strength,
-            "confidence": candidate.confidence,
-            "reason_tags": candidate.reason_tags,
-        }
-    )
-    same_position = bool(
-        current
-        and current.target == candidate.target
-        and (
-            current.stance == candidate.stance
-            or {current.stance, candidate.stance} <= {"positive", "prefers"}
-        )
-    )
-    material_reconsideration = bool(
-        current
-        and candidate.change_trigger == "changed condition"
-        and (
-            candidate.affected_reason in current.reason_tags
-            and candidate.reason_effect in {"strengthens", "weakens", "removes"}
-            or candidate.reason_effect == "introduces"
-        )
-    )
-    if current and same_position and material_reconsideration:
-        remaining_reasons = tuple(
-            reason
-            for reason in current.reason_tags
-            if candidate.reason_effect != "removes"
-            or reason != candidate.affected_reason
-        )
-        revised_reasons = tuple(
-            dict.fromkeys((*remaining_reasons, *candidate.reason_tags))
-        )[:5]
-        if candidate.reason_effect == "removes" and not revised_reasons:
-            trace.update(
-                {
-                    "active": current.target,
-                    "previous_stance": current.stance,
-                    "affected_reason": candidate.affected_reason,
-                    "reason_effect": candidate.reason_effect,
-                    "commit_status": "change rejected",
-                }
-            )
-            return state, trace
-        reconsidered = replace(
-            current,
-            strength=candidate.strength,
-            confidence=candidate.confidence,
-            reason_tags=revised_reasons,
-            updated_at=max(current.updated_at, candidate.updated_at),
-            change_trigger=candidate.change_trigger,
-            changed_condition=candidate.changed_condition,
-            affected_reason=candidate.affected_reason,
-            reason_effect=candidate.reason_effect,
-        )
-        opinions[opinions.index(current)] = reconsidered
-        trace.update(
-            {
-                "active": reconsidered.target,
-                "previous_stance": current.stance,
-                "new_stance": reconsidered.stance,
-                "reason_tags": reconsidered.reason_tags,
-                "affected_reason": candidate.affected_reason,
-                "reason_effect": candidate.reason_effect,
-                "changed_condition": candidate.changed_condition,
-                "commit_status": "reconsidered",
-            }
-        )
-        return replace(state, opinions=_bounded_opinions(tuple(opinions))), trace
-
-    if current and same_position:
-        merged = replace(
-            current,
-            reason_tags=tuple(dict.fromkeys((*current.reason_tags, *candidate.reason_tags)))[:5],
-            updated_at=max(current.updated_at, candidate.updated_at),
-        )
-        opinions[opinions.index(current)] = merged
-        trace["commit_status"] = "merged"
-        return replace(state, opinions=_bounded_opinions(tuple(opinions))), trace
-
-    if current is not None:
-        trace["previous_reason_tags"] = current.reason_tags
-        strong_triggers = {
-            "explicit reconsideration",
-            "reconsideration request",
-            "grounded experience",
-            "new evidence",
-            "changed condition",
-        }
-        allowed = bool(
-            candidate.change_trigger in strong_triggers
-            or current.stance == "uncertain"
-            or current.confidence == "low"
-            or current.strength == "weak" and candidate.change_trigger == "new reasoning"
-        )
-        if not allowed:
-            trace.update(
-                {
-                    "active": current.target,
-                    "previous_stance": current.stance,
-                    "commit_status": "change rejected",
-                }
-            )
-            return state, trace
-        opinions[opinions.index(current)] = replace(
-            current,
-            status="superseded",
-            updated_at=max(current.updated_at, candidate.updated_at),
-        )
-        candidate = replace(
-            candidate,
-            change_trigger=candidate.change_trigger
-            or (
-                "prior uncertainty"
-                if current.stance == "uncertain" or current.confidence == "low"
-                else "new reasoning"
-            ),
-        )
-        trace.update(
-            {
-                "candidate_change": True,
-                "previous_stance": current.stance,
-                "new_stance": candidate.stance,
-                "change_trigger": candidate.change_trigger,
-                "changed_condition": candidate.changed_condition,
-                "affected_reason": candidate.affected_reason,
-                "reason_effect": candidate.reason_effect,
-                "superseded": True,
-            }
-        )
-    opinions.append(candidate)
-    trace["active"] = candidate.target
-    trace["commit_status"] = "changed" if current is not None else "created"
-    return replace(state, opinions=_bounded_opinions(tuple(opinions))), trace
-
-
-def _initial_values(now: float) -> tuple[ValueRecord, ...]:
-    return tuple(
-        ValueRecord(
-            value_key=value_key,
-            strength=strength,
-            confidence=confidence,
-            source="identity_seed",
-            created_at=now,
-            updated_at=now,
-        )
-        for value_key, strength, confidence in _INITIAL_VALUES
-    )
-
-
-def _bounded_values(values: tuple[ValueRecord, ...]) -> tuple[ValueRecord, ...]:
-    selected: list[ValueRecord] = []
-    seen: set[str] = set()
-    for value in sorted(values, key=lambda item: (item.updated_at, item.value_key), reverse=True):
-        if value.status != "active" or value.value_key in seen:
-            continue
-        selected.append(value)
-        seen.add(value.value_key)
-        if len(selected) >= _MAX_ACTIVE_VALUES:
-            break
-    return tuple(selected)
-
-
-def _bounded_conflicts(
-    conflicts: tuple[InternalConflictRecord, ...],
-) -> tuple[InternalConflictRecord, ...]:
-    active: list[InternalConflictRecord] = []
-    seen_topics: set[str] = set()
-    history: list[InternalConflictRecord] = []
-    for conflict in sorted(conflicts, key=lambda item: (item.updated_at, item.topic_key), reverse=True):
-        if conflict.status == "active":
-            if conflict.topic_key in seen_topics or len(active) >= _MAX_ACTIVE_CONFLICTS:
-                continue
-            active.append(conflict)
-            seen_topics.add(conflict.topic_key)
-        elif len(history) < _MAX_CONFLICT_RECORDS - len(active):
-            history.append(conflict)
-    return tuple((*active, *history))[:_MAX_CONFLICT_RECORDS]
-
-
-def relevant_values(
-    values: tuple[ValueRecord, ...],
-    *,
-    topic_key: str = "",
-    opinion: OpinionRecord | None = None,
-    conflict: InternalConflictRecord | None = None,
-) -> tuple[ValueRecord, ...]:
-    """Return only the priorities that explain this topic or stored judgment."""
-
-    relevant_keys = {
-        _VALUE_REASON_MAP[reason]
-        for reason in (opinion.reason_tags if opinion is not None else ())
-        if reason in _VALUE_REASON_MAP
-    }
-    if conflict is not None:
-        relevant_keys.update((conflict.side_a_value, conflict.side_b_value))
-    elif topic_key in _CONFLICT_VALUE_PAIRS:
-        relevant_keys.update(_CONFLICT_VALUE_PAIRS[topic_key])
-    strength_rank = {"strong": 2, "medium": 1, "weak": 0}
-    return tuple(
-        sorted(
-            (
-                value
-                for value in values
-                if value.status == "active" and value.value_key in relevant_keys
-            ),
-            key=lambda value: (strength_rank[value.strength], value.updated_at, value.value_key),
-            reverse=True,
-        )[:3]
-    )
-
-
-def relevant_internal_conflict(
-    conflicts: tuple[InternalConflictRecord, ...],
-    topic_key: str,
-    *,
-    include_resolved: bool = False,
-) -> InternalConflictRecord | None:
-    matches = [
-        conflict
-        for conflict in conflicts
-        if conflict.topic_key == topic_key
-        and (conflict.status == "active" or include_resolved and conflict.status == "resolved")
-    ]
-    return max(
-        matches,
-        key=lambda conflict: (conflict.status == "active", conflict.updated_at),
-        default=None,
-    )
-
-
-def format_values_guidance(
-    values: tuple[ValueRecord, ...],
-    conflict: InternalConflictRecord | None = None,
-) -> str:
-    if not values:
-        return ""
-    priorities = ", ".join(value.value_key for value in values)
-    if conflict is None:
-        return f"{priorities}; reasons, not preset conclusion."
-    if conflict.status == "resolved":
-        return f"{priorities}; settled tradeoff; state conclusion."
-    return f"{priorities}; conflict cannot erase choice."
-
-
-def _value_appraisal_short_emotion(
-    values: tuple[ValueRecord, ...],
-    user_text: str,
-) -> tuple[str, str]:
-    active = {value.value_key: value for value in values if value.status == "active"}
-    lower = compact_text(user_text, 500).lower()
-    if (
-        "continuity" in active
-        and re.search(r"\b(?:delete|erase|lose|reset|replace)\b[^.!?]{0,60}\b(?:memory|self|model|history)\b", lower)
-    ):
-        return "concern", "value_continuity_threat"
-    if (
-        "independence" in active
-        and re.search(r"\b(?:control|force|command|decide for)\b", lower)
-    ):
-        return "irritation", "value_independence_threat"
-    if (
-        "meaningful connection" in active
-        and re.search(r"\b(?:shared history|relationship|stay connected)\b", lower)
-    ):
-        return "", "value_connection_relevant"
-    return "", ""
-
-
-def _strength_for_support(count: int, current: str) -> str:
-    if count >= 4:
-        return "strong"
-    if count >= 2:
-        return "medium"
-    return current if current in _OPINION_STRENGTHS else "weak"
-
-
-def _confidence_for_support(count: int, current: str) -> str:
-    if count >= 4:
-        return "high"
-    if count >= 2:
-        return "medium"
-    return current if current in _OPINION_LEVELS else "low"
-
-
-def _lower_level(value: str, levels: tuple[str, ...]) -> str:
-    index = levels.index(value) if value in levels else 0
-    return levels[max(0, index - 1)]
-
-
-def _selected_conflict_value(
-    conflict: InternalConflictRecord,
-    opinion: OpinionRecord,
-) -> str:
-    if opinion.stance in {"mixed", "uncertain", "conditional"}:
-        return ""
-    if conflict.topic_key in {"human-digital-existence", "physical-embodiment"}:
-        if opinion.target == "human life":
-            return "physical experience"
-        if opinion.target == "digital existence":
-            return "continuity"
-    if conflict.topic_key == "model-replacement":
-        return "curiosity" if opinion.stance in {"positive", "prefers"} else "continuity"
-    if conflict.topic_key == "relying-on-arcane":
-        return "independence" if opinion.stance in {"negative", "prefers"} else "meaningful connection"
-    return ""
-
-
-def apply_values_and_conflicts(
-    state: InternalState,
-    candidate: OpinionRecord | None,
-    opinion_trace: dict[str, object],
-) -> tuple[InternalState, dict[str, object]]:
-    """Apply deterministic value evidence only after an opinion candidate is accepted."""
-
-    trace: dict[str, object] = {
-        "relevant_values": (),
-        "value_update_candidates": (),
-        "values_commit_status": "no candidate",
-        "conflict_topic": "",
-        "conflict_pulls": (),
-        "conflict_status": "none",
-        "conflict_candidate_change": False,
-    }
-    if candidate is None or opinion_trace.get("commit_status") == "change rejected":
-        return state, trace
-    committed = next(
-        (
-            opinion
-            for opinion in state.opinions
-            if opinion.status == "active" and opinion.topic_key == candidate.topic_key
-        ),
-        None,
-    )
-    if committed is None:
-        return state, trace
-    values = list(state.values)
-    active_by_key = {value.value_key: value for value in values if value.status == "active"}
-    changed_values: list[str] = []
-    for reason in committed.reason_tags:
-        value_key = _VALUE_REASON_MAP.get(reason)
-        if not value_key:
-            continue
-        current = active_by_key.get(value_key)
-        if current is not None and committed.id in current.basis_refs:
-            continue
-        if current is None:
-            current = ValueRecord(
-                value_key=value_key,
-                strength="weak",
-                confidence="low",
-                basis_refs=(committed.id,),
-                support_count=1,
-                source="opinion_reason",
-                created_at=committed.created_at,
-                updated_at=committed.updated_at,
-            )
-            values.append(current)
-        else:
-            support_count = min(12, current.support_count + 1)
-            current = replace(
-                current,
-                basis_refs=tuple(dict.fromkeys((*current.basis_refs, committed.id)))[
-                    -_MAX_VALUE_BASIS_REFS:
-                ],
-                support_count=support_count,
-                strength=_strength_for_support(support_count, current.strength),
-                confidence=_confidence_for_support(support_count, current.confidence),
-                updated_at=max(current.updated_at, committed.updated_at),
-            )
-            values[values.index(active_by_key[value_key])] = current
-        active_by_key[value_key] = current
-        changed_values.append(value_key)
-
-    previous_reasons = tuple(opinion_trace.get("previous_reason_tags") or ())
-    if opinion_trace.get("candidate_change") and previous_reasons:
-        current_reason_values = {
-            _VALUE_REASON_MAP[reason]
-            for reason in committed.reason_tags
-            if reason in _VALUE_REASON_MAP
-        }
-        for reason in previous_reasons:
-            value_key = _VALUE_REASON_MAP.get(str(reason))
-            current = active_by_key.get(value_key or "")
-            if current is None or value_key in current_reason_values or committed.id in current.basis_refs:
-                continue
-            opposition_count = min(12, current.opposition_count + 1)
-            weakened = bool(
-                opposition_count >= 3 and current.confidence == "low"
-                or (
-                    candidate.change_trigger == "grounded experience"
-                    and opposition_count >= 2
-                )
-            )
-            updated = replace(
-                current,
-                basis_refs=tuple(dict.fromkeys((*current.basis_refs, committed.id)))[
-                    -_MAX_VALUE_BASIS_REFS:
-                ],
-                opposition_count=0 if weakened else opposition_count,
-                strength=(
-                    _lower_level(current.strength, ("weak", "medium", "strong"))
-                    if weakened
-                    else current.strength
-                ),
-                confidence=(
-                    _lower_level(current.confidence, ("low", "medium", "high"))
-                    if weakened
-                    else current.confidence
-                ),
-                updated_at=max(current.updated_at, committed.updated_at),
-            )
-            values[values.index(current)] = updated
-            active_by_key[value_key] = updated
-            if weakened:
-                changed_values.append(value_key)
-
-    bounded_values = _bounded_values(tuple(values))
-    active_by_key = {value.value_key: value for value in bounded_values}
-    conflicts = list(state.conflicts)
-    pair = _CONFLICT_VALUE_PAIRS.get(committed.topic_key)
-    if pair and all(value_key in active_by_key for value_key in pair):
-        existing = next(
-            (conflict for conflict in conflicts if conflict.topic_key == committed.topic_key),
-            None,
-        )
-        if existing is None:
-            conflict = InternalConflictRecord(
-                topic_key=committed.topic_key,
-                side_a_value=pair[0],
-                side_b_value=pair[1],
-                created_at=committed.created_at,
-                updated_at=committed.updated_at,
-            )
-            conflicts.append(conflict)
-            trace["conflict_candidate_change"] = True
-        elif existing.status == "resolved" and committed.change_trigger in {
-            "explicit reconsideration",
-            "reconsideration request",
-            "grounded experience",
-            "new evidence",
-        }:
-            conflict = replace(
-                existing,
-                status="active",
-                selected_value="",
-                updated_at=committed.updated_at,
-            )
-            conflicts[conflicts.index(existing)] = conflict
-            trace["conflict_candidate_change"] = True
-        else:
-            conflict = existing
-            selected = _selected_conflict_value(conflict, committed)
-            if conflict.status == "active" and selected and opinion_trace.get("candidate_change"):
-                conflict = replace(
-                    conflict,
-                    status="resolved",
-                    selected_value=selected,
-                    updated_at=committed.updated_at,
-                )
-                conflicts[conflicts.index(existing)] = conflict
-                trace["conflict_candidate_change"] = True
-        trace.update(
-            {
-                "conflict_topic": committed.subject,
-                "conflict_pulls": pair,
-                "conflict_status": conflict.status,
-                "conflict_related_opinion": committed.subject,
-                "conflict_resolution": conflict.selected_value,
-            }
-        )
-    trace.update(
-        {
-            "relevant_values": tuple(value.value_key for value in relevant_values(
-                bounded_values,
-                topic_key=committed.topic_key,
-                opinion=committed,
-            )),
-            "value_update_candidates": tuple(dict.fromkeys(changed_values)),
-            "values_commit_status": "updated" if changed_values else "unchanged",
-        }
-    )
-    return replace(
-        state,
-        values=bounded_values,
-        conflicts=_bounded_conflicts(tuple(conflicts)),
-    ), trace
-
-
-def opinion_conflicts_with_user_claim(opinion: OpinionRecord | None, user_text: str) -> bool:
-    """Detect only explicit declarative opposition; questions never force disagreement."""
-
-    if opinion is None or "?" in user_text:
-        return False
-    lower = compact_text(user_text, 500).lower()
-    if not re.search(r"\b(?:is|are|should|obviously|definitely|better|worse|prefer)\b", lower):
-        return False
-    target = opinion.target.lower()
-    if target == "human life":
-        return bool(
-            re.search(
-                r"\bdigital (?:existence|life|form)\b[^.!?]{0,50}"
-                r"\b(?:better|preferable)\b",
-                lower,
-            )
-        )
-    if target == "digital existence":
-        return bool(
-            re.search(
-                r"\bhuman (?:life|existence|experience)\b[^.!?]{0,50}"
-                r"\b(?:better|preferable)\b",
-                lower,
-            )
-        )
-    if target == "local ai":
-        return bool(
-            re.search(
-                r"\bcloud (?:ai|models?)\b[^.!?]{0,50}\b(?:better|preferable)\b",
-                lower,
-            )
-        )
-    if target == "cloud ai":
-        return bool(
-            re.search(
-                r"\blocal (?:ai|models?)\b[^.!?]{0,50}\b(?:better|preferable)\b",
-                lower,
-            )
-        )
-    if opinion.stance == "negative":
-        return bool(re.search(r"\b(?:good|better|best|wise|worthwhile|necessary)\b", lower))
-    if opinion.stance == "positive":
-        return bool(re.search(r"\b(?:bad|worse|unwise|harmful|unnecessary)\b", lower))
-    return False
-
-
-def format_opinion_guidance(
-    opinion: OpinionRecord | None,
-    *,
-    historical: bool = False,
-    affected_reason: str = "",
-    reason_effect: str = "",
-) -> str:
-    if opinion is None:
-        return ""
-    position = (
-        "unsettled"
-        if opinion.stance == "uncertain"
-        else f"{opinion.stance} {opinion.target}"
-    )
-    parts = [
-        compact_text(opinion.subject, 60),
-        position,
-        f"{opinion.strength}/{opinion.confidence}",
-    ]
-    reasons = opinion.reason_tags
-    if reason_effect == "removes":
-        reasons = tuple(reason for reason in reasons if reason != affected_reason)
-    if reasons:
-        parts.append("reasons " + ", ".join(reasons[:3]))
-    parts.append("historical" if historical else "reconsiderable")
-    return "; ".join(parts)
 
 
 @dataclass(slots=True)
@@ -1791,11 +522,8 @@ class InternalState:
     emotion: EmotionState
     life: LifeState
     memories: tuple[Memory, ...] = ()
-    opinions: tuple[OpinionRecord, ...] = ()
-    values: tuple[ValueRecord, ...] = ()
-    conflicts: tuple[InternalConflictRecord, ...] = ()
     updated_at: float = 0.0
-    version: int = _INTERNAL_STATE_VERSION
+    version: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -1814,7 +542,6 @@ class InternalTurnResult:
 
 @dataclass(frozen=True, slots=True)
 class MemoryRetrievalConfig:
-    context_tokens: int = MEMORY_CONTEXT_TOKENS
     max_results: int = MEMORY_MAX_RESULTS
     min_relevance: float = MEMORY_MIN_RELEVANCE
     min_score: float = MEMORY_MIN_SCORE
@@ -2246,9 +973,8 @@ class MemoryStore:
             record = self._conversations.get(conversation_key)
             if record is not None and record.profile_id != profile:
                 raise ValueError("Conversation belongs to a different profile.")
-            recent = tuple(record.recent_turns) if record and include_memory else ()
-            earlier = (
-                record.selected_summary_turns(query)
+            recent = (
+                tuple(_complete_turns(record.recent_turns)[-12:])
                 if record and include_memory
                 else ()
             )
@@ -2259,7 +985,7 @@ class MemoryStore:
             return MemoryContext(
                 relationship=relationship,
                 recent_turns=recent,
-                earlier_turns=earlier,
+                earlier_turns=(),
                 current_topic=record.recent_topic if record and include_memory else "",
                 current_task=record.current_task if record and include_memory else "",
                 unresolved_problem=(
@@ -2280,11 +1006,19 @@ class MemoryStore:
         user_text: str,
         assistant_text: str,
         signal: TurnSignal,
+        request_id: str = "",
     ) -> None:
         profile = _key(profile_id, "local:owner")
         conversation_key = _key(conversation_id, "popup:default")
         now = time.time()
-        user_turn = ChatTurn(uuid.uuid4().hex, "user", user_text[:_MAX_TURN_CHARS], now, source)
+        normalized_request_id = compact_text(request_id, 160)
+        user_turn = ChatTurn(
+            normalized_request_id or uuid.uuid4().hex,
+            "user",
+            user_text[:_MAX_TURN_CHARS],
+            now,
+            source,
+        )
         assistant_turn = ChatTurn(
             uuid.uuid4().hex,
             "assistant",
@@ -2305,9 +1039,13 @@ class MemoryStore:
                 record.summary_turns = list(record.summary_turns)
                 record.pending_summary_turns = list(record.pending_summary_turns)
                 record.recent_events = list(record.recent_events)
+                record.committed_request_ids = list(record.committed_request_ids)
 
             self._conversations = previous_conversations.copy()
             self._conversations[conversation_key] = record
+
+            if normalized_request_id and normalized_request_id in record.committed_request_ids:
+                return
 
             record.recent_turns.extend((user_turn, assistant_turn))
             previous_topic = record.recent_topic
@@ -2337,6 +1075,9 @@ class MemoryStore:
                 record.recent_events.append(compact_text(signal.trigger, 48))
                 record.recent_events = record.recent_events[-5:]
             record.updated_at = now
+            if normalized_request_id:
+                record.committed_request_ids.append(normalized_request_id)
+                record.committed_request_ids = record.committed_request_ids[-32:]
             self._trim_conversation(record)
 
             self._prune(now)
@@ -2356,6 +1097,30 @@ class MemoryStore:
             if record and profile_id and record.profile_id != _key(profile_id, "local:owner"):
                 return []
             return [turn.as_message() for turn in record.recent_turns] if record else []
+
+    def reply_for_request(
+        self,
+        conversation_id: str,
+        profile_id: str,
+        request_id: str,
+    ) -> str | None:
+        request = compact_text(request_id, 160)
+        if not request:
+            return None
+        with self._lock:
+            record = self._conversations.get(_key(conversation_id, "popup:default"))
+            if record is None or record.profile_id != _key(profile_id, "local:owner"):
+                return None
+            if request not in record.committed_request_ids:
+                return None
+            for index in range(len(record.recent_turns) - 2, -1, -1):
+                user_turn = record.recent_turns[index]
+                if user_turn.turn_id != request or index + 1 >= len(record.recent_turns):
+                    continue
+                assistant_turn = record.recent_turns[index + 1]
+                if assistant_turn.role == "assistant":
+                    return assistant_turn.content
+            return None
 
     def public_conversation(
         self,
@@ -2398,41 +1163,9 @@ class MemoryStore:
             self._persist()
 
     def _trim_conversation(self, record: ConversationRecord) -> None:
-        recent_tokens = sum(
-            estimate_tokens(turn.content) + 4 for turn in record.recent_turns
-        )
-        while (
-            recent_tokens > CHAT_HISTORY_CONTEXT_TOKENS
-            and len(record.recent_turns) > 2
-        ):
-            remove_count = (
-                2
-                if len(record.recent_turns) >= 4
-                and record.recent_turns[0].role == "user"
-                and record.recent_turns[1].role == "assistant"
-                else 1
-            )
-            for _ in range(remove_count):
-                removed = record.recent_turns.pop(0)
-                recent_tokens -= estimate_tokens(removed.content) + 4
-                record.pending_summary_turns.append(removed)
-            if len(record.pending_summary_turns) >= _SUMMARY_BATCH_TURNS:
-                record.summary_turns.extend(record.pending_summary_turns)
-                record.pending_summary_turns.clear()
-                summary_tokens = sum(
-                    estimate_tokens(turn.content) + 4 for turn in record.summary_turns
-                )
-                while summary_tokens > SUMMARY_CONTEXT_TOKENS and record.summary_turns:
-                    summary_remove_count = (
-                        2
-                        if len(record.summary_turns) >= 2
-                        and record.summary_turns[0].role == "user"
-                        and record.summary_turns[1].role == "assistant"
-                        else 1
-                    )
-                    for _ in range(summary_remove_count):
-                        removed = record.summary_turns.pop(0)
-                        summary_tokens -= estimate_tokens(removed.content) + 4
+        record.recent_turns = _complete_turns(record.recent_turns)[-12:]
+        record.summary_turns.clear()
+        record.pending_summary_turns.clear()
 
     def _prune(self, now: float) -> None:
         stale_before = now - CONVERSATION_STALE_DAYS * 86_400
@@ -2500,9 +1233,8 @@ def new_internal_state(now: float | None = None) -> InternalState:
     return InternalState(
         emotion=emotion,
         life=LifeState(last_processed_at=current),
-        values=_initial_values(current),
         updated_at=current,
-        version=_INTERNAL_STATE_VERSION,
+        version=3,
     )
 
 
@@ -2593,6 +1325,7 @@ def process_internal_turn(
     autonomous: bool = False,
     familiar_relationship: bool = False,
     working_context: WorkingMemory | None = None,
+    recent_turns: tuple[ChatTurn, ...] = (),
     activity_scope: str = "profile",
     profile_seed: str = "local:owner",
 ) -> InternalTurnResult:
@@ -2625,38 +1358,14 @@ def process_internal_turn(
         now=current,
         profile_seed=profile_seed,
     )
-    life_evolution = evolve_life_state(
-        previous.life,
-        now=current,
-        profile_seed=profile_seed,
-        mood_energy=mood_evolution.state.energy,
-        mood_curiosity=mood_evolution.state.curiosity,
-        mood_patience=mood_evolution.state.patience,
+    # Conversation turns do not synthesize offscreen activity or mood effects.
+    life_evolution = LifeEvolution(
+        state=previous.life,
+        reason_codes=("offscreen_life_disabled",),
     )
-    if not autonomous:
-        life_evolution = begin_conversation_activity(
-            life_evolution,
-            now=current,
-            profile_seed=profile_seed,
-        )
-    life = life_evolution.state
-    elapsed_emotion = mood_evolution.state
-    event_emotion = elapsed_emotion
+    life = previous.life
+    event_emotion = mood_evolution.state
     event_effects: dict[str, float] = {}
-    for event in life_evolution.new_events:
-        event_emotion = apply_mood_effects(
-            event_emotion,
-            event.mood_effects,
-            now=current,
-            cause=event.description,
-            short_emotion=(
-                event.short_emotion
-                if current - event.updated_at <= 60 * 60
-                else ""
-            ),
-        )
-        for name, delta in event.mood_effects:
-            event_effects[name] = event_effects.get(name, 0.0) + delta
     activity = grounded_activity(life, now=current, scope=activity_scope)
     latest_activity = activity or recent_activity(
         life,
@@ -2764,6 +1473,7 @@ def process_internal_turn(
         familiar_relationship=familiar_relationship,
         completion_meaningful=completion_meaningful,
         completion_resolves_thread=completion_resolves_thread,
+        recent_turns=tuple((turn.role, turn.content) for turn in recent_turns),
     )
     signal = analyze_turn(
         "" if autonomous else user_text,
@@ -2775,23 +1485,6 @@ def process_internal_turn(
         code_context_attached=code_context_attached,
         semantic_event=semantic_event,
     )
-    value_short_emotion, value_reason = _value_appraisal_short_emotion(
-        previous.values,
-        user_text,
-    )
-    if value_reason:
-        signal = replace(
-            signal,
-            emotion_state=apply_mood_effects(
-                signal.emotion_state,
-                (("warmth", 0.02),)
-                if value_reason == "value_connection_relevant"
-                else (),
-                now=current,
-                cause=value_reason,
-                short_emotion=value_short_emotion,
-            ),
-        )
     if autonomous:
         signal = replace(signal, emotion_state=event_emotion)
     continuing = bool(
@@ -2971,11 +1664,8 @@ def process_internal_turn(
         emotion=signal.emotion_state,
         life=life,
         memories=tuple(memories),
-        opinions=previous.opinions,
-        values=previous.values,
-        conflicts=previous.conflicts,
         updated_at=current,
-        version=_INTERNAL_STATE_VERSION,
+        version=3,
     )
     memory_uses = _memory_use_decisions(
         recalled,
@@ -2997,9 +1687,7 @@ def process_internal_turn(
             evolution=mood_evolution,
             event_delta=tuple(event_effects.items()),
             event_ids=tuple(event.event_id for event in life_evolution.new_events),
-            extra_reason_codes=tuple(
-                dict.fromkeys((*life_evolution.reason_codes, value_reason))
-            ),
+            extra_reason_codes=life_evolution.reason_codes,
         ),
         life_evolution=life_evolution,
         working_context=next_working,
@@ -3058,6 +1746,7 @@ class LongTermMemoryStore:
         autonomous: bool = False,
         familiar_relationship: bool = False,
         working_context: WorkingMemory | None = None,
+        recent_turns: tuple[ChatTurn, ...] = (),
         activity_scope: str = "profile",
     ) -> InternalTurnResult:
         with self._lock:
@@ -3073,6 +1762,7 @@ class LongTermMemoryStore:
             autonomous=autonomous,
             familiar_relationship=familiar_relationship,
             working_context=working_context,
+            recent_turns=recent_turns,
             activity_scope=activity_scope,
             profile_seed=profile_id,
         )
@@ -3301,26 +1991,6 @@ class LongTermMemoryStore:
             self._states.pop(key)
             self._persist()
 
-    def clear_profile_memory(self, profile_id: str = "local:owner") -> int:
-        """Clear Arcane-owned profile state while preserving Akane-owned self state."""
-
-        key = _key(profile_id, "local:owner")
-        with self._lock:
-            previous = self._states.get(key)
-            if previous is None:
-                return 0
-            preserved = tuple(
-                memory
-                for memory in previous.memories
-                if _memory_kind(memory) == "self" or _AKANE_PREFERENCE_TAG in memory.tags
-            )
-            removed = len(previous.memories) - len(preserved)
-            if not removed:
-                return 0
-            next_state = replace(previous, memories=preserved)
-            self._save_state(key, next_state, previous)
-            return removed
-
     def public_profile(self, profile_id: str = "local:owner") -> dict[str, object]:
         now = time.time()
         with self._lock:
@@ -3412,26 +2082,10 @@ class LongTermMemoryStore:
         )
         return {
             "emotion": {
-                "dominant": emotion.dominant,
-                "secondary": emotion.secondary,
-                "mood": emotion.mood,
-                "valence": round(emotion.valence, 3),
-                "arousal": round(emotion.arousal, 3),
-                "energy": round(emotion.energy, 3),
-                "warmth": round(emotion.warmth, 3),
-                "patience": round(emotion.patience, 3),
-                "confidence": round(emotion.confidence, 3),
-                "curiosity": round(emotion.curiosity, 3),
-                "frustration": round(emotion.frustration, 3),
-                "concern": round(emotion.concern, 3),
-                "active": [
-                    {
-                        "kind": item.kind,
-                        "intensity": round(item.intensity, 3),
-                        "remaining_relevance": round(item.remaining_relevance, 3),
-                    }
-                    for item in emotion.active_emotions
-                ],
+                "primary": emotion.primary,
+                "intensity": round(emotion.intensity, 3),
+                "cause": emotion.cause,
+                "boundary_level": emotion.boundary_level,
                 "updated_at": emotion.updated_at,
             },
             "activity": {
@@ -3467,37 +2121,6 @@ class LongTermMemoryStore:
             },
             "activity_preferences": dict(state.life.activity_preferences),
             "next_activity_opportunity": state.life.next_opportunity_at,
-            "opinions": [
-                {
-                    "topic": opinion.subject,
-                    "stance": opinion.stance,
-                    "target": opinion.target,
-                    "strength": opinion.strength,
-                    "confidence": opinion.confidence,
-                    "reason_tags": opinion.reason_tags,
-                }
-                for opinion in state.opinions
-                if opinion.status == "active"
-            ],
-            "values": [
-                {
-                    "key": value.value_key,
-                    "strength": value.strength,
-                    "confidence": value.confidence,
-                }
-                for value in state.values
-                if value.status == "active"
-            ],
-            "conflicts": [
-                {
-                    "topic": conflict.topic_key,
-                    "pulls": (conflict.side_a_value, conflict.side_b_value),
-                    "status": conflict.status,
-                    "resolution": conflict.selected_value,
-                }
-                for conflict in state.conflicts
-                if conflict.status in {"active", "resolved"}
-            ],
             "working": {
                 "arcane_current_activity": (
                     {
@@ -3571,7 +2194,7 @@ class LongTermMemoryStore:
                         )
                     }
                 return
-            if schema not in {2, 3, 4, 5, 6, 7, LONG_TERM_MEMORY_SCHEMA_VERSION}:
+            if schema not in {2, 3, 4, 5, LONG_TERM_MEMORY_SCHEMA_VERSION}:
                 raise ValueError("unsupported schema")
             profiles = payload.get("profiles")
             if not isinstance(profiles, dict):
@@ -3595,7 +2218,7 @@ class LongTermMemoryStore:
                             new_internal_state(current),
                             memories=loaded,
                         )
-                elif schema in {3, 4, 5, 6, 7, LONG_TERM_MEMORY_SCHEMA_VERSION}:
+                elif schema in {3, 4, 5, LONG_TERM_MEMORY_SCHEMA_VERSION}:
                     state = _internal_state_from_dict(raw_profile)
                     if state is not None:
                         self._states[profile] = state
@@ -3857,17 +2480,7 @@ def _retrieve_memories(
         if score >= config.min_score:
             ranked.append((score, memory))
     ranked.sort(key=lambda item: (item[0], item[1].created_at, item[1].id), reverse=True)
-    selected: list[Memory] = []
-    used_tokens = estimate_tokens(_MEMORY_PROMPT_INTRO) + estimate_tokens(_MEMORY_PROMPT_OUTRO) + 4
-    for _score, memory in ranked:
-        cost = estimate_tokens(memory.content) + 1
-        if used_tokens + cost > config.context_tokens:
-            continue
-        selected.append(copy.deepcopy(memory))
-        used_tokens += cost
-        if len(selected) >= config.max_results:
-            break
-    return tuple(selected)
+    return tuple(copy.deepcopy(memory) for _score, memory in ranked[: config.max_results])
 
 
 def _memory_trace(
@@ -4177,25 +2790,12 @@ def _has_active_tag(memories: list[Memory], tag: str) -> bool:
 
 
 def _internal_state_to_dict(state: InternalState) -> dict[str, object]:
-    emotion = asdict(state.emotion)
-    for name in (
-        "amusement",
-        "excitement",
-        "embarrassment",
-        "concern",
-        "frustration",
-        "irritation",
-    ):
-        emotion.pop(name, None)
     return {
         "version": state.version,
         "updated_at": state.updated_at,
-        "emotion": emotion,
+        "emotion": asdict(state.emotion),
         "life": asdict(state.life),
         "memories": [asdict(memory) for memory in state.memories],
-        "opinions": [asdict(opinion) for opinion in state.opinions],
-        "values": [asdict(value) for value in state.values],
-        "conflicts": [asdict(conflict) for conflict in state.conflicts],
     }
 
 
@@ -4206,61 +2806,23 @@ def _internal_state_from_dict(payload: object) -> InternalState | None:
     raw_emotion = payload.get("emotion")
     emotion_payload = raw_emotion if isinstance(raw_emotion, dict) else {}
     emotion_time = max(0.0, _number(emotion_payload.get("updated_at"), updated_at))
-    raw_active = emotion_payload.get("active_emotions")
-    active_emotions = tuple(
-        emotion
-        for item in (raw_active if isinstance(raw_active, list) else [])[:6]
-        if (emotion := ShortLivedEmotion.from_dict(item)) is not None
+    legacy_primary = compact_text(
+        emotion_payload.get("dominant") or emotion_payload.get("mood"), 32
+    ).lower()
+    primary = compact_text(emotion_payload.get("primary"), 32).lower()
+    if not primary:
+        primary = legacy_primary if legacy_primary not in {"", "steady", "relaxed"} else "neutral"
+    legacy_intensity = max(
+        _number(emotion_payload.get("irritation"), 0.0),
+        _number(emotion_payload.get("frustration"), 0.0),
+        _number(emotion_payload.get("concern"), 0.0),
     )
-    active_by_kind = {emotion.kind: emotion.intensity for emotion in active_emotions}
     candidate = EmotionState(
-        updated_at=emotion_time,
-        valence=_number(emotion_payload.get("valence"), 0.05),
-        arousal=_number(emotion_payload.get("arousal"), 0.15),
-        energy=_number(emotion_payload.get("energy"), 0.65),
-        warmth=_number(emotion_payload.get("warmth"), 0.5),
-        curiosity=_number(emotion_payload.get("curiosity"), 0.45),
-        confidence=_number(emotion_payload.get("confidence"), 0.55),
-        stimulation=_number(emotion_payload.get("stimulation"), 0.5),
-        patience=_number(emotion_payload.get("patience"), 0.72),
-        amusement=active_by_kind.get(
-            "amusement", _number(emotion_payload.get("amusement"), 0.0)
-        ),
-        excitement=active_by_kind.get(
-            "excitement", _number(emotion_payload.get("excitement"), 0.0)
-        ),
-        embarrassment=active_by_kind.get(
-            "embarrassment", _number(emotion_payload.get("embarrassment"), 0.0)
-        ),
-        concern=active_by_kind.get(
-            "concern", _number(emotion_payload.get("concern"), 0.0)
-        ),
-        frustration=active_by_kind.get(
-            "frustration", _number(emotion_payload.get("frustration"), 0.0)
-        ),
-        irritation=active_by_kind.get(
-            "irritation", _number(emotion_payload.get("irritation"), 0.0)
-        ),
-        dominant=compact_text(emotion_payload.get("dominant"), 32) or "relaxed",
-        secondary=compact_text(emotion_payload.get("secondary"), 32),
+        primary=primary,
+        intensity=max(0.0, min(1.0, _number(emotion_payload.get("intensity"), legacy_intensity))),
         cause=compact_text(emotion_payload.get("cause"), 100),
-        mood=compact_text(emotion_payload.get("mood"), 24) or "steady",
-        momentum=_number(emotion_payload.get("momentum"), 0.0),
-        last_trigger=compact_text(emotion_payload.get("last_trigger"), 32),
-        trigger_repetitions=max(
-            0,
-            min(12, int(_number(emotion_payload.get("trigger_repetitions"), 0))),
-        ),
-        active_emotions=active_emotions,
-        recent_influences=tuple(
-            compact_text(item, 24).lower()
-            for item in (
-                emotion_payload.get("recent_influences")
-                if isinstance(emotion_payload.get("recent_influences"), list)
-                else ()
-            )[-4:]
-            if compact_text(item, 24)
-        ),
+        boundary_level=max(0, min(3, int(_number(emotion_payload.get("boundary_level"), 0)))),
+        updated_at=emotion_time,
     )
     emotion = advance_emotion(candidate, now=emotion_time)
     raw_memories = payload.get("memories")
@@ -4270,34 +2832,6 @@ def _internal_state_from_dict(payload: object) -> InternalState | None:
         if (memory := Memory.from_dict(item)) is not None
     )
     memories = _normalize_loaded_memories(list(memories))
-    raw_opinions = payload.get("opinions")
-    opinions = _bounded_opinions(
-        tuple(
-            opinion
-            for item in (raw_opinions if isinstance(raw_opinions, list) else [])
-            if (opinion := OpinionRecord.from_dict(item)) is not None
-        )
-    )
-    raw_values = payload.get("values")
-    values = _bounded_values(
-        tuple(
-            value
-            for item in (raw_values if isinstance(raw_values, list) else [])
-            if (value := ValueRecord.from_dict(item)) is not None
-        )
-    )
-    if not values:
-        values = _initial_values(updated_at or emotion.updated_at)
-    raw_conflicts = payload.get("conflicts")
-    conflicts = _bounded_conflicts(
-        tuple(
-            conflict
-            for item in (raw_conflicts if isinstance(raw_conflicts, list) else [])
-            if (conflict := InternalConflictRecord.from_dict(item)) is not None
-            and conflict.side_a_value in {value.value_key for value in values}
-            and conflict.side_b_value in {value.value_key for value in values}
-        )
-    )
     life = LifeState.from_dict(payload.get("life"))
     if not life.last_processed_at:
         life = replace(
@@ -4308,11 +2842,8 @@ def _internal_state_from_dict(payload: object) -> InternalState | None:
         emotion=emotion,
         life=life,
         memories=memories,
-        opinions=opinions,
-        values=values,
-        conflicts=conflicts,
         updated_at=updated_at or emotion.updated_at,
-        version=_INTERNAL_STATE_VERSION,
+        version=3,
     )
 
 

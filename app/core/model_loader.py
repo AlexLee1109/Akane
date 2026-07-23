@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
+import importlib.metadata
 import queue
 import threading
 import time
@@ -26,7 +28,6 @@ from app.core.config import (
     LLAMA_UBATCH_SIZE,
     LLAMA_USE_MLOCK,
     LLAMA_USE_MMAP,
-    LLAMA_WARMUP_STATIC_PROMPT,
     MAX_TOKENS,
     MIN_P,
     MODEL_PATH,
@@ -36,7 +37,6 @@ from app.core.config import (
     TOP_P,
 )
 
-_THINKING_OFF_TEMPLATE_KWARGS = {"enable_thinking": False}
 _STOP_SEQUENCES = list(GENERATION_STOP_SEQUENCES)
 _OPTIONAL_LOAD_ARGUMENTS = {
     "flash_attn",
@@ -130,17 +130,6 @@ def _has_embedded_chat_template(llm) -> bool:
     return False
 
 
-def _supports_chat_template_kwargs(llm) -> bool:
-    try:
-        parameters = inspect.signature(llm.create_chat_completion).parameters
-    except (TypeError, ValueError):
-        return False
-    return "chat_template_kwargs" in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-
-
 def _friendly_load_error(exc: Exception, model_path: Path) -> Exception:
     message = str(exc).lower()
     if "unknown model architecture" in message and "gemma" in _compact_text(message, model_path):
@@ -188,8 +177,6 @@ class ModelManager:
         self._load_error: Exception | None = None
         self._load_lock = threading.RLock()
         self._inference_lock = threading.Lock()
-        self._completion_capability_llm = None
-        self._disable_thinking = False
         self._active_timing: InferenceTiming | None = None
 
     @classmethod
@@ -207,6 +194,44 @@ class ModelManager:
             "error": str(self._load_error) if self._load_error else None,
             "backend": "llama_cpp",
             "local_model_path": str(self._local_model_path),
+        }
+
+    def runtime_report(self, *, include_model_hash: bool = False) -> dict[str, object]:
+        path = self._local_model_path.expanduser().resolve()
+        model_hash = "not requested"
+        if include_model_hash and path.is_file():
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            model_hash = digest.hexdigest()
+        llm = self._llm
+        metadata = getattr(llm, "metadata", {}) if llm is not None else {}
+        template = ""
+        if isinstance(metadata, dict):
+            template = str(
+                metadata.get("tokenizer.chat_template")
+                or metadata.get("tokenizer.ggml.chat_template")
+                or ""
+            )
+        try:
+            binding_version = importlib.metadata.version("llama-cpp-python")
+        except importlib.metadata.PackageNotFoundError:
+            binding_version = "not installed"
+        return {
+            "model_path": str(path),
+            "model_size": path.stat().st_size if path.is_file() else 0,
+            "model_sha256": model_hash,
+            "llama_cpp_python": binding_version,
+            "chat_template": hashlib.sha256(template.encode("utf-8")).hexdigest()[:12] if template else "unavailable until model load",
+            "context_window": LLAMA_CONTEXT_WINDOW,
+            "enable_thinking": False,
+            "temperature": TEMPERATURE,
+            "top_p": TOP_P,
+            "top_k": TOP_K,
+            "min_p": MIN_P,
+            "repeat_penalty": REPETITION_PENALTY,
+            "seed": "backend random",
         }
 
     def _load_kwargs(self) -> dict[str, object]:
@@ -271,9 +296,7 @@ class ModelManager:
                 )
                 llm = Llama(**kwargs)
                 self._validate_loaded_model(llm)
-                self._configure_completion_capabilities(llm)
                 self._instrument_tokenizer(llm)
-                self._warm_static_prompt(llm)
                 self._llm = llm
             except Exception as exc:
                 self._llm = None
@@ -291,33 +314,6 @@ class ModelManager:
                 "Gemma GGUF is missing tokenizer.chat_template; use an instruction-tuned "
                 "Gemma 4/E4B IT GGUF with the embedded chat template."
             )
-
-    def _warm_static_prompt(self, llm) -> None:
-        if not LLAMA_WARMUP_STATIC_PROMPT:
-            return
-        from app.core.character import get_static_system_prompt
-
-        started_at = time.perf_counter()
-        print("Warming static prompt prefix", flush=True)
-        kwargs = completion_kwargs(1, False)
-        kwargs.update(
-            {
-                "messages": [
-                    {"role": "system", "content": get_static_system_prompt()},
-                    {"role": "user", "content": " "},
-                ],
-                "temperature": 0.0,
-                "top_k": 1,
-                "top_p": 1.0,
-                "min_p": 0.0,
-                "repeat_penalty": 1.0,
-            }
-        )
-        llm.create_chat_completion(**self._completion_kwargs(llm, kwargs))
-        print(
-            f"Static prompt prefix ready in {time.perf_counter() - started_at:.2f}s",
-            flush=True,
-        )
 
     @property
     def llm(self):
@@ -343,14 +339,6 @@ class ModelManager:
             yield self.llm
         finally:
             self._inference_lock.release()
-
-    def _configure_completion_capabilities(self, llm) -> None:
-        if self._completion_capability_llm is not llm:
-            self._disable_thinking = _is_gemma_model(
-                llm,
-                self._local_model_path,
-            ) and _supports_chat_template_kwargs(llm)
-            self._completion_capability_llm = llm
 
     def _instrument_tokenizer(self, llm) -> None:
         """Time the backend's existing tokenizer without another tokenization pass."""
@@ -379,40 +367,45 @@ class ModelManager:
 
         llm.tokenize = timed_tokenize
 
-    def count_prompt_tokens(self, messages: list[dict[str, str]]):
-        """Count the exact prompt produced by the active llama.cpp chat formatter.
-
-        A labeled unavailable result lets the canonical builder retain its
-        conservative estimate when a binding uses an opaque/custom chat handler.
-        """
+    def tokenize_prompt(self, messages: list[dict[str, str]]):
+        """Apply the active template with thinking disabled and return exact IDs."""
 
         from app.core.prompt import PromptTokenCount
 
         with self.inference() as llm:
-            self._configure_completion_capabilities(llm)
-            if self._disable_thinking:
-                return PromptTokenCount(
-                    None,
-                    False,
-                    "estimated_chat_template_options_not_exposed",
-                )
             formatter = _resolved_chat_formatter(llm)
             if formatter is None:
-                return PromptTokenCount(
-                    None,
-                    False,
-                    "estimated_chat_handler_formatter_not_exposed",
+                raise RuntimeError(
+                    "The active llama.cpp chat formatter is unavailable; exact Gemma "
+                    "prompt tokenization cannot be guaranteed."
                 )
-            rendered = formatter(messages=messages)
+            try:
+                prompt = formatter._environment.render(
+                    messages=messages,
+                    eos_token=formatter.eos_token,
+                    bos_token=formatter.bos_token,
+                    raise_exception=lambda message: (_ for _ in ()).throw(ValueError(message)),
+                    add_generation_prompt=formatter.add_generation_prompt,
+                    functions=None,
+                    function_call=None,
+                    tools=None,
+                    tool_choice=None,
+                    strftime_now=formatter.strftime_now,
+                    enable_thinking=False,
+                )
+            except AttributeError as exc:
+                raise RuntimeError(
+                    "The active chat formatter cannot expose its embedded template."
+                ) from exc
             tokens = llm.tokenize(
-                rendered.prompt.encode("utf-8"),
-                add_bos=not rendered.added_special,
+                prompt.encode("utf-8"),
+                add_bos=False,
                 special=True,
             )
             return PromptTokenCount(
-                len(tokens),
-                True,
-                "exact_llama_cpp_active_chat_formatter",
+                tuple(tokens),
+                "exact_active_chat_template_enable_thinking_false",
+                (formatter.eos_token,) if formatter.eos_token else (),
             )
 
     def _start_timing(
@@ -431,60 +424,53 @@ class ModelManager:
             timing.model_finished_at = time.perf_counter()
             self._active_timing = None
 
-    def _completion_kwargs(self, llm, kwargs: dict[str, object]) -> dict[str, object]:
-        self._configure_completion_capabilities(llm)
-        if not self._disable_thinking:
-            return kwargs
-        updated = dict(kwargs)
-        template_kwargs = dict(updated.get("chat_template_kwargs") or {})
-        template_kwargs.update(_THINKING_OFF_TEMPLATE_KWARGS)
-        updated["chat_template_kwargs"] = template_kwargs
-        return updated
-
-    def create_chat_completion(
+    def create_token_completion(
         self,
         *,
-        messages,
-        max_tokens,
-        temperature,
-        top_k=None,
-        top_p=None,
-        min_p=None,
-        repeat_penalty=None,
-        stop=None,
-        stream=False,
+        prompt_tokens: tuple[int, ...],
+        max_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        min_p: float,
+        repeat_penalty: float,
+        stop: list[str],
+        stream: bool,
         cancellation: threading.Event | None = None,
         queue_deadline: float | None = None,
         on_model_start: Callable[[], None] | None = None,
         timing: InferenceTiming | None = None,
     ):
-        kwargs = {
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_k": top_k,
-            "top_p": top_p,
-            "min_p": min_p,
-            "repeat_penalty": repeat_penalty,
-            "stream": stream,
-        }
-        if stop:
-            kwargs["stop"] = stop
+        """Infer directly from the exact IDs produced by the active chat template."""
+
+        def invoke(llm):
+            if timing is not None:
+                timing.prompt_tokens = len(prompt_tokens)
+            return llm.create_completion(
+                prompt=list(prompt_tokens),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                repeat_penalty=repeat_penalty,
+                stop=stop,
+                stream=stream,
+            )
+
         if not stream:
             with self.inference(cancellation, queue_deadline) as llm:
-                resolved_kwargs = self._completion_kwargs(llm, kwargs)
                 try:
                     self._start_timing(timing, on_model_start)
-                    return llm.create_chat_completion(**resolved_kwargs)
+                    return invoke(llm)
                 finally:
                     self._finish_timing(timing)
 
         def wrapped():
             with self.inference(cancellation, queue_deadline) as llm:
-                resolved_kwargs = self._completion_kwargs(llm, kwargs)
                 try:
                     self._start_timing(timing, on_model_start)
-                    yield from llm.create_chat_completion(**resolved_kwargs)
+                    yield from invoke(llm)
                 finally:
                     self._finish_timing(timing)
 
@@ -494,6 +480,8 @@ class ModelManager:
         self,
         messages: list[dict[str, str]],
         *,
+        prompt_tokens: tuple[int, ...] = (),
+        template_stop_sequences: tuple[str, ...] = (),
         max_tokens: int,
         cancellation: threading.Event | None = None,
         queue_deadline: float | None = None,
@@ -515,13 +503,18 @@ class ModelManager:
         def produce() -> None:
             response = None
             try:
-                response = self.create_chat_completion(
-                    messages=messages,
+                if not prompt_tokens:
+                    raise RuntimeError("Exact prompt token IDs are required for inference.")
+                options = completion_kwargs(max_tokens, True)
+                configured_stops = list(options.pop("stop", []))
+                response = self.create_token_completion(
+                    prompt_tokens=prompt_tokens,
                     cancellation=cancellation,
                     queue_deadline=queue_deadline,
                     on_model_start=on_model_start,
                     timing=timing,
-                    **completion_kwargs(max_tokens, True),
+                    stop=list(dict.fromkeys((*template_stop_sequences, *configured_stops))),
+                    **options,
                 )
                 for chunk in response:
                     if cancellation is not None and cancellation.is_set():

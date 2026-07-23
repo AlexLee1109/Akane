@@ -159,6 +159,7 @@ def _headers() -> dict[str, str]:
 def _payload(message, text: str) -> dict[str, object]:
     return {
         "message": text,
+        "request_id": f"discord:message:{int(message.id)}",
         "profile_id": _profile_id(message),
         "conversation_id": _conversation_id(message),
         "source": "discord",

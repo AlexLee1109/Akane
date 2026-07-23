@@ -24,26 +24,13 @@ from app.core.memory import (
     Memory,
     MemoryContext,
     MemoryStore,
-    InternalConflictRecord,
-    OpinionRecord,
-    ValueRecord,
     WorkingMemory,
-    apply_opinion_candidate,
-    apply_values_and_conflicts,
     akane_preference_answer,
-    canonical_opinion_topic,
-    estimate_tokens,
     established_akane_preference,
-    format_opinion_guidance,
-    format_values_guidance,
     format_relevant_memories,
     get_internal_state_store,
     get_memory_store,
-    opinion_conflicts_with_user_claim,
     preference_update_requested,
-    relevant_opinion,
-    relevant_internal_conflict,
-    relevant_values,
 )
 from app.core.prompt import (
     PromptContext,
@@ -85,21 +72,8 @@ _DIRECT_REQUEST = re.compile(
     re.IGNORECASE,
 )
 _OPINION_REQUEST = re.compile(
-    r"\b(?:do you (?:like|prefer)|would you rather|favorite|"
-    r"what's your opinion|what is your opinion|what (?:is|was) your view|your take|"
-    r"how do you feel about|reconsider)\b",
-    re.IGNORECASE,
-)
-_EVALUATIVE_OPINION_REQUEST = re.compile(
-    r"\b(?:what do you think (?:about|of)|"
-    r"(?:do you (?:think|believe)|what do you think).{0,100}\b(?:better|worse|"
-    r"good idea|bad idea|fair|meaningful|matters?|preferable|worthwhile|"
-    r"desirable|should))\b",
-    re.IGNORECASE,
-)
-_PAST_OPINION_REQUEST = re.compile(
-    r"\b(?:used to think|past opinion|previous opinion|before you changed|"
-    r"changed your mind)\b",
+    r"\b(?:do you (?:like|prefer)|favorite|what do you think|what's your opinion|"
+    r"what is your opinion|your take)\b",
     re.IGNORECASE,
 )
 _REASSURANCE_REQUEST = re.compile(
@@ -124,15 +98,6 @@ _CREATIVE_SELF_REQUEST = re.compile(
     r"\b(?:that|your)\s+(?:(?:creative|story|character)\s+)?(?:idea|concept)\b",
     re.IGNORECASE,
 )
-_CONTEXTUAL_PERSONAL_CHOICE = re.compile(
-    r"^(?:which (?:one )?(?:would|do) you (?:personally )?"
-    r"(?:choose|prefer|want)(?: between (?:them|the two))?|"
-    r"what would you (?:choose|prefer|want))\s*[?.!]*$",
-    re.IGNORECASE,
-)
-_STYLE_DIRECTIVE_TOKEN_BUDGET = 128
-
-
 @dataclass(frozen=True, slots=True)
 class ChatInput:
     profile_id: str
@@ -143,6 +108,7 @@ class ChatInput:
     display_name: str = ""
     reply_context: str = ""
     autonomous: bool = False
+    request_id: str = ""
 
 
 @dataclass(slots=True)
@@ -249,7 +215,6 @@ class ResponseIntention:
     active_thread: bool = False
     relationship_safe: bool = False
     correction_active: bool = False
-    choice_required: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,16 +245,6 @@ class CoordinatedTurnContext:
     reply_context: str = ""
     date_time: str = ""
     preference_anchor: str = ""
-    opinion_topic_key: str = ""
-    active_opinion: OpinionRecord | None = None
-    historical_opinion: bool = False
-    opinion_conflict: bool = False
-    relevant_values: tuple[ValueRecord, ...] = ()
-    active_internal_conflict: InternalConflictRecord | None = None
-    changed_condition: str = ""
-    affected_reason: str = ""
-    reason_effect: str = ""
-    reconsideration_warranted: bool = False
     initiative_worthwhile: bool = True
     response_intention: ResponseIntention = ResponseIntention("acknowledge")
     compiled_style: CompiledStyle = CompiledStyle(
@@ -340,8 +295,6 @@ def select_response_intention(
     familiar_relationship: bool = False,
     has_grounded_activity: bool = False,
     recent_turns: tuple[object, ...] = (),
-    active_opinion: OpinionRecord | None = None,
-    opinion_conflict: bool = False,
 ) -> ResponseIntention:
     """Select one response purpose from already-computed, structured turn state."""
 
@@ -369,16 +322,8 @@ def select_response_intention(
     correction_active = bool(
         signal.correction_requested or "correction" in use_by_id.values()
     )
-    question_mode = signal.semantic_event.question_mode
     opinion_requested = bool(
-        question_mode in {"personal_choice", "hypothetical_choice"}
-        or question_mode != "objective_comparison"
-        and (
-            signal.identity_attribute == "preferences"
-            or _OPINION_REQUEST.search(text)
-            or _EVALUATIVE_OPINION_REQUEST.search(text)
-            or active_opinion is not None and _PAST_OPINION_REQUEST.search(text)
-        )
+        signal.identity_attribute == "preferences" or _OPINION_REQUEST.search(text)
     )
     creative_experience_requested = bool(_CREATIVE_SELF_REQUEST.search(text))
     experience_requested = bool(
@@ -404,13 +349,13 @@ def select_response_intention(
         )
         and (not arcane_activity_update or explicit_request)
     )
-    boundary_crossed = bool(signal.hostility)
+    boundary_crossed = bool(
+        signal.hostility
+        or signal.embodied_action and signal.emotion_state.boundary_level >= 2
+    )
     distress = bool(signal.sadness or signal.intent == "emotional_support")
-    # TurnSignal has no objection flag; honor an explicit structured trigger or reaction.
     substantive_objection = bool(
-        opinion_conflict
-        or
-        signal.trigger == "substantive_objection"
+        signal.continued_after_objection
         or signal.contextual_reaction.kind == "disagreement"
     )
     grounded_experience = experience_requested and (
@@ -424,7 +369,7 @@ def select_response_intention(
     supported_reassurance = bool(
         reassurance_requested
         or (
-            signal.contextual_reaction.kind == "concern"
+            signal.contextual_reaction.kind == "concerned"
             and not distress
             and not generic_request
         )
@@ -434,7 +379,6 @@ def select_response_intention(
     candidates = (
         ("set boundary", boundary_crossed),
         ("comfort", distress),
-        ("disagree", opinion_conflict),
         ("answer", generic_request),
         ("disagree", substantive_objection),
         ("celebrate", meaningful_success),
@@ -464,8 +408,10 @@ def select_response_intention(
         not serious
         and not signal.hostility
         and not signal.sadness
-        and signal.emotion_state.irritation < 0.35
-        and signal.emotion_state.frustration < 0.45
+        and not (
+            signal.emotion_state.primary in {"irritated", "angry"}
+            and signal.emotion_state.intensity >= 0.35
+        )
     )
     teasing_allowed = bool(
         relationship_safe
@@ -541,9 +487,7 @@ def select_response_intention(
         grounding = "apply correction silently"
 
     continuity = (
-        "established view"
-        if active_opinion is not None
-        else "active thread"
+        "active thread"
         if active_thread
         else "brief callback available"
         if callback_allowed
@@ -573,7 +517,6 @@ def select_response_intention(
         active_thread=active_thread,
         relationship_safe=relationship_safe,
         correction_active=correction_active,
-        choice_required=question_mode in {"personal_choice", "hypothetical_choice"},
     )
 
 
@@ -583,14 +526,6 @@ def compile_akane_style(
     *,
     user_text: str = "",
     familiar_relationship: bool = False,
-    active_opinion: OpinionRecord | None = None,
-    historical_opinion: bool = False,
-    relevant_values: tuple[ValueRecord, ...] = (),
-    active_internal_conflict: InternalConflictRecord | None = None,
-    changed_condition: str = "",
-    affected_reason: str = "",
-    reason_effect: str = "",
-    reconsideration_warranted: bool = False,
 ) -> CompiledStyle:
     """Compile existing turn state into one bounded model-visible style contract."""
 
@@ -609,22 +544,6 @@ def compile_akane_style(
         "unnecessary offers",
     ]
     primary = intention.primary
-    question_mode = signal.semantic_event.question_mode
-    personal_reflective = bool(
-        not signal.technical
-        and question_mode != "objective_comparison"
-        and (
-            question_mode in {"personal_choice", "hypothetical_choice"}
-            or signal.intent in {"reflection", "emotional_support"}
-            or signal.identity_attribute
-            or re.search(
-                r"\b(?:identity|existence|existential|relationship|connection|"
-                r"memory|continuity|fear|desire|human|digital life)\b",
-                user_text,
-                re.IGNORECASE,
-            )
-        )
-    )
 
     if signal.identity_attribute:
         grounding.append("stable identity facts")
@@ -671,17 +590,8 @@ def compile_akane_style(
     if intention.optional_behavior == "light dry humor":
         humor = "dry"
 
-    if personal_reflective:
-        avoid.extend(
-            (
-                "objective-comparison framing",
-                "equal-balance summary",
-                "clinical AI terms (variable, iteration, processing, collected patterns)",
-            )
-        )
-
     reaction = signal.contextual_reaction.kind
-    if reaction == "concern":
+    if reaction == "concerned":
         humor = "none"
     elif reaction in {"relief", "satisfaction", "pride", "appreciation"}:
         if familiar_relationship and intention.relationship_safe:
@@ -689,42 +599,30 @@ def compile_akane_style(
     elif reaction in {"amusement", "playfulness"}:
         if intention.relationship_safe and not signal.technical and familiar_relationship:
             humor = "dry"
-    elif reaction in {"irritation", "criticism", "lingering_irritation"}:
+    elif reaction in {"irritated", "angry", "criticism"}:
         humor = "none"
-    elif reaction in {"embarrassment", "lingering_embarrassment"}:
+    elif reaction == "embarrassed":
         avoid.extend(("exaggerated mannerisms", "forced hesitation"))
 
-    active = (
-        signal.emotion_state.active_emotions[0]
-        if signal.emotion_state.active_emotions
-        else None
-    )
     serious = bool(
         primary in {"comfort", "disagree", "reassure", "set boundary"}
         or signal.intent == "serious"
         or signal.sadness
         or signal.hostility
-        or reaction == "concern"
-        or (active is not None and active.kind == "concern")
+        or reaction == "concerned"
     )
     if serious:
         humor = "none"
 
     tension = bool(
         signal.hostility
-        or signal.emotion_state.irritation >= 0.35
-        or signal.emotion_state.frustration >= 0.45
+        or signal.emotion_state.primary in {"irritated", "angry"}
+        and signal.emotion_state.intensity >= 0.35
     )
     if tension:
         humor = "none"
         avoid.append("callbacks")
-    if active is not None and active.kind in {"concern", "irritation"}:
-        humor = "none"
-
-    mood = signal.emotion_state
-    if not serious and mood.irritation >= 0.35:
-        humor = "none"
-    if mood.patience < 0.35:
+    if signal.emotion_state.boundary_level:
         humor = "none"
 
     final_callback_open = bool(
@@ -780,107 +678,20 @@ def compile_akane_style(
         if reaction not in {"", "neutral"}
         else "natural companion participation"
     )
-    if active_opinion is not None and primary in {"state opinion", "disagree"}:
-        reaction_guidance = (
-            "reflective and concise"
-            if historical_opinion
-            else "measured and candid"
-            if active_opinion.confidence == "low"
-            else "direct and controlled"
-            if active_opinion.strength == "strong"
-            else reaction_guidance
-        )
-    if relevant_values and primary in {"state opinion", "disagree"}:
-        if active_internal_conflict is not None and active_internal_conflict.status == "active":
-            reaction_guidance = "measured and candid"
-        elif active_internal_conflict is not None:
-            reaction_guidance = "direct and controlled"
-        elif any(value.strength == "strong" for value in relevant_values):
-            reaction_guidance = "direct and controlled"
-    if intention.choice_required:
-        reaction_guidance = "direct, personal, and candid"
     directives: list[tuple[str, str]] = [
         ("Situation", situation),
         ("Reaction", reaction_guidance),
         ("Goal", primary),
     ]
-    if intention.optional_behavior != "none" and active_opinion is None:
+    if intention.optional_behavior != "none":
         directives.append(("Optional", intention.optional_behavior))
-    if intention.continuity != "none" and active_opinion is None:
+    if intention.continuity != "none":
         directives.append(("Continuity", intention.continuity))
-    if intention.choice_required:
-        directives.append(
-            (
-                "Choice",
-                "early stance; main reason; one cost; specific uncertainty",
-            )
-        )
-    opinion_guidance = format_opinion_guidance(
-        active_opinion,
-        historical=historical_opinion,
-        affected_reason=affected_reason,
-        reason_effect=reason_effect,
-    )
-    if opinion_guidance and primary in {"state opinion", "disagree"}:
-        directives.append(("View", opinion_guidance))
-    values_guidance = format_values_guidance(relevant_values, active_internal_conflict)
-    if values_guidance and primary in {"state opinion", "disagree"}:
-        directives.append(("Priorities", values_guidance))
-    if changed_condition and question_mode == "hypothetical_choice":
-        reconsideration = changed_condition
-        if affected_reason and reason_effect:
-            reconsideration += f" {reason_effect} {affected_reason}"
-        reconsideration += (
-            "; reassess"
-            if reconsideration_warranted
-            else "; address effect on choice"
-        )
-        directives.append(("Reconsideration", reconsideration))
     if grounding:
         directives.append(("Grounding", "; ".join(dict.fromkeys(grounding))))
     directives.append(("Length", length))
     directives.append(("Avoid", "; ".join(dict.fromkeys(avoid))))
     directives = [(category, value) for category, value in directives if value]
-    if estimate_tokens("\n".join(f"{key}: {value}" for key, value in directives)) > _STYLE_DIRECTIVE_TOKEN_BUDGET:
-        avoid_index = next(
-            (index for index, item in enumerate(directives) if item[0] == "Avoid"),
-            -1,
-        )
-        if avoid_index >= 0:
-            directives[avoid_index] = (
-                "Avoid",
-                "clinical AI terms (variable/iteration/processing); objective balance"
-                if personal_reflective
-                else "service posture; generic validation",
-            )
-    for removable_category in (
-        "Situation",
-        "Optional",
-        "Continuity",
-        "Reaction",
-        "Grounding",
-        "Length",
-    ):
-        if estimate_tokens(
-            "\n".join(f"{category}: {value}" for category, value in directives)
-        ) <= _STYLE_DIRECTIVE_TOKEN_BUDGET:
-            break
-        directives = [
-            item for item in directives if item[0] != removable_category
-        ]
-    if estimate_tokens(
-        "\n".join(f"{category}: {value}" for category, value in directives)
-    ) > _STYLE_DIRECTIVE_TOKEN_BUDGET:
-        view_index = next(
-            (index for index, item in enumerate(directives) if item[0] == "View"),
-            -1,
-        )
-        if view_index >= 0 and "; reasons" in directives[view_index][1]:
-            directives[view_index] = (
-                "View",
-                ";".join(directives[view_index][1].split(";")[:3]).strip(),
-            )
-
     return CompiledStyle(
         humor=humor,
         directives=tuple(directives),
@@ -940,6 +751,7 @@ class InternalStateCoordinator:
             autonomous=chat.autonomous,
             familiar_relationship=familiar_relationship,
             working_context=conversation_working,
+            recent_turns=memory_context.recent_turns,
             activity_scope=chat.conversation_id,
         )
         signal = state_delta.signal
@@ -948,9 +760,6 @@ class InternalStateCoordinator:
             "appearance",
             "relationships",
         }
-        if stable_identity:
-            memory_context = MemoryContext("", ())
-
         working = state_delta.working_context
         preference_memory = (
             established_akane_preference(
@@ -976,7 +785,7 @@ class InternalStateCoordinator:
         if preference_memory is not None and all(
             memory.id != preference_memory.id for memory in selected_memories
         ):
-            selected_memories.append(preference_memory)
+            selected_memories.insert(0, preference_memory)
         relevant_memories = tuple(
             memory
             for memory in selected_memories
@@ -993,67 +802,6 @@ class InternalStateCoordinator:
                 compact_text(memory.content, 120) for memory in selected_memories
             ),
         )
-        active_opinion, opinion_topic_key, _opinion_subject, historical_opinion = (
-            relevant_opinion(
-                state_delta.state.opinions,
-                chat.text,
-                semantic_subject=signal.semantic_event.subject,
-                signal_topic=signal.topic,
-            )
-            if not skip_memory and not chat.autonomous and not stable_identity
-            else (None, "", "", False)
-        )
-        question_mode = signal.semantic_event.question_mode
-        referential_choice = bool(
-            re.search(
-                r"\b(?:which|that|this|them|those|the two|either|"
-                r"change your (?:answer|choice|mind|preference))\b",
-                chat.text,
-                re.IGNORECASE,
-            )
-        )
-        if (
-            question_mode == "hypothetical_choice" and referential_choice
-            or question_mode == "personal_choice"
-            and active_opinion is None
-            and _CONTEXTUAL_PERSONAL_CHOICE.fullmatch(chat.text.strip()) is not None
-        ):
-            active_by_topic = {
-                opinion.topic_key: opinion
-                for opinion in state_delta.state.opinions
-                if opinion.status == "active"
-            }
-            for recent_turn in reversed(memory_context.recent_turns):
-                if recent_turn.role != "user":
-                    continue
-                contextual_key, _contextual_subject = canonical_opinion_topic(
-                    recent_turn.content
-                )
-                contextual_opinion = active_by_topic.get(contextual_key)
-                if contextual_opinion is not None:
-                    active_opinion = contextual_opinion
-                    opinion_topic_key = contextual_key
-                    historical_opinion = False
-                    break
-        changed_condition = signal.semantic_event.changed_condition
-        affected_reason = signal.semantic_event.affected_reason
-        reason_effect = signal.semantic_event.reason_effect
-        if (
-            active_opinion is not None
-            and affected_reason
-            and affected_reason not in active_opinion.reason_tags
-            and reason_effect in {"strengthens", "weakens"}
-        ):
-            reason_effect = "introduces"
-        reconsideration_warranted = bool(
-            active_opinion is not None
-            and (
-                affected_reason in active_opinion.reason_tags
-                and reason_effect in {"strengthens", "weakens", "removes"}
-                or reason_effect == "introduces"
-            )
-        )
-        opinion_conflict = opinion_conflicts_with_user_claim(active_opinion, chat.text)
         response_intention = select_response_intention(
             signal,
             state_delta.recalled_memories,
@@ -1062,48 +810,19 @@ class InternalStateCoordinator:
             familiar_relationship=familiar_relationship,
             has_grounded_activity=state_delta.grounded_activity_source != "none",
             recent_turns=memory_context.recent_turns,
-            active_opinion=active_opinion,
-            opinion_conflict=opinion_conflict,
         )
-        active_internal_conflict = relevant_internal_conflict(
-            state_delta.state.conflicts,
-            opinion_topic_key,
-            include_resolved=True,
-        )
-        turn_values = (
-            relevant_values(
-                state_delta.state.values,
-                topic_key=opinion_topic_key,
-                opinion=active_opinion,
-                conflict=active_internal_conflict,
-            )
-            if response_intention.primary in {"state opinion", "disagree"}
-            else ()
-        )
-        if reason_effect == "removes" and affected_reason:
-            invalidated_value = {
-                "freedom": "independence",
-                "control": "independence",
-            }.get(affected_reason, affected_reason)
-            turn_values = tuple(
-                value for value in turn_values if value.value_key != invalidated_value
-            )
         compiled_style = compile_akane_style(
             signal,
             response_intention,
             user_text=chat.text,
             familiar_relationship=familiar_relationship,
-            active_opinion=active_opinion,
-            historical_opinion=historical_opinion,
-            relevant_values=turn_values,
-            active_internal_conflict=active_internal_conflict,
-            changed_condition=changed_condition,
-            affected_reason=affected_reason,
-            reason_effect=reason_effect,
-            reconsideration_warranted=reconsideration_warranted,
         )
 
-        behavioral_summary = compiled_style.prompt_text()
+        behavioral_summary = "\n".join(
+            value
+            for value in (compiled_style.prompt_text(), signal.emotion_prompt())
+            if value
+        )
 
         editor_context = code_context.prompt_text
         if code_context.requested and not code_context.connected:
@@ -1146,16 +865,6 @@ class InternalStateCoordinator:
             reply_context="" if stable_identity else chat.reply_context,
             date_time=date_time_line() if _time_context_relevant(chat.text) else "",
             preference_anchor=preference_anchor,
-            opinion_topic_key=opinion_topic_key,
-            active_opinion=active_opinion,
-            historical_opinion=historical_opinion,
-            opinion_conflict=opinion_conflict,
-            relevant_values=turn_values,
-            active_internal_conflict=active_internal_conflict,
-            changed_condition=changed_condition,
-            affected_reason=affected_reason,
-            reason_effect=reason_effect,
-            reconsideration_warranted=reconsideration_warranted,
             initiative_worthwhile=initiative_worthwhile,
             response_intention=response_intention,
             compiled_style=compiled_style,
@@ -1166,27 +875,15 @@ class InternalStateCoordinator:
         chat: ChatInput,
         turn: CoordinatedTurnContext,
         reply: str,
-        opinion_candidate: OpinionRecord | None = None,
-    ) -> dict[str, object]:
-        candidate_state, opinion_trace = apply_opinion_candidate(
-            turn.state_delta.state,
-            opinion_candidate,
-        )
-        candidate_state, values_trace = apply_values_and_conflicts(
-            candidate_state,
-            opinion_candidate,
-            opinion_trace,
-        )
-        opinion_trace.update(values_trace)
-        state_delta = replace(turn.state_delta, state=candidate_state)
+    ) -> None:
         previous_state = self._state_store.commit_turn(
             chat.profile_id,
-            state_delta,
+            turn.state_delta,
             used_memory_ids=turn.memory_context.memory_ids,
             now=chat.timestamp,
         )
         if chat.autonomous:
-            return opinion_trace
+            return
         try:
             self._conversation_store.commit_turn(
                 profile_id=chat.profile_id,
@@ -1195,11 +892,11 @@ class InternalStateCoordinator:
                 user_text=chat.text,
                 assistant_text=reply,
                 signal=turn.signal,
+                request_id=chat.request_id,
             )
         except Exception:
             self._state_store.restore_internal_state(chat.profile_id, previous_state)
             raise
-        return opinion_trace
 
 
 @dataclass(frozen=True, slots=True)
@@ -1242,6 +939,7 @@ def normalize_chat_input(
     display_name: object = "",
     reply_context: object = "",
     autonomous: object = False,
+    request_id: object = "",
 ) -> ChatInput:
     message = str(text or "").strip()
     if not message:
@@ -1264,6 +962,7 @@ def normalize_chat_input(
         display_name=compact_text(display_name, 60),
         reply_context=compact_text(reply_context, 600),
         autonomous=bool(autonomous),
+        request_id=compact_text(request_id, 160),
     )
 
 
@@ -1301,6 +1000,9 @@ def prepare_turn(
                 relationship=turn_context.relationship_context,
                 preference_continuity=turn_context.preference_context,
                 relevant_memories=turn_context.relevant_memories,
+                durable_memories=tuple(
+                    turn_context.memory_context.memory_contents
+                ),
                 earlier_turns=turn_context.memory_context.earlier_turns,
                 recent_turns=turn_context.memory_context.recent_turns,
                 behavioral_summary=turn_context.behavioral_summary,
@@ -1315,7 +1017,7 @@ def prepare_turn(
         submitted_memory = "\n".join(
             source.content
             for source in prompt_plan.sources
-            if source.kind in {"retrieved_memory", "preference_continuity"}
+            if source.kind in {"durable_memory", "preference_continuity"}
         )
         included_ids = tuple(
             memory_id
@@ -1354,19 +1056,14 @@ def prepare_turn(
         raise
 
 
-def commit_turn(
-    prepared: TurnPreparation,
-    reply: str,
-    opinion_candidate: OpinionRecord | None = None,
-) -> dict[str, object]:
+def commit_turn(prepared: TurnPreparation, reply: str) -> None:
     prepared.handle.raise_if_cancelled()
     with _COMMIT_LOCK:
         prepared.handle.raise_if_cancelled()
-        return prepared.coordinator.commit_completed_turn(
+        prepared.coordinator.commit_completed_turn(
             prepared.chat_input,
             prepared.turn_context,
             reply,
-            opinion_candidate,
         )
 
 
@@ -1397,7 +1094,7 @@ def forget_profile(profile_id: str) -> None:
     with _COMMIT_LOCK:
         _SCHEDULER.cancel_profile(profile)
         get_memory_store().clear_profile(profile)
-        get_internal_state_store().clear_profile_memory(profile)
+        get_internal_state_store().clear(profile)
 
 
 def session_state_snapshot(

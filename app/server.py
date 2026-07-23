@@ -111,6 +111,7 @@ def _parse_chat_request(payload: dict) -> ChatRequestData:
             display_name=payload.get("display_name", ""),
             reply_context=payload.get("reply_context", ""),
             autonomous=_coerce_bool(payload.get("autonomous", False)),
+            request_id=payload.get("request_id", ""),
         ),
         skip_memory=_coerce_bool(payload.get("skip_memory", False)),
         skip_if_busy=_coerce_bool(payload.get("skip_if_busy", False)),
@@ -478,6 +479,22 @@ def create_app() -> FastAPI:
         command = handle_builtin_command(chat.chat_input)
         if command is not None:
             return JSONResponse(command)
+        prior_reply = get_memory_store().reply_for_request(
+            chat.chat_input.conversation_id,
+            chat.chat_input.profile_id,
+            chat.chat_input.request_id,
+        )
+        if prior_reply is not None:
+            return JSONResponse(
+                {
+                    "reply": prior_reply,
+                    "messages": _messages(
+                        chat.chat_input.conversation_id,
+                        chat.chat_input.profile_id,
+                    ),
+                    "duplicate_retry": True,
+                }
+            )
         try:
             reply = await asyncio.to_thread(_generate_reply, chat)
         except Exception as exc:

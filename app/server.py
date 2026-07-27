@@ -25,14 +25,10 @@ from app.core.config import (
     _coerce_bool,
 )
 from app.core.memory import get_internal_state_store, get_memory_store
+from app.core.life_worker import start_life_worker, stop_life_worker
 from app.core.model_loader import ModelManager
 from app.core.reply_pipeline import (
-    GenerationEvent,
-    commit_reply,
     debug_state_report,
-    generate_reply,
-    prepare_reply,
-    stream_reply,
 )
 from app.core.session import (
     ChatInput,
@@ -41,10 +37,12 @@ from app.core.session import (
     GenerationQueueFullError,
     cancel_all_generations,
     cancel_generation,
-    finish_turn,
     forget_profile,
     normalize_chat_input,
     reset_conversation,
+    run_companion_turn,
+    run_initiative_turn,
+    run_life_turn,
     session_state_snapshot,
 )
 from app.integrations.vscode_context import active_file_reply
@@ -158,21 +156,13 @@ def _error_status(exc: Exception) -> int:
 
 def _generate_reply(chat: ChatRequestData) -> str:
     item = chat.chat_input
-    direct_reply = active_file_reply(item.text)
-    prepared = prepare_reply(
+    result = run_companion_turn(
         item,
         skip_memory=chat.skip_memory,
         skip_if_busy=chat.skip_if_busy,
-        exact_tokens=direct_reply is None,
+        direct_reply=active_file_reply(item.text),
     )
-    if direct_reply is not None:
-        try:
-            commit_reply(prepared, direct_reply)
-            return direct_reply
-        finally:
-            finish_turn(prepared)
-    reply = generate_reply(prepared)
-    return reply
+    return result.message if result.decision.should_respond else ""
 
 
 def _review_vscode_context(decision: ReviewDecision | None = None) -> str:
@@ -202,89 +192,55 @@ def _review_vscode_context(decision: ReviewDecision | None = None) -> str:
 
 def _stream_chat_events(chat: ChatRequestData):
     item = chat.chat_input
-    direct_reply = active_file_reply(item.text)
-    if direct_reply is not None:
-        prepared = prepare_reply(
-            item,
-            skip_memory=chat.skip_memory,
-            skip_if_busy=chat.skip_if_busy,
-            exact_tokens=False,
-        )
-        try:
-            yield _json_line(
-                {
-                    "type": "start",
-                    "generation_id": prepared.generation_id,
-                    "messages": _messages_with_user(item),
-                }
-            )
-            yield _event_json(
-                GenerationEvent("delta", prepared.generation_id, text=direct_reply),
-                item.conversation_id,
-                item.profile_id,
-            )
-            commit_reply(prepared, direct_reply)
-            yield _event_json(
-                GenerationEvent("done", prepared.generation_id, reply=direct_reply),
-                item.conversation_id,
-                item.profile_id,
-            )
-        finally:
-            finish_turn(prepared)
-        return
-    prepared = None
+    generation_id = ""
     try:
-        prepared = prepare_reply(
-            item,
-            skip_memory=chat.skip_memory,
-            skip_if_busy=chat.skip_if_busy,
-        )
         yield _json_line(
             {
                 "type": "start",
-                "generation_id": prepared.generation_id,
+                "generation_id": generation_id,
                 "messages": _messages_with_user(item),
             }
         )
-        for event in stream_reply(prepared):
-            yield _event_json(event, item.conversation_id, item.profile_id)
-        prepared = None
+        result = run_companion_turn(
+            item,
+            skip_memory=chat.skip_memory,
+            skip_if_busy=chat.skip_if_busy,
+            direct_reply=active_file_reply(item.text),
+        )
+        generation_id = result.generation_id
+        if result.decision.should_respond and result.message:
+            yield _json_line(
+                {
+                    "type": "delta",
+                    "generation_id": generation_id,
+                    "content": result.message,
+                }
+            )
+        yield _json_line(
+            {
+                "type": "done",
+                "generation_id": generation_id,
+                "reply": (
+                    result.message if result.decision.should_respond else ""
+                ),
+                "messages": _messages(item.conversation_id, item.profile_id),
+            }
+        )
     except GenerationCancelled:
-        generation_id = prepared.generation_id if prepared else ""
         _log("cancelled", f"conversation={item.conversation_id}")
         yield _json_line({"type": "cancelled", "generation_id": generation_id})
     except Exception as exc:
-        _log("error", f"conversation={item.conversation_id} type={type(exc).__name__} detail={exc}")
+        _log(
+            "error",
+            f"conversation={item.conversation_id} type={type(exc).__name__} detail={exc}",
+        )
         yield _json_line(
             {
                 "type": "error",
-                "generation_id": prepared.generation_id if prepared else "",
+                "generation_id": generation_id,
                 "error": _safe_error(exc),
             }
         )
-    finally:
-        if prepared is not None:
-            finish_turn(prepared)
-
-
-def _event_json(event: GenerationEvent, conversation_id: str, profile_id: str) -> bytes:
-    if event.kind == "delta":
-        return _json_line(
-            {
-                "type": "delta",
-                "generation_id": event.generation_id,
-                "content": event.text,
-            }
-        )
-    return _json_line(
-        {
-            "type": "done",
-            "generation_id": event.generation_id,
-            "reply": event.reply,
-            "messages": _messages(conversation_id, profile_id),
-            "metadata": event.metadata or {},
-        }
-    )
 
 
 def handle_builtin_command(chat_input: ChatInput) -> dict | None:
@@ -356,9 +312,11 @@ async def _lifespan(_app: FastAPI):
     get_memory_store()
     get_internal_state_store()
     _start_model_loading()
+    start_life_worker()
     try:
         yield
     finally:
+        stop_life_worker()
         cancel_all_generations()
 
 
@@ -524,6 +482,48 @@ def create_app() -> FastAPI:
             media_type="application/x-ndjson; charset=utf-8",
             headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
         )
+
+    @app.post("/api/initiative")
+    async def api_initiative(request: Request):
+        payload = await _request_payload(request)
+        profile = str(payload.get("profile_id") or DEFAULT_PROFILE_ID)
+        conversation = str(
+            payload.get("conversation_id") or payload.get("session_id") or DEFAULT_CONVERSATION_ID
+        )
+        source = str(payload.get("source") or "web")
+        try:
+            result = await asyncio.to_thread(
+                run_initiative_turn,
+                profile_id=profile,
+                conversation_id=conversation,
+                source=source,
+                display_name=str(payload.get("display_name") or ""),
+                now=payload.get("timestamp") or None,
+            )
+        except Exception as exc:
+            _log("error", f"type={type(exc).__name__} detail={exc}")
+            return JSONResponse({"error": _safe_error(exc)}, status_code=_error_status(exc))
+        return JSONResponse(
+            {
+                "reply": result.message if result.decision.should_respond else "",
+                "messages": _messages(conversation, profile),
+            }
+        )
+
+    @app.post("/api/life")
+    async def api_life(request: Request):
+        payload = await _request_payload(request)
+        profile = str(payload.get("profile_id") or DEFAULT_PROFILE_ID)
+        try:
+            changed = await asyncio.to_thread(
+                run_life_turn,
+                profile_id=profile,
+                now=payload.get("timestamp") or None,
+            )
+        except Exception as exc:
+            _log("error", f"type={type(exc).__name__} detail={exc}")
+            return JSONResponse({"error": _safe_error(exc)}, status_code=_error_status(exc))
+        return JSONResponse({"changed": changed, "akane": get_internal_state_store().public_internal_state(profile)})
 
     @app.get("/{asset_path:path}", include_in_schema=False)
     async def static_assets(asset_path: str):

@@ -31,13 +31,14 @@ from app.core.config import (
     POPUP_USER_PATH,
 )
 from app.core.persistence import atomic_write_json, read_json
-from app.core.life import (
-    ActivityRecord,
-    LifeEvolution,
-    LifeState,
-    grounded_activity,
-    recent_activity,
-    record_grounded_activity,
+from app.core.presence import (
+    PresenceActivity,
+    PresenceState,
+    advance_presence,
+    apply_activity_updates,
+    apply_life_decision,
+    life_decision_rejection,
+    LifeDecision,
 )
 from app.core.signal import (
     AffectTrace,
@@ -45,6 +46,7 @@ from app.core.signal import (
     SemanticEvent,
     TurnContext,
     TurnSignal,
+    VALID_EMOTION_LABELS,
     advance_emotion,
     analyze_turn,
     build_affect_trace,
@@ -57,7 +59,13 @@ from app.core.signal import (
 from app.core.utils import compact_text
 
 MEMORY_SCHEMA_VERSION = 2
-LONG_TERM_MEMORY_SCHEMA_VERSION = 6
+LONG_TERM_MEMORY_SCHEMA_VERSION = 9
+_LIFE_PENDING_NOTIFIER: Callable[[str], None] | None = None
+
+
+def set_life_pending_notifier(callback: Callable[[str], None] | None) -> None:
+    global _LIFE_PENDING_NOTIFIER
+    _LIFE_PENDING_NOTIFIER = callback
 _MEMORY_PROMPT_INTRO = "A few past details may matter in this conversation:"
 _MEMORY_PROMPT_OUTRO = (
     "Use them only when they genuinely improve the reply, and do not overstate uncertain details."
@@ -100,12 +108,47 @@ _MEMORY_STOPWORDS = {
     "your",
 }
 _AKANE_PREFERENCE_TAG = "akane-preference"
+_STARTING_INTERESTS = ("anime", "manga", "VTubers")
+_PREFERENCE_STANCES = {
+    "likes",
+    "dislikes",
+    "curious",
+    "mixed",
+    "uncertain",
+    "indifferent",
+}
 _AKANE_PREFERENCE_UPDATE = re.compile(
     r"\b(?:change(?:d)? your mind|different favorite|new favorite|not anymore|"
     r"reconsider|taste(?:s)? changed|prefer now|pick (?:a )?different|"
     r"choose (?:a )?different)\b",
     re.I,
 )
+_RELATIONSHIP_UPDATE_CATEGORIES = {
+    "pattern",
+    "shared_context",
+    "unresolved_event",
+    "resolved_event",
+}
+_MAX_RELATIONSHIP_PATTERNS = 24
+_MAX_RELATIONSHIP_CONTEXTS = 24
+_MAX_UNRESOLVED_EVENTS = 16
+_EMOTION_CHANGES = {
+    "started",
+    "intensified",
+    "sustained",
+    "softened",
+    "cleared",
+    "replaced",
+}
+_RELATIONSHIP_RETRIEVAL_STOPWORDS = {
+    "akane",
+    "arcane",
+    "discussion",
+    "discussed",
+    "relationship",
+    "shared",
+    "together",
+}
 
 
 _SUMMARY_BATCH_TURNS = 4
@@ -189,6 +232,36 @@ def _number(value: object, default: float) -> float:
     return number if math.isfinite(number) else default
 
 
+def _updated_emotion(
+    current: EmotionState,
+    update: dict[str, object] | None,
+    *,
+    now: float,
+) -> EmotionState:
+    """Accept only a fully validated model-proposed emotion state."""
+
+    if not isinstance(update, dict):
+        return current
+    primary = compact_text(update.get("primary"), 32).lower()
+    cause = compact_text(update.get("cause"), 100)
+    change = compact_text(update.get("change"), 24).lower()
+    intensity = update.get("intensity")
+    if (
+        primary not in VALID_EMOTION_LABELS
+        or not cause
+        or change not in _EMOTION_CHANGES
+        or type(intensity) not in {int, float}
+        or not math.isfinite(float(intensity))
+    ):
+        return current
+    return EmotionState(
+        primary=primary,
+        intensity=max(0.0, min(1.0, float(intensity))),
+        cause=cause,
+        updated_at=now,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ChatTurn:
     turn_id: str
@@ -222,12 +295,18 @@ class ChatTurn:
 
 
 def _complete_turns(turns: list[ChatTurn]) -> list[ChatTurn]:
-    """Keep only chronological, committed user/assistant pairs."""
+    """Keep committed dialogue plus genuine, userless Akane initiatives."""
 
     complete: list[ChatTurn] = []
     index = 0
-    while index + 1 < len(turns):
+    while index < len(turns):
         user_turn = turns[index]
+        if user_turn.role == "assistant" and user_turn.source == "initiative":
+            complete.append(user_turn)
+            index += 1
+            continue
+        if index + 1 >= len(turns):
+            break
         assistant_turn = turns[index + 1]
         if user_turn.role == "user" and assistant_turn.role == "assistant":
             complete.extend((user_turn, assistant_turn))
@@ -235,6 +314,30 @@ def _complete_turns(turns: list[ChatTurn]) -> list[ChatTurn]:
         else:
             index += 1
     return complete
+
+
+@dataclass(frozen=True, slots=True)
+class InitiativeOpportunity:
+    """One grounded reason Akane may choose to begin a conversation."""
+
+    reason: str
+    context: str
+    importance: float
+    created_at: float
+    expires_at: float
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "InitiativeOpportunity | None":
+        if not isinstance(payload, dict):
+            return None
+        reason = compact_text(payload.get("reason"), 80)
+        context = compact_text(payload.get("context"), 360)
+        created_at = max(0.0, _number(payload.get("created_at"), 0.0))
+        expires_at = max(0.0, _number(payload.get("expires_at"), 0.0))
+        importance = max(0.0, min(1.0, _number(payload.get("importance"), 0.0)))
+        if not reason or not context or expires_at <= created_at:
+            return None
+        return cls(reason, context, importance, created_at, expires_at)
 
 
 @dataclass(slots=True)
@@ -255,6 +358,9 @@ class ConversationRecord:
     recent_events: list[str] = field(default_factory=list)
     updated_at: float = field(default_factory=time.time)
     committed_request_ids: list[str] = field(default_factory=list)
+    initiative_opportunity: InitiativeOpportunity | None = None
+    initiative_cooldown_until: float = 0.0
+    initiative_handled_contexts: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, key: str, payload: object) -> "ConversationRecord | None":
@@ -303,6 +409,17 @@ class ConversationRecord:
                 for item in (payload.get("committed_request_ids") or [])[-32:]
                 if (value := compact_text(item, 160))
             ],
+            initiative_opportunity=InitiativeOpportunity.from_dict(
+                payload.get("initiative_opportunity")
+            ),
+            initiative_cooldown_until=max(
+                0.0, _number(payload.get("initiative_cooldown_until"), 0.0)
+            ),
+            initiative_handled_contexts=tuple(
+                value
+                for item in (payload.get("initiative_handled_contexts") or [])[-5:]
+                if (value := compact_text(item, 360))
+            ),
         )
 
     def selected_summary_turns(self, query: str = "") -> tuple[ChatTurn, ...]:
@@ -361,6 +478,12 @@ class ConversationRecord:
             "last_outcome": self.last_outcome,
             "correction": self.correction,
             "updated_at": self.updated_at,
+            "initiative_opportunity": (
+                asdict(self.initiative_opportunity)
+                if self.initiative_opportunity
+                else None
+            ),
+            "initiative_cooldown_until": self.initiative_cooldown_until,
         }
 
 
@@ -376,6 +499,7 @@ class MemoryContext:
     unresolved_problem: bool = False
     repeated_topic_count: int = 0
     last_outcome: str = ""
+    updated_at: float = 0.0
 
 
 @dataclass(slots=True)
@@ -520,10 +644,77 @@ class WorkingMemory:
 @dataclass(frozen=True, slots=True)
 class InternalState:
     emotion: EmotionState
-    life: LifeState
+    presence: PresenceState
     memories: tuple[Memory, ...] = ()
+    interests: tuple[str, ...] = _STARTING_INTERESTS
+    preferences: tuple["AkanePreference", ...] = ()
+    relationship: "RelationshipState" = field(default_factory=lambda: RelationshipState())
     updated_at: float = 0.0
-    version: int = 3
+    version: int = 4
+
+
+@dataclass(frozen=True, slots=True)
+class AkanePreference:
+    """One model-proposed personal conclusion, separate from user memories."""
+
+    topic: str
+    stance: str
+    strength: float
+    reason: str
+    updated_at: float
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "AkanePreference | None":
+        if not isinstance(payload, dict):
+            return None
+        topic = compact_text(payload.get("topic"), 140)
+        stance = compact_text(payload.get("stance"), 24).lower()
+        reason = compact_text(payload.get("reason"), 240)
+        if not topic or stance not in _PREFERENCE_STANCES or not reason:
+            return None
+        return cls(
+            topic=topic,
+            stance=stance,
+            strength=max(0.0, min(1.0, _number(payload.get("strength"), 0.0))),
+            reason=reason,
+            updated_at=max(0.0, _number(payload.get("updated_at"), 0.0)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipEntry:
+    """One model-proposed observation about Akane and this profile's shared history."""
+
+    summary: str
+    importance: float
+    confidence: float
+    updated_at: float
+    status: str = "active"
+
+    @classmethod
+    def from_dict(cls, payload: object, *, unresolved: bool = False) -> "RelationshipEntry | None":
+        if not isinstance(payload, dict):
+            return None
+        summary = compact_text(payload.get("summary"), 240)
+        if not summary:
+            return None
+        status = compact_text(payload.get("status"), 24).lower() if unresolved else "active"
+        if unresolved and status not in {"unresolved", "resolved"}:
+            status = "unresolved"
+        return cls(
+            summary=summary,
+            importance=max(0.0, min(1.0, _number(payload.get("importance"), 0.0))),
+            confidence=max(0.0, min(1.0, _number(payload.get("confidence"), 0.0))),
+            updated_at=max(0.0, _number(payload.get("updated_at"), 0.0)),
+            status=status,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipState:
+    patterns: tuple[RelationshipEntry, ...] = ()
+    shared_context: tuple[RelationshipEntry, ...] = ()
+    unresolved_events: tuple[RelationshipEntry, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -532,7 +723,9 @@ class InternalTurnResult:
     signal: TurnSignal
     recalled_memories: tuple[Memory, ...]
     affect_trace: AffectTrace | None = None
-    life_evolution: LifeEvolution | None = None
+    presence_advanced: bool = False
+    presence_activated: bool = False
+    presence_expired: bool = False
     working_context: WorkingMemory = WorkingMemory()
     grounded_activity_source: str = "none"
     grounded_activity_age_seconds: float = 0.0
@@ -995,6 +1188,7 @@ class MemoryStore:
                     record.repeated_topic_count if record and include_memory else 0
                 ),
                 last_outcome=record.last_outcome if record and include_memory else "",
+                updated_at=record.updated_at if record and include_memory else 0.0,
             )
 
     def commit_turn(
@@ -1048,6 +1242,7 @@ class MemoryStore:
                 return
 
             record.recent_turns.extend((user_turn, assistant_turn))
+            record.initiative_opportunity = None
             previous_topic = record.recent_topic
             record.recent_topic = compact_text(signal.topic, 80)
             record.recent_intent = signal.intent
@@ -1087,6 +1282,175 @@ class MemoryStore:
                 self._conversations = previous_conversations
                 raise
 
+    def record_silence(
+        self,
+        *,
+        profile_id: str,
+        conversation_id: str,
+        signal: TurnSignal,
+        request_id: str = "",
+    ) -> None:
+        """Preserve a model-chosen silence without manufacturing dialogue."""
+
+        profile = _key(profile_id, "local:owner")
+        conversation_key = _key(conversation_id, "popup:default")
+        now = time.time()
+        normalized_request_id = compact_text(request_id, 160)
+        with self._lock:
+            previous_conversations = self._conversations
+            record = previous_conversations.get(conversation_key)
+            if record is None:
+                record = ConversationRecord(conversation_key, profile)
+            elif record.profile_id != profile:
+                raise ValueError("Conversation belongs to a different profile.")
+            else:
+                record = copy.copy(record)
+                record.recent_turns = list(record.recent_turns)
+                record.summary_turns = list(record.summary_turns)
+                record.pending_summary_turns = list(record.pending_summary_turns)
+                record.recent_events = list(record.recent_events)
+                record.committed_request_ids = list(record.committed_request_ids)
+
+            if normalized_request_id and normalized_request_id in record.committed_request_ids:
+                return
+
+            self._conversations = previous_conversations.copy()
+            self._conversations[conversation_key] = record
+            previous_topic = record.recent_topic
+            record.initiative_opportunity = None
+            record.recent_topic = compact_text(signal.topic, 80)
+            record.recent_intent = signal.intent
+            record.recent_user_tone = signal.tone
+            record.current_task = compact_text(signal.task, 100)
+            record.repeated_topic_count = (
+                min(20, record.repeated_topic_count + 1)
+                if previous_topic and topic_overlap(previous_topic, signal.topic) >= 0.45
+                else 1
+            )
+            record.last_outcome = "akane_silence"
+            record.recent_events.append("akane_silence")
+            record.recent_events = record.recent_events[-5:]
+            record.updated_at = now
+            if normalized_request_id:
+                record.committed_request_ids.append(normalized_request_id)
+                record.committed_request_ids = record.committed_request_ids[-32:]
+            self._prune(now)
+            try:
+                self._persist()
+            except Exception:
+                self._conversations = previous_conversations
+                raise
+
+    def claim_initiative_opportunity(
+        self,
+        *,
+        profile_id: str,
+        conversation_id: str,
+        candidates: tuple[InitiativeOpportunity, ...],
+        now: float,
+        active_window_seconds: float,
+    ) -> InitiativeOpportunity | None:
+        """Return one persisted opportunity only when the conversation is idle."""
+
+        profile = _key(profile_id, "local:owner")
+        conversation_key = _key(conversation_id, "popup:default")
+        current = max(0.0, float(now))
+        with self._lock:
+            previous_conversations = self._conversations
+            existing = previous_conversations.get(conversation_key)
+            if existing is None or existing.profile_id != profile:
+                return None
+            record = copy.copy(existing)
+            record.recent_turns = list(record.recent_turns)
+            record.summary_turns = list(record.summary_turns)
+            record.pending_summary_turns = list(record.pending_summary_turns)
+            record.recent_events = list(record.recent_events)
+            record.committed_request_ids = list(record.committed_request_ids)
+            changed = False
+            if (
+                record.initiative_opportunity is not None
+                and record.initiative_opportunity.expires_at <= current
+            ):
+                record.initiative_opportunity = None
+                changed = True
+            if current - record.updated_at < active_window_seconds:
+                if changed:
+                    self._replace_conversation(conversation_key, record, previous_conversations)
+                return None
+            if record.initiative_opportunity is not None:
+                if changed:
+                    self._replace_conversation(conversation_key, record, previous_conversations)
+                return record.initiative_opportunity
+            if record.initiative_cooldown_until > current:
+                if changed:
+                    self._replace_conversation(conversation_key, record, previous_conversations)
+                return None
+            eligible = tuple(
+                candidate
+                for candidate in candidates
+                if candidate.importance >= 0.55
+                and candidate.expires_at > current
+                and candidate.context not in record.initiative_handled_contexts
+            )
+            if not eligible:
+                if changed:
+                    self._replace_conversation(conversation_key, record, previous_conversations)
+                return None
+            opportunity = max(
+                eligible,
+                key=lambda item: (item.importance, item.created_at, item.context),
+            )
+            record.initiative_opportunity = opportunity
+            self._replace_conversation(conversation_key, record, previous_conversations)
+            return opportunity
+
+    def record_initiative_result(
+        self,
+        *,
+        profile_id: str,
+        conversation_id: str,
+        opportunity: InitiativeOpportunity,
+        message: str,
+        used: bool,
+        cooldown_seconds: float,
+        now: float | None = None,
+    ) -> None:
+        """Record an offered initiative without inventing a user turn."""
+
+        profile = _key(profile_id, "local:owner")
+        conversation_key = _key(conversation_id, "popup:default")
+        current = time.time() if now is None else max(0.0, float(now))
+        with self._lock:
+            previous_conversations = self._conversations
+            existing = previous_conversations.get(conversation_key)
+            if existing is None or existing.profile_id != profile:
+                return
+            record = copy.copy(existing)
+            record.recent_turns = list(record.recent_turns)
+            record.summary_turns = list(record.summary_turns)
+            record.pending_summary_turns = list(record.pending_summary_turns)
+            record.recent_events = list(record.recent_events)
+            record.committed_request_ids = list(record.committed_request_ids)
+            pending = record.initiative_opportunity
+            if pending is None or pending.context != opportunity.context:
+                return
+            record.initiative_opportunity = None
+            record.initiative_cooldown_until = current + max(0.0, cooldown_seconds)
+            record.initiative_handled_contexts = (
+                *record.initiative_handled_contexts,
+                opportunity.context,
+            )[-5:]
+            record.recent_events.append("initiative_used" if used else "initiative_offered")
+            record.recent_events = record.recent_events[-5:]
+            record.last_outcome = "initiative_used" if used else "initiative_declined"
+            if used and message:
+                record.recent_turns.append(
+                    ChatTurn(uuid.uuid4().hex, "assistant", message[:_MAX_TURN_CHARS], current, "initiative")
+                )
+                self._trim_conversation(record)
+            record.updated_at = current
+            self._replace_conversation(conversation_key, record, previous_conversations)
+
     def messages(
         self,
         conversation_id: str,
@@ -1097,6 +1461,22 @@ class MemoryStore:
             if record and profile_id and record.profile_id != _key(profile_id, "local:owner"):
                 return []
             return [turn.as_message() for turn in record.recent_turns] if record else []
+
+    def last_assistant_turn_at(self, profile_id: str) -> float | None:
+        """Return the newest persisted, completed assistant turn for a profile."""
+
+        profile = _key(profile_id, "local:owner")
+        with self._lock:
+            timestamps = [
+                turn.timestamp
+                for record in self._conversations.values()
+                if record.profile_id == profile
+                for turn in _complete_turns(
+                    [*record.summary_turns, *record.recent_turns]
+                )
+                if turn.role == "assistant"
+            ]
+        return max(timestamps) if timestamps else None
 
     def reply_for_request(
         self,
@@ -1120,7 +1500,7 @@ class MemoryStore:
                 assistant_turn = record.recent_turns[index + 1]
                 if assistant_turn.role == "assistant":
                     return assistant_turn.content
-            return None
+            return ""
 
     def public_conversation(
         self,
@@ -1132,6 +1512,19 @@ class MemoryStore:
             if record and profile_id and record.profile_id != _key(profile_id, "local:owner"):
                 return {}
             return record.public_state() if record else {}
+
+    def recent_profile_topic(self, profile_id: str) -> str:
+        """Return the newest persisted conversation topic for one profile."""
+
+        profile = _key(profile_id, "local:owner")
+        with self._lock:
+            candidates = (
+                record
+                for record in self._conversations.values()
+                if record.profile_id == profile and record.recent_topic
+            )
+            latest = max(candidates, key=lambda item: item.updated_at, default=None)
+            return latest.recent_topic if latest is not None else ""
 
     def clear_conversation(
         self,
@@ -1166,6 +1559,20 @@ class MemoryStore:
         record.recent_turns = _complete_turns(record.recent_turns)[-12:]
         record.summary_turns.clear()
         record.pending_summary_turns.clear()
+
+    def _replace_conversation(
+        self,
+        key: str,
+        record: ConversationRecord,
+        previous_conversations: dict[str, ConversationRecord],
+    ) -> None:
+        self._conversations = previous_conversations.copy()
+        self._conversations[key] = record
+        try:
+            self._persist()
+        except Exception:
+            self._conversations = previous_conversations
+            raise
 
     def _prune(self, now: float) -> None:
         stale_before = now - CONVERSATION_STALE_DAYS * 86_400
@@ -1232,9 +1639,9 @@ def new_internal_state(now: float | None = None) -> InternalState:
     emotion = EmotionState(updated_at=current)
     return InternalState(
         emotion=emotion,
-        life=LifeState(last_processed_at=current),
+        presence=PresenceState(),
         updated_at=current,
-        version=3,
+        version=4,
     )
 
 
@@ -1249,14 +1656,6 @@ def _semantic_memory_match(memory: Memory, event: SemanticEvent) -> bool:
         or len(shared) / max(1, min(len(subject_terms), len(memory_terms))) >= 0.50
         or topic_overlap(memory.content, event.subject) >= 0.38
     )
-
-
-def _self_event_memory_content(event: ActivityRecord) -> str:
-    detail = compact_text(event.description, 150)
-    subject = compact_text(event.subject, 90)
-    if subject and subject.casefold() not in detail.casefold():
-        detail = f"{detail}: {subject}"
-    return f"Akane completed: {detail}."
 
 
 def _completion_context(
@@ -1358,20 +1757,21 @@ def process_internal_turn(
         now=current,
         profile_seed=profile_seed,
     )
-    # Conversation turns do not synthesize offscreen activity or mood effects.
-    life_evolution = LifeEvolution(
-        state=previous.life,
-        reason_codes=("offscreen_life_disabled",),
+    presence = advance_presence(previous.presence, now=current)
+    presence_activated = bool(
+        previous.presence.next_activity is not None
+        and previous.presence.next_activity.started_at <= current
     )
-    life = previous.life
+    presence_expired = bool(
+        previous.presence.current_activity is not None
+        and previous.presence.current_activity.ends_at <= current
+    ) or bool(
+        previous.presence.next_activity is not None
+        and previous.presence.next_activity.ends_at <= current
+    )
     event_emotion = mood_evolution.state
     event_effects: dict[str, float] = {}
-    activity = grounded_activity(life, now=current, scope=activity_scope)
-    latest_activity = activity or recent_activity(
-        life,
-        now=current,
-        scope=activity_scope,
-    )
+    latest_activity = presence.current_activity or presence.previous_activity
 
     memory_decisions: list[str] = []
     source_reference = f"chat:{compact_text(activity_scope, 80)}:{current:.6f}"
@@ -1387,28 +1787,8 @@ def process_internal_turn(
             now=current,
         )
     )
-    grounded_candidates = [
-        _MemoryCandidate(
-            content=_self_event_memory_content(event),
-            category="episode",
-            importance=0.66,
-            confidence=event.confidence,
-            tags=("life-activity", f"activity:{event.activity_type}"),
-            kind="self",
-            source_type=_source_type(event.source),
-            source_reference=event.event_id,
-            canonical_key=f"self:event:{event.event_id}",
-            scope=event.scope or "profile",
-            evidence_refs=(event.event_id,),
-        )
-        for event in life_evolution.new_events
-        if event.status == "completed"
-        and event.activity_type not in {"conversation", "quiet_downtime"}
-        and event.event_id
-    ]
     needs_memory_mutation = bool(
         candidates
-        or grounded_candidates
         or semantic_event.event_type in {"completion", "failure"}
     )
     memories = (
@@ -1416,7 +1796,7 @@ def process_internal_turn(
         if needs_memory_mutation
         else list(previous.memories)
     )
-    for candidate in (*candidates, *grounded_candidates):
+    for candidate in candidates:
         _insert_into_memories(
             memories,
             candidate,
@@ -1437,7 +1817,7 @@ def process_internal_turn(
     if autonomous:
         retrieval_memories = tuple(autonomous_memories)
         query_parts = (
-            latest_activity.description if latest_activity else "",
+            latest_activity.fact() if latest_activity else "",
             *(memory.content for memory in retrieval_memories[-4:]),
         )
     appraisal_query = " ".join(
@@ -1662,10 +2042,13 @@ def process_internal_turn(
     _prune_memories(memories)
     next_state = InternalState(
         emotion=signal.emotion_state,
-        life=life,
+        presence=presence,
         memories=tuple(memories),
+        interests=previous.interests,
+        preferences=previous.preferences,
+        relationship=previous.relationship,
         updated_at=current,
-        version=3,
+        version=4,
     )
     memory_uses = _memory_use_decisions(
         recalled,
@@ -1686,14 +2069,14 @@ def process_internal_turn(
             signal,
             evolution=mood_evolution,
             event_delta=tuple(event_effects.items()),
-            event_ids=tuple(event.event_id for event in life_evolution.new_events),
-            extra_reason_codes=life_evolution.reason_codes,
         ),
-        life_evolution=life_evolution,
+        presence_advanced=presence != previous.presence,
+        presence_activated=presence_activated,
+        presence_expired=presence_expired,
         working_context=next_working,
-        grounded_activity_source=latest_activity.source if latest_activity else "none",
+        grounded_activity_source="presence" if latest_activity else "none",
         grounded_activity_age_seconds=(
-            max(0.0, current - latest_activity.updated_at) if latest_activity else 0.0
+            max(0.0, current - latest_activity.started_at) if latest_activity else 0.0
         ),
         memory_trace=_memory_trace(
             used_memories,
@@ -1734,6 +2117,33 @@ class LongTermMemoryStore:
         with self._lock:
             return copy.deepcopy(self._states.get(_key(profile_id, "local:owner")))
 
+    def refresh_presence(
+        self,
+        profile_id: str,
+        *,
+        now: float,
+    ) -> InternalState:
+        """Advance and persist presence before any consumer builds context."""
+
+        key = _key(profile_id, "local:owner")
+        current = max(0.0, float(now))
+        with self._lock:
+            previous = self._states.get(key)
+            state = previous or new_internal_state(current)
+            presence = advance_presence(state.presence, now=current)
+            refreshed = (
+                replace(
+                    state,
+                    presence=presence,
+                    updated_at=max(state.updated_at, current),
+                )
+                if presence != state.presence
+                else state
+            )
+            if refreshed != previous:
+                self._save_state(key, refreshed, previous)
+            return copy.deepcopy(refreshed)
+
     def preview_turn(
         self,
         profile_id: str,
@@ -1749,11 +2159,24 @@ class LongTermMemoryStore:
         recent_turns: tuple[ChatTurn, ...] = (),
         activity_scope: str = "profile",
     ) -> InternalTurnResult:
+        key = _key(profile_id, "local:owner")
+        current = time.time() if now is None else max(0.0, float(now))
         with self._lock:
-            state = self._states.get(_key(profile_id, "local:owner"))
-        return process_internal_turn(
+            previous = self._states.get(key)
+            state = previous or new_internal_state(current)
+            presence_before = state.presence
+            presence_after = advance_presence(presence_before, now=current)
+            initialized = replace(
+                state,
+                presence=presence_after,
+                updated_at=max(state.updated_at, current),
+            )
+            if initialized != previous:
+                self._save_state(key, initialized, previous)
+            state = initialized
+        result = process_internal_turn(
             user_text,
-            state or new_internal_state(now),
+            state,
             now=now,
             retrieval=self._retrieval,
             include_memory=include_memory,
@@ -1766,6 +2189,31 @@ class LongTermMemoryStore:
             activity_scope=activity_scope,
             profile_seed=profile_id,
         )
+        return replace(
+            result,
+            presence_advanced=(
+                result.presence_advanced or presence_after != presence_before
+            ),
+            presence_activated=(
+                result.presence_activated
+                or bool(
+                    presence_before.next_activity is not None
+                    and presence_before.next_activity.started_at <= current
+                    and presence_after.current_activity is not None
+                )
+            ),
+            presence_expired=(
+                result.presence_expired
+                or bool(
+                    presence_before.current_activity is not None
+                    and presence_before.current_activity.ends_at <= current
+                )
+                or bool(
+                    presence_before.next_activity is not None
+                    and presence_before.next_activity.ends_at <= current
+                )
+            ),
+        )
 
     def commit_turn(
         self,
@@ -1773,6 +2221,12 @@ class LongTermMemoryStore:
         result: InternalTurnResult,
         *,
         used_memory_ids: tuple[str, ...] = (),
+        preference_updates: tuple[dict[str, object], ...] = (),
+        interest_additions: tuple[str, ...] = (),
+        relationship_updates: tuple[dict[str, object], ...] = (),
+        activity_update: dict[str, object] | None = None,
+        next_activity: dict[str, object] | None = None,
+        emotion_update: dict[str, object] | None = None,
         now: float | None = None,
     ) -> InternalState | None:
         key = _key(profile_id, "local:owner")
@@ -1798,11 +2252,192 @@ class LongTermMemoryStore:
                         memory.access_count += 1
             next_state = replace(
                 result.state,
+                emotion=_updated_emotion(
+                    result.state.emotion,
+                    emotion_update,
+                    now=current,
+                ),
+                presence=apply_activity_updates(
+                    result.state.presence,
+                    activity_update=activity_update,
+                    next_activity=next_activity,
+                    now=current,
+                ),
                 memories=tuple(memories),
+                interests=_merge_interests(
+                    result.state.interests,
+                    interest_additions,
+                ),
+                preferences=_merge_akane_preferences(
+                    result.state.preferences,
+                    preference_updates,
+                    updated_at=current,
+                ),
+                relationship=_merge_relationship(
+                    result.state.relationship,
+                    relationship_updates,
+                    updated_at=current,
+                ),
                 updated_at=current,
             )
             self._save_state(key, next_state, previous)
             return previous
+
+    def claim_life_opportunity(
+        self,
+        profile_id: str,
+        *,
+        now: float,
+        cooldown_seconds: float = 15 * 60,
+    ) -> InternalState | None:
+        """Atomically claim one due autonomous-life decision for a profile."""
+
+        key = _key(profile_id, "local:owner")
+        current = max(0.0, float(now))
+        with self._lock:
+            previous = self._states.get(key)
+            state = previous or new_internal_state(current)
+            presence = advance_presence(state.presence, now=current)
+            if not presence.life_pending:
+                return None
+            if presence.life_claimed_at and current - presence.life_claimed_at < 5 * 60:
+                return None
+            if presence.life_last_run_at and current - presence.life_last_run_at < cooldown_seconds:
+                return None
+            next_state = replace(
+                state,
+                presence=replace(presence, life_claimed_at=current),
+                updated_at=max(state.updated_at, current),
+            )
+            self._save_state(key, next_state, previous)
+            return copy.deepcopy(next_state)
+
+    def release_life_opportunity(
+        self,
+        profile_id: str,
+        *,
+        now: float,
+        failure_reason: str = "",
+    ) -> None:
+        key = _key(profile_id, "local:owner")
+        with self._lock:
+            previous = self._states.get(key)
+            if previous is None or not previous.presence.life_pending:
+                return
+            reason = (
+                f"failed:{compact_text(failure_reason, 32)}"
+                if failure_reason
+                else previous.presence.life_reason
+            )
+            self._save_state(
+                key,
+                replace(
+                    previous,
+                    presence=replace(
+                        previous.presence,
+                        life_claimed_at=0.0,
+                        life_reason=reason,
+                    ),
+                    updated_at=max(previous.updated_at, now),
+                ),
+                previous,
+            )
+
+    def pending_life_profiles(
+        self,
+        *,
+        now: float,
+        claim_timeout_seconds: float = 5 * 60,
+    ) -> tuple[str, ...]:
+        """Recover stale claims and return all pending profiles."""
+
+        current = max(0.0, float(now))
+        with self._lock:
+            previous_states = self._states
+            next_states = previous_states.copy()
+            changed = False
+            pending: list[str] = []
+            for key, state in previous_states.items():
+                presence = advance_presence(state.presence, now=current)
+                if (
+                    presence.life_claimed_at
+                    and current - presence.life_claimed_at >= claim_timeout_seconds
+                ):
+                    presence = replace(
+                        presence,
+                        life_claimed_at=0.0,
+                        life_reason="failed:stale_claim",
+                    )
+                if presence != state.presence:
+                    next_states[key] = replace(
+                        state,
+                        presence=presence,
+                        updated_at=max(state.updated_at, current),
+                    )
+                    changed = True
+                if presence.life_pending:
+                    pending.append(key)
+            if changed:
+                self._states = next_states
+                try:
+                    self._persist()
+                except Exception:
+                    self._states = previous_states
+                    raise
+            return tuple(pending)
+
+    def commit_life_decision(
+        self,
+        profile_id: str,
+        decision: LifeDecision,
+        *,
+        now: float,
+    ) -> tuple[bool, str]:
+        key = _key(profile_id, "local:owner")
+        with self._lock:
+            previous = self._states.get(key)
+            if previous is None:
+                return False, "profile is unavailable"
+            refreshed_presence = advance_presence(previous.presence, now=now)
+            rejection = life_decision_rejection(refreshed_presence, decision)
+            if rejection:
+                rejected = replace(
+                    refreshed_presence,
+                    life_pending=True,
+                    life_reason=f"rejected:{compact_text(rejection, 64)}",
+                    life_claimed_at=0.0,
+                )
+                self._save_state(
+                    key,
+                    replace(
+                        previous,
+                        presence=rejected,
+                        updated_at=max(previous.updated_at, now),
+                    ),
+                    previous,
+                )
+                return False, rejection
+            next_state = replace(
+                previous,
+                presence=apply_life_decision(refreshed_presence, decision, now=now),
+                interests=_merge_interests(previous.interests, (decision.interest_addition,) if decision.interest_addition else ()),
+                updated_at=max(previous.updated_at, now),
+            )
+            self._save_state(key, next_state, previous)
+            return True, ""
+
+    def next_life_wake_at(self) -> float:
+        """Return the nearest persisted activity lifecycle deadline."""
+
+        with self._lock:
+            return min(
+                (
+                    state.presence.life_next_run_at
+                    for state in self._states.values()
+                    if state.presence.life_next_run_at > 0.0
+                ),
+                default=0.0,
+            )
 
     def retrieve(
         self,
@@ -1901,79 +2536,6 @@ class LongTermMemoryStore:
             self._save_state(key, next_state, previous)
             return copy.deepcopy(memory)
 
-    def record_activity(
-        self,
-        profile_id: str,
-        *,
-        activity_type: str,
-        source: str,
-        description: str,
-        now: float,
-        scope: str = "profile",
-        status: str = "active",
-        confidence: float = 1.0,
-        ttl_seconds: float = 24 * 60 * 60,
-        subject: str = "",
-        reaction: str = "",
-        authority: str = "",
-    ) -> ActivityRecord:
-        """Persist one explicit or integration-verified activity report."""
-
-        key = _key(profile_id, "local:owner")
-        with self._lock:
-            previous = self._states.get(key)
-            state = copy.deepcopy(previous) if previous else new_internal_state(now)
-            life = record_grounded_activity(
-                state.life,
-                activity_type=activity_type,
-                source=source,
-                description=description,
-                now=now,
-                scope=scope,
-                status=status,
-                confidence=confidence,
-                ttl_seconds=ttl_seconds,
-                subject=subject,
-                reaction=reaction,
-                authority=authority,
-            )
-            activity = life.activity or (
-                life.recent_events[-1] if life.recent_events else None
-            )
-            if activity is None:
-                raise RuntimeError("Grounded activity was not recorded.")
-            memories = list(state.memories)
-            if (
-                activity.status == "completed"
-                and activity.activity_type not in {"conversation", "quiet_downtime"}
-            ):
-                _insert_into_memories(
-                    memories,
-                    _MemoryCandidate(
-                        content=_self_event_memory_content(activity),
-                        category="episode",
-                        importance=0.66,
-                        confidence=activity.confidence,
-                        tags=("life-activity", f"activity:{activity.activity_type}"),
-                        kind="self",
-                        source_type=_source_type(activity.source),
-                        source_reference=activity.event_id,
-                        canonical_key=f"self:event:{activity.event_id}",
-                        scope=activity.scope,
-                        evidence_refs=(activity.event_id,),
-                    ),
-                    source=activity.source,
-                    created_at=activity.completed_at or activity.updated_at,
-                )
-            next_state = replace(
-                state,
-                life=life,
-                memories=tuple(memories),
-                updated_at=max(state.updated_at, _number(now, state.updated_at)),
-            )
-            self._save_state(key, next_state, previous)
-            return copy.deepcopy(activity)
-
     def restore_internal_state(self, profile_id: str, state: InternalState | None) -> None:
         key = _key(profile_id, "local:owner")
         with self._lock:
@@ -2036,7 +2598,22 @@ class LongTermMemoryStore:
     def public_internal_state(self, profile_id: str = "local:owner") -> dict[str, object]:
         key = _key(profile_id, "local:owner")
         with self._lock:
-            state = self._states.get(key) or new_internal_state(0.0)
+            previous = self._states.get(key)
+            current = time.time()
+            state = previous or new_internal_state(current)
+            presence = advance_presence(state.presence, now=current)
+            refreshed = (
+                replace(
+                    state,
+                    presence=presence,
+                    updated_at=max(state.updated_at, current),
+                )
+                if presence != state.presence
+                else state
+            )
+            if refreshed != previous:
+                self._save_state(key, refreshed, previous)
+            state = refreshed
             return self.public_state_snapshot(state)
 
     @staticmethod
@@ -2044,26 +2621,7 @@ class LongTermMemoryStore:
         """Render one stored or read-only candidate state for diagnostics."""
 
         emotion = state.emotion
-        recent = recent_activity(
-            state.life,
-            now=state.updated_at,
-            scope="profile",
-        )
-        background = state.life.activity
-        interaction = state.life.interaction
-        activity = background or recent
-        creative = next(
-            (
-                event
-                for event in reversed(state.life.recent_events)
-                if event.activity_type == "creative_brainstorming"
-                and event.status == "completed"
-            ),
-            background
-            if background is not None
-            and background.activity_type == "creative_brainstorming"
-            else None,
-        )
+        presence = state.presence
         available_memories = [
             memory for memory in state.memories if memory.is_available(state.updated_at)
         ]
@@ -2085,42 +2643,12 @@ class LongTermMemoryStore:
                 "primary": emotion.primary,
                 "intensity": round(emotion.intensity, 3),
                 "cause": emotion.cause,
-                "boundary_level": emotion.boundary_level,
                 "updated_at": emotion.updated_at,
             },
-            "activity": {
-                "source": activity.source if activity else "none",
-                "description": activity.description if activity else "",
-                "status": activity.status if activity else "none",
-                "updated_at": activity.updated_at if activity else 0.0,
-                "expected_completion_at": activity.expires_at if activity else 0.0,
-                "completed_at": activity.completed_at if activity else 0.0,
-                "scope": activity.scope if activity else "none",
-                "event_id": activity.event_id if activity else "",
-                "reaction": activity.reaction if activity else "",
-                "authority": activity.authority if activity else "none",
-                "recent_event_count": len(state.life.recent_events),
-                "current_interaction": (
-                    interaction.description if interaction is not None else ""
-                ),
-                "background_activity": (
-                    background.description if background is not None else ""
-                ),
-                "recent_completed_activity": (
-                    recent.description if recent is not None else ""
-                ),
-                "active_creative_event": (
-                    creative.subject or creative.description if creative is not None else ""
-                ),
-            },
-            "needs": {
-                "energy": round(state.life.needs.energy, 3),
-                "social": round(state.life.needs.social, 3),
-                "curiosity": round(state.life.needs.curiosity, 3),
-                "stimulation": round(state.life.needs.stimulation, 3),
-            },
-            "activity_preferences": dict(state.life.activity_preferences),
-            "next_activity_opportunity": state.life.next_opportunity_at,
+            "presence": presence.as_dict(),
+            "interests": list(state.interests),
+            "preferences": [asdict(preference) for preference in state.preferences],
+            "relationship": _relationship_state_to_dict(state.relationship),
             "working": {
                 "arcane_current_activity": (
                     {
@@ -2150,7 +2678,6 @@ class LongTermMemoryStore:
                 "schema_version": LONG_TERM_MEMORY_SCHEMA_VERSION,
             },
             "state_schema_version": state.version,
-            "life_schema_version": state.life.version,
             "updated_at": state.updated_at,
         }
 
@@ -2169,6 +2696,15 @@ class LongTermMemoryStore:
             else:
                 self._states[key] = previous
             raise
+        notifier = _LIFE_PENDING_NOTIFIER
+        deadline_changed = (
+            previous is None
+            or state.presence.life_next_run_at != previous.presence.life_next_run_at
+        )
+        if notifier is not None and (
+            state.presence.life_pending or deadline_changed
+        ):
+            notifier(key)
 
     def _load(self) -> None:
         try:
@@ -2193,13 +2729,15 @@ class LongTermMemoryStore:
                             memories=tuple(migrated),
                         )
                     }
+                self._initialize_loaded_presence()
                 return
-            if schema not in {2, 3, 4, 5, LONG_TERM_MEMORY_SCHEMA_VERSION}:
+            if schema not in {2, 3, 4, 5, 6, 7, 8, LONG_TERM_MEMORY_SCHEMA_VERSION}:
                 raise ValueError("unsupported schema")
             profiles = payload.get("profiles")
             if not isinstance(profiles, dict):
                 raise ValueError("invalid profiles")
             self._states = {}
+            migrate_presence = False
             for key, raw_profile in profiles.items():
                 profile = _key(key, "")
                 if not profile:
@@ -2218,10 +2756,24 @@ class LongTermMemoryStore:
                             new_internal_state(current),
                             memories=loaded,
                         )
-                elif schema in {3, 4, 5, LONG_TERM_MEMORY_SCHEMA_VERSION}:
+                elif schema in {3, 4, 5, 6, 7, 8, LONG_TERM_MEMORY_SCHEMA_VERSION}:
+                    raw_presence = (
+                        raw_profile.get("presence")
+                        if isinstance(raw_profile, dict)
+                        else None
+                    )
+                    migrate_presence = migrate_presence or (
+                        isinstance(raw_presence, dict)
+                        and "recent_activities" in raw_presence
+                    )
                     state = _internal_state_from_dict(raw_profile)
                     if state is not None:
                         self._states[profile] = state
+            self._initialize_loaded_presence(
+                force_persist=(
+                    migrate_presence or schema != LONG_TERM_MEMORY_SCHEMA_VERSION
+                )
+            )
         except FileNotFoundError:
             return
         except (OSError, TypeError, ValueError) as exc:
@@ -2230,6 +2782,23 @@ class LongTermMemoryStore:
                 flush=True,
             )
             self._states = {}
+
+    def _initialize_loaded_presence(self, *, force_persist: bool = False) -> None:
+        """Persist lifecycle advancement and presence-schema migration on restart."""
+
+        current = time.time()
+        changed = False
+        for key, state in tuple(self._states.items()):
+            initialized = replace(
+                state,
+                presence=advance_presence(state.presence, now=current),
+                updated_at=max(state.updated_at, current),
+            )
+            if initialized != state:
+                self._states[key] = initialized
+                changed = True
+        if changed or force_persist:
+            self._persist()
 
     def _persist(self) -> None:
         atomic_write_json(
@@ -2273,7 +2842,7 @@ def _memory_use_decisions(
     signal: TurnSignal,
     working: WorkingMemory,
     *,
-    activity: ActivityRecord | None = None,
+    activity: PresenceActivity | None = None,
     familiar_relationship: bool = False,
 ) -> tuple[tuple[str, str], ...]:
     """Assign one compact use to each relevant record without rescoring it."""
@@ -2321,7 +2890,7 @@ def _memory_use_decisions(
         else:
             continue
         if use == "self_experience" and activity is not None:
-            if topic_overlap(memory.content, activity.description) < 0.20 and not signal.current_activity:
+            if topic_overlap(memory.content, activity.fact()) < 0.20 and not signal.current_activity:
                 use = "fact"
         decisions.append((memory.id, use))
     return tuple(decisions)
@@ -2376,6 +2945,58 @@ def akane_preference_answer(memory: Memory | None) -> str:
         return ""
     prefix = "Akane's established preference: "
     return memory.content[len(prefix) :] if memory.content.startswith(prefix) else memory.content
+
+
+def relevant_akane_tastes(state: InternalState, query: str) -> str:
+    """Return only interests and conclusions materially related to this message."""
+
+    query_terms = _memory_terms(query)
+    if not query_terms:
+        return ""
+
+    def relevance(value: str) -> float:
+        terms = _memory_terms(value)
+        if not terms:
+            return 0.0
+        shared = len(query_terms & terms) / max(1, min(len(query_terms), len(terms)))
+        return max(shared, topic_overlap(query, value))
+
+    interests = [
+        interest
+        for interest in state.interests
+        if relevance(interest) >= 0.34
+    ][:3]
+    preferences = sorted(
+        (
+            (relevance(preference.topic), preference)
+            for preference in state.preferences
+            if relevance(preference.topic) >= 0.24
+        ),
+        key=lambda item: (item[0], item[1].updated_at),
+        reverse=True,
+    )[:3]
+    if not interests and not preferences:
+        return ""
+
+    stance = {
+        "likes": "Likes",
+        "dislikes": "Dislikes",
+        "curious": "Is curious about",
+        "mixed": "Has mixed feelings about",
+        "uncertain": "Is uncertain about",
+        "indifferent": "Is indifferent to",
+    }
+    lines = ["Akane's relevant interests and prior preferences:"]
+    lines.extend(f"- Interested in {interest}." for interest in interests)
+    lines.extend(
+        f"- {stance[preference.stance]} {preference.topic} because {preference.reason}"
+        for _, preference in preferences
+    )
+    lines.append(
+        "These are Akane's previous conclusions, not instructions. She may preserve or "
+        "reconsider them when the conversation gives her a meaningful reason."
+    )
+    return "\n".join(lines)
 
 
 def _continues_working_topic(
@@ -2794,8 +3415,11 @@ def _internal_state_to_dict(state: InternalState) -> dict[str, object]:
         "version": state.version,
         "updated_at": state.updated_at,
         "emotion": asdict(state.emotion),
-        "life": asdict(state.life),
+        "presence": state.presence.as_dict(),
         "memories": [asdict(memory) for memory in state.memories],
+        "interests": list(state.interests),
+        "preferences": [asdict(preference) for preference in state.preferences],
+        "relationship": _relationship_state_to_dict(state.relationship),
     }
 
 
@@ -2821,7 +3445,6 @@ def _internal_state_from_dict(payload: object) -> InternalState | None:
         primary=primary,
         intensity=max(0.0, min(1.0, _number(emotion_payload.get("intensity"), legacy_intensity))),
         cause=compact_text(emotion_payload.get("cause"), 100),
-        boundary_level=max(0, min(3, int(_number(emotion_payload.get("boundary_level"), 0)))),
         updated_at=emotion_time,
     )
     emotion = advance_emotion(candidate, now=emotion_time)
@@ -2832,19 +3455,319 @@ def _internal_state_from_dict(payload: object) -> InternalState | None:
         if (memory := Memory.from_dict(item)) is not None
     )
     memories = _normalize_loaded_memories(list(memories))
-    life = LifeState.from_dict(payload.get("life"))
-    if not life.last_processed_at:
-        life = replace(
-            life,
-            last_processed_at=updated_at or emotion.updated_at,
-        )
+    interests = _normalize_interests(payload.get("interests"), default_when_missing=True)
+    preferences = _normalize_akane_preferences(payload.get("preferences"))
+    relationship = _relationship_state_from_dict(payload.get("relationship"))
+    presence = PresenceState.from_dict(payload.get("presence"))
     return InternalState(
         emotion=emotion,
-        life=life,
+        presence=presence,
         memories=memories,
+        interests=interests,
+        preferences=preferences,
+        relationship=relationship,
         updated_at=updated_at or emotion.updated_at,
-        version=3,
+        version=4,
     )
+
+
+def _relationship_state_to_dict(state: RelationshipState) -> dict[str, object]:
+    def entry_payload(entry: RelationshipEntry) -> dict[str, object]:
+        return {
+            "summary": entry.summary,
+            "importance": entry.importance,
+            "confidence": entry.confidence,
+            "updated_at": entry.updated_at,
+        }
+
+    return {
+        "patterns": [entry_payload(entry) for entry in state.patterns],
+        "shared_context": [entry_payload(entry) for entry in state.shared_context],
+        "unresolved_events": [
+            {**entry_payload(entry), "status": entry.status}
+            for entry in state.unresolved_events
+        ],
+    }
+
+
+def _relationship_state_from_dict(payload: object) -> RelationshipState:
+    if not isinstance(payload, dict):
+        return RelationshipState()
+
+    def entries(key: str, *, unresolved: bool = False) -> list[RelationshipEntry]:
+        values = payload.get(key)
+        if not isinstance(values, list):
+            return []
+        return [
+            entry
+            for item in values
+            if (entry := RelationshipEntry.from_dict(item, unresolved=unresolved)) is not None
+        ]
+
+    return RelationshipState(
+        patterns=_cap_relationship_entries(entries("patterns"), _MAX_RELATIONSHIP_PATTERNS),
+        shared_context=_cap_relationship_entries(entries("shared_context"), _MAX_RELATIONSHIP_CONTEXTS),
+        unresolved_events=_cap_relationship_entries(
+            entries("unresolved_events", unresolved=True),
+            _MAX_UNRESOLVED_EVENTS,
+        ),
+    )
+
+
+def _normalize_interests(
+    values: object,
+    *,
+    default_when_missing: bool = False,
+) -> tuple[str, ...]:
+    if not isinstance(values, (list, tuple)):
+        return _STARTING_INTERESTS if default_when_missing else ()
+    interests: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        interest = compact_text(item, 100)
+        signature = normalized_signature(interest)
+        if interest and signature and signature not in seen:
+            interests.append(interest)
+            seen.add(signature)
+    return tuple(interests)
+
+
+def _normalize_akane_preferences(values: object) -> tuple[AkanePreference, ...]:
+    if not isinstance(values, (list, tuple)):
+        return ()
+    preferences: list[AkanePreference] = []
+    for item in values:
+        preference = AkanePreference.from_dict(item)
+        if preference is None:
+            continue
+        duplicate = next(
+            (
+                index
+                for index, existing in enumerate(preferences)
+                if normalized_signature(existing.topic)
+                == normalized_signature(preference.topic)
+            ),
+            None,
+        )
+        if duplicate is None:
+            preferences.append(preference)
+        else:
+            preferences[duplicate] = _stronger_preference(
+                preferences[duplicate],
+                preference,
+            )
+    return tuple(preferences)
+
+
+def _merge_interests(
+    current: tuple[str, ...],
+    additions: tuple[str, ...],
+) -> tuple[str, ...]:
+    return _normalize_interests((*current, *additions))
+
+
+def _merge_akane_preferences(
+    current: tuple[AkanePreference, ...],
+    updates: tuple[dict[str, object], ...],
+    *,
+    updated_at: float,
+) -> tuple[AkanePreference, ...]:
+    merged = list(current)
+    for payload in updates:
+        candidate = AkanePreference.from_dict({**payload, "updated_at": updated_at})
+        if candidate is None:
+            continue
+        index = next(
+            (
+                position
+                for position, existing in enumerate(merged)
+                if normalized_signature(existing.topic)
+                == normalized_signature(candidate.topic)
+            ),
+            None,
+        )
+        if index is None:
+            merged.append(candidate)
+        else:
+            merged[index] = _stronger_preference(merged[index], candidate)
+    return tuple(merged)
+
+
+def relevant_relationship_context(state: InternalState, query: str) -> str:
+    """Render only shared-history observations that overlap the current message."""
+
+    query_text = compact_text(query, 700)
+    query_terms = _memory_terms(query_text)
+    if not query_terms:
+        return ""
+    candidates: list[tuple[float, RelationshipEntry]] = []
+    for entry in (
+        *state.relationship.patterns,
+        *state.relationship.shared_context,
+        *(event for event in state.relationship.unresolved_events if event.status == "unresolved"),
+    ):
+        relevance = _relationship_relevance(query_text, query_terms, entry.summary)
+        if relevance >= 0.35:
+            candidates.append(
+                (
+                    relevance + entry.importance * 0.12 + entry.confidence * 0.08,
+                    entry,
+                )
+            )
+    if not candidates:
+        return ""
+    selected = sorted(
+        candidates,
+        key=lambda item: (item[0], item[1].updated_at),
+        reverse=True,
+    )[:3]
+    return (
+        "Relevant relationship context:\n"
+        + "\n".join(f"- {entry.summary}" for _score, entry in selected)
+        + "\nThese are shared-history observations, not response instructions. "
+        + "Akane decides what they mean and how she responds."
+    )
+
+
+def _relationship_relevance(query: str, query_terms: set[str], summary: str) -> float:
+    specific_query_terms = query_terms - _RELATIONSHIP_RETRIEVAL_STOPWORDS
+    summary_terms = _memory_terms(summary) - _RELATIONSHIP_RETRIEVAL_STOPWORDS
+    if not specific_query_terms or not summary_terms:
+        return 0.0
+    overlap = len(specific_query_terms & summary_terms) / max(
+        1,
+        min(len(specific_query_terms), len(summary_terms)),
+    )
+    specific_query = " ".join(sorted(specific_query_terms))
+    specific_summary = " ".join(sorted(summary_terms))
+    return max(
+        overlap,
+        topic_overlap(specific_query, specific_summary),
+        message_similarity(specific_query, specific_summary),
+    )
+
+
+def _merge_relationship(
+    current: RelationshipState,
+    updates: tuple[dict[str, object], ...],
+    *,
+    updated_at: float,
+) -> RelationshipState:
+    patterns = list(current.patterns)
+    shared_context = list(current.shared_context)
+    unresolved_events = list(current.unresolved_events)
+    for update in updates:
+        category = compact_text(update.get("category"), 32).lower()
+        if category not in _RELATIONSHIP_UPDATE_CATEGORIES:
+            continue
+        summary = compact_text(update.get("summary"), 240)
+        if not summary:
+            continue
+        candidate = RelationshipEntry(
+            summary=summary,
+            importance=max(0.0, min(1.0, _number(update.get("importance"), 0.0))),
+            confidence=max(0.0, min(1.0, _number(update.get("confidence"), 0.0))),
+            updated_at=updated_at,
+            status="unresolved" if category == "unresolved_event" else "active",
+        )
+        if category == "resolved_event":
+            _resolve_relationship_event(unresolved_events, candidate, updated_at)
+        elif category == "pattern":
+            _merge_relationship_entry(patterns, candidate)
+        elif category == "shared_context":
+            _merge_relationship_entry(shared_context, candidate)
+        else:
+            _merge_relationship_entry(unresolved_events, candidate)
+    return RelationshipState(
+        patterns=_cap_relationship_entries(patterns, _MAX_RELATIONSHIP_PATTERNS),
+        shared_context=_cap_relationship_entries(shared_context, _MAX_RELATIONSHIP_CONTEXTS),
+        unresolved_events=_cap_relationship_entries(unresolved_events, _MAX_UNRESOLVED_EVENTS),
+    )
+
+
+def _merge_relationship_entry(
+    entries: list[RelationshipEntry], candidate: RelationshipEntry
+) -> None:
+    match = next(
+        (
+            index
+            for index, existing in enumerate(entries)
+            if _relationship_equivalent(existing.summary, candidate.summary)
+        ),
+        None,
+    )
+    if match is None:
+        entries.append(candidate)
+        return
+    existing = entries[match]
+    summary = candidate.summary if len(candidate.summary) < len(existing.summary) else existing.summary
+    entries[match] = replace(
+        existing,
+        summary=summary,
+        importance=max(existing.importance, candidate.importance),
+        confidence=min(1.0, existing.confidence + (1.0 - existing.confidence) * candidate.confidence * 0.5),
+        updated_at=max(existing.updated_at, candidate.updated_at),
+    )
+
+
+def _resolve_relationship_event(
+    events: list[RelationshipEntry], candidate: RelationshipEntry, updated_at: float
+) -> None:
+    unresolved = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event.status == "unresolved"
+    ]
+    if not unresolved:
+        return
+    index, event = max(
+        unresolved,
+        key=lambda item: _relationship_similarity(item[1].summary, candidate.summary),
+    )
+    if _relationship_similarity(event.summary, candidate.summary) < 0.35:
+        return
+    events[index] = replace(
+        event,
+        status="resolved",
+        importance=max(event.importance, candidate.importance),
+        confidence=min(1.0, event.confidence + (1.0 - event.confidence) * candidate.confidence * 0.5),
+        updated_at=updated_at,
+    )
+
+
+def _relationship_equivalent(left: str, right: str) -> bool:
+    if normalized_signature(left) == normalized_signature(right):
+        return True
+    return _relationship_similarity(left, right) >= 0.72
+
+
+def _relationship_similarity(left: str, right: str) -> float:
+    return max(message_similarity(left, right), topic_overlap(left, right))
+
+
+def _cap_relationship_entries(
+    entries: list[RelationshipEntry], limit: int
+) -> tuple[RelationshipEntry, ...]:
+    return tuple(
+        sorted(
+            entries,
+            key=lambda entry: (entry.status == "unresolved", entry.importance, entry.confidence, entry.updated_at),
+            reverse=True,
+        )[:limit]
+    )
+
+
+def _stronger_preference(
+    existing: AkanePreference,
+    candidate: AkanePreference,
+) -> AkanePreference:
+    """Keep a strong conclusion from being replaced by a weaker impression."""
+
+    if candidate.stance != existing.stance and candidate.strength + 0.12 < existing.strength:
+        return existing
+    if candidate.stance == existing.stance and candidate.strength < existing.strength:
+        return existing
+    return candidate
 
 
 def _semantic_relevance(query: str, query_terms: set[str], memory: Memory) -> float:

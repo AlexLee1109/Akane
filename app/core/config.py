@@ -97,6 +97,7 @@ def _is_raspberry_pi() -> bool:
 
 IS_RASPBERRY_PI = _bool_secret("RASPBERRY_PI", _is_raspberry_pi())
 APP_MODE = (_secret_or_env("APP_MODE", "popup") or "popup").lower()
+TIMEZONE = _secret_or_env("TIMEZONE", "America/New_York") or "America/New_York"
 SERVER_HOST = _secret_or_env("SERVER_HOST", "127.0.0.1") or "127.0.0.1"
 SERVER_PORT = _int_secret("SERVER_PORT", 8000)
 POPUP_BACKEND_URL = _secret_or_env(
@@ -183,7 +184,9 @@ MEMORY_CONTINUITY_WEIGHT = max(0.0, _float_secret("MEMORY_CONTINUITY_WEIGHT", 0.
 MEMORY_REPETITION_PENALTY = max(0.0, _float_secret("MEMORY_REPETITION_PENALTY", 0.06))
 MEMORY_STALENESS_PENALTY = max(0.0, _float_secret("MEMORY_STALENESS_PENALTY", 0.08))
 
-DATA_DIR = Path(_secret_or_env("DATA_DIR", "data") or "data").expanduser()
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DATA_DIR_VALUE = Path(_secret_or_env("DATA_DIR", "data") or "data").expanduser()
+DATA_DIR = _DATA_DIR_VALUE if _DATA_DIR_VALUE.is_absolute() else PROJECT_ROOT / _DATA_DIR_VALUE
 MEMORY_PATH = DATA_DIR / "memory.json"
 POPUP_USER_PATH = DATA_DIR / "popup_user.json"
 LONG_TERM_MEMORY_PATH = DATA_DIR / "long_term_memory.json"

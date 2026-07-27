@@ -26,11 +26,6 @@ _RECENT_EVENT_IDS: deque[int] = deque()
 _RECENT_EVENT_SET: set[int] = set()
 _RAW_MENTION = re.compile(r"<@!?\d+>|<@&\d+>|<#\d+>")
 _CUSTOM_EMOJI = re.compile(r"<a?:([A-Za-z0-9_]+):\d+>")
-_UNPROMPTED_PROMPT = """[UNPROMPTED DISCORD POST]
-Write one short, natural, unprompted thought as Akane. Keep it one to three sentences. Continue from a supplied concrete interest, recent concern, or activity when one is relevant; use a specific thought, reaction, or opinion instead of generic atmosphere. Do not pretend this is a reply or address a specific person.
-Do not mention timers, schedules, automation, Discord, silence, or that the chat is quiet. Do not ask for attention. Do not include @everyone, @here, a role mention, or a user mention. Return only the completed message."""
-
-
 def _log(label: str, text: str = "") -> None:
     suffix = f" {text}" if text else ""
     print(f"[Akane:discord:{label}]{suffix}", flush=True)
@@ -169,18 +164,13 @@ def _payload(message, text: str) -> dict[str, object]:
     }
 
 
-def _unprompted_payload(channel) -> dict[str, object]:
-    guild = getattr(channel, "guild", None)
-    guild_id = int(getattr(guild, "id", 0) or 0)
-    channel_id = int(channel.id)
+def _initiative_payload(target: dict[str, str]) -> dict[str, object]:
     return {
-        "message": _UNPROMPTED_PROMPT,
-        "profile_id": "local:owner",
-        "conversation_id": f"discord:guild:{guild_id}:channel:{channel_id}:autonomous",
+        "profile_id": target["profile_id"],
+        "conversation_id": target["conversation_id"],
         "source": "discord",
+        "display_name": target.get("display_name", ""),
         "timestamp": time.time(),
-        "autonomous": True,
-        "skip_if_busy": True,
     }
 
 
@@ -227,6 +217,29 @@ async def _post_chat(http, payload: dict[str, object]) -> dict:
             if isinstance(data, dict):
                 return data
             return {"error": "Akane server returned invalid JSON."}
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        return {"error": f"Could not reach the Akane server: {type(exc).__name__}."}
+
+
+async def _post_initiative(http, target: dict[str, str]) -> dict:
+    import aiohttp
+
+    timeout = aiohttp.ClientTimeout(total=_CHAT_TIMEOUT_SECONDS)
+    try:
+        async with http.post(
+            f"{DISCORD_SERVER_URL}/api/initiative",
+            json=_initiative_payload(target),
+            headers=_headers(),
+            timeout=timeout,
+        ) as response:
+            text = await response.text()
+            try:
+                data = json.loads(text) if text else {}
+            except json.JSONDecodeError:
+                data = {"error": "Akane server returned invalid JSON."}
+            if response.status >= 400:
+                return {"error": data.get("error") or f"Akane server returned HTTP {response.status}."}
+            return data if isinstance(data, dict) else {"error": "Akane server returned invalid JSON."}
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         return {"error": f"Could not reach the Akane server: {type(exc).__name__}."}
 
@@ -292,6 +305,7 @@ def run_discord_bot() -> None:
     class AkaneDiscordClient(discord.Client):
         http_session: aiohttp.ClientSession
         unprompted_task: asyncio.Task | None = None
+        initiative_targets: dict[int, dict[str, str]]
         unprompted_channel = None
 
         async def setup_hook(self) -> None:
@@ -309,13 +323,17 @@ def run_discord_bot() -> None:
     intents = discord.Intents.default()
     intents.message_content = True
     client = AkaneDiscordClient(intents=intents)
+    client.initiative_targets = {}
     allowed_mentions = discord.AllowedMentions.none()
 
     async def unprompted_loop(channel) -> None:
         while True:
             await asyncio.sleep(_UNPROMPTED_INTERVAL_SECONDS)
             try:
-                result = await _post_chat(client.http_session, _unprompted_payload(channel))
+                target = client.initiative_targets.get(int(channel.id))
+                if target is None:
+                    continue
+                result = await _post_initiative(client.http_session, target)
                 error = compact_text(result.get("error"), 240)
                 if error:
                     _log("unprompted-skip", error)
@@ -369,6 +387,11 @@ def run_discord_bot() -> None:
         conversation_id = _conversation_id(message)
         profile_id = _profile_id(message)
         payload = _payload(message, text)
+        client.initiative_targets[int(message.channel.id)] = {
+            "profile_id": profile_id,
+            "conversation_id": conversation_id,
+            "display_name": _display_name(message),
+        }
         try:
             async with message.channel.typing():
                 result = await _post_chat(client.http_session, payload)

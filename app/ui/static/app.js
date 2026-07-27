@@ -971,6 +971,30 @@ async function refreshStatus() {
   }
 }
 
+async function checkInitiative() {
+  if (isSending) {
+    return;
+  }
+
+  try {
+    const response = await fetch(apiUrl("/api/initiative"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        conversation_id: SESSION_ID,
+        source: "popup",
+      }),
+    });
+    const payload = await response.json();
+    if (Array.isArray(payload.messages) && payload.reply) {
+      renderMessages(payload.messages);
+      lastKnownStateVersion = -1;
+    }
+  } catch {
+    return;
+  }
+}
+
 async function handleComposerSubmit(event) {
   event.preventDefault();
 
@@ -1208,6 +1232,11 @@ async function boot() {
   window.setInterval(
     refreshStatus,
     2500,
+  );
+
+  window.setInterval(
+    checkInitiative,
+    5 * 60 * 1000,
   );
 
   focusComposerInput();

@@ -10,8 +10,30 @@ from typing import Callable
 from app.core.config import LLAMA_CONTEXT_WINDOW, MAX_TOKENS
 from app.core.memory import ChatTurn
 
-PROMPT_BUILDER_VERSION = "3"
+PROMPT_BUILDER_VERSION = "4"
 
+_PARTICIPATION_DECISION_GUIDANCE = (
+    "Akane may reply, stay silent, or take a short pause. "
+    "For silence or a pause, begin with "
+    '<AKANE_DECISION>{"should_respond":false,"pause_seconds":null}</AKANE_DECISION>. '
+    "Omit the block for a normal reply. Return no visible text when staying silent."
+)
+_PERSONAL_TASTES_GUIDANCE = (
+    "Akane has personal tastes rather than automatic enthusiasm. Let her form, express, "
+    "preserve, and reconsider her own preferences. Do not make her like something merely "
+    "because it belongs to one of her interests."
+)
+_CURIOSITY_GUIDANCE = (
+    "Akane does not ask questions automatically. She asks only when she genuinely wants "
+    "to know something relevant, interesting, unclear, or personally meaningful. "
+    "A greeting does not require a follow-up question. Do not use generic reciprocal "
+    "questions merely to keep the conversation active."
+)
+_STATE_UPDATE_GUIDANCE = (
+    "After the visible reply, optionally include one <AKANE_STATE> JSON block "
+    "containing only meaningful updates supported by the conversation. "
+    "Omit unchanged fields and do not invent facts."
+)
 
 class PromptAuthority(str, Enum):
     STABLE_POLICY = "stable_policy"
@@ -56,6 +78,7 @@ class PromptContext:
     behavioral_summary: str = ""
     relationship: str = ""
     preference_continuity: str = ""
+    taste_context: str = ""
     relevant_memories: str = ""
     durable_memories: tuple[str, ...] = ()
     earlier_turns: tuple[ChatTurn, ...] = ()
@@ -218,6 +241,50 @@ def _prompt_sources(
                 "InternalStateCoordinator",
             )
         )
+    sources.append(
+        PromptSource(
+            "participation_decision",
+            _PARTICIPATION_DECISION_GUIDANCE,
+            "system",
+            PromptAuthority.STABLE_POLICY,
+            True,
+            99,
+            "app/core/prompt.py",
+        )
+    )
+    sources.append(
+        PromptSource(
+            "personal_tastes",
+            _PERSONAL_TASTES_GUIDANCE,
+            "system",
+            PromptAuthority.DYNAMIC_GUIDANCE,
+            True,
+            99,
+            "app/core/prompt.py",
+        )
+    )
+    sources.append(
+        PromptSource(
+            "selective_curiosity",
+            _CURIOSITY_GUIDANCE,
+            "system",
+            PromptAuthority.DYNAMIC_GUIDANCE,
+            True,
+            99,
+            "app/core/prompt.py",
+        )
+    )
+    sources.append(
+        PromptSource(
+            "state_updates",
+            _STATE_UPDATE_GUIDANCE,
+            "system",
+            PromptAuthority.STABLE_POLICY,
+            True,
+            99,
+            "app/core/prompt.py",
+        )
+    )
 
     optional_details = (
         ("editor_context", context.external_context, "VSCodeSnapshot"),
@@ -226,6 +293,7 @@ def _prompt_sources(
         ("life_context", context.life_context, "LifeState"),
         ("date_time", context.date_time, "server_clock"),
         ("preference_continuity", context.preference_continuity, "LongTermMemoryStore.preference"),
+        ("taste_context", context.taste_context, "LongTermMemoryStore.tastes"),
     )
     for kind, content, origin in optional_details:
         if content:

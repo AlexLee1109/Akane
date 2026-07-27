@@ -41,7 +41,6 @@ _DIRECT_PATTERN = re.compile(
     r"make|optimize|read|refactor|remove|review|rewrite|show|simplify|tell|test|use|write)\b",
     re.IGNORECASE,
 )
-_APOLOGY = re.compile(r"\b(?:sorry|i apologize|my fault)\b", re.IGNORECASE)
 _PRAISE = re.compile(
     r"\b(?:awesome|good job|great job|nice work|perfect|well done)\b", re.IGNORECASE
 )
@@ -88,11 +87,10 @@ _ACTION = re.compile(
     r"slap(?:s|ped|ping)?|kick(?:s|ed|ing)?|poke(?:s|d|ing)?|"
     r"pat(?:s|ted|ting)?|tap(?:s|ped|ping)?|grab(?:s|bed|bing)?|"
     r"hug(?:s|ged|ging)?|kiss(?:es|ed|ing)?|touch(?:es|ed|ing)?)\b"
-    r"(?:\s+(?:at|on))?\s+(?P<target>(?:your|akane(?:'s)?)\s+"
+    r"(?:\s+(?:at|on))?\s+(?P<target>(?:(?:your|akane(?:'s)?)\s+)?"
     r"(?:head|arm|hand|shoulder|cheek|face|hair|ear|nose|forehead|waist|leg|back))\b",
     re.IGNORECASE,
 )
-_FORCEFUL_ACTIONS = {"bonk", "whack", "hit", "slap", "kick", "poke", "grab"}
 
 _ACTIVITY_UPDATE = re.compile(
     r"\b(?P<actor>i|we)(?:(?:'m)|\s+(?:am|are))?\s+"
@@ -121,13 +119,31 @@ _IDENTITY_PATTERNS = (
     ("preferences", re.compile(r"\b(?:favorite|what do you (?:like|enjoy)|what are you into|your preferences)\b", re.I)),
     ("identity", re.compile(r"\b(?:who are you|what are you|about yourself|your identity|your personality|yourself)\b", re.I)),
 )
-_CURRENT_ACTIVITY = re.compile(
-    r"\b(?:what are you doing|what are you up to|what have you been doing|how was your day)\b",
-    re.IGNORECASE,
-)
 _CURRENT_THOUGHT = re.compile(
     r"\b(?:current thought|what are you thinking about|what(?:'s| is) on your mind)\b",
     re.IGNORECASE,
+)
+
+VALID_EMOTION_LABELS = frozenset(
+    {
+        "neutral",
+        "irritated",
+        "angry",
+        "mildly exasperated",
+        "concerned",
+        "warm",
+        "embarrassed",
+        "pleased",
+        "amused",
+        "annoyed",
+        "frustrated",
+        "guarded",
+        "sad",
+        "calm",
+        "relieved",
+        "happy",
+        "curious",
+    }
 )
 
 
@@ -143,7 +159,6 @@ class EmotionState:
     primary: str = "neutral"
     intensity: float = 0.0
     cause: str = ""
-    boundary_level: int = 0
     updated_at: float = 0.0
 
 
@@ -167,7 +182,6 @@ class AffectTrace:
     previous: str
     immediate: str
     candidate: str
-    boundary_level: int
     applied: bool
     decay_applied: float = 0.0
     reason_codes: tuple[str, ...] = ()
@@ -236,6 +250,7 @@ class TurnSignal:
     code_context_attached: bool = False
     identity_attribute: str = ""
     current_activity: bool = False
+    activity_timeframe: str = ""
     current_thought: bool = False
     emotion_state: EmotionState = EmotionState()
     immediate_reaction: ImmediateReaction = ImmediateReaction()
@@ -261,33 +276,27 @@ class TurnSignal:
             topic_confidence=self.topic_confidence if confidence is None else confidence,
         )
 
-    def emotion_prompt(self) -> str:
+    def emotion_prompt(self, *, emotion_relevant: bool | None = None) -> str:
         parts: list[str] = []
         if self.embodied_action:
-            again = " again" if self.repetition_count > 1 else ""
-            parts.append(f"Arcane {_past_action(self.embodied_action)} {self.embodied_target}{again}.")
-        if self.repetition_count > 1:
-            parts.append(f"This is repetition {self.repetition_count} in the recent conversation.")
-        if self.immediate_reaction.primary != "neutral":
-            parts.append(f"Immediate reaction: {_reaction_phrase(self.immediate_reaction)}.")
+            parts.append(
+                f"Arcane {_past_action(self.embodied_action)} {self.embodied_target}."
+            )
+        if self.embodied_action and self.repetition_count > 1:
+            parts.append("A matching action occurred earlier.")
         if self.emotion_state.primary != "neutral" and self.emotion_state.intensity >= 0.05:
             parts.append(
-                f"Ongoing emotion: {_intensity_label(self.emotion_state.intensity)} "
-                f"{_emotion_phrase(self.emotion_state.primary)} carried from earlier turns."
+                f"Akane currently carries {_intensity_label(self.emotion_state.intensity)} "
+                f"{_emotion_phrase(self.emotion_state.primary)} from earlier turns."
             )
-        if self.emotion_state.boundary_level == 1 and self.embodied_action:
-            parts.append("Akane may object plainly.")
+            if emotion_relevant is False:
+                parts.append("The present message concerns a different topic.")
         if self.continued_after_objection:
-            parts.append("Akane has already objected.")
-        if self.emotion_state.boundary_level >= 2:
-            parts.append(
-                "Set a firmer boundary. Akane may refuse to keep entertaining the behavior, "
-                "but must not claim the application paused or shut down."
-            )
+            parts.append("Akane previously objected to that matching action.")
         if parts:
             parts.append(
-                "React directly and naturally. Do not mention software, avatars, simulations, "
-                "internal state, or lasting injuries."
+                "Treat these as conversational facts, not instructions for a particular "
+                "reaction. Let Akane decide what she thinks, feels, and says."
             )
         return "\n".join(parts)
 
@@ -371,14 +380,13 @@ def evolve_emotion(state: EmotionState, *, now: float, profile_seed: str = "loca
     elapsed = max(0.0, current - state.updated_at)
     if state.intensity <= 0.0:
         return MoodEvolution(EmotionState(updated_at=current), elapsed, 0.0, ("neutral",))
-    retained = 0.5 ** (elapsed / (4.0 * 3600.0))
+    retained = 0.5 ** (elapsed / (12.0 * 3600.0))
     intensity = state.intensity * retained
     decayed = max(0.0, state.intensity - intensity)
     if intensity < 0.04:
         return MoodEvolution(EmotionState(updated_at=current), elapsed, decayed, ("emotion_expired",))
-    boundary = _boundary_level(intensity) if state.primary in {"irritated", "angry"} else 0
     return MoodEvolution(
-        EmotionState(state.primary, intensity, state.cause, boundary, current),
+        EmotionState(state.primary, intensity, state.cause, current),
         elapsed,
         decayed,
         (("elapsed_decay",) if decayed else ("unchanged",)),
@@ -410,15 +418,9 @@ def analyze_turn(
     token_set = set(normalized.split())
     action, target = _embodied_action(summary)
     repetition_count = _repetition_count(summary, action, target, context)
-    continued = bool(action and _prior_objection(context.recent_turns))
-    immediate = _immediate_reaction(summary, action, target, repetition_count, continued)
-    persistent = _persistent_emotion(
-        decayed,
-        immediate,
-        repetition_count=repetition_count,
-        continued_after_objection=continued,
-        now=current,
-    )
+    continued = _continued_after_objection(action, target, context.recent_turns)
+    immediate = _immediate_reaction(summary, action)
+    persistent = decayed
     event = semantic_event or semantic_event_from_text(summary)
     personal_continuation = _personal_continuation(summary, context.recent_turns)
     technical = bool(
@@ -435,7 +437,8 @@ def analyze_turn(
     teasing = bool(_PLAYFUL.search(summary))
     sadness = bool(_DISTRESS.search(summary))
     identity_attribute = _identity_focus(summary)
-    current_activity = bool(_CURRENT_ACTIVITY.search(summary))
+    activity_timeframe = _activity_timeframe(summary)
+    current_activity = activity_timeframe == "current"
     current_thought = bool(_CURRENT_THOUGHT.search(summary))
     topic, topic_confidence = topic_from_text(summary)
     if personal_continuation and context.current_topic:
@@ -446,9 +449,13 @@ def analyze_turn(
         else "instruction" if _DIRECT_PATTERN.search(summary) else "reflection" if personal_continuation
         else "casual"
     )
-    tone = "guarded" if hostility or persistent.boundary_level else "gentle" if sadness else "teasing" if teasing else "neutral"
-    reaction_kind = immediate.primary if immediate.primary != "neutral" else persistent.primary
-    contextual = ContextualReaction(reaction_kind, max(immediate.intensity, persistent.intensity), immediate.cause or persistent.cause)
+    tone = "guarded" if hostility else "gentle" if sadness else "teasing" if teasing else "neutral"
+    reaction_kind = immediate.primary
+    contextual = ContextualReaction(
+        reaction_kind,
+        immediate.intensity,
+        immediate.cause,
+    )
     emotional = EmotionalSignal(reaction_kind, immediate.intensity, 1.0 if reaction_kind != "neutral" else 0.0, immediate.cause)
     trigger = "embodied_action" if action else "repetition" if repetition_count > 1 else "hostility" if hostility else ""
     return TurnSignal(
@@ -474,6 +481,7 @@ def analyze_turn(
         code_context_attached=code_context_attached,
         identity_attribute=identity_attribute,
         current_activity=current_activity,
+        activity_timeframe=activity_timeframe,
         current_thought=current_thought,
         emotion_state=persistent,
         immediate_reaction=immediate,
@@ -484,7 +492,7 @@ def analyze_turn(
         embodied_action=action,
         embodied_target=target,
         continued_after_objection=continued,
-        emotion_applied=immediate.primary != "neutral" or persistent.intensity >= 0.05,
+        emotion_applied=False,
         personal_continuation=personal_continuation,
     )
 
@@ -512,7 +520,6 @@ def build_affect_trace(
         previous=_emotion_label(prior),
         immediate=_reaction_label(signal.immediate_reaction),
         candidate=_emotion_label(signal.emotion_state),
-        boundary_level=signal.emotion_state.boundary_level,
         applied=signal.emotion_applied,
         decay_applied=evolution.decay_applied if evolution else 0.0,
         reason_codes=tuple(dict.fromkeys(reasons)),
@@ -539,15 +546,12 @@ def _embodied_action(text: str) -> tuple[str, str]:
 def _repetition_count(text: str, action: str, target: str, context: TurnContext) -> int:
     prior_users = [content for role, content in context.recent_turns if role == "user"]
     if action:
-        action_count = 1
         same_count = 1
         for prior in prior_users:
             prior_action, prior_target = _embodied_action(prior)
-            if prior_action:
-                action_count += 1
             if prior_action == action and prior_target == target:
                 same_count += 1
-        return max(action_count, same_count)
+        return same_count
     matches = sum(message_similarity(text, prior) >= 0.78 for prior in prior_users)
     if matches:
         return max(matches + 1, context.repeated_topic_count + 1)
@@ -556,8 +560,36 @@ def _repetition_count(text: str, action: str, target: str, context: TurnContext)
     return 1
 
 
-def _prior_objection(recent_turns: tuple[tuple[str, str], ...]) -> bool:
-    return any(role == "assistant" and _OBJECTION.search(content) for role, content in recent_turns)
+def _continued_after_objection(
+    action: str,
+    target: str,
+    recent_turns: tuple[tuple[str, str], ...],
+) -> bool:
+    if not action or not target:
+        return False
+    latest_assistant_index = next(
+        (
+            index
+            for index in range(len(recent_turns) - 1, -1, -1)
+            if recent_turns[index][0] == "assistant"
+        ),
+        -1,
+    )
+    if latest_assistant_index < 0:
+        return False
+    _role, assistant_text = recent_turns[latest_assistant_index]
+    if not _OBJECTION.search(assistant_text):
+        return False
+    prior_user = next(
+        (
+            text
+            for role, text in reversed(recent_turns[:latest_assistant_index])
+            if role == "user"
+        ),
+        "",
+    )
+    prior_action, prior_target = _embodied_action(prior_user)
+    return prior_action == action and prior_target == target
 
 
 def _personal_continuation(text: str, recent_turns: tuple[tuple[str, str], ...]) -> bool:
@@ -569,69 +601,9 @@ def _personal_continuation(text: str, recent_turns: tuple[tuple[str, str], ...])
     return bool(previous_user and re.search(r"\b(?:you|your|human|ai)\b", previous_user, re.I))
 
 
-def _immediate_reaction(text: str, action: str, target: str, repetition: int, continued: bool) -> ImmediateReaction:
-    if action:
-        forceful = action in _FORCEFUL_ACTIONS
-        primary = "startled" if forceful else "warm" if action in {"hug", "pat"} else "embarrassed"
-        intensity = min(1.0, (0.48 if forceful else 0.30) + 0.08 * (repetition - 1))
-        if continued:
-            primary = "irritated"
-            intensity = max(intensity, 0.68)
-        return ImmediateReaction(primary, intensity, f"Arcane {_past_action(action)} {target}")
-    if _HOSTILITY.search(text):
-        return ImmediateReaction("irritated", 0.72, "Arcane was hostile")
-    if _DISTRESS.search(text):
-        return ImmediateReaction("concerned", 0.62, "Arcane sounded distressed")
-    if _APOLOGY.search(text):
-        return ImmediateReaction("softened", 0.40, "Arcane apologized")
-    if _PRAISE.search(text):
-        return ImmediateReaction("pleased", 0.42, "Arcane praised Akane")
-    if repetition > 1:
-        return ImmediateReaction("mildly exasperated", min(0.55, 0.18 + repetition * 0.08), "Arcane repeated the question")
+def _immediate_reaction(text: str, action: str) -> ImmediateReaction:
+    del text, action
     return ImmediateReaction()
-
-
-def _persistent_emotion(
-    prior: EmotionState,
-    immediate: ImmediateReaction,
-    *,
-    repetition_count: int,
-    continued_after_objection: bool,
-    now: float,
-) -> EmotionState:
-    current = replace(prior, updated_at=now)
-    if immediate.primary in {"startled", "irritated"}:
-        base = current.intensity if current.primary in {"irritated", "angry"} else 0.12
-        increase = 0.14 + 0.05 * max(0, repetition_count - 1)
-        if continued_after_objection:
-            increase += 0.08
-        intensity = min(1.0, base + increase)
-        primary = "angry" if intensity >= 0.72 else "irritated"
-        return EmotionState(primary, intensity, immediate.cause, _boundary_level(intensity), now)
-    if immediate.primary == "mildly exasperated":
-        base = current.intensity if current.primary == "mildly exasperated" else 0.08
-        intensity = min(0.62, base + 0.08 + 0.04 * max(0, repetition_count - 1))
-        return EmotionState("mildly exasperated", intensity, immediate.cause, 0, now)
-    if immediate.primary == "concerned":
-        intensity = max(current.intensity * 0.75 if current.primary == "concerned" else 0.0, 0.30)
-        return EmotionState("concerned", intensity, immediate.cause, 0, now)
-    if immediate.primary in {"warm", "embarrassed", "pleased"}:
-        primary = "warm" if immediate.primary in {"warm", "pleased"} else "embarrassed"
-        return EmotionState(primary, max(0.16, current.intensity * 0.70), immediate.cause, 0, now)
-    if immediate.primary == "softened":
-        intensity = max(0.0, current.intensity - 0.24)
-        if intensity < 0.05:
-            return EmotionState(updated_at=now)
-        return EmotionState(current.primary, intensity, current.cause, _boundary_level(intensity), now)
-    intensity = max(0.0, current.intensity - 0.04)
-    if intensity < 0.05:
-        return EmotionState(updated_at=now)
-    boundary = _boundary_level(intensity) if current.primary in {"irritated", "angry"} else 0
-    return EmotionState(current.primary, intensity, current.cause, boundary, now)
-
-
-def _boundary_level(intensity: float) -> int:
-    return 3 if intensity >= 0.76 else 2 if intensity >= 0.52 else 1 if intensity >= 0.24 else 0
 
 
 def _identity_focus(text: str) -> str:
@@ -641,17 +613,23 @@ def _identity_focus(text: str) -> str:
     return ""
 
 
-def _reaction_phrase(reaction: ImmediateReaction) -> str:
-    return {
-        "startled": "startled recoil",
-        "irritated": "an irritated flinch",
-        "mildly exasperated": "mild exasperation",
-        "concerned": "immediate concern",
-        "softened": "a slight softening",
-        "pleased": "quiet pleasure",
-        "warm": "warmth",
-        "embarrassed": "brief embarrassment",
-    }.get(reaction.primary, reaction.primary)
+def _activity_timeframe(text: str) -> str:
+    """Classify an activity question by concepts, not fixed question wording."""
+
+    tokens = set(_WORD.findall(normalized_signature(text)))
+    if not tokens or not tokens & {"you", "akane", "your"}:
+        return ""
+    activity_terms = {
+        "activity", "busy", "doing", "occupied", "up", "been", "did", "done",
+        "schedule", "plan", "planning", "next", "later",
+    }
+    if not tokens & activity_terms:
+        return ""
+    if tokens & {"next", "later", "plan", "planning", "schedule", "going"}:
+        return "planned"
+    if tokens & {"before", "earlier", "recent", "recently", "did", "done", "been"}:
+        return "recent"
+    return "current"
 
 
 def _past_action(action: str) -> str:

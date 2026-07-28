@@ -21,6 +21,9 @@ const elements = {
   memoryCloseBtn: document.getElementById("memoryCloseBtn"),
   memoryPanel: document.getElementById("memoryPanel"),
   memoryContent: document.getElementById("memoryContent"),
+  avatarHitbox: document.getElementById("avatarHitbox"),
+  actionDock: document.querySelector(".avatar-action-dock"),
+  characterArt: document.getElementById("characterArt"),
 };
 
 let currentMessages = [];
@@ -60,6 +63,8 @@ function setComposerOpenState(open) {
   if (elements.composer) {
     elements.composer.hidden = !open;
   }
+
+  syncInteractiveRegions();
 }
 
 function focusComposerInput() {
@@ -233,6 +238,8 @@ function setBubbleVisible(visible) {
   if (elements.speechBubble) {
     elements.speechBubble.hidden = !bubbleVisible;
   }
+
+  syncInteractiveRegions();
 }
 
 function showBubbleNow() {
@@ -271,6 +278,8 @@ function setBubbleText(text) {
   setBubbleVisible(true);
   elements.messages.innerHTML =
     renderMessageBody(nextText);
+  elements.messages.scrollTop =
+    elements.messages.scrollHeight;
 }
 
 window.__akaneSetBubbleText = setBubbleText;
@@ -280,7 +289,8 @@ window.__akanePendingMessage = "";
 window.__akaneStreamEvent = (event) => {
   if (
     event.type === "done" ||
-    event.type === "error"
+    event.type === "error" ||
+    event.type === "cancelled"
   ) {
     setSendingState(false);
   }
@@ -439,41 +449,33 @@ function makeBubbleRow(message, index) {
   return row;
 }
 
-function renderMessages(messages) {
+function rememberMessages(messages) {
   currentMessages = Array.isArray(messages)
     ? messages
     : [];
 
   lastRenderedMessagesKey =
     JSON.stringify(currentMessages);
+}
+
+function renderMessages(messages) {
+  rememberMessages(messages);
 
   if (!elements.messages) {
     return;
   }
 
   if (POPUP_ROLE === "companion") {
-    const latestAssistant = [
-      ...currentMessages,
-    ]
-      .reverse()
-      .find(
-        (message) =>
-          message.role === "assistant",
-      );
-
     const lastMessage =
       currentMessages[
         currentMessages.length - 1
       ];
 
     if (
-      latestAssistant?.content &&
-      (
-        bubbleStreaming ||
-        lastMessage?.role === "assistant"
-      )
+      lastMessage?.role === "assistant" &&
+      lastMessage.content
     ) {
-      setBubbleText(latestAssistant.content);
+      setBubbleText(lastMessage.content);
     }
 
     return;
@@ -865,15 +867,18 @@ function handleStreamEvent(
     bubbleStreaming = false;
 
     /*
-     * Prefer the server's finalized message list.
-     * Do not append event.reply to the streamed
-     * response because it is normally the complete
-     * final response.
+     * Preserve the already-streamed companion text.
+     * Final history is stored without rerendering
+     * the visible speech bubble.
      */
     if (Array.isArray(event.messages)) {
-      renderMessages(event.messages);
+      if (POPUP_ROLE === "companion") {
+        rememberMessages(event.messages);
+      } else {
+        renderMessages(event.messages);
+      }
     } else if (event.reply) {
-      streamingAssistantText = String(
+      const finalizedAssistantText = String(
         event.reply,
       );
 
@@ -887,16 +892,20 @@ function handleStreamEvent(
       ) {
         next[next.length - 1] = {
           ...lastMessage,
-          content: streamingAssistantText,
+          content: finalizedAssistantText,
         };
       } else {
         next.push({
           role: "assistant",
-          content: streamingAssistantText,
+          content: finalizedAssistantText,
         });
       }
 
-      renderMessages(next);
+      if (POPUP_ROLE === "companion") {
+        rememberMessages(next);
+      } else {
+        renderMessages(next);
+      }
     }
 
     hideBubbleSoon(10000);
@@ -913,8 +922,14 @@ function handleStreamEvent(
     throw new Error(
       event.error ||
         event.detail ||
-        "Streaming failed.",
+      "Streaming failed.",
     );
+  }
+
+  if (event.type === "cancelled") {
+    bubbleStreaming = false;
+    streamingAssistantText = "";
+    hideBubbleSoon(1200);
   }
 }
 
@@ -1145,6 +1160,88 @@ elements.input?.addEventListener(
 
 let memoryPanelVisible = false;
 
+function syncInteractiveRegions() {
+  if (
+    POPUP_ROLE !== "companion" ||
+    !window.pywebview?.api
+      ?.update_interactive_regions
+  ) {
+    return;
+  }
+
+  const interactiveElements = [
+    elements.speechBubble,
+    elements.avatarHitbox,
+    elements.composer,
+    elements.memoryPanel,
+  ];
+  const dockOpacity = elements.actionDock
+    ? Number.parseFloat(
+        getComputedStyle(elements.actionDock)
+          .opacity || "0",
+      )
+    : 0;
+
+  if (dockOpacity > 0.01) {
+    interactiveElements.push(
+      elements.memoryActionButton,
+      elements.messageActionButton,
+      elements.minimizeButton,
+      elements.closeButton,
+    );
+  }
+  const clippedRect = (
+    element,
+    includeHidden = false,
+  ) => {
+    if (
+      !element ||
+      (!includeHidden && element.hidden) ||
+      getComputedStyle(element).display === "none"
+    ) {
+      return null;
+    }
+    const rect = element.getBoundingClientRect();
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(
+      window.innerWidth,
+      rect.right,
+    );
+    const bottom = Math.min(
+      window.innerHeight,
+      rect.bottom,
+    );
+
+    if (right <= left || bottom <= top) {
+      return null;
+    }
+
+    return {
+      x: left,
+      y: top,
+      width: right - left,
+      height: bottom - top,
+    };
+  };
+  const interactiveRegions =
+    interactiveElements
+      .map((element) => clippedRect(element))
+      .filter(Boolean);
+  const hiddenBubbleRegion =
+    elements.speechBubble?.hidden
+      ? clippedRect(elements.speechBubble, true)
+      : null;
+
+  void window.pywebview.api
+    .update_interactive_regions(
+      interactiveRegions,
+      hiddenBubbleRegion
+        ? [hiddenBubbleRegion]
+        : [],
+    );
+}
+
 async function openMemoryPanel() {
   if (
     !elements.memoryPanel ||
@@ -1159,6 +1256,7 @@ async function openMemoryPanel() {
   elements.memoryPanel.removeAttribute(
     "hidden",
   );
+  syncInteractiveRegions();
 
   elements.memoryContent.innerHTML =
     '<div class="memory-loading">Loading memory...</div>';
@@ -1199,6 +1297,7 @@ function closeMemoryPanel() {
     "hidden",
     "",
   );
+  syncInteractiveRegions();
 }
 
 function toggleMemoryPanel() {
@@ -1240,6 +1339,35 @@ async function boot() {
   );
 
   focusComposerInput();
+  syncInteractiveRegions();
+  elements.characterArt?.addEventListener(
+    "load",
+    syncInteractiveRegions,
+  );
+
+  const syncDockRegions = () => {
+    window.requestAnimationFrame(
+      syncInteractiveRegions,
+    );
+    window.setTimeout(
+      syncInteractiveRegions,
+      220,
+    );
+  };
+
+  for (const element of [
+    elements.avatarHitbox,
+    elements.actionDock,
+  ]) {
+    element?.addEventListener(
+      "pointerenter",
+      syncDockRegions,
+    );
+    element?.addEventListener(
+      "pointerleave",
+      syncDockRegions,
+    );
+  }
 
   elements.memoryActionButton
     ?.addEventListener(
@@ -1272,5 +1400,14 @@ async function boot() {
       },
     );
 }
+
+window.addEventListener(
+  "pywebviewready",
+  syncInteractiveRegions,
+);
+window.addEventListener(
+  "resize",
+  syncInteractiveRegions,
+);
 
 void boot();

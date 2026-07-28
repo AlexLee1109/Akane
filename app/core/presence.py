@@ -1,23 +1,57 @@
-"""Persisted offscreen presence; activity choices belong to Akane's life turn."""
+"""Canonical schema and validation for Akane's persisted offscreen life."""
 
 from __future__ import annotations
 
 import json
 import math
+import random
 import re
+import time
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 
-from app.core.signal import EmotionState
 from app.core.utils import compact_text
+
+MIN_DECISION_MINUTES = 150
+MAX_DECISION_MINUTES = 210
+CLAIM_SECONDS = 10 * 60
+RETRY_SECONDS = 5 * 60
 
 _MAX_ACTIVITY_CHARS = 160
 _MAX_DETAIL_CHARS = 240
-_MAX_DURATION_MINUTES = 120
-_MAX_START_AFTER_MINUTES = 7 * 24 * 60
-_LIFE_DECISIONS = {"start_activity", "schedule_activity", "continue_activity", "quiet_downtime", "do_nothing"}
+_LIFE_MODES = {"new", "continue"}
 _ACTIVITY_KEY_STOPWORDS = {
-    "a", "about", "an", "and", "at", "her", "in", "of", "on", "some",
-    "something", "the", "to", "with",
+    "a",
+    "about",
+    "after",
+    "an",
+    "and",
+    "as",
+    "at",
+    "because",
+    "by",
+    "for",
+    "from",
+    "her",
+    "herself",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "she",
+    "some",
+    "something",
+    "the",
+    "that",
+    "this",
+    "to",
+    "up",
+    "while",
+    "with",
 }
 
 
@@ -26,21 +60,36 @@ def _timestamp(value: object, default: float = 0.0) -> float:
         number = float(value)
     except (TypeError, ValueError):
         return default
-    return number if math.isfinite(number) and number >= 0 else default
+    return number if math.isfinite(number) and number >= 0.0 else default
+
+
+def _optional_text(value: object, limit: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    return compact_text(value, limit) or None
 
 
 def _activity_text(value: object) -> str:
     activity = compact_text(value, _MAX_ACTIVITY_CHARS)
-    words = re.findall(r"[a-z]+", activity.casefold())
-    if not 1 <= len(words) <= 16:
-        return ""
-    return activity
+    words = re.findall(r"[a-z0-9]+", activity.casefold())
+    return activity if 1 <= len(words) <= 24 else ""
+
+
+def minutes_to_seconds(minutes: float) -> float:
+    return float(minutes) * 60.0
+
+
+def next_decision_time(now: float) -> float:
+    minutes = random.uniform(MIN_DECISION_MINUTES, MAX_DECISION_MINUTES)
+    return max(0.0, float(now)) + minutes_to_seconds(minutes)
 
 
 def activity_key(value: object) -> str:
-    """Return compact comparison metadata, not a displayable activity history."""
+    """Create small comparison metadata without retaining activity history."""
 
-    tokens = []
+    tokens: list[str] = []
     for token in re.findall(
         r"[a-z0-9]+",
         compact_text(value, _MAX_ACTIVITY_CHARS).casefold(),
@@ -59,10 +108,47 @@ def activity_key(value: object) -> str:
     return " ".join(tokens)[:96]
 
 
+def _near_key(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    left_tokens = set(left.split())
+    right_tokens = set(right.split())
+    shared = left_tokens & right_tokens
+    union = left_tokens | right_tokens
+    return (
+        bool(shared)
+        and len(shared) / max(1, len(union)) >= 0.6
+    ) or SequenceMatcher(None, left, right).ratio() >= 0.86
+
+
+def _activity_semantic_key(
+    activity: object,
+    subject: object = None,
+) -> str:
+    return activity_key(" ".join(value for value in (
+        compact_text(activity, _MAX_ACTIVITY_CHARS),
+        compact_text(subject, 160),
+    ) if value))
+
+
+def _record_key(activity: "PresenceActivity | None") -> str:
+    if activity is None:
+        return ""
+    return _activity_semantic_key(activity.activity, activity.subject)
+
+
+def _meaningful_detail(detail: str | None, *, activity: str) -> bool:
+    detail_tokens = set(activity_key(detail).split())
+    activity_tokens = set(activity_key(activity).split())
+    return len(detail_tokens) >= 3 and len(detail_tokens - activity_tokens) >= 2
+
+
 @dataclass(frozen=True, slots=True)
 class ActivityPattern:
+    current_key: str = ""
     previous_key: str = ""
-    prior_key: str = ""
     repeat_count: int = 0
 
     @classmethod
@@ -73,15 +159,21 @@ class ActivityPattern:
         except (TypeError, ValueError):
             repeat_count = 0
         return cls(
-            activity_key(values.get("previous_key")),
-            activity_key(values.get("prior_key")),
-            repeat_count,
+            current_key=activity_key(
+                values.get("current_key") or values.get("previous_key")
+            ),
+            previous_key=activity_key(
+                values.get("previous_key")
+                if "current_key" in values
+                else values.get("prior_key")
+            ),
+            repeat_count=repeat_count,
         )
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "current_key": self.current_key,
             "previous_key": self.previous_key,
-            "prior_key": self.prior_key,
             "repeat_count": self.repeat_count,
         }
 
@@ -89,213 +181,271 @@ class ActivityPattern:
 @dataclass(frozen=True, slots=True)
 class PresenceActivity:
     activity: str
+    category: str | None
+    subject: str | None
     detail: str | None
     started_at: float
-    ends_at: float
-    source: str = ""
-    category: str = ""
-    title: str | None = None
+    expected_end_at: float
+    source: str = "autonomous_life"
 
     @classmethod
     def from_dict(cls, payload: object) -> "PresenceActivity | None":
         if not isinstance(payload, dict):
             return None
-        activity = compact_text(payload.get("activity"), _MAX_ACTIVITY_CHARS)
-        detail_value = payload.get("detail")
-        detail = compact_text(detail_value, _MAX_DETAIL_CHARS) if isinstance(detail_value, str) else None
-        started_at, ends_at = _timestamp(payload.get("started_at")), _timestamp(payload.get("ends_at"))
-        if not activity or (detail_value is not None and not detail) or ends_at <= started_at:
+        activity = _activity_text(payload.get("activity"))
+        started_at = _timestamp(payload.get("started_at"))
+        expected_end_at = _timestamp(
+            payload.get("expected_end_at"),
+            _timestamp(payload.get("ends_at")),
+        )
+        if not activity or expected_end_at <= started_at:
             return None
-        ends_at = min(ends_at, started_at + _MAX_DURATION_MINUTES * 60)
-        title_value = payload.get("title")
-        title = compact_text(title_value, 160) if isinstance(title_value, str) else None
+        detail_value = payload.get("detail")
+        detail = _optional_text(detail_value, _MAX_DETAIL_CHARS)
+        if detail_value is not None and detail is None:
+            return None
         return cls(
-            activity,
-            detail,
-            started_at,
-            ends_at,
-            compact_text(payload.get("source"), 48),
-            compact_text(payload.get("category"), 48),
-            title,
+            activity=activity,
+            category=_optional_text(payload.get("category"), 48),
+            subject=_optional_text(
+                payload.get("subject", payload.get("title")),
+                160,
+            ),
+            detail=detail,
+            started_at=started_at,
+            expected_end_at=expected_end_at,
+            source=compact_text(payload.get("source"), 48) or "autonomous_life",
         )
 
     def as_dict(self) -> dict[str, object]:
-        return {"activity": self.activity, "category": self.category or None, "title": self.title, "detail": self.detail, "started_at": self.started_at, "ends_at": self.ends_at, "source": self.source}
+        return {
+            "activity": self.activity,
+            "category": self.category,
+            "subject": self.subject,
+            "detail": self.detail,
+            "started_at": self.started_at,
+            "expected_end_at": self.expected_end_at,
+            "source": self.source,
+        }
 
     def fact(self) -> str:
         return f"{self.activity} — {self.detail}" if self.detail else self.activity
+
+
+def _newest_historical_activity(values: dict[str, object]) -> PresenceActivity | None:
+    candidates: list[PresenceActivity] = []
+    previous = PresenceActivity.from_dict(values.get("previous_activity"))
+    if previous is not None:
+        candidates.append(previous)
+    recent = values.get("recent_activities")
+    if isinstance(recent, (list, tuple)):
+        candidates.extend(
+            activity
+            for item in recent
+            if (activity := PresenceActivity.from_dict(item)) is not None
+        )
+    return max(
+        candidates,
+        key=lambda item: (item.expected_end_at, item.started_at),
+        default=None,
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class PresenceState:
     current_activity: PresenceActivity | None = None
     previous_activity: PresenceActivity | None = None
-    next_activity: PresenceActivity | None = None
-    life_pending: bool = False
-    life_reason: str = ""
-    life_claimed_at: float = 0.0
-    life_last_run_at: float = 0.0
-    life_next_run_at: float = 0.0
+    last_decision_at: float = 0.0
+    next_decision_at: float = 0.0
+    decision_pending: bool = False
+    claim_token: str | None = None
+    claim_expires_at: float = 0.0
+    retry_at: float = 0.0
+    last_error: str | None = None
     activity_pattern: ActivityPattern = ActivityPattern()
 
     @classmethod
-    def from_dict(cls, payload: object) -> "PresenceState":
+    def from_dict(
+        cls,
+        payload: object,
+        *,
+        now: float | None = None,
+    ) -> "PresenceState":
+        current_time = time.time() if now is None else max(0.0, float(now))
         values = payload if isinstance(payload, dict) else {}
-        previous = PresenceActivity.from_dict(values.get("previous_activity"))
-        if previous is None:
-            raw_recent = (
-                values.get("recent_activities")
-                if isinstance(values.get("recent_activities"), (list, tuple))
-                else ()
-            )
-            migrated = tuple(
-                (
-                    activity,
-                    _timestamp(item.get("ends_at"), _timestamp(item.get("started_at"))),
-                    _timestamp(item.get("started_at")),
-                )
-                for item in raw_recent
-                if isinstance(item, dict)
-                and (activity := PresenceActivity.from_dict(item)) is not None
-            )
-            if migrated:
-                previous = max(
-                    migrated,
-                    key=lambda item: (item[1], item[2]),
-                )[0]
-        current = PresenceActivity.from_dict(values.get("current_activity"))
-        scheduled = PresenceActivity.from_dict(values.get("next_activity"))
-        next_run = _timestamp(values.get("life_next_run_at"))
-        if not next_run:
-            next_run = _next_lifecycle_at(current, scheduled)
-        pattern = ActivityPattern.from_dict(values.get("activity_pattern"))
-        if not pattern.previous_key and (current is not None or previous is not None):
-            latest = current if current is not None else previous
-            assert latest is not None
-            pattern = ActivityPattern(
-                previous_key=activity_key(latest.activity),
-                prior_key=activity_key(previous.activity) if current and previous else "",
-                repeat_count=1,
-            )
-        return cls(
-            current,
-            previous,
-            scheduled,
-            bool(values.get("life_pending")),
-            compact_text(values.get("life_reason"), 80),
-            _timestamp(values.get("life_claimed_at")),
-            _timestamp(values.get("life_last_run_at")),
-            next_run,
-            pattern,
+        current_activity = PresenceActivity.from_dict(
+            values.get("current_activity")
         )
+        previous = _newest_historical_activity(values)
+        next_decision_at = _timestamp(values.get("next_decision_at"))
+        if not next_decision_at:
+            next_decision_at = _timestamp(values.get("life_next_run_at"))
+        claim_token = _optional_text(values.get("claim_token"), 80)
+        claim_expires_at = _timestamp(values.get("claim_expires_at"))
+        if claim_token is None or claim_expires_at <= current_time:
+            claim_token = None
+            claim_expires_at = 0.0
+        state = cls(
+            current_activity=current_activity,
+            previous_activity=previous,
+            last_decision_at=_timestamp(
+                values.get("last_decision_at"),
+                _timestamp(values.get("life_last_run_at")),
+            ),
+            next_decision_at=next_decision_at,
+            decision_pending=bool(values.get("decision_pending", False)),
+            claim_token=claim_token,
+            claim_expires_at=claim_expires_at,
+            retry_at=_timestamp(values.get("retry_at")),
+            last_error=_optional_text(values.get("last_error"), 120),
+            activity_pattern=ActivityPattern.from_dict(
+                values.get("activity_pattern")
+            ),
+        )
+        return normalize_presence(
+            state,
+            now=current_time,
+            initialize_schedule=True,
+            repair_schedule=True,
+        )
+
     def as_dict(self) -> dict[str, object]:
         return {
-            "current_activity": self.current_activity.as_dict() if self.current_activity else None,
-            "previous_activity": self.previous_activity.as_dict() if self.previous_activity else None,
-            "next_activity": self.next_activity.as_dict() if self.next_activity else None,
-            "life_pending": self.life_pending,
-            "life_reason": self.life_reason,
-            "life_claimed_at": self.life_claimed_at,
-            "life_last_run_at": self.life_last_run_at,
-            "life_next_run_at": self.life_next_run_at,
+            "current_activity": (
+                self.current_activity.as_dict()
+                if self.current_activity is not None
+                else None
+            ),
+            "previous_activity": (
+                self.previous_activity.as_dict()
+                if self.previous_activity is not None
+                else None
+            ),
+            "last_decision_at": self.last_decision_at,
+            "next_decision_at": self.next_decision_at,
+            "decision_pending": self.decision_pending,
+            "claim_token": self.claim_token,
+            "claim_expires_at": self.claim_expires_at,
+            "retry_at": self.retry_at,
+            "last_error": self.last_error,
             "activity_pattern": self.activity_pattern.as_dict(),
         }
+
+
+def normalize_presence(
+    state: PresenceState,
+    *,
+    now: float,
+    initialize_schedule: bool,
+    repair_schedule: bool = False,
+) -> PresenceState:
+    """Validate lifecycle metadata without expiring the current activity."""
+
+    current = state.current_activity
+    previous = state.previous_activity
+    pending = state.decision_pending
+    next_at = state.next_decision_at
+    token = state.claim_token
+    claim_expires_at = state.claim_expires_at
+    last_error = state.last_error
+
+    if token is not None and claim_expires_at <= now:
+        token = None
+        claim_expires_at = 0.0
+        pending = True
+        last_error = "stale claim released"
+
+    schedule_invalid = next_at <= 0.0
+    if repair_schedule and not state.retry_at and not state.last_error:
+        lifecycle_seconds = next_at - state.last_decision_at
+        schedule_invalid = schedule_invalid or (
+            state.last_decision_at > 0.0
+            and (
+                lifecycle_seconds
+                < minutes_to_seconds(MIN_DECISION_MINUTES) - 1.0
+                or lifecycle_seconds
+                > minutes_to_seconds(MAX_DECISION_MINUTES) + 1.0
+            )
+        )
+        schedule_invalid = schedule_invalid or (
+            state.last_decision_at <= 0.0
+            and next_at > now + minutes_to_seconds(MAX_DECISION_MINUTES)
+        )
+        schedule_invalid = schedule_invalid or (
+            state.last_decision_at > 0.0 and current is None
+        )
+        schedule_invalid = schedule_invalid or (
+            current is not None
+            and abs(current.expected_end_at - next_at) > 1.0
+        )
+        schedule_invalid = schedule_invalid or (
+            current is not None
+            and not _meaningful_detail(current.detail, activity=current.activity)
+        )
+    if schedule_invalid and initialize_schedule:
+        next_at = now
+        pending = True
+        token = None
+        claim_expires_at = 0.0
+        last_error = None
+    if next_at > 0.0 and next_at <= now:
+        pending = True
+
+    pattern = state.activity_pattern
+    current_key = _record_key(current)
+    previous_key = _record_key(previous)
+    if (
+        pattern.current_key != current_key
+        or pattern.previous_key != previous_key
+    ):
+        pattern = ActivityPattern(
+            current_key=current_key,
+            previous_key=previous_key,
+            repeat_count=pattern.repeat_count or int(bool(current_key)),
+        )
+
+    return replace(
+        state,
+        current_activity=current,
+        previous_activity=previous,
+        next_decision_at=next_at,
+        decision_pending=pending,
+        claim_token=token,
+        claim_expires_at=claim_expires_at,
+        last_error=last_error,
+        activity_pattern=pattern,
+    )
 
 
 def activity_continuity(
     current: PresenceActivity | None,
     last_assistant_at: float | None,
 ) -> str:
-    """Classify an active activity against committed assistant history."""
-
     if current is None:
         return "none"
-    if last_assistant_at is None:
-        return "new"
-    if current.started_at > last_assistant_at:
+    if last_assistant_at is None or current.started_at > last_assistant_at:
         return "new"
     return "ongoing"
 
 
-def _next_lifecycle_at(
-    current: PresenceActivity | None,
-    scheduled: PresenceActivity | None,
-) -> float:
-    deadlines = []
-    if current is not None:
-        deadlines.append(current.ends_at)
-    if scheduled is not None:
-        deadlines.append(scheduled.started_at)
-    return min(deadlines, default=0.0)
-
-
-def request_life_decision(state: PresenceState, *, reason: str) -> PresenceState:
-    if state.life_pending:
-        return state
-    return replace(state, life_pending=True, life_reason=compact_text(reason, 80), life_claimed_at=0.0)
-
-
-def advance_presence(state: PresenceState, *, now: float) -> PresenceState:
-    current = state.current_activity
-    previous = state.previous_activity
-    scheduled = state.next_activity
-    reason = ""
-    if current is not None and current.ends_at <= now:
-        previous, current, reason = current, None, "activity_expired"
-    if scheduled is not None and scheduled.started_at <= now:
-        if current is not None:
-            replacement_end = max(current.started_at + 1.0, scheduled.started_at)
-            previous = replace(current, ends_at=replacement_end)
-        if scheduled.ends_at <= now:
-            previous, current, reason = scheduled, None, "scheduled_expired"
-        else:
-            current, reason = scheduled, "scheduled_due"
-        scheduled = None
-    advanced = replace(
-        state,
-        current_activity=current,
-        previous_activity=previous,
-        next_activity=scheduled,
-        life_next_run_at=_next_lifecycle_at(current, scheduled),
-    )
-    if reason:
-        if reason in {"activity_expired", "scheduled_expired"}:
-            return replace(
-                advanced,
-                life_pending=True,
-                life_reason=reason,
-                life_claimed_at=0.0,
-            )
-        return advanced
-    if advanced.current_activity is None and advanced.next_activity is None:
-        return request_life_decision(advanced, reason="no_activity")
-    return advanced
-
-
 @dataclass(frozen=True, slots=True)
 class LifeDecision:
-    decision: str
+    mode: str
     activity: str = ""
-    category: str = ""
+    category: str | None = None
     subject: str | None = None
     detail: str | None = None
-    duration_minutes: int = 45
-    start_after_minutes: int = 0
-    reason: str = ""
     interest_addition: str | None = None
+    continuation_reason: str | None = None
 
 
 def _unsupported_proper_nouns(value: str, grounded_context: str) -> bool:
     grounded = grounded_context.casefold()
-    words = re.finditer(r"\b[A-Z][A-Za-z0-9'-]*\b", value)
     return any(
         match.group(0) != "I"
-        and not (
-            match.start() == 0
-            and match.group(0).casefold().endswith(("ing", "ed"))
-        )
+        and match.start() != 0
         and match.group(0).casefold() not in grounded
-        for match in words
+        for match in re.finditer(r"\b[A-Z][A-Za-z0-9'-]*\b", value)
     )
 
 
@@ -305,206 +455,287 @@ def parse_life_decision(
     grounded_context: str = "",
 ) -> LifeDecision | None:
     text = str(output or "")
-    matches = re.findall(r"<AKANE_LIFE>\s*(.*?)\s*</AKANE_LIFE>", text, re.DOTALL)
+    matches = re.findall(
+        r"<AKANE_LIFE>\s*(.*?)\s*</AKANE_LIFE>",
+        text,
+        re.DOTALL,
+    )
     if len(matches) != 1:
         return None
     try:
         payload = json.loads(matches[0])
     except (TypeError, ValueError):
         return None
-    required = {"decision", "activity", "subject", "detail", "duration_minutes", "reason", "interest_addition"}
-    allowed = required | {"category", "start_after_minutes"}
-    if not isinstance(payload, dict) or not required <= set(payload) <= allowed:
+    required = {
+        "mode",
+        "activity",
+        "category",
+        "subject",
+        "detail",
+        "interest_addition",
+        "continuation_reason",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
         return None
-    decision = compact_text(payload.get("decision"), 32).casefold()
+
+    mode = compact_text(payload.get("mode"), 16).casefold()
     activity = _activity_text(payload.get("activity"))
-    category = compact_text(payload.get("category"), 48).casefold()
-    detail = compact_text(payload.get("detail"), _MAX_DETAIL_CHARS) if isinstance(payload.get("detail"), str) else None
-    subject = compact_text(payload.get("subject"), 160) if isinstance(payload.get("subject"), str) else None
-    reason = compact_text(payload.get("reason"), 160)
-    addition = compact_text(payload.get("interest_addition"), 100) if isinstance(payload.get("interest_addition"), str) else None
-    duration, delay = payload.get("duration_minutes"), payload.get("start_after_minutes", 0)
-    if decision not in _LIFE_DECISIONS or type(duration) is not int or type(delay) is not int or not reason:
+    category = _optional_text(payload.get("category"), 48)
+    subject = _optional_text(payload.get("subject"), 160)
+    detail = _optional_text(payload.get("detail"), _MAX_DETAIL_CHARS)
+    addition = _optional_text(payload.get("interest_addition"), 100)
+    continuation_reason = _optional_text(
+        payload.get("continuation_reason"),
+        _MAX_DETAIL_CHARS,
+    )
+    optional_values = (
+        ("category", category),
+        ("subject", subject),
+        ("detail", detail),
+        ("interest_addition", addition),
+        ("continuation_reason", continuation_reason),
+    )
+    if (
+        not isinstance(payload.get("mode"), str)
+        or mode not in _LIFE_MODES
+        or any(
+            payload[name] is not None and value is None
+            for name, value in optional_values
+        )
+        or (
+            mode == "new"
+            and (
+                not isinstance(payload.get("activity"), str)
+                or not activity
+                or not _meaningful_detail(detail, activity=activity)
+                or continuation_reason is not None
+            )
+        )
+        or (
+            mode == "continue"
+            and (
+                payload.get("activity") is not None
+                or category is not None
+                or subject is not None
+                or detail is not None
+                or addition is not None
+                or continuation_reason is None
+            )
+        )
+    ):
         return None
-    if decision in {"start_activity", "schedule_activity"} and not activity:
-        return None
-    if decision == "quiet_downtime":
-        activity, detail = "quiet downtime", detail
-    grounded_text = " ".join(value for value in (activity, subject or "", detail or "") if value)
+
+    grounded_text = " ".join(
+        value
+        for value in (activity, category or "", subject or "", detail or "")
+        if value
+    )
     if (
         _unsupported_proper_nouns(grounded_text, grounded_context)
         or (
             subject is not None
-            and subject.casefold() not in grounded_context.casefold()
+            and _unsupported_proper_nouns(
+                f"about {subject}",
+                grounded_context,
+            )
         )
     ):
         return None
+
     return LifeDecision(
-        decision,
-        activity,
-        category,
-        subject,
-        detail,
-        max(15, min(_MAX_DURATION_MINUTES, duration)),
-        max(0, min(_MAX_START_AFTER_MINUTES, delay)),
-        reason,
-        addition,
+        mode=mode,
+        activity=activity,
+        category=category,
+        subject=subject,
+        detail=detail,
+        interest_addition=addition,
+        continuation_reason=continuation_reason,
     )
 
 
-def life_decision_rejection(state: PresenceState, decision: LifeDecision) -> str:
-    advanced = advance_presence(state, now=max(state.life_claimed_at, state.life_last_run_at))
-    current = advanced.current_activity
-    if decision.decision == "continue_activity":
-        if current is None:
-            return "no current activity to continue"
-        if len(decision.reason.split()) < 3:
-            return "continuation reason is not meaningful"
+def life_decision_rejection(
+    state: PresenceState,
+    decision: LifeDecision,
+) -> str:
+    if decision.mode == "continue":
+        current = state.current_activity
+        if (
+            current is None
+            or not _meaningful_detail(current.detail, activity=current.activity)
+        ):
+            return "no valid current activity to continue"
+        reason_tokens = set(activity_key(decision.continuation_reason).split())
+        current_tokens = set(
+            activity_key(
+                f"{current.activity} {current.subject or ''} {current.detail or ''}"
+            ).split()
+        )
+        minimum_reason_tokens = (
+            min(8, 3 + state.activity_pattern.repeat_count)
+            if state.activity_pattern.repeat_count >= 2
+            else 2
+        )
+        if (
+            len(reason_tokens) < minimum_reason_tokens
+            or not reason_tokens - current_tokens
+        ):
+            return "continuation needs a stronger meaningful reason"
         return ""
-    if decision.decision in {"do_nothing"}:
-        return ""
-    if current is not None:
-        return "current activity is still active"
-    key = activity_key(decision.activity)
-    pattern = advanced.activity_pattern
-    if key and key == pattern.previous_key:
-        return "proposal repeats the immediately previous activity"
-    if key and key == pattern.prior_key and pattern.repeat_count >= 2:
-        return "proposal would complete a two-activity loop"
+
+    key = _activity_semantic_key(decision.activity, decision.subject)
+    pattern = state.activity_pattern
+    if _near_key(key, pattern.current_key):
+        return "proposal repeats the current activity without choosing continuation"
+    if _near_key(key, pattern.previous_key):
+        return "proposal repeats a recent activity pattern"
     return ""
 
 
-def _updated_pattern(pattern: ActivityPattern, activity: str) -> ActivityPattern:
-    key = activity_key(activity)
-    if not key:
-        return pattern
-    repeating = key == pattern.previous_key or (
-        bool(pattern.prior_key) and key == pattern.prior_key
-    )
+def _updated_pattern(
+    pattern: ActivityPattern,
+    *,
+    new_activity: PresenceActivity,
+    old_current: PresenceActivity | None,
+) -> ActivityPattern:
     return ActivityPattern(
-        previous_key=key,
-        prior_key=pattern.previous_key,
-        repeat_count=pattern.repeat_count + 1 if repeating else 1,
+        current_key=_record_key(new_activity),
+        previous_key=_record_key(old_current) or pattern.previous_key,
+        repeat_count=1,
     )
 
 
-def apply_life_decision(state: PresenceState, decision: LifeDecision, *, now: float) -> PresenceState:
-    advanced = advance_presence(state, now=now)
-    current = advanced.current_activity
-    previous = advanced.previous_activity
-    scheduled = advanced.next_activity
-    pattern = advanced.activity_pattern
-    if decision.decision in {"start_activity", "quiet_downtime"}:
-        if current is not None:
-            previous = current
-        current = PresenceActivity(decision.activity, decision.detail, now, now + decision.duration_minutes * 60, "autonomous_life", decision.category, decision.subject)
-        pattern = _updated_pattern(pattern, decision.activity)
-    elif decision.decision == "schedule_activity":
-        scheduled = PresenceActivity(decision.activity, decision.detail, now + decision.start_after_minutes * 60, now + (decision.start_after_minutes + decision.duration_minutes) * 60, "autonomous_life", decision.category, decision.subject)
-        pattern = _updated_pattern(pattern, decision.activity)
-    elif decision.decision == "continue_activity" and current is not None:
-        current = replace(current, ends_at=max(current.ends_at, now + decision.duration_minutes * 60))
+def apply_life_decision(
+    state: PresenceState,
+    decision: LifeDecision,
+    *,
+    now: float,
+) -> PresenceState:
+    current = state.current_activity
+    previous = state.previous_activity
+    pattern = state.activity_pattern
+    next_at = next_decision_time(now)
+
+    if decision.mode == "new":
+        old_current = current
+        previous = current if current is not None else previous
+        current = PresenceActivity(
+            activity=decision.activity,
+            category=decision.category,
+            subject=decision.subject,
+            detail=decision.detail,
+            started_at=now,
+            expected_end_at=next_at,
+        )
+        pattern = _updated_pattern(
+            pattern,
+            new_activity=current,
+            old_current=old_current,
+        )
+    elif decision.mode == "continue" and current is not None:
+        current = replace(
+            current,
+            expected_end_at=next_at,
+        )
+        pattern = ActivityPattern(
+            current_key=_record_key(current),
+            previous_key=pattern.previous_key,
+            repeat_count=pattern.repeat_count + 1,
+        )
+
     return replace(
-        advanced,
+        state,
         current_activity=current,
         previous_activity=previous,
-        next_activity=scheduled,
-        life_pending=False,
-        life_reason="",
-        life_claimed_at=0.0,
-        life_last_run_at=now,
-        life_next_run_at=_next_lifecycle_at(current, scheduled),
+        last_decision_at=now,
+        next_decision_at=next_at,
+        decision_pending=False,
+        claim_token=None,
+        claim_expires_at=0.0,
+        retry_at=0.0,
+        last_error=None,
         activity_pattern=pattern,
     )
 
 
-def apply_activity_updates(state: PresenceState, *, activity_update: dict[str, object] | None, next_activity: dict[str, object] | None, now: float) -> PresenceState:
-    advanced = advance_presence(state, now=now)
-    current, scheduled = advanced.current_activity, advanced.next_activity
-    pattern = advanced.activity_pattern
-    if activity_update is not None and current is None:
-        current = PresenceActivity(str(activity_update["activity"]), activity_update["detail"], now, now + int(activity_update["duration_minutes"]) * 60, "gemma")
-        pattern = _updated_pattern(pattern, current.activity)
-    if next_activity is not None:
-        scheduled = PresenceActivity(str(next_activity["activity"]), None, now + int(next_activity["start_after_minutes"]) * 60, now + (int(next_activity["start_after_minutes"]) + int(next_activity["duration_minutes"])) * 60, "gemma")
-        pattern = _updated_pattern(pattern, scheduled.activity)
-    return replace(
-        advanced,
-        current_activity=current,
-        next_activity=scheduled,
-        life_next_run_at=_next_lifecycle_at(current, scheduled),
-        activity_pattern=pattern,
+def validate_interest_addition(
+    addition: str | None,
+    *,
+    activity: str,
+    subject: str | None,
+    detail: str | None,
+    existing_interests: tuple[str, ...],
+    grounded_context: str,
+) -> str | None:
+    candidate = compact_text(addition, 100)
+    if not candidate:
+        return None
+    key = activity_key(candidate)
+    words = key.split()
+    if (
+        not 1 <= len(words) <= 5
+        or key == activity_key(activity)
+        or any(key == activity_key(item) for item in existing_interests)
+        or _unsupported_proper_nouns(
+            f"interest in {candidate}",
+            grounded_context,
+        )
+    ):
+        return None
+    connection = set(words) & set(
+        activity_key(f"{activity} {subject or ''} {detail or ''}").split()
     )
-
-
-def validate_activity_update(payload: object) -> dict[str, object] | None:
-    if not isinstance(payload, dict) or set(payload) != {"activity", "detail", "duration_minutes"}:
-        return None
-    activity, duration = _activity_text(payload.get("activity")), payload.get("duration_minutes")
-    detail = compact_text(payload.get("detail"), _MAX_DETAIL_CHARS) if isinstance(payload.get("detail"), str) else None
-    grounding_text = " ".join(value for value in (activity, detail or "") if value)
-    if (
-        not activity
-        or (payload.get("detail") is not None and not detail)
-        or type(duration) is not int
-        or _unsupported_proper_nouns(grounding_text, "")
-    ):
-        return None
-    return {"activity": activity, "detail": detail, "duration_minutes": max(15, min(_MAX_DURATION_MINUTES, duration))}
-
-
-def validate_next_activity(payload: object) -> dict[str, object] | None:
-    if not isinstance(payload, dict) or set(payload) != {"activity", "start_after_minutes", "duration_minutes"}:
-        return None
-    activity, delay, duration = _activity_text(payload.get("activity")), payload.get("start_after_minutes"), payload.get("duration_minutes")
-    if (
-        not activity
-        or type(delay) is not int
-        or type(duration) is not int
-        or _unsupported_proper_nouns(activity, "")
-    ):
-        return None
-    return {"activity": activity, "start_after_minutes": max(0, min(_MAX_START_AFTER_MINUTES, delay)), "duration_minutes": max(15, min(_MAX_DURATION_MINUTES, duration))}
+    return candidate if connection else None
 
 
 def format_presence_context(
     state: PresenceState,
     *,
-    interests: tuple[str, ...],
-    emotion: EmotionState,
-    timeframe: str,
     now: float,
     continuity: str = "none",
     local_time: str = "",
     daypart: str = "",
 ) -> str:
-    del interests, emotion, timeframe
-    if state.current_activity is None:
-        parts = ["Current activity: none.", "Activity continuity: none."]
+    activity = state.current_activity
+    if activity is None:
+        parts = [
+            "Current activity: none.",
+            "Activity status: none.",
+        ]
         if state.previous_activity is not None:
-            parts.append(f"Previous activity: {state.previous_activity.fact()}.")
-        if state.life_pending:
-            parts.append("An autonomous life decision is pending.")
+            parts.append(
+                f"Previous activity: {state.previous_activity.activity}."
+            )
     else:
-        activity = state.current_activity
+        status = (
+            "new since the previous conversation"
+            if continuity == "new"
+            else "ongoing"
+        )
         parts = [
             f"Current activity: {activity.activity}.",
-            f"Activity continuity: {continuity}.",
-            f"Activity category: {activity.category or 'unavailable'}.",
-            f"Activity title: {activity.title or 'unavailable'}.",
-            f"Activity detail: {activity.detail or 'none recorded'}.",
-            f"Started {max(0, int((now - activity.started_at) // 60))} minutes ago.",
+            f"Activity status: {status}.",
         ]
+        if activity.subject is not None:
+            parts.append(f"Recorded subject: {activity.subject}.")
+        if activity.category is not None:
+            parts.append(f"Recorded category: {activity.category}.")
+        if activity.detail is not None:
+            parts.append(f"Recorded detail: {activity.detail}.")
+        else:
+            parts.append("No additional activity detail is recorded.")
+        minutes = max(0, int((now - activity.started_at) // 60))
+        parts.append(f"Started about {minutes} minutes ago.")
     if local_time:
         parts.append(f"Current local time: {local_time}.")
     if daypart:
         parts.append(f"Current daypart: {daypart}.")
-    parts.extend(
-        (
-            "Use temporal wording consistent with the supplied activity continuity. "
-            "Do not describe a new activity as continuing from an earlier conversation.",
-            "Do not add activity details that are not recorded.",
-            "Do not repeat internal missing-value markers unless they are directly relevant.",
-        )
+    parts.append(
+        "Use only the supplied activity details. Do not invent missing titles, "
+        "subjects, sources, progress, surroundings, or content."
     )
+    if continuity == "new":
+        parts.append(
+            "Do not describe this new activity as still happening, continuing, "
+            "happening again, or as before."
+        )
     return "Presence facts:\n" + "\n".join(parts)

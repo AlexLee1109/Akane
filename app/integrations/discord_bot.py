@@ -16,7 +16,7 @@ from app.core.config import (
     DISCORD_SERVER_URL,
     SERVER_API_TOKEN,
 )
-from app.core.utils import compact_text
+from app.core.utils import canonical_profile_id, compact_text
 
 _CHAT_TIMEOUT_SECONDS = 300
 _UNPROMPTED_INTERVAL_SECONDS = 4 * 60 * 60  # 14,400 seconds
@@ -47,7 +47,7 @@ def _is_dm(message) -> bool:
 
 
 def _profile_id(message) -> str:
-    return f"discord:user:{int(message.author.id)}"
+    return canonical_profile_id(f"discord:user:{int(message.author.id)}")
 
 
 def _conversation_id(message) -> str:

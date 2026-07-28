@@ -27,11 +27,12 @@
   --avatar-offset-y: 450px;
   --avatar-scale: 1;
 
-  --bubble-left: 10px;
+  --bubble-left: 20px;
   --bubble-right: 0px;
   --bubble-bottom: 330px;
+  --bubble-width: 289px;
   --bubble-max-width: 500px;
-  --bubble-text-width: 292px;
+  --bubble-text-width: 340px;
 
   --composer-left: 40px;
   --composer-right: 0px;
@@ -86,7 +87,7 @@ body[data-popup-role="companion"] .shell {
   width: var(--shell-width);
   height: 100vh;
   overflow: visible;
-  pointer-events: auto;
+  pointer-events: none;
 }
 
 /* Avatar */
@@ -118,7 +119,12 @@ body[data-popup-role="companion"] .character-wrap {
   z-index: 2;
 }
 
-body[data-popup-role="companion"] .character-art {
+.avatar-hitbox {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  transform: translate(var(--avatar-offset-x), var(--avatar-offset-y)) scale(var(--avatar-scale));
+  transform-origin: right bottom;
   pointer-events: auto;
 }
 
@@ -138,25 +144,31 @@ body[data-popup-role="companion"] .character-art {
 
 body[data-popup-role="companion"] .bubble-stage {
   left: var(--bubble-left);
-  right: var(--bubble-right);
+  right: auto;
   bottom: var(--bubble-bottom);
   top: auto;
+  width: var(--bubble-width);
   align-items: flex-end;
 }
 
 .speech-bubble {
   position: relative;
+  width: 100%;
   max-width: var(--bubble-max-width);
   height: auto;
-  padding: 22px 40px 42px 28px;
-  background: url("../../../images/Text%20Bubble.png") center / 100% 100% no-repeat;
+  aspect-ratio: 967 / 318;
+  flex: 0 0 auto;
+  padding: 22px 20px 42px 22px;
+  background: url("../../../images/Text%20Bubble.png") center / contain no-repeat;
   border: none;
   border-radius: 0;
   pointer-events: auto;
 }
 
 .speech-bubble[hidden] {
-  display: none !important;
+  display: block !important;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .speech-bubble-decoration {
@@ -170,45 +182,20 @@ body[data-popup-role="companion"] .bubble-stage {
   user-select: none;
 }
 
-.speech-bubble-header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  max-width: 330px;
-  height: auto;
-  margin-bottom: 8px;
-  padding-right: clamp(56px, 20%, 98px);
-  overflow: visible;
-}
-
-.speech-bubble-header-main {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-}
-
-.speech-icon {
-  color: var(--color-blue);
-  font-size: 0.95rem;
-}
-
-.speech-name {
-  color: var(--color-blue);
-  font-size: 0.97rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-
 .speech-bubble-body {
+  position: relative;
+  left: -6px;
+  top: 2px;
+  width: 100%;
   max-width: var(--bubble-text-width);
-  max-height: none;
-  height: auto;
-  padding-bottom: 12px;
-  overflow: visible;
+  height: 3lh;
+  max-height: 3lh;
+  padding-bottom: 0;
+  overflow: hidden;
   color: var(--color-text);
   font-family: var(--font-bubble);
-  font-size: 1rem;
-  line-height: 1.62;
+  font-size: 0.85rem;
+  line-height: 1.4;
 }
 
 /* Composer/input */
@@ -308,7 +295,7 @@ body[data-popup-role="companion"] .avatar-action-dock {
   transform: none;
 }
 
-body[data-popup-role="companion"] .character-art:hover ~ .avatar-action-dock,
+body[data-popup-role="companion"] .avatar-hitbox:hover ~ .avatar-action-dock,
 body[data-popup-role="companion"] .avatar-action-dock:hover {
   opacity: 1;
   pointer-events: auto;

@@ -32,13 +32,16 @@ from app.core.config import (
 )
 from app.core.persistence import atomic_write_json, read_json
 from app.core.presence import (
+    CLAIM_SECONDS,
+    RETRY_SECONDS,
+    LifeDecision,
     PresenceActivity,
     PresenceState,
-    advance_presence,
-    apply_activity_updates,
     apply_life_decision,
     life_decision_rejection,
-    LifeDecision,
+    next_decision_time,
+    normalize_presence,
+    validate_interest_addition,
 )
 from app.core.signal import (
     AffectTrace,
@@ -56,16 +59,14 @@ from app.core.signal import (
     semantic_event_from_text,
     topic_overlap,
 )
-from app.core.utils import compact_text
+from app.core.utils import (
+    OWNER_PROFILE_ID,
+    canonical_profile_id,
+    compact_text,
+)
 
 MEMORY_SCHEMA_VERSION = 2
-LONG_TERM_MEMORY_SCHEMA_VERSION = 9
-_LIFE_PENDING_NOTIFIER: Callable[[str], None] | None = None
-
-
-def set_life_pending_notifier(callback: Callable[[str], None] | None) -> None:
-    global _LIFE_PENDING_NOTIFIER
-    _LIFE_PENDING_NOTIFIER = callback
+LONG_TERM_MEMORY_SCHEMA_VERSION = 10
 _MEMORY_PROMPT_INTRO = "A few past details may matter in this conversation:"
 _MEMORY_PROMPT_OUTRO = (
     "Use them only when they genuinely improve the reply, and do not overstate uncertain details."
@@ -367,9 +368,10 @@ class ConversationRecord:
         if not isinstance(payload, dict):
             return None
         conversation_id = compact_text(payload.get("conversation_id") or key, 120)
-        profile_id = compact_text(payload.get("profile_id"), 120)
-        if not conversation_id or not profile_id:
+        raw_profile_id = compact_text(payload.get("profile_id"), 120)
+        if not conversation_id or not raw_profile_id:
             return None
+        profile_id = canonical_profile_id(raw_profile_id)
 
         def turns(name: str) -> list[ChatTurn]:
             raw = payload.get(name)
@@ -723,9 +725,6 @@ class InternalTurnResult:
     signal: TurnSignal
     recalled_memories: tuple[Memory, ...]
     affect_trace: AffectTrace | None = None
-    presence_advanced: bool = False
-    presence_activated: bool = False
-    presence_expired: bool = False
     working_context: WorkingMemory = WorkingMemory()
     grounded_activity_source: str = "none"
     grounded_activity_age_seconds: float = 0.0
@@ -1160,7 +1159,7 @@ class MemoryStore:
         query: str = "",
         include_memory: bool = True,
     ) -> MemoryContext:
-        profile = _key(profile_id, "local:owner")
+        profile = canonical_profile_id(profile_id)
         conversation_key = _key(conversation_id, "popup:default")
         with self._lock:
             record = self._conversations.get(conversation_key)
@@ -1202,7 +1201,7 @@ class MemoryStore:
         signal: TurnSignal,
         request_id: str = "",
     ) -> None:
-        profile = _key(profile_id, "local:owner")
+        profile = canonical_profile_id(profile_id)
         conversation_key = _key(conversation_id, "popup:default")
         now = time.time()
         normalized_request_id = compact_text(request_id, 160)
@@ -1292,7 +1291,7 @@ class MemoryStore:
     ) -> None:
         """Preserve a model-chosen silence without manufacturing dialogue."""
 
-        profile = _key(profile_id, "local:owner")
+        profile = canonical_profile_id(profile_id)
         conversation_key = _key(conversation_id, "popup:default")
         now = time.time()
         normalized_request_id = compact_text(request_id, 160)
@@ -1352,7 +1351,7 @@ class MemoryStore:
     ) -> InitiativeOpportunity | None:
         """Return one persisted opportunity only when the conversation is idle."""
 
-        profile = _key(profile_id, "local:owner")
+        profile = canonical_profile_id(profile_id)
         conversation_key = _key(conversation_id, "popup:default")
         current = max(0.0, float(now))
         with self._lock:
@@ -1417,7 +1416,7 @@ class MemoryStore:
     ) -> None:
         """Record an offered initiative without inventing a user turn."""
 
-        profile = _key(profile_id, "local:owner")
+        profile = canonical_profile_id(profile_id)
         conversation_key = _key(conversation_id, "popup:default")
         current = time.time() if now is None else max(0.0, float(now))
         with self._lock:
@@ -1458,14 +1457,14 @@ class MemoryStore:
     ) -> list[dict[str, str]]:
         with self._lock:
             record = self._conversations.get(_key(conversation_id, "popup:default"))
-            if record and profile_id and record.profile_id != _key(profile_id, "local:owner"):
+            if record and profile_id and record.profile_id != canonical_profile_id(profile_id):
                 return []
             return [turn.as_message() for turn in record.recent_turns] if record else []
 
     def last_assistant_turn_at(self, profile_id: str) -> float | None:
         """Return the newest persisted, completed assistant turn for a profile."""
 
-        profile = _key(profile_id, "local:owner")
+        profile = canonical_profile_id(profile_id)
         with self._lock:
             timestamps = [
                 turn.timestamp
@@ -1489,7 +1488,7 @@ class MemoryStore:
             return None
         with self._lock:
             record = self._conversations.get(_key(conversation_id, "popup:default"))
-            if record is None or record.profile_id != _key(profile_id, "local:owner"):
+            if record is None or record.profile_id != canonical_profile_id(profile_id):
                 return None
             if request not in record.committed_request_ids:
                 return None
@@ -1509,14 +1508,14 @@ class MemoryStore:
     ) -> dict[str, object]:
         with self._lock:
             record = self._conversations.get(_key(conversation_id, "popup:default"))
-            if record and profile_id and record.profile_id != _key(profile_id, "local:owner"):
+            if record and profile_id and record.profile_id != canonical_profile_id(profile_id):
                 return {}
             return record.public_state() if record else {}
 
     def recent_profile_topic(self, profile_id: str) -> str:
         """Return the newest persisted conversation topic for one profile."""
 
-        profile = _key(profile_id, "local:owner")
+        profile = canonical_profile_id(profile_id)
         with self._lock:
             candidates = (
                 record
@@ -1534,7 +1533,7 @@ class MemoryStore:
         with self._lock:
             key = _key(conversation_id, "popup:default")
             record = self._conversations.get(key)
-            if record and profile_id and record.profile_id != _key(profile_id, "local:owner"):
+            if record and profile_id and record.profile_id != canonical_profile_id(profile_id):
                 return False
             if record is None:
                 return False
@@ -1543,7 +1542,7 @@ class MemoryStore:
             return True
 
     def clear_profile(self, profile_id: str) -> None:
-        profile = _key(profile_id, "local:owner")
+        profile = canonical_profile_id(profile_id)
         with self._lock:
             conversations = {
                 key: value
@@ -1595,12 +1594,23 @@ class MemoryStore:
             conversations = payload.get("conversations")
             if not isinstance(conversations, dict):
                 raise ValueError("invalid memory document")
-            self._conversations = {
-                record.conversation_id: record
-                for key, value in conversations.items()
-                if (record := ConversationRecord.from_dict(str(key), value)) is not None
-            }
+            loaded: dict[str, ConversationRecord] = {}
+            migrated = False
+            for key, value in conversations.items():
+                record = ConversationRecord.from_dict(str(key), value)
+                if record is None:
+                    continue
+                raw_profile = (
+                    compact_text(value.get("profile_id"), 120)
+                    if isinstance(value, dict)
+                    else ""
+                )
+                migrated = migrated or record.profile_id != raw_profile
+                loaded[record.conversation_id] = record
+            self._conversations = loaded
             self._prune(time.time())
+            if migrated:
+                self._persist()
         except FileNotFoundError:
             return
         except (OSError, ValueError, TypeError) as exc:
@@ -1757,18 +1767,7 @@ def process_internal_turn(
         now=current,
         profile_seed=profile_seed,
     )
-    presence = advance_presence(previous.presence, now=current)
-    presence_activated = bool(
-        previous.presence.next_activity is not None
-        and previous.presence.next_activity.started_at <= current
-    )
-    presence_expired = bool(
-        previous.presence.current_activity is not None
-        and previous.presence.current_activity.ends_at <= current
-    ) or bool(
-        previous.presence.next_activity is not None
-        and previous.presence.next_activity.ends_at <= current
-    )
+    presence = previous.presence
     event_emotion = mood_evolution.state
     event_effects: dict[str, float] = {}
     latest_activity = presence.current_activity or presence.previous_activity
@@ -2070,9 +2069,6 @@ def process_internal_turn(
             evolution=mood_evolution,
             event_delta=tuple(event_effects.items()),
         ),
-        presence_advanced=presence != previous.presence,
-        presence_activated=presence_activated,
-        presence_expired=presence_expired,
         working_context=next_working,
         grounded_activity_source="presence" if latest_activity else "none",
         grounded_activity_age_seconds=(
@@ -2091,7 +2087,7 @@ def process_internal_turn(
 
 
 class LongTermMemoryStore:
-    """Own the coordinated emotion, working context, and durable profile memory."""
+    """Own durable profile state, including the authoritative presence lifecycle."""
 
     def __init__(
         self,
@@ -2103,10 +2099,11 @@ class LongTermMemoryStore:
         self._retrieval = retrieval or MemoryRetrievalConfig()
         self._lock = threading.RLock()
         self._states: dict[str, InternalState] = {}
+        self._presence_wake: Callable[[str], None] | None = None
         self._load()
 
     def internal_state(self, profile_id: str = "local:owner") -> InternalState:
-        key = _key(profile_id, "local:owner")
+        key = canonical_profile_id(profile_id)
         with self._lock:
             state = self._states.get(key)
             return copy.deepcopy(state) if state is not None else new_internal_state(0.0)
@@ -2115,22 +2112,33 @@ class LongTermMemoryStore:
         """Return the persisted profile record, without manufacturing a default."""
 
         with self._lock:
-            return copy.deepcopy(self._states.get(_key(profile_id, "local:owner")))
+            return copy.deepcopy(self._states.get(canonical_profile_id(profile_id)))
 
-    def refresh_presence(
+    def set_presence_wake(
+        self,
+        callback: Callable[[str], None] | None,
+    ) -> None:
+        with self._lock:
+            self._presence_wake = callback
+
+    def prepare_presence(
         self,
         profile_id: str,
         *,
         now: float,
     ) -> InternalState:
-        """Advance and persist presence before any consumer builds context."""
+        """Load, validate, and flag due presence without running inference."""
 
-        key = _key(profile_id, "local:owner")
+        key = canonical_profile_id(profile_id)
         current = max(0.0, float(now))
         with self._lock:
             previous = self._states.get(key)
             state = previous or new_internal_state(current)
-            presence = advance_presence(state.presence, now=current)
+            presence = normalize_presence(
+                state.presence,
+                now=current,
+                initialize_schedule=True,
+            )
             refreshed = (
                 replace(
                     state,
@@ -2159,21 +2167,9 @@ class LongTermMemoryStore:
         recent_turns: tuple[ChatTurn, ...] = (),
         activity_scope: str = "profile",
     ) -> InternalTurnResult:
-        key = _key(profile_id, "local:owner")
+        key = canonical_profile_id(profile_id)
         current = time.time() if now is None else max(0.0, float(now))
-        with self._lock:
-            previous = self._states.get(key)
-            state = previous or new_internal_state(current)
-            presence_before = state.presence
-            presence_after = advance_presence(presence_before, now=current)
-            initialized = replace(
-                state,
-                presence=presence_after,
-                updated_at=max(state.updated_at, current),
-            )
-            if initialized != previous:
-                self._save_state(key, initialized, previous)
-            state = initialized
+        state = self.prepare_presence(key, now=current)
         result = process_internal_turn(
             user_text,
             state,
@@ -2189,31 +2185,7 @@ class LongTermMemoryStore:
             activity_scope=activity_scope,
             profile_seed=profile_id,
         )
-        return replace(
-            result,
-            presence_advanced=(
-                result.presence_advanced or presence_after != presence_before
-            ),
-            presence_activated=(
-                result.presence_activated
-                or bool(
-                    presence_before.next_activity is not None
-                    and presence_before.next_activity.started_at <= current
-                    and presence_after.current_activity is not None
-                )
-            ),
-            presence_expired=(
-                result.presence_expired
-                or bool(
-                    presence_before.current_activity is not None
-                    and presence_before.current_activity.ends_at <= current
-                )
-                or bool(
-                    presence_before.next_activity is not None
-                    and presence_before.next_activity.ends_at <= current
-                )
-            ),
-        )
+        return result
 
     def commit_turn(
         self,
@@ -2224,12 +2196,10 @@ class LongTermMemoryStore:
         preference_updates: tuple[dict[str, object], ...] = (),
         interest_additions: tuple[str, ...] = (),
         relationship_updates: tuple[dict[str, object], ...] = (),
-        activity_update: dict[str, object] | None = None,
-        next_activity: dict[str, object] | None = None,
         emotion_update: dict[str, object] | None = None,
         now: float | None = None,
     ) -> InternalState | None:
-        key = _key(profile_id, "local:owner")
+        key = canonical_profile_id(profile_id)
         current = result.state.updated_at if now is None else max(
             result.state.updated_at,
             0.0,
@@ -2237,6 +2207,7 @@ class LongTermMemoryStore:
         )
         with self._lock:
             previous = self._states.get(key)
+            latest = previous or new_internal_state(current)
             wanted = set(used_memory_ids)
             memories = list(result.state.memories)
             if wanted:
@@ -2257,19 +2228,24 @@ class LongTermMemoryStore:
                     emotion_update,
                     now=current,
                 ),
-                presence=apply_activity_updates(
-                    result.state.presence,
-                    activity_update=activity_update,
-                    next_activity=next_activity,
-                    now=current,
-                ),
+                presence=latest.presence,
                 memories=tuple(memories),
                 interests=_merge_interests(
+                    latest.interests,
                     result.state.interests,
+                ),
+                preferences=result.state.preferences,
+                relationship=result.state.relationship,
+                updated_at=current,
+            )
+            next_state = replace(
+                next_state,
+                interests=_merge_interests(
+                    next_state.interests,
                     interest_additions,
                 ),
                 preferences=_merge_akane_preferences(
-                    result.state.preferences,
+                    next_state.preferences,
                     preference_updates,
                     updated_at=current,
                 ),
@@ -2283,91 +2259,26 @@ class LongTermMemoryStore:
             self._save_state(key, next_state, previous)
             return previous
 
-    def claim_life_opportunity(
-        self,
-        profile_id: str,
-        *,
-        now: float,
-        cooldown_seconds: float = 15 * 60,
-    ) -> InternalState | None:
-        """Atomically claim one due autonomous-life decision for a profile."""
-
-        key = _key(profile_id, "local:owner")
-        current = max(0.0, float(now))
-        with self._lock:
-            previous = self._states.get(key)
-            state = previous or new_internal_state(current)
-            presence = advance_presence(state.presence, now=current)
-            if not presence.life_pending:
-                return None
-            if presence.life_claimed_at and current - presence.life_claimed_at < 5 * 60:
-                return None
-            if presence.life_last_run_at and current - presence.life_last_run_at < cooldown_seconds:
-                return None
-            next_state = replace(
-                state,
-                presence=replace(presence, life_claimed_at=current),
-                updated_at=max(state.updated_at, current),
-            )
-            self._save_state(key, next_state, previous)
-            return copy.deepcopy(next_state)
-
-    def release_life_opportunity(
-        self,
-        profile_id: str,
-        *,
-        now: float,
-        failure_reason: str = "",
-    ) -> None:
-        key = _key(profile_id, "local:owner")
-        with self._lock:
-            previous = self._states.get(key)
-            if previous is None or not previous.presence.life_pending:
-                return
-            reason = (
-                f"failed:{compact_text(failure_reason, 32)}"
-                if failure_reason
-                else previous.presence.life_reason
-            )
-            self._save_state(
-                key,
-                replace(
-                    previous,
-                    presence=replace(
-                        previous.presence,
-                        life_claimed_at=0.0,
-                        life_reason=reason,
-                    ),
-                    updated_at=max(previous.updated_at, now),
-                ),
-                previous,
-            )
-
-    def pending_life_profiles(
+    def presence_schedule(
         self,
         *,
         now: float,
-        claim_timeout_seconds: float = 5 * 60,
-    ) -> tuple[str, ...]:
-        """Recover stale claims and return all pending profiles."""
+    ) -> tuple[tuple[str, ...], float | None]:
+        """Return due profiles and the next persisted wake timestamp."""
 
         current = max(0.0, float(now))
         with self._lock:
             previous_states = self._states
             next_states = previous_states.copy()
             changed = False
-            pending: list[str] = []
+            due: list[str] = []
+            wake_at: list[float] = []
             for key, state in previous_states.items():
-                presence = advance_presence(state.presence, now=current)
-                if (
-                    presence.life_claimed_at
-                    and current - presence.life_claimed_at >= claim_timeout_seconds
-                ):
-                    presence = replace(
-                        presence,
-                        life_claimed_at=0.0,
-                        life_reason="failed:stale_claim",
-                    )
+                presence = normalize_presence(
+                    state.presence,
+                    now=current,
+                    initialize_schedule=True,
+                )
                 if presence != state.presence:
                     next_states[key] = replace(
                         state,
@@ -2375,8 +2286,17 @@ class LongTermMemoryStore:
                         updated_at=max(state.updated_at, current),
                     )
                     changed = True
-                if presence.life_pending:
-                    pending.append(key)
+                if presence.claim_token is not None:
+                    wake_at.append(presence.claim_expires_at)
+                elif presence.retry_at > current:
+                    wake_at.append(presence.retry_at)
+                elif (
+                    presence.decision_pending
+                    or presence.next_decision_at <= current
+                ):
+                    due.append(key)
+                else:
+                    wake_at.append(presence.next_decision_at)
             if changed:
                 self._states = next_states
                 try:
@@ -2384,60 +2304,159 @@ class LongTermMemoryStore:
                 except Exception:
                     self._states = previous_states
                     raise
-            return tuple(pending)
+            return tuple(due), min(wake_at, default=None)
 
-    def commit_life_decision(
+    def claim_presence_decision(
+        self,
+        profile_id: str,
+        *,
+        now: float,
+    ) -> InternalState | None:
+        """Atomically claim one due autonomous-life decision."""
+
+        key = canonical_profile_id(profile_id)
+        current = max(0.0, float(now))
+        with self._lock:
+            previous = self._states.get(key)
+            if previous is None:
+                return None
+            presence = normalize_presence(
+                previous.presence,
+                now=current,
+                initialize_schedule=True,
+            )
+            if presence.claim_token is not None:
+                return None
+            if presence.retry_at > current:
+                return None
+            if (
+                not presence.decision_pending
+                and presence.next_decision_at > current
+            ):
+                return None
+            token = uuid.uuid4().hex
+            next_state = replace(
+                previous,
+                presence=replace(
+                    presence,
+                    decision_pending=True,
+                    claim_token=token,
+                    claim_expires_at=current + CLAIM_SECONDS,
+                ),
+                updated_at=max(previous.updated_at, current),
+            )
+            self._save_state(key, next_state, previous)
+            return copy.deepcopy(next_state)
+
+    def fail_presence_decision(
+        self,
+        profile_id: str,
+        *,
+        claim_token: str,
+        now: float,
+        error: str,
+        retryable: bool = True,
+    ) -> bool:
+        key = canonical_profile_id(profile_id)
+        current = max(0.0, float(now))
+        with self._lock:
+            previous = self._states.get(key)
+            if (
+                previous is None
+                or previous.presence.claim_token != claim_token
+            ):
+                return False
+            second_attempt = previous.presence.retry_at > 0.0
+            retry_at = (
+                current + RETRY_SECONDS
+                if retryable and not second_attempt
+                else 0.0
+            )
+            next_at = (
+                previous.presence.next_decision_at
+                if retry_at
+                else next_decision_time(current)
+            )
+            current_activity = previous.presence.current_activity
+            if current_activity is not None and not retry_at:
+                current_activity = replace(
+                    current_activity,
+                    expected_end_at=next_at,
+                )
+            self._save_state(
+                key,
+                replace(
+                    previous,
+                    presence=replace(
+                        previous.presence,
+                        current_activity=current_activity,
+                        decision_pending=bool(retry_at),
+                        claim_token=None,
+                        claim_expires_at=0.0,
+                        retry_at=retry_at,
+                        next_decision_at=next_at,
+                        last_error=compact_text(error, 120) or "life decision failed",
+                    ),
+                    updated_at=max(previous.updated_at, current),
+                ),
+                previous,
+            )
+            return True
+
+    def commit_presence_decision(
         self,
         profile_id: str,
         decision: LifeDecision,
         *,
+        claim_token: str,
         now: float,
+        grounded_context: str,
     ) -> tuple[bool, str]:
-        key = _key(profile_id, "local:owner")
+        key = canonical_profile_id(profile_id)
+        current = max(0.0, float(now))
         with self._lock:
             previous = self._states.get(key)
-            if previous is None:
-                return False, "profile is unavailable"
-            refreshed_presence = advance_presence(previous.presence, now=now)
-            rejection = life_decision_rejection(refreshed_presence, decision)
+            if (
+                previous is None
+                or previous.presence.claim_token != claim_token
+            ):
+                return False, "life claim is unavailable"
+            rejection = life_decision_rejection(previous.presence, decision)
             if rejection:
-                rejected = replace(
-                    refreshed_presence,
-                    life_pending=True,
-                    life_reason=f"rejected:{compact_text(rejection, 64)}",
-                    life_claimed_at=0.0,
-                )
-                self._save_state(
-                    key,
-                    replace(
-                        previous,
-                        presence=rejected,
-                        updated_at=max(previous.updated_at, now),
-                    ),
-                    previous,
+                self.fail_presence_decision(
+                    profile_id,
+                    claim_token=claim_token,
+                    now=current,
+                    error=rejection,
                 )
                 return False, rejection
+            interest = (
+                validate_interest_addition(
+                    decision.interest_addition,
+                    activity=decision.activity,
+                    subject=decision.subject,
+                    detail=decision.detail,
+                    existing_interests=previous.interests,
+                    grounded_context=grounded_context,
+                )
+                if decision.mode == "new"
+                else None
+            )
             next_state = replace(
                 previous,
-                presence=apply_life_decision(refreshed_presence, decision, now=now),
-                interests=_merge_interests(previous.interests, (decision.interest_addition,) if decision.interest_addition else ()),
-                updated_at=max(previous.updated_at, now),
+                presence=apply_life_decision(
+                    previous.presence,
+                    decision,
+                    now=current,
+                ),
+                interests=_merge_interests(
+                    previous.interests,
+                    (interest,) if interest else (),
+                ),
+                updated_at=max(previous.updated_at, current),
             )
             self._save_state(key, next_state, previous)
             return True, ""
-
-    def next_life_wake_at(self) -> float:
-        """Return the nearest persisted activity lifecycle deadline."""
-
-        with self._lock:
-            return min(
-                (
-                    state.presence.life_next_run_at
-                    for state in self._states.values()
-                    if state.presence.life_next_run_at > 0.0
-                ),
-                default=0.0,
-            )
 
     def retrieve(
         self,
@@ -2449,7 +2468,7 @@ class LongTermMemoryStore:
     ) -> tuple[Memory, ...]:
         current = time.time() if now is None else float(now)
         with self._lock:
-            state = self._states.get(_key(profile_id, "local:owner"))
+            state = self._states.get(canonical_profile_id(profile_id))
             if state is None:
                 return ()
             return _retrieve_memories(
@@ -2512,7 +2531,7 @@ class LongTermMemoryStore:
         )
         if not candidate.content or candidate.category not in _MEMORY_CATEGORIES:
             return None
-        key = _key(profile_id, "local:owner")
+        key = canonical_profile_id(profile_id)
         with self._lock:
             previous = self._states.get(key)
             state = copy.deepcopy(previous) if previous else new_internal_state(created_at)
@@ -2537,26 +2556,37 @@ class LongTermMemoryStore:
             return copy.deepcopy(memory)
 
     def restore_internal_state(self, profile_id: str, state: InternalState | None) -> None:
-        key = _key(profile_id, "local:owner")
+        key = canonical_profile_id(profile_id)
         with self._lock:
+            current = self._states.get(key)
+            if current is not None:
+                state = replace(
+                    copy.deepcopy(state)
+                    if state is not None
+                    else new_internal_state(current.updated_at),
+                    presence=current.presence,
+                )
             if state is None:
                 self._states.pop(key, None)
             else:
-                self._states[key] = copy.deepcopy(state)
+                self._states[key] = state
             self._persist()
 
     def clear(self, profile_id: str = "local:owner") -> None:
         with self._lock:
-            key = _key(profile_id, "local:owner")
+            key = canonical_profile_id(profile_id)
             if key not in self._states:
                 return
             self._states.pop(key)
             self._persist()
+            notifier = self._presence_wake
+            if notifier is not None:
+                notifier(key)
 
     def public_profile(self, profile_id: str = "local:owner") -> dict[str, object]:
         now = time.time()
         with self._lock:
-            state = self._states.get(_key(profile_id, "local:owner"))
+            state = self._states.get(canonical_profile_id(profile_id))
             active = [
                 copy.deepcopy(memory)
                 for memory in (state.memories if state else ())
@@ -2596,25 +2626,8 @@ class LongTermMemoryStore:
         }
 
     def public_internal_state(self, profile_id: str = "local:owner") -> dict[str, object]:
-        key = _key(profile_id, "local:owner")
-        with self._lock:
-            previous = self._states.get(key)
-            current = time.time()
-            state = previous or new_internal_state(current)
-            presence = advance_presence(state.presence, now=current)
-            refreshed = (
-                replace(
-                    state,
-                    presence=presence,
-                    updated_at=max(state.updated_at, current),
-                )
-                if presence != state.presence
-                else state
-            )
-            if refreshed != previous:
-                self._save_state(key, refreshed, previous)
-            state = refreshed
-            return self.public_state_snapshot(state)
+        state = self.prepare_presence(profile_id, now=time.time())
+        return self.public_state_snapshot(state)
 
     @staticmethod
     def public_state_snapshot(state: InternalState) -> dict[str, object]:
@@ -2687,6 +2700,8 @@ class LongTermMemoryStore:
         state: InternalState,
         previous: InternalState | None,
     ) -> None:
+        if state == previous:
+            return
         self._states[key] = state
         try:
             self._persist()
@@ -2696,14 +2711,18 @@ class LongTermMemoryStore:
             else:
                 self._states[key] = previous
             raise
-        notifier = _LIFE_PENDING_NOTIFIER
-        deadline_changed = (
-            previous is None
-            or state.presence.life_next_run_at != previous.presence.life_next_run_at
+        notifier = self._presence_wake
+        previous_presence = previous.presence if previous is not None else None
+        schedule_changed = previous_presence is None or any(
+            getattr(state.presence, field) != getattr(previous_presence, field)
+            for field in (
+                "next_decision_at",
+                "decision_pending",
+                "retry_at",
+                "claim_expires_at",
+            )
         )
-        if notifier is not None and (
-            state.presence.life_pending or deadline_changed
-        ):
+        if notifier is not None and schedule_changed:
             notifier(key)
 
     def _load(self) -> None:
@@ -2724,24 +2743,37 @@ class LongTermMemoryStore:
                 if migrated:
                     current = max(memory.created_at for memory in migrated)
                     self._states = {
-                        "local:owner": replace(
+                        OWNER_PROFILE_ID: replace(
                             new_internal_state(current),
                             memories=tuple(migrated),
                         )
                     }
                 self._initialize_loaded_presence()
                 return
-            if schema not in {2, 3, 4, 5, 6, 7, 8, LONG_TERM_MEMORY_SCHEMA_VERSION}:
+            if schema not in {
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                LONG_TERM_MEMORY_SCHEMA_VERSION,
+            }:
                 raise ValueError("unsupported schema")
             profiles = payload.get("profiles")
             if not isinstance(profiles, dict):
                 raise ValueError("invalid profiles")
             self._states = {}
             migrate_presence = False
+            load_time = time.time()
             for key, raw_profile in profiles.items():
-                profile = _key(key, "")
-                if not profile:
+                raw_profile_id = _key(key, "")
+                if not raw_profile_id:
                     continue
+                profile = canonical_profile_id(raw_profile_id)
+                migrate_presence = migrate_presence or profile != raw_profile_id
                 if schema == 2 and isinstance(raw_profile, list):
                     loaded = _normalize_loaded_memories(
                         [
@@ -2752,23 +2784,65 @@ class LongTermMemoryStore:
                     )
                     if loaded:
                         current = max(memory.created_at for memory in loaded)
-                        self._states[profile] = replace(
+                        candidate = replace(
                             new_internal_state(current),
                             memories=loaded,
                         )
-                elif schema in {3, 4, 5, 6, 7, 8, LONG_TERM_MEMORY_SCHEMA_VERSION}:
+                        existing = self._states.get(profile)
+                        if (
+                            existing is None
+                            or _state_completeness(candidate)
+                            > _state_completeness(existing)
+                        ):
+                            self._states[profile] = candidate
+                elif schema in {
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    LONG_TERM_MEMORY_SCHEMA_VERSION,
+                }:
                     raw_presence = (
                         raw_profile.get("presence")
                         if isinstance(raw_profile, dict)
                         else None
                     )
+                    canonical_presence_keys = {
+                        "current_activity",
+                        "previous_activity",
+                        "last_decision_at",
+                        "next_decision_at",
+                        "decision_pending",
+                        "claim_token",
+                        "claim_expires_at",
+                        "retry_at",
+                        "last_error",
+                        "activity_pattern",
+                    }
                     migrate_presence = migrate_presence or (
                         isinstance(raw_presence, dict)
-                        and "recent_activities" in raw_presence
+                        and set(raw_presence) != canonical_presence_keys
                     )
-                    state = _internal_state_from_dict(raw_profile)
+                    state = _internal_state_from_dict(
+                        raw_profile,
+                        now=load_time,
+                    )
                     if state is not None:
-                        self._states[profile] = state
+                        migrate_presence = (
+                            migrate_presence
+                            or not isinstance(raw_presence, dict)
+                            or state.presence.as_dict() != raw_presence
+                        )
+                        existing = self._states.get(profile)
+                        if (
+                            existing is None
+                            or _state_completeness(state)
+                            > _state_completeness(existing)
+                        ):
+                            self._states[profile] = state
             self._initialize_loaded_presence(
                 force_persist=(
                     migrate_presence or schema != LONG_TERM_MEMORY_SCHEMA_VERSION
@@ -2784,18 +2858,22 @@ class LongTermMemoryStore:
             self._states = {}
 
     def _initialize_loaded_presence(self, *, force_persist: bool = False) -> None:
-        """Persist lifecycle advancement and presence-schema migration on restart."""
+        """Validate and migrate presence once during startup."""
 
         current = time.time()
         changed = False
         for key, state in tuple(self._states.items()):
-            initialized = replace(
-                state,
-                presence=advance_presence(state.presence, now=current),
-                updated_at=max(state.updated_at, current),
+            presence = normalize_presence(
+                state.presence,
+                now=current,
+                initialize_schedule=True,
             )
-            if initialized != state:
-                self._states[key] = initialized
+            if presence != state.presence:
+                self._states[key] = replace(
+                    state,
+                    presence=presence,
+                    updated_at=max(state.updated_at, current),
+                )
                 changed = True
         if changed or force_persist:
             self._persist()
@@ -3423,7 +3501,47 @@ def _internal_state_to_dict(state: InternalState) -> dict[str, object]:
     }
 
 
-def _internal_state_from_dict(payload: object) -> InternalState | None:
+def _state_completeness(state: InternalState) -> tuple[int, int, float]:
+    presence = state.presence
+    relationship_count = sum(
+        len(values)
+        for values in (
+            state.relationship.patterns,
+            state.relationship.shared_context,
+            state.relationship.unresolved_events,
+        )
+    )
+    domain_counts = (
+        int(
+            presence.current_activity is not None
+            and bool(presence.current_activity.detail)
+        ),
+        int(presence.previous_activity is not None),
+        int(bool(state.memories)),
+        int(bool(state.interests)),
+        int(bool(state.preferences)),
+        int(relationship_count > 0),
+        int(
+            state.emotion.primary != "neutral"
+            or state.emotion.intensity > 0.0
+            or bool(state.emotion.cause)
+        ),
+    )
+    content_count = (
+        len(state.memories)
+        + len(state.interests)
+        + len(state.preferences)
+        + relationship_count
+        + sum(domain_counts[:2])
+    )
+    return sum(domain_counts), content_count, state.updated_at
+
+
+def _internal_state_from_dict(
+    payload: object,
+    *,
+    now: float,
+) -> InternalState | None:
     if not isinstance(payload, dict):
         return None
     updated_at = max(0.0, _number(payload.get("updated_at"), 0.0))
@@ -3458,7 +3576,7 @@ def _internal_state_from_dict(payload: object) -> InternalState | None:
     interests = _normalize_interests(payload.get("interests"), default_when_missing=True)
     preferences = _normalize_akane_preferences(payload.get("preferences"))
     relationship = _relationship_state_from_dict(payload.get("relationship"))
-    presence = PresenceState.from_dict(payload.get("presence"))
+    presence = PresenceState.from_dict(payload.get("presence"), now=now)
     return InternalState(
         emotion=emotion,
         presence=presence,

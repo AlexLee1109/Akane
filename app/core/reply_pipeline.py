@@ -337,8 +337,6 @@ def commit_reply(
     preference_updates: tuple[dict[str, object], ...] = (),
     interest_additions: tuple[str, ...] = (),
     relationship_updates: tuple[dict[str, object], ...] = (),
-    activity_update: dict[str, object] | None = None,
-    next_activity: dict[str, object] | None = None,
     emotion_update: dict[str, object] | None = None,
 ) -> None:
     """Commit a completed deterministic or generated reply and record diagnostics."""
@@ -370,8 +368,6 @@ def commit_reply(
         preference_updates=preference_updates,
         interest_additions=interest_additions,
         relationship_updates=relationship_updates,
-        activity_update=activity_update,
-        next_activity=next_activity,
         emotion_update=emotion_update,
     )
     _remember_metrics(
@@ -450,8 +446,6 @@ def _reply_events(prepared: TurnPreparation, *, emit_deltas: bool):
                 preference_updates=state.preference_updates,
                 interest_additions=state.interest_additions,
                 relationship_updates=state.relationship_updates,
-                activity_update=state.activity_update,
-                next_activity=state.next_activity,
                 emotion_update=state.emotion_update,
             )
         else:
@@ -460,8 +454,6 @@ def _reply_events(prepared: TurnPreparation, *, emit_deltas: bool):
                 preference_updates=state.preference_updates,
                 interest_additions=state.interest_additions,
                 relationship_updates=state.relationship_updates,
-                activity_update=state.activity_update,
-                next_activity=state.next_activity,
                 emotion_update=state.emotion_update,
             )
         persistence_seconds = time.perf_counter() - persistence_started_at
@@ -575,10 +567,8 @@ def debug_state_report(
     loaded_emotion = akane.get("emotion") or {}
     with _METRICS_LOCK:
         metrics = dict(_METRICS.get(conversation, {}))
-    presence_debug = metrics.get("presence_debug") or {}
     current_activity = presence.get("current_activity") or {}
     previous_activity = presence.get("previous_activity") or {}
-    next_activity = presence.get("next_activity") or {}
     runtime = ModelManager.get_instance().runtime_report(include_model_hash=verbose)
     prompt = metrics.get("prompt_debug") or {}
     trimmed = prompt.get("trimmed") or ()
@@ -631,30 +621,18 @@ def debug_state_report(
         f"  Configured Timezone: {metrics.get('configured_timezone') or 'None'}",
         f"  Current Local Time: {metrics.get('current_local_time') or 'None'}",
         f"  Current Daypart: {metrics.get('current_daypart') or 'None'}",
-        f"  Current Activity Ends At: {current_activity.get('ends_at') or 'None'}",
+        "  Current Activity Expected End At: "
+        f"{current_activity.get('expected_end_at') or 'None'}",
         f"  Previous Activity: {previous_activity.get('activity') or 'None'}",
-        f"  Next Activity: {next_activity.get('activity') or 'None'}",
-        f"  Life Pending: {_debug_bool(presence.get('life_pending'))}",
-        f"  Life Reason: {presence.get('life_reason') or 'None'}",
-        f"  Life Next Run At: {presence.get('life_next_run_at') or 'None'}",
-        "  Activity Expired This Turn: "
-        f"{_debug_bool(presence_debug.get('activity_expired_this_turn'))}",
-        "  Activity Activated This Turn: "
-        f"{_debug_bool(presence_debug.get('activity_activated_this_turn'))}",
-        f"  Autonomous Proposal: {life_worker.get('Autonomous Proposal') or 'None'}",
-        f"  Proposal Rejected: {_debug_bool(life_worker.get('Proposal Rejected'))}",
-        f"  Rejection Reason: {life_worker.get('Rejection Reason') or 'None'}",
+        f"  Decision Pending: {_debug_bool(presence.get('decision_pending'))}",
+        f"  Last Decision At: {presence.get('last_decision_at') or 'None'}",
+        f"  Next Decision At: {presence.get('next_decision_at') or 'None'}",
+        f"  Retry At: {presence.get('retry_at') or 'None'}",
+        f"  Last Error: {presence.get('last_error') or 'None'}",
         f"  Activity Pattern: {presence.get('activity_pattern') or {}}",
         f"  Life Worker Started: {_debug_bool(life_worker.get('Life Worker Started'))}",
         f"  Pending Profiles: {', '.join(life_worker.get('Pending Profiles') or ()) or 'None'}",
-        f"  Life Job Claimed: {life_worker.get('Life Job Claimed') or 'None'}",
-        f"  Claim Age: {float(life_worker.get('Claim Age') or 0.0):.1f}",
-        f"  Life Inference Started: {_debug_bool(life_worker.get('Life Inference Started'))}",
-        f"  Life Block Parsed: {_debug_bool(life_worker.get('Life Block Parsed'))}",
-        f"  Life Activity Persisted: {_debug_bool(life_worker.get('Life Activity Persisted'))}",
-        f"  Life Job Completed: {life_worker.get('Life Job Completed') or 'None'}",
-        f"  Life Job Failed: {life_worker.get('Life Job Failed') or 'None'}",
-        f"  Next Retry At: {life_worker.get('Next Retry At') or 'None'}",
+        f"  Active Profile: {life_worker.get('Active Profile') or 'None'}",
         "",
         "Conversation",
         f"  Complete Pairs: {int(metrics.get('complete_pairs') or 0)}",
@@ -676,7 +654,6 @@ def _remember_metrics(
     committed: bool,
     timing: InferenceTiming | None = None,
     validation: ResponseValidation | None = None,
-    presence_debug: dict[str, object] | None = None,
 ) -> None:
     del validation
     signal = prepared.internal_turn.signal
@@ -723,7 +700,6 @@ def _remember_metrics(
                 else prepared.prompt_plan.rendered_prompt_tokens
             ),
             "updated_at": time.time(),
-            "presence_debug": dict(presence_debug or {}),
         }
         if len(_METRICS) > _MAX_METRICS:
             oldest = min(_METRICS, key=lambda key: float(_METRICS[key].get("updated_at") or 0.0))

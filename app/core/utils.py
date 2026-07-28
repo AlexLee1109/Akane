@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 
 WORD_RE = re.compile(r"[a-z0-9_+#./-]+", re.IGNORECASE)
+OWNER_PROFILE_ID = "local:owner"
+LEGACY_OWNER_PROFILE_ID = "discord:user:299271213967081483"
 
 
 def clamp(
@@ -27,6 +29,11 @@ def compact_text(value: object, limit: int = 180) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:") or text[:limit]
+
+
+def canonical_profile_id(value: object) -> str:
+    profile = compact_text(value, 120) or OWNER_PROFILE_ID
+    return OWNER_PROFILE_ID if profile == LEGACY_OWNER_PROFILE_ID else profile
 
 
 def words(value: object) -> set[str]:

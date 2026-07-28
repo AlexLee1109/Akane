@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,8 +15,10 @@ from app.core.config import POPUP_BACKEND_URL, popup_backend_is_local
 
 try:
     import AppKit
+    from PyObjCTools import AppHelper
 except ImportError:  # pragma: no cover - macOS-only popup behavior
     AppKit = None
+    AppHelper = None
 
 AVATAR_RIGHT_MARGIN = -145
 AVATAR_BOTTOM_MARGIN = -50
@@ -25,6 +28,7 @@ DEFAULT_SESSION_ID = "popup"
 COMPANION_WIDTH = 460
 COMPANION_HEIGHT = 560
 WINDOW_TITLE = "Akane"
+MOUSE_UPDATE_INTERVAL = 1 / 60
 _TIMING_ENABLED = str(os.environ.get("AKANE_TIMING", "")).strip().lower() in {
     "1",
     "true",
@@ -89,6 +93,13 @@ class WindowApi:
     def toggle_composer(self) -> None:
         self.app.toggle_composer()
 
+    def update_interactive_regions(
+        self,
+        regions: list[dict],
+        passthrough_regions: list[dict],
+    ) -> None:
+        self.app.update_interactive_regions(regions, passthrough_regions)
+
 
 class PopupApp:
     def __init__(self):
@@ -99,6 +110,16 @@ class PopupApp:
         self.windows: dict[str, object] = {}
         self._shutting_down = False
         self._composer_visible = False
+        self._stream_lock = threading.Lock()
+        self._stream_thread: threading.Thread | None = None
+        self._region_lock = threading.Lock()
+        self._interactive_regions: tuple[Frame, ...] = ()
+        self._passthrough_regions: tuple[Frame, ...] = ()
+        self._local_mouse_monitor = None
+        self._global_mouse_monitor = None
+        self._mouse_update_pending = False
+        self._last_mouse_update_at = 0.0
+        self._mouse_capture = False
         self._ensure_server()
 
     def _emit_stream_event(self, payload: dict) -> None:
@@ -149,6 +170,10 @@ class PopupApp:
                 lines=line_count,
             )
             self._emit_stream_event({"type": "error", "error": str(exc)})
+        finally:
+            with self._stream_lock:
+                if self._stream_thread is threading.current_thread():
+                    self._stream_thread = None
 
     def _emit_stream_line(self, line: str | bytes) -> dict | None:
         if isinstance(line, bytes):
@@ -199,13 +224,155 @@ class PopupApp:
             raise RuntimeError(f"Could not reach remote backend at {self.backend_url}: {exc.reason}") from exc
 
     def send_message_stream(self, message: str) -> None:
-        thread = threading.Thread(
-            target=self._run_message_stream,
-            args=(message,),
-            daemon=True,
-            name="AkanePopupStream",
+        with self._stream_lock:
+            if self._stream_thread is not None and self._stream_thread.is_alive():
+                raise RuntimeError("A reply is already in progress.")
+            thread = threading.Thread(
+                target=self._run_message_stream,
+                args=(message,),
+                daemon=True,
+                name="AkanePopupStream",
+            )
+            self._stream_thread = thread
+            thread.start()
+
+    @staticmethod
+    def _parse_regions(regions: list[dict]) -> tuple[Frame, ...]:
+        parsed = []
+        for region in regions or ():
+            try:
+                values = tuple(
+                    float(region[key]) for key in ("x", "y", "width", "height")
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not all(math.isfinite(value) for value in values):
+                continue
+            x, y, width, height = values
+            if width > 0 and height > 0:
+                parsed.append(Frame(x, y, width, height))
+        return tuple(parsed)
+
+    def update_interactive_regions(
+        self,
+        regions: list[dict],
+        passthrough_regions: list[dict],
+    ) -> None:
+        with self._region_lock:
+            self._interactive_regions = self._parse_regions(regions)
+            self._passthrough_regions = self._parse_regions(passthrough_regions)
+        self._schedule_mouse_passthrough_update()
+
+    def _schedule_mouse_passthrough_update(self, _event=None) -> None:
+        if AppHelper is None:
+            return
+        with self._region_lock:
+            if self._mouse_update_pending:
+                return
+            self._mouse_update_pending = True
+            delay = max(
+                0.0,
+                MOUSE_UPDATE_INTERVAL
+                - (time.monotonic() - self._last_mouse_update_at),
+            )
+        if delay:
+            AppHelper.callLater(delay, self._run_scheduled_mouse_update)
+        else:
+            AppHelper.callAfter(self._run_scheduled_mouse_update)
+
+    def _run_scheduled_mouse_update(self) -> None:
+        with self._region_lock:
+            self._mouse_update_pending = False
+            self._last_mouse_update_at = time.monotonic()
+        self._update_mouse_passthrough()
+
+    def _handle_local_mouse_event(self, event):
+        self._schedule_mouse_passthrough_update()
+        return event
+
+    def _update_mouse_passthrough(self) -> None:
+        if AppKit is None:
+            return
+        window = self.windows.get("companion")
+        native = getattr(window, "native", None)
+        if native is None:
+            return
+        try:
+            point = AppKit.NSEvent.mouseLocation()
+            frame = native.frame()
+            dom_x = float(point.x - frame.origin.x)
+            dom_y = float(frame.origin.y + frame.size.height - point.y)
+            with self._region_lock:
+                passthrough = any(
+                    region.x <= dom_x <= region.x + region.width
+                    and region.y <= dom_y <= region.y + region.height
+                    for region in self._passthrough_regions
+                )
+                interactive = not passthrough and any(
+                    region.x <= dom_x <= region.x + region.width
+                    and region.y <= dom_y <= region.y + region.height
+                    for region in self._interactive_regions
+                )
+            pressed = bool(AppKit.NSEvent.pressedMouseButtons())
+            if pressed and self._mouse_capture:
+                interactive = True
+            elif pressed and interactive and not native.ignoresMouseEvents():
+                self._mouse_capture = True
+            elif not pressed:
+                self._mouse_capture = False
+            ignores_mouse = not interactive
+            if bool(native.ignoresMouseEvents()) != ignores_mouse:
+                native.setIgnoresMouseEvents_(ignores_mouse)
+        except Exception:
+            return
+
+    def _configure_mouse_passthrough(self) -> None:
+        if AppHelper is None:
+            return
+        AppHelper.callAfter(self._configure_mouse_passthrough_on_main)
+
+    def _configure_mouse_passthrough_on_main(self) -> None:
+        if AppKit is None or self._local_mouse_monitor is not None:
+            return
+        window = self.windows.get("companion")
+        native = getattr(window, "native", None)
+        if native is None:
+            return
+        native.setIgnoresMouseEvents_(True)
+        event_mask = (
+            AppKit.NSEventMaskMouseMoved
+            | AppKit.NSEventMaskLeftMouseDragged
+            | AppKit.NSEventMaskRightMouseDragged
+            | AppKit.NSEventMaskOtherMouseDragged
+            | AppKit.NSEventMaskLeftMouseDown
+            | AppKit.NSEventMaskRightMouseDown
+            | AppKit.NSEventMaskOtherMouseDown
+            | AppKit.NSEventMaskLeftMouseUp
+            | AppKit.NSEventMaskRightMouseUp
+            | AppKit.NSEventMaskOtherMouseUp
         )
-        thread.start()
+        self._local_mouse_monitor = (
+            AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                event_mask,
+                self._handle_local_mouse_event,
+            )
+        )
+        self._global_mouse_monitor = (
+            AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                event_mask,
+                self._schedule_mouse_passthrough_update,
+            )
+        )
+        self._update_mouse_passthrough()
+
+    def _remove_mouse_monitors_on_main(self) -> None:
+        if AppKit is None:
+            return
+        for attribute in ("_local_mouse_monitor", "_global_mouse_monitor"):
+            monitor = getattr(self, attribute, None)
+            if monitor is not None:
+                AppKit.NSEvent.removeMonitor_(monitor)
+                setattr(self, attribute, None)
 
     @staticmethod
     def _window_call(window, method: str, *args) -> None:
@@ -323,6 +490,7 @@ class PopupApp:
 
     def _on_start(self) -> None:
         self._position_windows()
+        self._configure_mouse_passthrough()
 
     def _on_window_closed(self) -> None:
         if self._shutting_down:
@@ -345,6 +513,10 @@ class PopupApp:
         if self._shutting_down:
             return
         self._shutting_down = True
+        if AppKit is not None and AppKit.NSThread.isMainThread():
+            self._remove_mouse_monitors_on_main()
+        elif AppHelper is not None:
+            AppHelper.callAfter(self._remove_mouse_monitors_on_main)
         for window in list(self.windows.values()):
             try:
                 window.destroy()

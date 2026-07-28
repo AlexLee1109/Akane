@@ -24,12 +24,8 @@ from app.core.config import (
 )
 from app.core.presence import (
     activity_continuity,
-    apply_activity_updates,
-    advance_presence,
     format_presence_context,
     parse_life_decision,
-    validate_activity_update,
-    validate_next_activity,
 )
 from app.core.memory import (
     InternalTurnResult,
@@ -55,7 +51,11 @@ from app.core.prompt import (
     build_prompt_plan,
 )
 from app.core.signal import TurnSignal, VALID_EMOTION_LABELS, topic_overlap
-from app.core.utils import compact_text
+from app.core.utils import (
+    OWNER_PROFILE_ID,
+    canonical_profile_id,
+    compact_text,
+)
 from app.integrations.vscode_context import CodeContext, code_context_for_message
 
 _TIMING_ENABLED = str(os.environ.get("AKANE_TIMING", "")).strip().lower() in {
@@ -68,8 +68,7 @@ _COMMIT_LOCK = threading.RLock()
 _PAUSE_LOCK = threading.RLock()
 _PAUSED_UNTIL: dict[tuple[str, str], float] = {}
 _COMPANION_DEBUG: dict[tuple[str, str], dict[str, object]] = {}
-_LIFE_LOCK = threading.RLock()
-_LIFE_ACTIVE: set[str] = set()
+_LIFE_INFERENCE_LOCK = threading.Lock()
 _DECISION_BLOCK = re.compile(
     r"<AKANE_DECISION>\s*(.*?)\s*</AKANE_DECISION>",
     re.DOTALL,
@@ -78,6 +77,9 @@ _STATE_BLOCK = re.compile(
     r"<AKANE_STATE>\s*(.*?)\s*</AKANE_STATE>",
     re.DOTALL,
 )
+_DECISION_OPEN = "<AKANE_DECISION>"
+_DECISION_CLOSE = "</AKANE_DECISION>"
+_STATE_OPEN = "<AKANE_STATE>"
 _PREFERENCE_STANCES = {
     "likes",
     "dislikes",
@@ -145,10 +147,80 @@ class _ParsedAkaneState:
     preference_updates: tuple[dict[str, object], ...] = ()
     interest_additions: tuple[str, ...] = ()
     relationship_updates: tuple[dict[str, object], ...] = ()
-    activity_update: dict[str, object] | None = None
-    next_activity: dict[str, object] | None = None
     emotion_update: dict[str, object] | None = None
     parsed: bool = False
+
+
+class _VisibleReplyStream:
+    """Release model chunks while withholding internal metadata markers."""
+
+    def __init__(self) -> None:
+        self._leading = ""
+        self._pending = ""
+        self._visible = False
+        self._finished = False
+
+    def feed(self, chunk: object) -> str:
+        text = str(chunk or "")
+        if not text or self._finished:
+            return ""
+        if not self._visible:
+            self._leading += text
+            stripped = self._leading.lstrip()
+            if _DECISION_OPEN.startswith(stripped):
+                return ""
+            if stripped.startswith(_DECISION_OPEN):
+                if _DECISION_CLOSE not in stripped:
+                    return ""
+                decision, remainder = stripped.split(_DECISION_CLOSE, 1)
+                try:
+                    metadata = json.loads(decision[len(_DECISION_OPEN):])
+                except (TypeError, ValueError):
+                    metadata = {}
+                if metadata.get("should_respond") is not True:
+                    self._finished = True
+                    return ""
+                self._visible = True
+                self._leading = ""
+                text = remainder
+                if not text:
+                    return ""
+            else:
+                self._visible = True
+                text = self._leading
+                self._leading = ""
+
+        combined = self._pending + text
+        marker_at = combined.find(_STATE_OPEN)
+        if marker_at >= 0:
+            self._finished = True
+            self._pending = ""
+            return combined[:marker_at]
+
+        held = 0
+        limit = min(len(combined), len(_STATE_OPEN) - 1)
+        for size in range(1, limit + 1):
+            if combined.endswith(_STATE_OPEN[:size]):
+                held = size
+        if not held:
+            self._pending = ""
+            return combined
+        self._pending = combined[-held:]
+        return combined[:-held]
+
+    def finish(self) -> str:
+        if self._finished:
+            return ""
+        if not self._visible:
+            stripped = self._leading.lstrip()
+            if stripped.startswith(_DECISION_OPEN):
+                return ""
+            self._visible = True
+            self._pending = self._leading
+            self._leading = ""
+        pending = self._pending
+        self._pending = ""
+        return pending
 
 
 def parse_companion_decision(output: object) -> _ParsedCompanionOutput:
@@ -229,7 +301,7 @@ def parse_akane_state(output: object) -> _ParsedAkaneState:
         return _ParsedAkaneState(visible)
     permitted_keys = {
         "preference_updates", "interest_additions", "relationship_updates",
-        "activity_update", "next_activity", "emotion_update",
+        "emotion_update",
     }
     if (
         not isinstance(metadata, dict)
@@ -246,16 +318,6 @@ def parse_akane_state(output: object) -> _ParsedAkaneState:
         or not isinstance(relationship_updates, list)
     ):
         return _ParsedAkaneState(visible)
-    activity_update = None
-    if "activity_update" in metadata:
-        activity_update = validate_activity_update(metadata["activity_update"])
-        if activity_update is None:
-            return _ParsedAkaneState(visible)
-    next_activity = None
-    if "next_activity" in metadata:
-        next_activity = validate_next_activity(metadata["next_activity"])
-        if next_activity is None:
-            return _ParsedAkaneState(visible)
     emotion_update = None
     if "emotion_update" in metadata:
         candidate = metadata["emotion_update"]
@@ -357,8 +419,6 @@ def parse_akane_state(output: object) -> _ParsedAkaneState:
         tuple(validated_updates),
         tuple(validated_additions),
         tuple(validated_relationship_updates),
-        activity_update,
-        next_activity,
         emotion_update,
         parsed=True,
     )
@@ -994,6 +1054,10 @@ class InternalStateCoordinator:
         *,
         skip_memory: bool = False,
     ) -> CoordinatedTurnContext:
+        self._state_store.prepare_presence(
+            chat.profile_id,
+            now=chat.timestamp,
+        )
         last_assistant_at = self._conversation_store.last_assistant_turn_at(
             chat.profile_id
         )
@@ -1107,11 +1171,6 @@ class InternalStateCoordinator:
             user_text=chat.text,
             familiar_relationship=familiar_relationship,
         )
-        presence_planning_available = (
-            state_delta.state.presence.current_activity is None
-            and state_delta.state.presence.next_activity is None
-        )
-
         behavioral_summary = "\n".join(
             value
             for value in (
@@ -1127,14 +1186,6 @@ class InternalStateCoordinator:
                     "Akane chose silence on the previous turn. This is factual "
                     "continuity, not spoken dialogue or a response instruction."
                     if conversation_working.last_outcome == "akane_silence"
-                    else ""
-                ),
-                (
-                    "Akane currently has no active or scheduled activity. She may choose "
-                    "a grounded activity or quiet downtime based on her interests and "
-                    "preferences. Record an activity choice through activity metadata only "
-                    "when she genuinely wants one."
-                    if presence_planning_available
                     else ""
                 ),
                 (
@@ -1191,9 +1242,6 @@ class InternalStateCoordinator:
             life_context=(
                 format_presence_context(
                     state_delta.state.presence,
-                    interests=state_delta.state.interests,
-                    emotion=state_delta.state.emotion,
-                    timeframe=signal.activity_timeframe,
                     now=chat.timestamp,
                     continuity=continuity,
                     local_time=current_local_time,
@@ -1238,8 +1286,6 @@ class InternalStateCoordinator:
         preference_updates: tuple[dict[str, object], ...] = (),
         interest_additions: tuple[str, ...] = (),
         relationship_updates: tuple[dict[str, object], ...] = (),
-        activity_update: dict[str, object] | None = None,
-        next_activity: dict[str, object] | None = None,
         emotion_update: dict[str, object] | None = None,
     ) -> None:
         previous_state = self._state_store.commit_turn(
@@ -1249,8 +1295,6 @@ class InternalStateCoordinator:
             preference_updates=preference_updates,
             interest_additions=interest_additions,
             relationship_updates=relationship_updates,
-            activity_update=activity_update,
-            next_activity=next_activity,
             emotion_update=emotion_update,
             now=chat.timestamp,
         )
@@ -1278,8 +1322,6 @@ class InternalStateCoordinator:
         preference_updates: tuple[dict[str, object], ...] = (),
         interest_additions: tuple[str, ...] = (),
         relationship_updates: tuple[dict[str, object], ...] = (),
-        activity_update: dict[str, object] | None = None,
-        next_activity: dict[str, object] | None = None,
         emotion_update: dict[str, object] | None = None,
     ) -> None:
         """Commit model-chosen state without creating a fictional chat turn."""
@@ -1291,8 +1333,6 @@ class InternalStateCoordinator:
             preference_updates=preference_updates,
             interest_additions=interest_additions,
             relationship_updates=relationship_updates,
-            activity_update=activity_update,
-            next_activity=next_activity,
             emotion_update=emotion_update,
             now=chat.timestamp,
         )
@@ -1319,8 +1359,6 @@ class InternalStateCoordinator:
         preference_updates: tuple[dict[str, object], ...] = (),
         interest_additions: tuple[str, ...] = (),
         relationship_updates: tuple[dict[str, object], ...] = (),
-        activity_update: dict[str, object] | None = None,
-        next_activity: dict[str, object] | None = None,
         emotion_update: dict[str, object] | None = None,
     ) -> None:
         opportunity = chat.initiative_opportunity
@@ -1333,8 +1371,6 @@ class InternalStateCoordinator:
             preference_updates=preference_updates,
             interest_additions=interest_additions,
             relationship_updates=relationship_updates,
-            activity_update=activity_update,
-            next_activity=next_activity,
             emotion_update=emotion_update,
             now=chat.timestamp,
         )
@@ -1386,7 +1422,7 @@ class TurnPreparation:
 def normalize_chat_input(
     *,
     text: object,
-    profile_id: object = "local:owner",
+    profile_id: object = OWNER_PROFILE_ID,
     conversation_id: object = "popup:default",
     source: object = "popup",
     timestamp: object = 0.0,
@@ -1408,7 +1444,7 @@ def normalize_chat_input(
     if normalized_source not in {"popup", "discord", "web"}:
         normalized_source = "web"
     return ChatInput(
-        profile_id=compact_text(profile_id, 120) or "local:owner",
+        profile_id=canonical_profile_id(profile_id),
         conversation_id=compact_text(conversation_id, 120) or "popup:default",
         text=message,
         source=normalized_source,
@@ -1521,8 +1557,6 @@ def commit_turn(
     preference_updates: tuple[dict[str, object], ...] = (),
     interest_additions: tuple[str, ...] = (),
     relationship_updates: tuple[dict[str, object], ...] = (),
-    activity_update: dict[str, object] | None = None,
-    next_activity: dict[str, object] | None = None,
     emotion_update: dict[str, object] | None = None,
 ) -> None:
     prepared.handle.raise_if_cancelled()
@@ -1535,8 +1569,6 @@ def commit_turn(
             preference_updates=preference_updates,
             interest_additions=interest_additions,
             relationship_updates=relationship_updates,
-            activity_update=activity_update,
-            next_activity=next_activity,
             emotion_update=emotion_update,
         )
 
@@ -1547,8 +1579,6 @@ def commit_silent_turn(
     preference_updates: tuple[dict[str, object], ...] = (),
     interest_additions: tuple[str, ...] = (),
     relationship_updates: tuple[dict[str, object], ...] = (),
-    activity_update: dict[str, object] | None = None,
-    next_activity: dict[str, object] | None = None,
     emotion_update: dict[str, object] | None = None,
 ) -> None:
     prepared.handle.raise_if_cancelled()
@@ -1560,8 +1590,6 @@ def commit_silent_turn(
             preference_updates=preference_updates,
             interest_additions=interest_additions,
             relationship_updates=relationship_updates,
-            activity_update=activity_update,
-            next_activity=next_activity,
             emotion_update=emotion_update,
         )
 
@@ -1574,8 +1602,6 @@ def commit_initiative_turn(
     preference_updates: tuple[dict[str, object], ...] = (),
     interest_additions: tuple[str, ...] = (),
     relationship_updates: tuple[dict[str, object], ...] = (),
-    activity_update: dict[str, object] | None = None,
-    next_activity: dict[str, object] | None = None,
     emotion_update: dict[str, object] | None = None,
 ) -> None:
     prepared.handle.raise_if_cancelled()
@@ -1589,8 +1615,6 @@ def commit_initiative_turn(
             preference_updates=preference_updates,
             interest_additions=interest_additions,
             relationship_updates=relationship_updates,
-            activity_update=activity_update,
-            next_activity=next_activity,
             emotion_update=emotion_update,
         )
 
@@ -1659,75 +1683,6 @@ def _record_companion_debug(
         }
 
 
-def _presence_debug(
-    prepared: TurnPreparation,
-    raw_reply: str,
-    state: _ParsedAkaneState,
-) -> dict[str, object]:
-    """Expose compact, factual presence diagnostics for a completed turn."""
-
-    turn_context = getattr(prepared, "turn_context", None)
-    turn = getattr(turn_context, "state_delta", None)
-    before = getattr(getattr(turn, "state", None), "presence", None)
-    if before is None:
-        return {
-            "state_block_found": _STATE_BLOCK.search(raw_reply) is not None,
-            "presence_persisted": True,
-        }
-    state_match = _STATE_BLOCK.search(raw_reply)
-    proposed_activity = False
-    proposed_next = False
-    malformed = False
-    if state_match is not None:
-        try:
-            payload = json.loads(state_match.group(1))
-        except (TypeError, ValueError):
-            payload = None
-            malformed = True
-        if isinstance(payload, dict):
-            proposed_activity = "activity_update" in payload
-            proposed_next = "next_activity" in payload
-        elif payload is not None:
-            malformed = True
-    activity_accepted = bool(state.activity_update) and (
-        before.current_activity is None
-        or before.current_activity.source == "autonomous_life"
-    )
-    rejection_reason = ""
-    if proposed_activity and not state.activity_update:
-        rejection_reason = "invalid activity metadata"
-    elif (
-        proposed_activity
-        and before.current_activity is not None
-        and before.current_activity.source != "autonomous_life"
-    ):
-        rejection_reason = "an active activity already exists"
-    elif malformed:
-        rejection_reason = "invalid state metadata"
-    after = apply_activity_updates(
-        before,
-        activity_update=state.activity_update if activity_accepted else None,
-        next_activity=state.next_activity,
-        now=getattr(getattr(prepared, "chat_input", None), "timestamp", time.time()),
-    )
-    return {
-        "current_activity": after.current_activity.fact() if after.current_activity else "",
-        "next_activity": after.next_activity.fact() if after.next_activity else "",
-        "presence_planning_available": (
-            before.current_activity is None and before.next_activity is None
-        ),
-        "state_block_found": state_match is not None,
-        "activity_update_proposed": proposed_activity,
-        "next_activity_proposed": proposed_next,
-        "activity_update_accepted": activity_accepted,
-        "activity_rejection_reason": rejection_reason,
-        "activity_activated_this_turn": bool(getattr(turn, "presence_activated", False)),
-        "activity_expired_this_turn": bool(getattr(turn, "presence_expired", False)),
-        "presence_persisted": True,
-        "presence_included_in_prompt": bool(getattr(turn_context, "life_context", "")),
-    }
-
-
 def run_companion_turn(
     chat_input: ChatInput | str,
     *,
@@ -1735,6 +1690,7 @@ def run_companion_turn(
     skip_memory: bool = False,
     skip_if_busy: bool = False,
     direct_reply: str | None = None,
+    on_delta: Callable[[str], None] | None = None,
 ) -> CompanionTurnResult:
     """Run one shared companion turn, including decision parsing and persistence."""
 
@@ -1783,6 +1739,7 @@ def run_companion_turn(
         if direct_reply is None:
             manager = ModelManager.get_instance()
             parts: list[str] = []
+            visible_stream = _VisibleReplyStream()
             try:
                 for chunk in manager.stream(
                     prepared.prompt_plan.messages,
@@ -1794,10 +1751,16 @@ def run_companion_turn(
                     timing=timing,
                 ):
                     parts.append(chunk)
+                    delta = visible_stream.feed(chunk)
+                    if on_delta is not None and delta:
+                        on_delta(delta)
             except InferenceCancelled as exc:
                 raise GenerationCancelled(str(exc)) from exc
             except InferenceQueueTimeout as exc:
                 raise GenerationQueueFullError(str(exc)) from exc
+            final_delta = visible_stream.finish()
+            if on_delta is not None and final_delta:
+                on_delta(final_delta)
             raw_reply = "".join(parts).strip()
             if not raw_reply:
                 raise RuntimeError("Model returned no completion.")
@@ -1811,6 +1774,8 @@ def run_companion_turn(
 
         state = parse_akane_state(parsed.decision.message)
         decision = replace(parsed.decision, message=state.message)
+        if direct_reply is not None and on_delta is not None and decision.should_respond:
+            on_delta(decision.message)
 
         prepared.handle.raise_if_cancelled()
         _apply_pause(chat, decision.pause_seconds)
@@ -1824,8 +1789,6 @@ def run_companion_turn(
             "preference_updates": state.preference_updates,
             "interest_additions": state.interest_additions,
             "relationship_updates": state.relationship_updates,
-            "activity_update": state.activity_update,
-            "next_activity": state.next_activity,
             "emotion_update": state.emotion_update,
         }
         if chat.initiative_opportunity is not None:
@@ -1850,7 +1813,6 @@ def run_companion_turn(
             prepared,
             committed=True,
             timing=timing,
-            presence_debug=_presence_debug(prepared, raw_reply, state),
         )
         return CompanionTurnResult(decision, prepared.generation_id)
     finally:
@@ -1888,44 +1850,84 @@ def _life_prompt(state, *, now: float) -> str:
         for memory in grounded_memories
         if memory.content not in unfinished
     )
+    relationship = sorted(
+        (
+            *state.relationship.unresolved_events,
+            *state.relationship.shared_context,
+            *state.relationship.patterns,
+        ),
+        key=lambda item: (item.importance, item.updated_at),
+        reverse=True,
+    )[:3]
     lines = [
-        "Decide Akane's offscreen life state. Return only one <AKANE_LIFE> JSON block.",
-        "Allowed decisions: start_activity, schedule_activity, continue_activity, quiet_downtime, do_nothing.",
+        "Choose what Akane genuinely becomes occupied with during the next part "
+        "of her offscreen life. Her current interests are possible starting "
+        "points, not limits. She may pursue a related subject, combine multiple "
+        "influences, or become interested in something unrelated. Make the choice "
+        "distinct from her current and previous activities unless she intentionally "
+        "continues the current one. Provide enough concrete detail for the activity "
+        "to remain grounded.",
         f"Current local time: {current_local_time}.",
         f"Current daypart: {daypart}.",
         f"Current activity: {activity.activity if activity else 'none'}.",
-        "Current activity category: "
-        f"{activity.category if activity and activity.category else 'unavailable'}.",
-        "Current activity title: "
-        f"{activity.title if activity and activity.title else 'unavailable'}.",
-        "Current activity detail: "
-        f"{activity.detail if activity and activity.detail else 'none recorded'}.",
-        f"Immediately previous activity: {presence.previous_activity.fact() if presence.previous_activity else 'none'}.",
-        f"Planned activity: {presence.next_activity.fact() if presence.next_activity else 'none'}.",
-        "Activity pattern keys: "
+        (
+            f"Current recorded subject: {activity.subject}."
+            if activity and activity.subject
+            else ""
+        ),
+        (
+            f"Current recorded detail: {activity.detail}."
+            if activity and activity.detail
+            else ""
+        ),
+        "Immediately previous activity: "
+        f"{presence.previous_activity.fact() if presence.previous_activity else 'none'}.",
+        "Repetition metadata: "
+        f"current={presence.activity_pattern.current_key or 'none'}; "
         f"previous={presence.activity_pattern.previous_key or 'none'}; "
-        f"prior={presence.activity_pattern.prior_key or 'none'}; "
         f"repeat_count={presence.activity_pattern.repeat_count}.",
-        "Interests: " + (", ".join(state.interests) or "none") + ".",
-        "Preferences: " + ("; ".join(f"{item.topic}: {item.reason}" for item in state.preferences[-3:]) or "none") + ".",
+        "Starting and developed interests: "
+        + (", ".join(state.interests) or "none")
+        + ".",
+        "Developed preferences: "
+        + (
+            "; ".join(
+                f"{item.topic}: {item.reason}"
+                for item in state.preferences[-3:]
+            )
+            or "none"
+        )
+        + ".",
         "Grounded memories: " + ("; ".join(grounded) or "none") + ".",
+        "Relevant relationship context: "
+        + ("; ".join(item.summary for item in relationship) or "none")
+        + ".",
         "Unfinished thoughts: " + ("; ".join(unfinished) or "none") + ".",
         f"Emotion: {state.emotion.primary}.",
-        f"Pending reason: {presence.life_reason or 'none'}.",
-        "Choose what you genuinely want to do next. You may draw from your interests, "
-        "recent thoughts, preferences, memories, the time of day, or something new. "
-        "You may also choose quiet downtime or no activity. Avoid repeating or "
-        "alternating between the same recent activities unless continuing them is "
-        "personally meaningful.",
-        "Do not invent specific external titles, creators, streams, products, news, "
-        "or real-world events. Such details require explicit support in the grounded "
-        "context above; assistant-generated dialogue is not evidence.",
-        "The JSON object must contain decision, activity, category, subject, detail, "
-        "duration_minutes, start_after_minutes, reason, and interest_addition. "
-        "Activity may be unrelated to existing interests, and interest_addition may "
-        "name a new broad interest. Use null where an optional text field does not apply.",
+        (
+            "Previous proposal issue: it was too similar to recent activity."
+            if presence.retry_at
+            and presence.last_error
+            and presence.last_error.startswith("proposal repeats")
+            else ""
+        ),
+        "Specific external titles, creators, streams, releases, news, products, "
+        "and real-world events require direct support in the grounded context. "
+        "Assistant dialogue is not evidence.",
+        "Return only one <AKANE_LIFE> block containing a JSON object with exactly "
+        "these keys: mode, activity, category, subject, detail, interest_addition, "
+        "continuation_reason.",
+        "mode must be new or continue. For new, activity must be non-empty free "
+        "text, detail must concretely describe what has Akane's attention and why, "
+        "and continuation_reason must be null. For continue, activity, category, "
+        "subject, detail, and interest_addition must be null, and continuation_reason "
+        "must explain why continuing is intentionally meaningful.",
+        "A new interest must be broad, reusable, meaningfully reflected in the "
+        "selected activity, and not an unsupported proper noun. Leave "
+        "interest_addition null unless a genuinely meaningful broad interest is "
+        "developing; do not propose one routinely.",
     ]
-    return "\n".join(lines)
+    return "\n".join(line for line in lines if line)
 
 
 def run_life_turn(
@@ -1933,37 +1935,32 @@ def run_life_turn(
     profile_id: str,
     now: float | None = None,
     direct_reply: str | None = None,
-    status_callback: Callable[[str, str, object], None] | None = None,
 ) -> bool:
     """Run one separately scheduled, non-conversational life inference when due."""
 
     current = time.time() if now is None else max(0.0, float(now))
-    with _LIFE_LOCK:
-        if profile_id in _LIFE_ACTIVE:
-            return False
-        _LIFE_ACTIVE.add(profile_id)
+    _LIFE_INFERENCE_LOCK.acquire()
     store = get_internal_state_store()
+    claim_token = ""
     try:
-        state = store.claim_life_opportunity(profile_id, now=current)
+        state = store.claim_presence_decision(profile_id, now=current)
         if state is None:
             return False
-        if status_callback is not None:
-            status_callback("claimed", profile_id, True)
-            status_callback(
-                "claim_age",
-                profile_id,
-                max(0.0, current - state.presence.life_claimed_at),
+        claim_token = state.presence.claim_token or ""
+        if not claim_token:
+            return False
+        life_context = _life_prompt(state, now=current)
+        recent_topic = get_memory_store().recent_profile_topic(profile_id)
+        if recent_topic:
+            life_context += (
+                "\nRecent meaningful conversation topic: "
+                f"{recent_topic}."
             )
-            status_callback("inference_started", profile_id, True)
         if direct_reply is None:
             from app.core.character import get_hard_constraints_prompt, load_character_profile
             from app.core.model_loader import ModelManager
 
             profile = load_character_profile()
-            life_context = _life_prompt(state, now=current)
-            recent_topic = get_memory_store().recent_profile_topic(profile_id)
-            if recent_topic:
-                life_context += f"\nRecent meaningful conversation topic: {recent_topic}."
             messages = [
                 {"role": "system", "content": profile.identity},
                 {"role": "system", "content": profile.soul},
@@ -1975,44 +1972,35 @@ def run_life_turn(
             raw = "".join(manager.stream(messages, prompt_tokens=tokenized.tokens, template_stop_sequences=tokenized.stop_sequences, max_tokens=min(MAX_TOKENS, 220))).strip()
         else:
             raw = str(direct_reply)
-            life_context = _life_prompt(state, now=current)
         decision = parse_life_decision(raw, grounded_context=life_context)
         if decision is None:
-            store.release_life_opportunity(
+            store.fail_presence_decision(
                 profile_id,
+                claim_token=claim_token,
                 now=current,
-                failure_reason="invalid_life_block",
+                error="invalid life block",
             )
-            if status_callback is not None:
-                status_callback("rejected", profile_id, "invalid life block")
             return False
-        if status_callback is not None:
-            status_callback("block_parsed", profile_id, True)
-            status_callback("proposal", profile_id, decision.activity or decision.decision)
-        accepted, rejection = store.commit_life_decision(
+        decision_at = current if now is not None else time.time()
+        accepted, _rejection = store.commit_presence_decision(
             profile_id,
             decision,
-            now=current,
+            claim_token=claim_token,
+            now=decision_at,
+            grounded_context=life_context,
         )
-        if not accepted:
-            if status_callback is not None:
-                status_callback("rejected", profile_id, rejection)
-            return False
-        if status_callback is not None:
-            committed = store.internal_state(profile_id).presence
-            status_callback(
-                "activity_persisted",
-                profile_id,
-                bool(committed.current_activity or committed.next_activity),
-            )
-            status_callback("completed", profile_id, True)
-        return True
+        return accepted
     except Exception:
-        store.release_life_opportunity(profile_id, now=current)
+        if claim_token:
+            store.fail_presence_decision(
+                profile_id,
+                claim_token=claim_token,
+                now=time.time() if now is None else current,
+                error="life inference failed",
+            )
         raise
     finally:
-        with _LIFE_LOCK:
-            _LIFE_ACTIVE.discard(profile_id)
+        _LIFE_INFERENCE_LOCK.release()
 
 
 def _initiative_candidates(
@@ -2024,12 +2012,11 @@ def _initiative_candidates(
     """Derive bounded opportunities from persisted facts, never invented events."""
 
     state_store = get_internal_state_store()
-    if hasattr(state_store, "refresh_presence"):
-        state = state_store.refresh_presence(chat.profile_id, now=now)
-        presence = state.presence
-    else:  # Lightweight test doubles may expose only read access.
+    if hasattr(state_store, "prepare_presence"):
+        state = state_store.prepare_presence(chat.profile_id, now=now)
+    else:
         state = state_store.internal_state(chat.profile_id)
-        presence = advance_presence(state.presence, now=now)
+    presence = state.presence
     candidates: list[InitiativeOpportunity] = []
     source_time = memory_context.updated_at
     if memory_context.unresolved_problem and (
@@ -2051,15 +2038,17 @@ def _initiative_candidates(
     activity = presence.previous_activity
     if (
         activity is not None
-        and activity.ends_at <= now < activity.ends_at + 12 * 60 * 60
+        and activity.expected_end_at
+        <= now
+        < activity.expected_end_at + 12 * 60 * 60
     ):
         candidates.append(
             InitiativeOpportunity(
                 "recent completed offscreen activity",
                 activity.fact(),
                 0.62,
-                activity.ends_at,
-                activity.ends_at + 12 * 60 * 60,
+                activity.expected_end_at,
+                activity.expected_end_at + 12 * 60 * 60,
             )
         )
     relationship_entries = (
@@ -2147,7 +2136,7 @@ def run_initiative_turn(
 
 def cancel_generation(conversation_id: str, profile_id: str | None = None) -> bool:
     conversation = compact_text(conversation_id, 120) or "popup:default"
-    profile = compact_text(profile_id, 120) if profile_id is not None else None
+    profile = canonical_profile_id(profile_id) if profile_id is not None else None
     return _SCHEDULER.cancel(conversation, profile)
 
 
@@ -2157,7 +2146,7 @@ def cancel_all_generations() -> None:
 
 def reset_conversation(conversation_id: str, profile_id: str) -> None:
     conversation = compact_text(conversation_id, 120) or "popup:default"
-    profile = compact_text(profile_id, 120) or "local:owner"
+    profile = canonical_profile_id(profile_id)
     with _COMMIT_LOCK:
         _SCHEDULER.cancel(conversation, profile)
         with _PAUSE_LOCK:
@@ -2167,7 +2156,7 @@ def reset_conversation(conversation_id: str, profile_id: str) -> None:
 
 
 def forget_profile(profile_id: str) -> None:
-    profile = compact_text(profile_id, 120) or "local:owner"
+    profile = canonical_profile_id(profile_id)
     with _COMMIT_LOCK:
         _SCHEDULER.cancel_profile(profile)
         with _PAUSE_LOCK:
@@ -2186,7 +2175,7 @@ def session_state_snapshot(
     profile_id: str | None = None,
 ) -> dict[str, object]:
     conversation = compact_text(conversation_id, 120) or "popup:default"
-    profile = compact_text(profile_id, 120) or "local:owner"
+    profile = canonical_profile_id(profile_id)
     state_store = get_internal_state_store()
     remaining_pause = _pause_remaining(
         ChatInput(profile, conversation, "state", "web", time.time())

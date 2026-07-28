@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import secrets
 import threading
 from contextlib import asynccontextmanager
@@ -45,6 +46,7 @@ from app.core.session import (
     run_life_turn,
     session_state_snapshot,
 )
+from app.core.utils import OWNER_PROFILE_ID
 from app.integrations.vscode_context import active_file_reply
 from app.integrations.vscode_workspace import (
     MAX_REQUEST_BYTES,
@@ -57,7 +59,7 @@ from app.integrations.vscode_workspace import (
 from app.ui.assets import resolve_ui_asset
 
 STATIC_DIR = Path(__file__).parent / "ui" / "static"
-DEFAULT_PROFILE_ID = "local:owner"
+DEFAULT_PROFILE_ID = OWNER_PROFILE_ID
 DEFAULT_CONVERSATION_ID = "popup:default"
 _DEBUG_STATE_COMMAND = "/debug_state"
 _MODEL_LOAD_LOCK = threading.Lock()
@@ -201,21 +203,46 @@ def _stream_chat_events(chat: ChatRequestData):
                 "messages": _messages_with_user(item),
             }
         )
-        result = run_companion_turn(
-            item,
-            skip_memory=chat.skip_memory,
-            skip_if_busy=chat.skip_if_busy,
-            direct_reply=active_file_reply(item.text),
+        stream_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+
+        def generate() -> None:
+            try:
+                result = run_companion_turn(
+                    item,
+                    skip_memory=chat.skip_memory,
+                    skip_if_busy=chat.skip_if_busy,
+                    direct_reply=active_file_reply(item.text),
+                    on_delta=lambda text: stream_queue.put(("delta", text)),
+                )
+                stream_queue.put(("done", result))
+            except Exception as exc:
+                stream_queue.put(("error", exc))
+
+        worker = threading.Thread(
+            target=generate,
+            daemon=True,
+            name="AkaneResponseStream",
         )
+        worker.start()
+        result = None
+        while result is None:
+            kind, value = stream_queue.get()
+            if kind == "delta":
+                yield _json_line(
+                    {
+                        "type": "delta",
+                        "generation_id": generation_id,
+                        "content": value,
+                    }
+                )
+                continue
+            if kind == "error":
+                if not isinstance(value, Exception):
+                    raise RuntimeError("Streaming worker failed.")
+                raise value
+            result = value
+        worker.join()
         generation_id = result.generation_id
-        if result.decision.should_respond and result.message:
-            yield _json_line(
-                {
-                    "type": "delta",
-                    "generation_id": generation_id,
-                    "content": result.message,
-                }
-            )
         yield _json_line(
             {
                 "type": "done",

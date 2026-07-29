@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from app.integrations.vscode_workspace import EditorSnapshot, latest_editor_context
 
 MAX_PROMPT_CONTEXT_CHARS = 5_500
-EDITOR_CONTEXT_UNAVAILABLE_REPLY = "I don't have a current VS Code snapshot."
 _CODE_REQUEST = re.compile(
     r"\b(code|debug|error|exception|traceback|file|document|function|class|method|module|"
     r"script|test|bug|vscode|vs code|editor|implementation|refactor)\b",
@@ -59,13 +58,6 @@ def is_direct_active_file_question(message: str) -> bool:
             and re.search(r"\b(open|opened|active)\b", text, re.IGNORECASE)
         )
     )
-
-
-def active_file_reply(message: str) -> str | None:
-    if not is_direct_active_file_question(message):
-        return None
-    snapshot = latest_editor_context()
-    return snapshot.filename if snapshot is not None else EDITOR_CONTEXT_UNAVAILABLE_REPLY
 
 
 def requests_code_context(message: str) -> bool:

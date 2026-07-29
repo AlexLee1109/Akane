@@ -6,6 +6,7 @@ import asyncio
 import queue
 import secrets
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,12 +26,14 @@ from app.core.config import (
     SERVER_PORT,
     _coerce_bool,
 )
-from app.core.memory import get_internal_state_store, get_memory_store
-from app.core.life_worker import start_life_worker, stop_life_worker
-from app.core.model_loader import ModelManager
-from app.core.reply_pipeline import (
-    debug_state_report,
+from app.core.memory import get_state_store
+from app.core.life_worker import (
+    run_initiative_turn,
+    run_life_turn,
+    start_life_worker,
+    stop_life_worker,
 )
+from app.core.model_loader import ModelManager
 from app.core.session import (
     ChatInput,
     GenerationBusyError,
@@ -38,16 +41,14 @@ from app.core.session import (
     GenerationQueueFullError,
     cancel_all_generations,
     cancel_generation,
+    debug_state_report,
     forget_profile,
     normalize_chat_input,
     reset_conversation,
     run_companion_turn,
-    run_initiative_turn,
-    run_life_turn,
     session_state_snapshot,
 )
 from app.core.utils import OWNER_PROFILE_ID
-from app.integrations.vscode_context import active_file_reply
 from app.integrations.vscode_workspace import (
     MAX_REQUEST_BYTES,
     ReviewDecision,
@@ -79,7 +80,7 @@ class ChatRequestData:
 
 
 def _messages(conversation_id: str, profile_id: str) -> list[dict[str, str]]:
-    return get_memory_store().messages(conversation_id, profile_id)
+    return get_state_store().messages(conversation_id, profile_id)
 
 
 def _messages_with_user(chat_input: ChatInput) -> list[dict[str, str]]:
@@ -162,7 +163,6 @@ def _generate_reply(chat: ChatRequestData) -> str:
         item,
         skip_memory=chat.skip_memory,
         skip_if_busy=chat.skip_if_busy,
-        direct_reply=active_file_reply(item.text),
     )
     return result.message if result.decision.should_respond else ""
 
@@ -211,7 +211,6 @@ def _stream_chat_events(chat: ChatRequestData):
                     item,
                     skip_memory=chat.skip_memory,
                     skip_if_busy=chat.skip_if_busy,
-                    direct_reply=active_file_reply(item.text),
                     on_delta=lambda text: stream_queue.put(("delta", text)),
                 )
                 stream_queue.put(("done", result))
@@ -298,7 +297,7 @@ def _app_state_payload(
     *,
     include_messages: bool = True,
 ) -> dict:
-    conversation = get_memory_store().public_conversation(conversation_id, profile_id)
+    conversation = get_state_store().public_conversation(conversation_id, profile_id)
     payload = {
         "model": ModelManager.get_instance().status(),
         "internal_state": session_state_snapshot(conversation_id, profile_id),
@@ -336,8 +335,7 @@ def _start_model_loading() -> None:
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     load_character_profile()
-    get_memory_store()
-    get_internal_state_store()
+    get_state_store()
     _start_model_loading()
     start_life_worker()
     try:
@@ -444,6 +442,10 @@ def create_app() -> FastAPI:
             )
         )
 
+    @app.get("/api/memory")
+    async def api_memory(profile_id: str = DEFAULT_PROFILE_ID):
+        return JSONResponse(get_state_store().public_memory(profile_id))
+
     @app.post("/api/chat/cancel")
     async def api_cancel(request: Request):
         payload = await _request_payload(request)
@@ -464,7 +466,7 @@ def create_app() -> FastAPI:
         command = handle_builtin_command(chat.chat_input)
         if command is not None:
             return JSONResponse(command)
-        prior_reply = get_memory_store().reply_for_request(
+        prior_reply = get_state_store().reply_for_request(
             chat.chat_input.conversation_id,
             chat.chat_input.profile_id,
             chat.chat_input.request_id,
@@ -550,7 +552,7 @@ def create_app() -> FastAPI:
         except Exception as exc:
             _log("error", f"type={type(exc).__name__} detail={exc}")
             return JSONResponse({"error": _safe_error(exc)}, status_code=_error_status(exc))
-        return JSONResponse({"changed": changed, "akane": get_internal_state_store().public_internal_state(profile)})
+        return JSONResponse({"changed": changed, "akane": get_state_store().public_internal_state(profile)})
 
     @app.get("/{asset_path:path}", include_in_schema=False)
     async def static_assets(asset_path: str):
@@ -600,6 +602,14 @@ def serve_in_thread(
     thread = threading.Thread(target=server.run, daemon=True, name="AkaneAPIServer")
     server._thread = thread
     thread.start()
+    deadline = time.monotonic() + 5.0
+    while thread.is_alive() and not server._server.started:
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    if not server._server.started:
+        server._server.should_exit = True
+        raise RuntimeError(f"Akane API could not start on {host}:{port}.")
     print(f"Akane background API running at http://{host}:{port}", flush=True)
     return server, thread
 

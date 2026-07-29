@@ -3,7 +3,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote, urlencode, urljoin
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 import urllib.request
 import threading
@@ -11,7 +11,11 @@ import time
 
 import webview
 
-from app.core.config import POPUP_BACKEND_URL, popup_backend_is_local
+from app.core.config import (
+    POPUP_BACKEND_URL,
+    SERVER_API_TOKEN,
+    popup_backend_is_local,
+)
 
 try:
     import AppKit
@@ -61,6 +65,15 @@ class PopupLayout:
     """Single companion window anchored to the bottom-right corner."""
 
     def __init__(self, screen):
+        if screen is None:
+            self.screen_x = 0
+            self.screen_y = 0
+            self.screen_width = COMPANION_WIDTH
+            self.screen_height = COMPANION_HEIGHT
+            self.frames = {
+                "companion": Frame(0, 0, COMPANION_WIDTH, COMPANION_HEIGHT),
+            }
+            return
         f = screen.frame()
 
         self.screen_x = int(f.origin.x)
@@ -89,6 +102,13 @@ class WindowApi:
 
     def send_message_stream(self, message: str) -> None:
         self.app.send_message_stream(message)
+
+    def request_headers(self) -> dict[str, str]:
+        return (
+            {"Authorization": f"Bearer {SERVER_API_TOKEN}"}
+            if SERVER_API_TOKEN
+            else {}
+        )
 
     def toggle_composer(self) -> None:
         self.app.toggle_composer()
@@ -195,13 +215,16 @@ class PopupApp:
             },
             ensure_ascii=False,
         ).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/x-ndjson",
+        }
+        if SERVER_API_TOKEN:
+            headers["Authorization"] = f"Bearer {SERVER_API_TOKEN}"
         request = urllib.request.Request(
             urljoin(f"{self.backend_url}/", "api/chat/stream"),
             data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/x-ndjson",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -384,12 +407,30 @@ class PopupApp:
     def _ensure_server(self):
         if not popup_backend_is_local():
             return
-        try:
-            urllib.request.urlopen(urljoin(f"{self.backend_url}/", "api/state"), timeout=1)
-        except Exception:
-            from app.server import serve_in_thread
+        headers = {}
+        if SERVER_API_TOKEN:
+            headers["Authorization"] = f"Bearer {SERVER_API_TOKEN}"
+        for delay in (0.0, 0.2, 0.4):
+            if delay:
+                time.sleep(delay)
+            request = urllib.request.Request(
+                urljoin(f"{self.backend_url}/", "api/state"),
+                headers=headers,
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=1):
+                    return
+            except HTTPError:
+                # Any HTTP response proves that a server owns this address.
+                return
+            except (OSError, URLError):
+                continue
+        from app.server import serve_in_thread
 
-            self.server, _ = serve_in_thread()
+        backend = urlsplit(self.backend_url)
+        host = backend.hostname or "127.0.0.1"
+        port = backend.port or (443 if backend.scheme == "https" else 80)
+        self.server, _ = serve_in_thread(host=host, port=port)
 
     def _build_start_url(self) -> str:
         params = urlencode({"popup_role": "companion"})
@@ -414,7 +455,7 @@ class PopupApp:
             return self._layout_cache
 
         if AppKit is None:
-            layout = PopupLayout(AppKit.NSScreen.mainScreen())
+            layout = PopupLayout(None)
             self._layout_cache = layout
             return layout
 

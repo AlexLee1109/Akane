@@ -66,14 +66,27 @@ class InferenceTiming:
     model_started_at: float = 0.0
     first_token_at: float = 0.0
     model_finished_at: float = 0.0
-    chat_template_seconds: float = 0.0
-    prompt_tokenization_seconds: float = 0.0
     prompt_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class _StreamFailure:
     error: Exception
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceReservation:
+    """Exclusive access to the shared llama.cpp runtime for one complete job."""
+
+    llm: object
+    priority: str
+    preempted: threading.Event
+
+    def raise_if_preempted(self) -> None:
+        if self.preempted.is_set():
+            raise InferenceCancelled(
+                "Background inference yielded to a visible reply."
+            )
 
 
 def content_to_text(content) -> str:
@@ -176,8 +189,11 @@ class ModelManager:
         self._loading = False
         self._load_error: Exception | None = None
         self._load_lock = threading.RLock()
-        self._inference_lock = threading.Lock()
-        self._active_timing: InferenceTiming | None = None
+        self._inference_condition = threading.Condition()
+        self._inference_active = False
+        self._visible_waiters = 0
+        self._active_priority = ""
+        self._active_preemption: threading.Event | None = None
 
     @classmethod
     def get_instance(cls) -> "ModelManager":
@@ -296,7 +312,6 @@ class ModelManager:
                 )
                 llm = Llama(**kwargs)
                 self._validate_loaded_model(llm)
-                self._instrument_tokenizer(llm)
                 self._llm = llm
             except Exception as exc:
                 self._llm = None
@@ -323,56 +338,89 @@ class ModelManager:
         return self._llm
 
     @contextmanager
-    def inference(
+    def reserve(
         self,
+        *,
+        priority: str = "visible",
         cancellation: threading.Event | None = None,
         queue_deadline: float | None = None,
     ):
-        while not self._inference_lock.acquire(timeout=0.1):
-            if cancellation is not None and cancellation.is_set():
-                raise InferenceCancelled("Generation was cancelled before inference.")
-            if queue_deadline is not None and time.monotonic() >= queue_deadline:
-                raise InferenceQueueTimeout("Generation timed out while waiting for the model.")
+        """Reserve tokenization and generation as one priority-aware operation."""
+
+        visible = priority != "background"
+        normalized_priority = "visible" if visible else "background"
+        preempted = threading.Event()
+        with self._inference_condition:
+            if visible:
+                self._visible_waiters += 1
+            try:
+                if cancellation is not None and cancellation.is_set():
+                    raise InferenceCancelled(
+                        "Generation was cancelled before inference."
+                    )
+                if (
+                    queue_deadline is not None
+                    and time.monotonic() >= queue_deadline
+                ):
+                    raise InferenceQueueTimeout(
+                        "Generation timed out while waiting for the model."
+                    )
+                if (
+                    visible
+                    and self._active_priority == "background"
+                    and self._active_preemption is not None
+                ):
+                    self._active_preemption.set()
+                while self._inference_active or (
+                    not visible and self._visible_waiters
+                ):
+                    if cancellation is not None and cancellation.is_set():
+                        raise InferenceCancelled(
+                            "Generation was cancelled before inference."
+                        )
+                    if (
+                        queue_deadline is not None
+                        and time.monotonic() >= queue_deadline
+                    ):
+                        raise InferenceQueueTimeout(
+                            "Generation timed out while waiting for the model."
+                        )
+                    self._inference_condition.wait(timeout=0.1)
+                self._inference_active = True
+                self._active_priority = normalized_priority
+                self._active_preemption = preempted
+            finally:
+                if visible:
+                    self._visible_waiters -= 1
         try:
             if cancellation is not None and cancellation.is_set():
                 raise InferenceCancelled("Generation was cancelled before inference.")
-            yield self.llm
+            reservation = InferenceReservation(
+                self.llm,
+                normalized_priority,
+                preempted,
+            )
+            reservation.raise_if_preempted()
+            yield reservation
         finally:
-            self._inference_lock.release()
+            with self._inference_condition:
+                self._inference_active = False
+                self._active_priority = ""
+                self._active_preemption = None
+                self._inference_condition.notify_all()
 
-    def _instrument_tokenizer(self, llm) -> None:
-        """Time the backend's existing tokenizer without another tokenization pass."""
-
-        original = getattr(llm, "tokenize", None)
-        if original is None:
-            return
-
-        def timed_tokenize(*args, **kwargs):
-            started_at = time.perf_counter()
-            timing = self._active_timing
-            if timing is not None and timing.prompt_tokens == 0:
-                timing.chat_template_seconds = max(
-                    0.0,
-                    started_at - timing.model_started_at,
-                )
-            tokens = original(*args, **kwargs)
-            if timing is not None:
-                timing.prompt_tokenization_seconds += time.perf_counter() - started_at
-                if timing.prompt_tokens == 0:
-                    try:
-                        timing.prompt_tokens = len(tokens)
-                    except TypeError:
-                        pass
-            return tokens
-
-        llm.tokenize = timed_tokenize
-
-    def tokenize_prompt(self, messages: list[dict[str, str]]):
+    def tokenize_prompt(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        reservation: InferenceReservation,
+    ):
         """Apply the active template with thinking disabled and return exact IDs."""
 
         from app.core.prompt import PromptTokenCount
 
-        with self.inference() as llm:
+        def tokenize(llm):
+            reservation.raise_if_preempted()
             formatter = _resolved_chat_formatter(llm)
             if formatter is None:
                 raise RuntimeError(
@@ -402,11 +450,13 @@ class ModelManager:
                 add_bos=False,
                 special=True,
             )
+            reservation.raise_if_preempted()
             return PromptTokenCount(
                 tuple(tokens),
                 "exact_active_chat_template_enable_thinking_false",
                 (formatter.eos_token,) if formatter.eos_token else (),
             )
+        return tokenize(reservation.llm)
 
     def _start_timing(
         self,
@@ -415,78 +465,23 @@ class ModelManager:
     ) -> None:
         if timing is not None:
             timing.model_started_at = time.perf_counter()
-            self._active_timing = timing
         if on_model_start is not None:
             on_model_start()
 
     def _finish_timing(self, timing: InferenceTiming | None) -> None:
         if timing is not None:
             timing.model_finished_at = time.perf_counter()
-            self._active_timing = None
-
-    def create_token_completion(
-        self,
-        *,
-        prompt_tokens: tuple[int, ...],
-        max_tokens: int,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        min_p: float,
-        repeat_penalty: float,
-        stop: list[str],
-        stream: bool,
-        cancellation: threading.Event | None = None,
-        queue_deadline: float | None = None,
-        on_model_start: Callable[[], None] | None = None,
-        timing: InferenceTiming | None = None,
-    ):
-        """Infer directly from the exact IDs produced by the active chat template."""
-
-        def invoke(llm):
-            if timing is not None:
-                timing.prompt_tokens = len(prompt_tokens)
-            return llm.create_completion(
-                prompt=list(prompt_tokens),
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                min_p=min_p,
-                repeat_penalty=repeat_penalty,
-                stop=stop,
-                stream=stream,
-            )
-
-        if not stream:
-            with self.inference(cancellation, queue_deadline) as llm:
-                try:
-                    self._start_timing(timing, on_model_start)
-                    return invoke(llm)
-                finally:
-                    self._finish_timing(timing)
-
-        def wrapped():
-            with self.inference(cancellation, queue_deadline) as llm:
-                try:
-                    self._start_timing(timing, on_model_start)
-                    yield from invoke(llm)
-                finally:
-                    self._finish_timing(timing)
-
-        return wrapped()
 
     def stream(
         self,
-        messages: list[dict[str, str]],
         *,
-        prompt_tokens: tuple[int, ...] = (),
+        prompt_tokens: tuple[int, ...],
         template_stop_sequences: tuple[str, ...] = (),
         max_tokens: int,
         cancellation: threading.Event | None = None,
-        queue_deadline: float | None = None,
         on_model_start: Callable[[], None] | None = None,
         timing: InferenceTiming | None = None,
+        reservation: InferenceReservation,
     ):
         output: queue.Queue[object] = queue.Queue(maxsize=_STREAM_QUEUE_SIZE)
         stopped = threading.Event()
@@ -505,20 +500,30 @@ class ModelManager:
             try:
                 if not prompt_tokens:
                     raise RuntimeError("Exact prompt token IDs are required for inference.")
+                if cancellation is not None and cancellation.is_set():
+                    raise InferenceCancelled(
+                        "Generation was cancelled before inference."
+                    )
+                reservation.raise_if_preempted()
                 options = completion_kwargs(max_tokens, True)
                 configured_stops = list(options.pop("stop", []))
-                response = self.create_token_completion(
-                    prompt_tokens=prompt_tokens,
-                    cancellation=cancellation,
-                    queue_deadline=queue_deadline,
-                    on_model_start=on_model_start,
-                    timing=timing,
-                    stop=list(dict.fromkeys((*template_stop_sequences, *configured_stops))),
+                stops = list(
+                    dict.fromkeys(
+                        (*template_stop_sequences, *configured_stops)
+                    )
+                )
+                if timing is not None:
+                    timing.prompt_tokens = len(prompt_tokens)
+                self._start_timing(timing, on_model_start)
+                response = reservation.llm.create_completion(
+                    prompt=list(prompt_tokens),
+                    stop=stops,
                     **options,
                 )
                 for chunk in response:
                     if cancellation is not None and cancellation.is_set():
                         raise InferenceCancelled("Generation was cancelled during inference.")
+                    reservation.raise_if_preempted()
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
@@ -533,6 +538,8 @@ class ModelManager:
             except Exception as exc:
                 enqueue(_StreamFailure(exc))
             finally:
+                if timing is not None and timing.model_started_at:
+                    self._finish_timing(timing)
                 close = getattr(response, "close", None)
                 if close is not None:
                     close()

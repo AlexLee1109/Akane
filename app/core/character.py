@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -34,7 +33,6 @@ _HARD_RULES = (
 
     "Use plain text without emojis. Use one paragraph and maximum of 4 sentences.",
 )
-
 
 
 def get_hard_constraints_prompt() -> str:
@@ -79,14 +77,6 @@ class CharacterProfile:
         if not self.identity:
             object.__setattr__(self, "identity", _read_required(self.identity_path, "identity"))
 
-    def stable_prompt_text(self) -> str:
-        return "\n\n".join(
-            (
-                "[IDENTITY]\n" + self.identity,
-                "[CHARACTER]\n" + self.soul,
-            )
-        )
-
 
 def _file_signature(path: Path) -> tuple[int, int]:
     try:
@@ -111,38 +101,3 @@ def load_character_profile() -> CharacterProfile:
         _file_signature(SOUL_PATH),
         _file_signature(IDENTITY_PATH),
     )
-
-
-@lru_cache(maxsize=4)
-def _stable_character_prompt_cached(identity: str, soul: str) -> str:
-    return CharacterProfile(soul=soul, identity=identity).stable_prompt_text()
-
-
-def get_static_system_prompt() -> str:
-    """Return the only cacheable prompt prefix: stable identity and personality."""
-
-    profile = load_character_profile()
-    return _stable_character_prompt_cached(profile.identity, profile.soul)
-
-
-def _content_version(value: str) -> str:
-    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:12]
-
-
-def get_persona_versions(
-    profile: CharacterProfile | None = None,
-    hard_constraints: str | None = None,
-) -> dict[str, str]:
-    """Return content-only versions without exposing character text."""
-
-    current = profile or load_character_profile()
-    hard_text = (
-        get_hard_constraints_prompt()
-        if hard_constraints is None
-        else str(hard_constraints)
-    )
-    return {
-        "identity": _content_version(current.identity),
-        "soul": _content_version(current.soul),
-        "hard_constraints": _content_version(hard_text),
-    }

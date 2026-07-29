@@ -40,9 +40,49 @@ let streamingAssistantText = "";
 const messageTimestampCache = new Map();
 const API_BASE =
   SEARCH_PARAMS.get("api_base")?.replace(/\/$/, "") || "";
+const API_TOKEN = SEARCH_PARAMS.get("api_token") || "";
+let apiRequestHeaders = API_TOKEN
+  ? { Authorization: `Bearer ${API_TOKEN}` }
+  : {};
 
 function apiUrl(path) {
   return API_BASE ? `${API_BASE}${path}` : path;
+}
+
+async function initializeRequestHeaders() {
+  if (
+    POPUP_ROLE === "companion" &&
+    !window.pywebview?.api?.request_headers
+  ) {
+    await Promise.race([
+      new Promise((resolve) => {
+        window.addEventListener(
+          "pywebviewready",
+          resolve,
+          { once: true },
+        );
+      }),
+      new Promise((resolve) => {
+        window.setTimeout(resolve, 2000);
+      }),
+    ]);
+  }
+
+  try {
+    const bridgeHeaders =
+      (await window.pywebview?.api?.request_headers?.()) || {};
+    apiRequestHeaders = { ...apiRequestHeaders, ...bridgeHeaders };
+  } catch {}
+}
+
+function apiFetch(path, options = {}) {
+  return fetch(apiUrl(path), {
+    ...options,
+    headers: {
+      ...apiRequestHeaders,
+      ...(options.headers || {}),
+    },
+  });
 }
 
 async function callWindowApi(methodName) {
@@ -620,14 +660,12 @@ async function fetchState() {
 async function loadStatePayload(
   includeMessages = true,
 ) {
-  const response = await fetch(
-    apiUrl(
-      `/api/state?session_id=${encodeURIComponent(
+  const response = await apiFetch(
+    `/api/state?session_id=${encodeURIComponent(
         SESSION_ID,
       )}&include_messages=${
         includeMessages ? "1" : "0"
       }`,
-    ),
     {
       cache: "no-store",
     },
@@ -678,8 +716,8 @@ async function sendMessage(message) {
   }
 
   try {
-    const response = await fetch(
-      apiUrl("/api/chat/stream"),
+    const response = await apiFetch(
+      "/api/chat/stream",
       {
         method: "POST",
         headers: {
@@ -776,8 +814,8 @@ async function sendCommand(message) {
   setSendingState(true);
 
   try {
-    const response = await fetch(
-      apiUrl("/api/chat"),
+    const response = await apiFetch(
+      "/api/chat",
       {
         method: "POST",
         headers: {
@@ -992,7 +1030,7 @@ async function checkInitiative() {
   }
 
   try {
-    const response = await fetch(apiUrl("/api/initiative"), {
+    const response = await apiFetch("/api/initiative", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1262,9 +1300,7 @@ async function openMemoryPanel() {
     '<div class="memory-loading">Loading memory...</div>';
 
   try {
-    const response = await fetch(
-      apiUrl("/api/memory"),
-    );
+    const response = await apiFetch("/api/memory");
 
     if (!response.ok) {
       throw new Error(
@@ -1316,6 +1352,7 @@ async function boot() {
     POPUP_ROLE;
 
   autosizeInput();
+  await initializeRequestHeaders();
 
   try {
     await fetchState();

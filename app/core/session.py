@@ -21,14 +21,18 @@ from app.core.config import (
     PROMPT_DEBUG,
     TIMEZONE,
 )
-from app.core.memory import InitiativeOpportunity, StateSnapshot, get_state_store
+from app.core.memory import (
+    InitiativeOpportunity,
+    StateSnapshot,
+    format_emotional_context,
+    get_state_store,
+)
 from app.core.model_loader import (
     InferenceCancelled,
     InferenceQueueTimeout,
     InferenceTiming,
     ModelManager,
 )
-from app.core.presence import activity_continuity, format_presence_context
 from app.core.prompt import (
     PromptContext,
     PromptPlan,
@@ -48,6 +52,41 @@ _DEBUG_LOCK = threading.RLock()
 _TURN_DEBUG: dict[tuple[str, str], dict[str, object]] = {}
 _TIMING_ENABLED = str(os.environ.get("AKANE_TIMING", "")).strip().lower() in {
     "1", "true", "yes", "on",
+}
+_SECTION_DESCRIPTORS = (
+    ("identity", "who you identity self yourself tell describe description person "
+     "personality character values becoming changed change matters",
+     "Answer personally and concretely."),
+    ("activity", "current activity doing occupied working presence recent experience "
+     "continuing", "Answer from Akane's recorded current activity."),
+    ("emotion", "feel feeling emotion mood emotional bother bothered quieter affect",
+     "Describe Akane's current feeling naturally."),
+    ("relationship", "relationship between Akane Arcane trust conflict closeness "
+     "connection", "Reflect only from established relationship evidence."),
+    ("user_context", "Arcane user remember remembered facts taste prefer preference "
+     "likes dislikes recommend recommendation care cares confirmed",
+     "Use only confirmed information about Arcane."),
+    ("akane_context", "Akane interests likes taste preference preferences prefer "
+     "opinion opinions think goals thoughts realizations uncertainties memories "
+     "judgment values matters design designs",
+     "Give Akane's own judgment rather than automatic agreement."),
+    ("shared_context", "shared together our experience conversation event commitment "
+     "disagreement unresolved",
+     "Use only relevant experiences Akane and Arcane actually shared."),
+    ("tool_context", "tool editor file code external technical explain compare "
+     "algorithm model quantization",
+     "Answer the request directly without forcing personal state into it."),
+)
+_TIME_DESCRIPTOR = "current time date day calendar today tonight tomorrow morning evening"
+_SEMANTIC_STOPWORDS = {
+    "a", "about", "an", "and", "are", "as", "at", "be", "been", "but", "did",
+    "do", "does", "for", "from", "had", "has", "have", "how", "i", "in", "is",
+    "it", "me", "my", "of", "on", "or", "that", "the", "this", "to", "was",
+    "were", "what", "when", "where", "which", "why", "with", "would", "your",
+}
+_MEMORY_SECTIONS = {"user_context", "akane_context", "shared_context"}
+_REFERENCE_ONLY_TERMS = {
+    "it", "me", "my", "our", "ours", "that", "them", "this", "us", "you", "your",
 }
 
 
@@ -270,8 +309,8 @@ def parse_akane_state(output: object) -> ParsedStateOutput:
         return ParsedStateOutput(visible)
 
     permitted = {
-        "emotion", "memories", "preferences", "interests", "opinions",
-        "relationship",
+        "emotion_update", "mood_update", "memories", "preferences",
+        "interests", "opinions", "relationship",
     }
     proposals = {
         key: payload[key]
@@ -346,61 +385,97 @@ def _item_text(item: object) -> str:
     return ""
 
 
+def _semantic_terms(value: object) -> set[str]:
+    return words(value) - _SEMANTIC_STOPWORDS
+
+
+def _response_context_plan(
+    message: str,
+    recent_turns: tuple[object, ...],
+    *,
+    reply_context: str = "",
+    tool_requested: bool = False,
+) -> tuple[tuple[str, ...], str, bool, bool]:
+    """Select broad context concepts without classifying specific questions."""
+
+    current_terms = _semantic_terms(f"{message} {reply_context}")
+    recent_terms = _semantic_terms(
+        " ".join(_item_text(turn) for turn in recent_turns[-2:])
+    )
+    recent_weight = 0.65 if len(current_terms) <= 3 else 0.30
+
+    def similarity(left: set[str], descriptor: str) -> float:
+        right = _semantic_terms(descriptor)
+        if not left or not right:
+            return 0.0
+        return len(left & right) / math.sqrt(len(left) * len(right))
+
+    time_score = similarity(current_terms, _TIME_DESCRIPTOR)
+    time_score += recent_weight * similarity(recent_terms, _TIME_DESCRIPTOR)
+    time_overlap = current_terms & _semantic_terms(_TIME_DESCRIPTOR)
+    time_relevant = time_score >= 0.14 and (
+        len(time_overlap) >= 2 or len(current_terms) <= 2
+    )
+
+    scored: list[tuple[float, int, str, str]] = []
+    directly_relevant_memory_sections: set[str] = set()
+    for index, (name, descriptor, focus) in enumerate(_SECTION_DESCRIPTORS):
+        direct_score = similarity(current_terms, descriptor)
+        score = direct_score
+        score += recent_weight * similarity(recent_terms, descriptor)
+        if name == "tool_context" and tool_requested:
+            score = max(score, 1.0)
+        if name == "tool_context" and time_relevant:
+            score = max(score, time_score)
+        if score >= 0.14:
+            scored.append((score, index, name, focus))
+        if name in _MEMORY_SECTIONS and direct_score >= 0.14:
+            directly_relevant_memory_sections.add(name)
+    identity_descriptor = _SECTION_DESCRIPTORS[0][1]
+    identity_overlap = current_terms & _semantic_terms(identity_descriptor)
+    if identity_overlap == {"you"} and (
+        any(item[2] != "identity" for item in scored)
+        or ("?" not in str(message) and current_terms - _REFERENCE_ONLY_TERMS)
+    ):
+        scored = [item for item in scored if item[2] != "identity"]
+    strongest = max(scored, default=None, key=lambda item: (item[0], -item[1]))
+    chosen = sorted(
+        sorted(scored, key=lambda item: (-item[0], item[1]))[:3],
+        key=lambda item: item[1],
+    )
+    memory_relevant = any(
+        item[2] in directly_relevant_memory_sections for item in chosen
+    ) and bool(current_terms - _REFERENCE_ONLY_TERMS)
+    return (
+        tuple(item[2] for item in chosen),
+        strongest[3] if strongest else "",
+        time_relevant,
+        memory_relevant,
+    )
+
+
 def _relevant_items(
     values: tuple[object, ...],
     query: str,
     *,
     limit: int,
-    broad_request: bool = False,
+    fallback: bool = False,
 ) -> tuple[str, ...]:
-    query_terms = words(query)
-    selected: list[str] = []
-    for item in reversed(values):
+    query_terms = _semantic_terms(query)
+    ranked: list[tuple[int, int, str]] = []
+    available: list[str] = []
+    for index, item in enumerate(values):
         text = _item_text(item)
         if not text:
             continue
-        if broad_request or query_terms & words(text):
-            selected.append(text)
-        if len(selected) >= limit:
-            break
-    return tuple(reversed(selected))
-
-
-def _emotion_context(emotion: object, now: float) -> str:
-    primary = compact_text(getattr(emotion, "primary", ""), 32).lower()
-    intensity = float(getattr(emotion, "intensity", 0.0) or 0.0)
-    cause = compact_text(getattr(emotion, "cause", ""), 140)
-    updated_at = float(getattr(emotion, "updated_at", 0.0) or 0.0)
-    if updated_at and now > updated_at:
-        intensity *= 0.5 ** ((now - updated_at) / (24.0 * 3600.0))
-    if not primary or intensity < 0.05:
-        return ""
-    result = f"{primary}, intensity {max(0.0, min(1.0, intensity)):.2f}"
-    return f"{result}; cause: {cause}" if cause else result
-
-
-def _relationship_context(relationship: object, query: str) -> tuple[str, ...]:
-    unresolved = tuple(getattr(relationship, "unresolved_events", ()) or ())
-    shared = tuple(getattr(relationship, "shared_context", ()) or ())
-    patterns = tuple(getattr(relationship, "patterns", ()) or ())
-    relationship_request = bool(
-        words(query) & {"relationship", "between", "promise", "promised", "us"}
-    )
-    return (
-        *_relevant_items(unresolved, query, limit=2, broad_request=True),
-        *_relevant_items(shared, query, limit=2, broad_request=relationship_request),
-        *_relevant_items(patterns, query, limit=1, broad_request=relationship_request),
-    )
-
-
-def _time_relevant(text: str) -> bool:
-    return bool(
-        words(text)
-        & {
-            "today", "tonight", "tomorrow", "yesterday", "time", "date",
-            "morning", "afternoon", "evening",
-        }
-    )
+        available.append(text)
+        overlap = len(query_terms & _semantic_terms(text))
+        if overlap:
+            ranked.append((overlap, index, text))
+    if ranked:
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return tuple(item[2] for item in ranked[:limit])
+    return tuple(reversed(available[-limit:])) if fallback else ()
 
 
 def date_time_line(timestamp: float | None = None) -> str:
@@ -419,56 +494,131 @@ def date_time_line(timestamp: float | None = None) -> str:
 def _prompt_context(
     snapshot: StateSnapshot,
     chat: ChatInput,
+    *,
+    sections: tuple[str, ...],
+    response_focus: str,
+    time_relevant: bool,
+    editor,
 ) -> PromptContext:
     profile = snapshot.profile
-    editor = code_context_for_message(chat.text)
-    editor_context = editor.prompt_text
-    if editor.requested and not editor.connected:
-        editor_context = "No current VS Code editor snapshot is available."
-    continuity = activity_continuity(
-        profile.presence.current_activity,
-        snapshot.last_profile_assistant_at or None,
+    planning_text = (
+        chat.initiative_opportunity.context
+        if chat.initiative_opportunity is not None
+        else chat.text
     )
-    tastes_requested = bool(
-        words(chat.text)
-        & {"like", "likes", "dislike", "prefer", "preference", "interest", "favorite"}
+    query = " ".join(
+        (
+            planning_text,
+            chat.reply_context,
+            *(_item_text(turn) for turn in snapshot.recent_turns[-2:]),
+        )
     )
-    opinions_requested = bool(words(chat.text) & {"opinion", "think", "view", "take"})
+    recalled = tuple(snapshot.relevant_memories[:3])
+
+    def relevant(
+        name: str, values: tuple[object, ...], limit: int, *, fallback: bool = False,
+    ) -> tuple[str, ...]:
+        if name not in sections:
+            return ()
+        return _relevant_items(values, query, limit=limit, fallback=fallback)
+
+    activity = ""
+    if "activity" in sections:
+        current = profile.presence.current_activity
+        if current is None:
+            activity = "Akane's current activity is not recorded."
+        else:
+            lines = [f"Akane's current activity: {current.activity}."]
+            if current.subject:
+                lines.append(f"Akane's recorded focus: {current.subject}.")
+            if current.detail:
+                lines.append(f"Grounded activity detail: {current.detail}.")
+            activity = "\n".join(lines)
+
+    emotion = (
+        format_emotional_context(profile, now=snapshot.now)
+        if "emotion" in sections else ""
+    )
+    if "emotion" in sections and not emotion:
+        emotion = "Akane's current emotional state is neutral."
+
+    relationship = relevant(
+        "relationship",
+        (
+            *(
+                f"Established relationship pattern: {item.summary}"
+                for item in profile.relationship.patterns
+            ),
+            *(
+                f"Unresolved relationship evidence: {item.summary}"
+                for item in profile.relationship.unresolved_events
+            ),
+        ),
+        2,
+        fallback=True,
+    )
+    user_context = (
+        tuple(
+            f"Arcane previously stated: {memory.text}"
+            for memory in recalled
+            if memory.subject == "user" and memory.confidence >= 0.75
+        )
+        if "user_context" in sections else ()
+    )
+    akane_context = relevant(
+        "akane_context",
+        (
+            *(f"Akane's established interest: {item}" for item in profile.interests),
+            *(
+                f"Akane remembers: {memory.content}"
+                for memory in recalled
+                if memory.subject == "akane"
+            ),
+            *(
+                f"Akane's established preference: {item.content}"
+                for item in profile.preferences
+            ),
+            *(
+                f"Akane's established opinion: {item.content}"
+                for item in profile.opinions
+            ),
+        ),
+        3,
+    )
+    shared_context = relevant(
+        "shared_context",
+        (
+            *(
+                f"Shared memory: {memory.content}"
+                for memory in recalled
+                if memory.subject == "shared"
+            ),
+            *(
+                f"Established shared experience: {item.summary}"
+                for item in profile.relationship.shared_context
+            ),
+        ),
+        3,
+    )
+    tool_lines = []
+    if editor.requested and editor.connected and editor.prompt_text:
+        tool_lines.append(editor.prompt_text)
+    elif editor.requested:
+        tool_lines.append("No current VS Code editor snapshot is available.")
+    if time_relevant:
+        tool_lines.append(f"Current local date and time: {date_time_line(snapshot.now)}")
+
     return PromptContext(
+        response_focus=response_focus,
         recent_turns=tuple(snapshot.recent_turns),
-        memories=tuple(
-            text
-            for item in snapshot.relevant_memories
-            if (text := _item_text(item))
-        ),
-        relationship=_relationship_context(profile.relationship, chat.text),
-        preferences=_relevant_items(
-            tuple(profile.preferences),
-            chat.text,
-            limit=3,
-            broad_request=tastes_requested,
-        ),
-        interests=_relevant_items(
-            tuple(profile.interests),
-            chat.text,
-            limit=3,
-            broad_request=tastes_requested,
-        ),
-        opinions=_relevant_items(
-            tuple(profile.opinions),
-            chat.text,
-            limit=3,
-            broad_request=opinions_requested,
-        ),
-        emotion=_emotion_context(profile.emotion, snapshot.now),
-        presence=format_presence_context(
-            profile.presence,
-            now=snapshot.now,
-            continuity=continuity,
-        ),
+        relationship=relationship,
+        emotion=emotion,
+        presence=activity,
+        user_context=user_context,
+        akane_context=akane_context,
+        shared_context=shared_context,
         reply_context=chat.reply_context,
-        external_context=editor_context,
-        date_time=date_time_line(snapshot.now) if _time_relevant(chat.text) else "",
+        tool_context="\n".join(tool_lines) if "tool_context" in sections else "",
         initiative_opportunity=(
             f"{chat.initiative_opportunity.reason}: "
             f"{chat.initiative_opportunity.context}"
@@ -482,9 +632,19 @@ def _build_prompt(
     snapshot: StateSnapshot,
     chat: ChatInput,
     *,
+    context_plan: tuple[tuple[str, ...], str, bool, bool],
+    editor,
     token_counter,
 ) -> PromptPlan:
-    context = _prompt_context(snapshot, chat)
+    sections, response_focus, time_relevant, _memory_relevant = context_plan
+    context = _prompt_context(
+        snapshot,
+        chat,
+        sections=sections,
+        response_focus=response_focus,
+        time_relevant=time_relevant,
+        editor=editor,
+    )
     if chat.initiative_opportunity is not None:
         return build_initiative_prompt(context, token_counter=token_counter)
     return build_conversation_prompt(
@@ -533,13 +693,6 @@ def run_companion_turn(
     started_at = time.perf_counter()
     store = get_state_store()
     try:
-        snapshot = store.snapshot(
-            chat.profile_id,
-            chat.conversation_id,
-            query=chat.text,
-            now=chat.timestamp,
-            include_memory=not skip_memory,
-        )
         timing = InferenceTiming(requested_at=started_at)
         manager = ModelManager.get_instance()
         priority = "background" if chat.autonomous else "visible"
@@ -551,9 +704,49 @@ def run_companion_turn(
                 cancellation=handle.cancellation,
                 queue_deadline=handle.queue_deadline,
             ) as reservation:
+                planning_text = (
+                    chat.initiative_opportunity.context
+                    if chat.initiative_opportunity is not None
+                    else chat.text
+                )
+                snapshot = store.snapshot(
+                    chat.profile_id,
+                    chat.conversation_id,
+                    now=time.time(),
+                    include_memory=False,
+                )
+                editor = code_context_for_message(planning_text)
+                context_plan = _response_context_plan(
+                    planning_text,
+                    tuple(snapshot.recent_turns),
+                    reply_context=chat.reply_context,
+                    tool_requested=editor.requested,
+                )
+                sections, _focus, _time_relevant, memory_relevant = context_plan
+                if (
+                    not skip_memory
+                    and memory_relevant
+                    and set(sections) & _MEMORY_SECTIONS
+                ):
+                    memory_query = " ".join(
+                        (
+                            planning_text,
+                            chat.reply_context,
+                            *(_item_text(turn) for turn in snapshot.recent_turns[-2:]),
+                        )
+                    )
+                    snapshot = store.snapshot(
+                        chat.profile_id,
+                        chat.conversation_id,
+                        query=memory_query,
+                        now=time.time(),
+                        include_memory=True,
+                    )
                 plan = _build_prompt(
                     snapshot,
                     chat,
+                    context_plan=context_plan,
+                    editor=editor,
                     token_counter=lambda messages: manager.tokenize_prompt(
                         messages,
                         reservation=reservation,

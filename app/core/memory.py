@@ -36,7 +36,7 @@ from app.core.presence import (
 )
 from app.core.utils import OWNER_PROFILE_ID, canonical_profile_id, compact_text, words
 
-STATE_SCHEMA_VERSION = 11
+STATE_SCHEMA_VERSION = 12
 STARTING_INTERESTS = ("anime", "manga", "VTubers")
 
 _MAX_RECENT_TURNS = 28
@@ -48,6 +48,49 @@ _MEMORY_SUBJECTS = {"user", "akane", "shared"}
 _MEMORY_KINDS = {"fact", "event", "commitment", "project", "concern"}
 _PREFERENCE_STANCES = {
     "likes", "dislikes", "curious", "mixed", "uncertain", "indifferent",
+}
+EMOTION_VOCABULARY = frozenset(
+    {
+        "neutral",
+        "calm",
+        "content",
+        "curious",
+        "interested",
+        "amused",
+        "excited",
+        "inspired",
+        "affectionate",
+        "hopeful",
+        "uncertain",
+        "concerned",
+        "anxious",
+        "lonely",
+        "tired",
+        "disappointed",
+        "sad",
+        "frustrated",
+        "irritated",
+        "angry",
+    }
+)
+_EMOTION_SOURCES = {
+    "conversation",
+    "offscreen_life",
+    "memory",
+    "relationship",
+    "self_reflection",
+}
+_GENERIC_CAUSES = {
+    "her systems are active",
+    "her system is active",
+    "her internal state changed",
+    "she is processing things",
+    "she felt something randomly",
+    "the model decided",
+    "time passed",
+}
+_TRIVIAL_EMOTIONAL_INPUTS = {
+    "hello", "hi", "hey", "okay", "ok", "thanks", "thank you", "hmm", "hm",
 }
 _GROUNDING_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "because", "been", "but",
@@ -538,14 +581,51 @@ def _trim_turns(turns: tuple[ChatTurn, ...]) -> tuple[ChatTurn, ...]:
 
 
 @dataclass(frozen=True, slots=True)
-class EmotionState:
-    primary: str = "neutral"
-    intensity: float = 0.0
+class MoodState:
+    valence: float = 0.0
+    energy: float = 0.0
     cause: str = ""
     updated_at: float = 0.0
 
     @classmethod
-    def from_dict(cls, payload: object, fallback_time: float = 0.0) -> "EmotionState":
+    def from_dict(
+        cls,
+        payload: object,
+        *,
+        now: float,
+    ) -> "MoodState":
+        values = payload if isinstance(payload, dict) else {}
+        updated = min(now, max(0.0, _number(values.get("updated_at"))))
+        return cls(
+            max(-1.0, min(1.0, _number(values.get("valence")))),
+            max(-1.0, min(1.0, _number(values.get("energy")))),
+            compact_text(values.get("cause"), 160),
+            updated,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class EmotionState:
+    primary: str = "neutral"
+    intensity: float = 0.0
+    cause: str = ""
+    source: str | None = None
+    source_id: str | None = None
+    started_at: float = 0.0
+    updated_at: float = 0.0
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        fallback_time: float = 0.0,
+        *,
+        now: float,
+        migrating: bool,
+    ) -> "EmotionState":
         if not isinstance(payload, dict) or not set(payload) & {
             "primary",
             "dominant",
@@ -563,7 +643,7 @@ class EmotionState:
             values.get("primary") or values.get("dominant") or values.get("mood"),
             32,
         ).casefold()
-        if primary in {"", "steady", "relaxed"}:
+        if primary not in EMOTION_VOCABULARY:
             primary = "neutral"
         intensity = max(
             0.0,
@@ -579,15 +659,63 @@ class EmotionState:
                 ),
             ),
         )
+        cause = compact_text(values.get("cause"), 160)
+        updated = min(
+            now,
+            max(0.0, _number(values.get("updated_at"), fallback_time)),
+        )
+        source = compact_text(values.get("source"), 32).casefold() or None
+        if source not in _EMOTION_SOURCES:
+            source = "self_reflection" if migrating and primary != "neutral" else None
+        source_id = compact_text(values.get("source_id"), 120) or None
+        started = min(
+            now,
+            max(
+                0.0,
+                _number(values.get("started_at"), updated if migrating else 0.0),
+            ),
+        )
+        if primary == "neutral" or intensity < 0.08 or not cause:
+            primary = "neutral"
+            intensity = 0.0
+            cause = ""
+            source = None
+            source_id = None
+            started = 0.0
         return cls(
             primary,
             intensity,
-            compact_text(values.get("cause"), 160),
-            max(0.0, _number(values.get("updated_at"), fallback_time)),
+            cause,
+            source,
+            source_id,
+            started,
+            updated,
         )
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+def effective_mood(mood: MoodState, *, now: float) -> MoodState:
+    if mood.updated_at <= 0.0:
+        return mood
+    elapsed_hours = max(0.0, (now - mood.updated_at) / 3600.0)
+    decay = 0.985 ** elapsed_hours
+    return replace(
+        mood,
+        valence=max(-1.0, min(1.0, mood.valence * decay)),
+        energy=max(-1.0, min(1.0, mood.energy * decay)),
+    )
+
+
+def effective_emotion(emotion: EmotionState, *, now: float) -> EmotionState:
+    if emotion.updated_at <= 0.0 or emotion.primary == "neutral":
+        return emotion
+    elapsed_hours = max(0.0, (now - emotion.updated_at) / 3600.0)
+    intensity = max(0.0, min(1.0, emotion.intensity * (0.88 ** elapsed_hours)))
+    if intensity < 0.08:
+        return EmotionState(updated_at=emotion.updated_at)
+    return replace(emotion, intensity=intensity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -788,6 +916,7 @@ class RelationshipState:
 
 @dataclass(frozen=True, slots=True)
 class ProfileState:
+    mood: MoodState = MoodState()
     emotion: EmotionState = EmotionState()
     presence: PresenceState = PresenceState()
     memories: tuple[Memory, ...] = ()
@@ -804,6 +933,7 @@ class ProfileState:
         *,
         now: float,
         repair_presence: bool = False,
+        migrating: bool = False,
     ) -> "ProfileState | None":
         if isinstance(payload, list):
             memories = tuple(
@@ -854,7 +984,13 @@ class ProfileState:
             if (opinion := Opinion.from_dict(item)) is not None
         )
         return cls(
-            emotion=EmotionState.from_dict(payload.get("emotion"), updated),
+            mood=MoodState.from_dict(payload.get("mood"), now=now),
+            emotion=EmotionState.from_dict(
+                payload.get("emotion"),
+                updated,
+                now=now,
+                migrating=migrating,
+            ),
             presence=PresenceState.from_dict(
                 payload.get("presence"),
                 now=now,
@@ -871,6 +1007,7 @@ class ProfileState:
     def as_dict(self) -> dict[str, object]:
         return {
             "updated_at": self.updated_at,
+            "mood": self.mood.as_dict(),
             "emotion": self.emotion.as_dict(),
             "presence": self.presence.as_dict(),
             "memories": [memory.as_dict() for memory in self.memories],
@@ -886,6 +1023,73 @@ def _new_profile(now: float) -> ProfileState:
         presence=PresenceState.from_dict({}, now=now),
         updated_at=0.0,
     )
+
+
+def effective_emotional_state(profile: ProfileState, *, now: float) -> ProfileState:
+    """Return lazy mood/emotion decay without mutating or persisting state."""
+
+    return replace(
+        profile,
+        mood=effective_mood(profile.mood, now=now),
+        emotion=effective_emotion(profile.emotion, now=now),
+    )
+
+
+def format_emotional_context(
+    profile: ProfileState,
+    *,
+    now: float,
+    include_unappraised: bool = False,
+) -> str:
+    effective = effective_emotional_state(profile, now=now)
+    mood = effective.mood
+    emotion = effective.emotion
+    lines: list[str] = []
+    if mood.updated_at > 0.0 or mood.cause:
+        valence = (
+            "strongly negative"
+            if mood.valence <= -0.6
+            else "mildly negative"
+            if mood.valence <= -0.15
+            else "strongly positive"
+            if mood.valence >= 0.6
+            else "mildly positive"
+            if mood.valence >= 0.15
+            else "balanced"
+        )
+        energy = (
+            "very depleted"
+            if mood.energy <= -0.6
+            else "somewhat depleted"
+            if mood.energy <= -0.15
+            else "highly energized"
+            if mood.energy >= 0.6
+            else "moderately energized"
+            if mood.energy >= 0.15
+            else "steady energy"
+        )
+        lines.append(f"Akane's mood: {valence} and {energy}.")
+        if mood.cause:
+            lines.append(f"Ongoing influence: {mood.cause}.")
+    elif include_unappraised:
+        lines.append("Akane's underlying mood has not yet been appraised.")
+
+    if emotion.primary != "neutral" and emotion.intensity >= 0.08:
+        degree = (
+            "strong"
+            if emotion.intensity >= 0.7
+            else "moderate"
+            if emotion.intensity >= 0.35
+            else "mild"
+        )
+        lines.append(
+            f"Akane's current emotion: {emotion.primary} at {degree} intensity."
+        )
+        if emotion.cause:
+            lines.append(f"Grounded cause: {emotion.cause}.")
+    elif include_unappraised and emotion.updated_at <= 0.0:
+        lines.append("Akane's immediate emotion has not yet been appraised.")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1011,6 +1215,13 @@ def _merge_relationship(
 
 
 def _merge_profiles(left: ProfileState, right: ProfileState, *, now: float) -> ProfileState:
+    mood = max(
+        (left.mood, right.mood),
+        key=lambda item: (
+            item.updated_at,
+            int(bool(item.cause) or item.valence != 0.0 or item.energy != 0.0),
+        ),
+    )
     emotion = max(
         (left.emotion, right.emotion),
         key=lambda item: (
@@ -1062,6 +1273,7 @@ def _merge_profiles(left: ProfileState, right: ProfileState, *, now: float) -> P
         repair_schedule=True,
     )
     return ProfileState(
+        mood=mood,
         emotion=emotion,
         presence=presence,
         memories=_merge_memories(left.memories, right.memories),
@@ -1133,6 +1345,19 @@ def _validate_canonical_profile(
             normalized_presence["claim_token"] = None
             normalized_presence["claim_expires_at"] = 0.0
         normalized["presence"] = normalized_presence
+    raw_mood = payload.get("mood")
+    if isinstance(raw_mood, dict):
+        normalized_mood = dict(raw_mood)
+        if _number(normalized_mood.get("updated_at")) > now:
+            normalized_mood["updated_at"] = now
+        normalized["mood"] = normalized_mood
+    raw_emotion = payload.get("emotion")
+    if isinstance(raw_emotion, dict):
+        normalized_emotion = dict(raw_emotion)
+        for field_name in ("started_at", "updated_at"):
+            if _number(normalized_emotion.get(field_name)) > now:
+                normalized_emotion[field_name] = now
+        normalized["emotion"] = normalized_emotion
     if normalized != profile.as_dict():
         raise ValueError("canonical profile contains malformed state")
 
@@ -1147,6 +1372,247 @@ def _validate_canonical_conversation(
     normalized["profile_id"] = canonical_profile_id(payload.get("profile_id"))
     if normalized != conversation.as_dict():
         raise ValueError("canonical conversation contains malformed state")
+
+
+def _profile_emotional_evidence(
+    profile: ProfileState,
+    *,
+    relevance: str,
+    broad: bool,
+) -> str:
+    activities = tuple(
+        activity.fact()
+        for activity in (
+            profile.presence.current_activity,
+            profile.presence.previous_activity,
+        )
+        if activity is not None
+    )
+    relationship = profile.relationship
+    relevance_terms = _terms(relevance)
+
+    def relevant(text: str) -> bool:
+        return broad or bool(_terms(text) & relevance_terms)
+
+    return " ".join(
+        (
+            *activities,
+            *(memory.text for memory in profile.memories if relevant(memory.text)),
+            *(item for item in profile.interests if relevant(item)),
+            *(
+                item.content
+                for item in profile.preferences
+                if relevant(item.content)
+            ),
+            *(item.content for item in profile.opinions if relevant(item.content)),
+            *(
+                item.summary
+                for item in relationship.patterns
+                if relevant(item.summary)
+            ),
+            *(
+                item.summary
+                for item in relationship.shared_context
+                if relevant(item.summary)
+            ),
+            *(item.summary for item in relationship.unresolved_events),
+            profile.mood.cause,
+            profile.emotion.cause,
+        )
+    )
+
+
+def _grounded_emotional_cause(cause: str, evidence: str) -> bool:
+    cause_key = _key(cause)
+    if not cause or any(item in cause_key for item in _GENERIC_CAUSES):
+        return False
+    candidate_terms = _terms(cause)
+    overlap = candidate_terms & _terms(evidence)
+    return bool(candidate_terms and overlap) and (
+        len(overlap) >= 2 or len(candidate_terms) <= 3
+    )
+
+
+def _materialize_effective_state(
+    profile: ProfileState,
+    *,
+    now: float,
+) -> ProfileState:
+    effective = effective_emotional_state(profile, now=now)
+    mood = effective.mood
+    emotion = effective.emotion
+    if mood != profile.mood:
+        mood = replace(mood, updated_at=now)
+    if emotion != profile.emotion:
+        emotion = (
+            EmotionState(updated_at=now)
+            if emotion.primary == "neutral"
+            else replace(emotion, updated_at=now)
+        )
+    return replace(profile, mood=mood, emotion=emotion)
+
+
+def _emotion_fields_valid(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    mode = compact_text(payload.get("mode"), 16).casefold()
+    if mode in {"keep", "settle"}:
+        return set(payload) == {"mode"}
+    if mode != "shift" or set(payload) != {
+        "mode", "primary", "intensity", "cause",
+    }:
+        return False
+    intensity = payload.get("intensity")
+    return (
+        compact_text(payload.get("primary"), 32).casefold()
+        in EMOTION_VOCABULARY - {"neutral"}
+        and type(intensity) in {int, float}
+        and math.isfinite(float(intensity))
+        and bool(compact_text(payload.get("cause"), 160))
+    )
+
+
+def _mood_fields_valid(payload: object) -> bool:
+    if not isinstance(payload, dict) or set(payload) != {
+        "valence_delta", "energy_delta", "cause",
+    }:
+        return False
+    return all(
+        type(payload.get(name)) in {int, float}
+        and math.isfinite(float(payload[name]))
+        for name in ("valence_delta", "energy_delta")
+    ) and bool(compact_text(payload.get("cause"), 160))
+
+
+def _apply_emotional_updates(
+    profile: ProfileState,
+    *,
+    emotion_update: object,
+    mood_update: object,
+    evidence: str,
+    source: str,
+    source_id: str | None,
+    now: float,
+    mood_delta_limit: float,
+    expected_emotion_updated_at: float,
+    require_complete: bool,
+    bootstrap: bool = False,
+) -> tuple[ProfileState, bool]:
+    emotion_valid = _emotion_fields_valid(emotion_update)
+    mood_valid = _mood_fields_valid(mood_update)
+    if require_complete and (not emotion_valid or not mood_valid):
+        return profile, False
+
+    next_profile = _materialize_effective_state(profile, now=now)
+    profile_evidence = _profile_emotional_evidence(
+        profile,
+        relevance=evidence,
+        broad=source == "offscreen_life",
+    )
+    emotional_evidence = f"{evidence} {profile_evidence}"
+
+    if emotion_valid:
+        values = emotion_update
+        mode = compact_text(values.get("mode"), 16).casefold()
+        emotion = next_profile.emotion
+        if mode == "keep":
+            emotion = replace(emotion, updated_at=now)
+        elif mode == "settle":
+            emotion = EmotionState(updated_at=now)
+        else:
+            primary = compact_text(values.get("primary"), 32).casefold()
+            intensity = max(0.0, min(1.0, float(values["intensity"])))
+            cause = compact_text(values.get("cause"), 160)
+            grounded = (
+                intensity >= 0.08
+                and _grounded_emotional_cause(cause, emotional_evidence)
+            )
+            if require_complete and not grounded:
+                return profile, False
+            stale = (
+                profile.emotion.updated_at > expected_emotion_updated_at
+                and profile.emotion.source_id != source_id
+            )
+            related_episode = (
+                primary == emotion.primary
+                or bool(emotion.cause)
+                and _similar(cause, emotion.cause) >= 0.72
+            )
+            if grounded and related_episode:
+                refreshed = (
+                    cause
+                    if not emotion.cause
+                    or (
+                        _similar(cause, emotion.cause) < 0.82
+                        and bool(_terms(cause) - _terms(emotion.cause))
+                    )
+                    else emotion.cause
+                )
+                refresh_source = refreshed != emotion.cause
+                emotion = replace(
+                    emotion,
+                    primary=primary,
+                    intensity=max(
+                        0.0,
+                        min(1.0, emotion.intensity * 0.60 + intensity * 0.40),
+                    ),
+                    cause=refreshed,
+                    source=source if refresh_source else emotion.source,
+                    source_id=source_id if refresh_source else emotion.source_id,
+                    started_at=emotion.started_at or now,
+                    updated_at=now,
+                )
+            elif (
+                grounded
+                and intensity >= 0.18
+                and (
+                    not stale
+                    or intensity >= emotion.intensity + 0.15
+                )
+            ):
+                emotion = EmotionState(
+                    primary,
+                    intensity,
+                    cause,
+                    source,
+                    source_id,
+                    now,
+                    now,
+                )
+        next_profile = replace(next_profile, emotion=emotion)
+
+    if mood_valid:
+        values = mood_update
+        cause = compact_text(values.get("cause"), 160)
+        valence_delta = max(
+            -mood_delta_limit,
+            min(mood_delta_limit, float(values["valence_delta"])),
+        )
+        energy_delta = max(
+            -mood_delta_limit,
+            min(mood_delta_limit, float(values["energy_delta"])),
+        )
+        grounded = _grounded_emotional_cause(cause, emotional_evidence)
+        if bootstrap and valence_delta == 0.0 and energy_delta == 0.0:
+            grounded = False
+        if grounded:
+            mood = next_profile.mood
+            changed = valence_delta != 0.0 or energy_delta != 0.0
+            next_profile = replace(
+                next_profile,
+                mood=MoodState(
+                    max(-1.0, min(1.0, mood.valence + valence_delta)),
+                    max(-1.0, min(1.0, mood.energy + energy_delta)),
+                    cause if changed or not mood.cause else mood.cause,
+                    now,
+                ),
+            )
+        elif require_complete:
+            return profile, False
+
+    if require_complete and bootstrap and next_profile.mood.updated_at <= 0.0:
+        return profile, False
+    return next_profile, True
 
 
 class StateStore:
@@ -1265,6 +1731,7 @@ class StateStore:
                     ),
                     now=now,
                     repair_presence=schema != STATE_SCHEMA_VERSION,
+                    migrating=schema != STATE_SCHEMA_VERSION,
                 )
                 if profile is None:
                     continue
@@ -1323,6 +1790,7 @@ class StateStore:
                 or not set(raw_owner)
                 & {
                     "emotion",
+                    "mood",
                     "presence",
                     "memories",
                     "interests",
@@ -1436,6 +1904,17 @@ class StateStore:
                                 raw_profile["presence"].get("claim_expires_at")
                             )
                             > 0.0
+                        )
+                    )
+                    or bool(
+                        isinstance(raw_profile.get("mood"), dict)
+                        and _number(raw_profile["mood"].get("updated_at")) > now
+                    )
+                    or bool(
+                        isinstance(raw_profile.get("emotion"), dict)
+                        and any(
+                            _number(raw_profile["emotion"].get(field_name)) > now
+                            for field_name in ("started_at", "updated_at")
                         )
                     )
                     for profile_id, raw_profile in raw_profiles.items()
@@ -1697,38 +2176,30 @@ class StateStore:
         *,
         user_text: str,
         assistant_text: str,
+        source: str,
+        source_id: str | None,
+        expected_emotion_updated_at: float,
         now: float,
     ) -> ProfileState:
-        if not isinstance(proposals, dict):
-            return profile
-        next_profile = profile
+        values = proposals if isinstance(proposals, dict) else {}
+        emotional_input = _key(user_text)
+        if emotional_input in _TRIVIAL_EMOTIONAL_INPUTS:
+            next_profile = _materialize_effective_state(profile, now=now)
+        else:
+            next_profile, _valid = _apply_emotional_updates(
+                profile,
+                emotion_update=values.get("emotion_update"),
+                mood_update=values.get("mood_update"),
+                evidence=f"{user_text} {assistant_text}",
+                source=source,
+                source_id=source_id,
+                now=now,
+                mood_delta_limit=0.12,
+                expected_emotion_updated_at=expected_emotion_updated_at,
+                require_complete=False,
+            )
 
-        emotion = proposals.get("emotion")
-        if isinstance(emotion, dict) and set(emotion) == {
-            "primary", "intensity", "cause",
-        }:
-            primary = compact_text(emotion.get("primary"), 32).casefold()
-            cause = compact_text(emotion.get("cause"), 160)
-            intensity = emotion.get("intensity")
-            if (
-                primary
-                and bool(re.fullmatch(r"[a-z][a-z -]{0,30}", primary))
-                and type(intensity) in {int, float}
-                and math.isfinite(float(intensity))
-                and cause
-                and _grounded(cause, user_text)
-            ):
-                next_profile = replace(
-                    next_profile,
-                    emotion=EmotionState(
-                        primary,
-                        max(0.0, min(1.0, float(intensity))),
-                        cause,
-                        now,
-                    ),
-                )
-
-        raw_memories = proposals.get("memories")
+        raw_memories = values.get("memories")
         if isinstance(raw_memories, list):
             additions = tuple(
                 memory
@@ -1749,7 +2220,7 @@ class StateStore:
                     memories=_merge_memories(next_profile.memories, additions),
                 )
 
-        raw_preferences = proposals.get("preferences")
+        raw_preferences = values.get("preferences")
         if isinstance(raw_preferences, list):
             additions: list[AkanePreference] = []
             for item in raw_preferences[:6]:
@@ -1776,7 +2247,7 @@ class StateStore:
                     ),
                 )
 
-        raw_interests = proposals.get("interests")
+        raw_interests = values.get("interests")
         if isinstance(raw_interests, list):
             additions = tuple(
                 interest
@@ -1796,7 +2267,7 @@ class StateStore:
                     ),
                 )
 
-        raw_opinions = proposals.get("opinions")
+        raw_opinions = values.get("opinions")
         if isinstance(raw_opinions, list):
             additions: list[Opinion] = []
             for item in raw_opinions[:6]:
@@ -1823,7 +2294,7 @@ class StateStore:
                     ),
                 )
 
-        relationship = proposals.get("relationship")
+        relationship = values.get("relationship")
         if isinstance(relationship, dict):
             additions: dict[str, tuple[RelationshipEntry, ...]] = {}
             for field_name in ("patterns", "shared_context", "unresolved_events"):
@@ -1913,16 +2384,19 @@ class StateStore:
                     query=user_text,
                     now=committed,
                 )
+            pair_id = request or uuid.uuid4().hex
             next_profile = self._apply_proposals(
                 profile,
                 proposals,
                 user_text=user_text,
                 assistant_text=assistant_text,
+                source="conversation",
+                source_id=pair_id,
+                expected_emotion_updated_at=snapshot.profile.emotion.updated_at,
                 now=committed,
             )
             turns = list(conversation.recent_turns)
             if assistant_text:
-                pair_id = request or uuid.uuid4().hex
                 turns.extend(
                     (
                         ChatTurn(
@@ -2018,6 +2492,9 @@ class StateStore:
                 proposals,
                 user_text=opportunity.context,
                 assistant_text=message,
+                source="self_reflection",
+                source_id=_key(opportunity.context)[:120] or None,
+                expected_emotion_updated_at=snapshot.profile.emotion.updated_at,
                 now=committed,
             )
             turns = list(conversation.recent_turns)
@@ -2213,10 +2690,12 @@ class StateStore:
         profile_id: str = OWNER_PROFILE_ID,
     ) -> dict[str, object]:
         profile = canonical_profile_id(profile_id)
+        current = time.time()
         with self._lock:
-            state = self._profiles.get(profile) or _new_profile(time.time())
+            state = self._profiles.get(profile) or _new_profile(current)
+            effective = effective_emotional_state(state, now=current)
             return {
-                **state.as_dict(),
+                **effective.as_dict(),
                 "profile_id": profile,
                 "revision": self._revision,
                 "committed_at": self._committed_at,
@@ -2444,6 +2923,7 @@ class StateStore:
         claim_token: str,
         now: float,
         grounded_context: str,
+        expected_emotion_updated_at: float = 0.0,
     ) -> tuple[bool, str]:
         profile = canonical_profile_id(profile_id)
         current = max(0.0, float(now))
@@ -2452,6 +2932,40 @@ class StateStore:
             if state is None or state.presence.claim_token != claim_token:
                 return False, "life claim is unavailable"
             rejection = life_decision_rejection(state.presence, decision)
+            emotionally_updated = state
+            if not rejection:
+                activity = (
+                    state.presence.current_activity.fact()
+                    if decision.mode == "continue"
+                    and state.presence.current_activity is not None
+                    else " ".join(
+                        item
+                        for item in (
+                            decision.activity,
+                            decision.subject or "",
+                            decision.detail or "",
+                        )
+                        if item
+                    )
+                )
+                emotionally_updated, appraisal_valid = _apply_emotional_updates(
+                    state,
+                    emotion_update=decision.emotion_update,
+                    mood_update=decision.mood_update,
+                    evidence=f"{activity} {decision.continuation_reason or ''}",
+                    source="offscreen_life",
+                    source_id=claim_token,
+                    now=current,
+                    mood_delta_limit=0.20,
+                    expected_emotion_updated_at=expected_emotion_updated_at,
+                    require_complete=True,
+                    bootstrap=(
+                        state.mood.updated_at == 0.0
+                        and state.emotion.updated_at == 0.0
+                    ),
+                )
+                if not appraisal_valid:
+                    rejection = "life decision lacks a grounded emotional appraisal"
             if rejection:
                 presence = self._failed_presence(
                     state.presence,
@@ -2471,19 +2985,19 @@ class StateStore:
                     activity=decision.activity,
                     subject=decision.subject,
                     detail=decision.detail,
-                    existing_interests=state.interests,
+                    existing_interests=emotionally_updated.interests,
                     grounded_context=grounded_context,
                 )
                 interests = (
                     _dedupe_text(
-                        (*state.interests, interest),
+                        (*emotionally_updated.interests, interest),
                         limit=_MAX_INTERESTS,
                     )
                     if interest
-                    else state.interests
+                    else emotionally_updated.interests
                 )
                 next_state = replace(
-                    state,
+                    emotionally_updated,
                     presence=presence,
                     interests=interests,
                     updated_at=current,

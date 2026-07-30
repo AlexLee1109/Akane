@@ -12,6 +12,7 @@ from app.core.config import MAX_TOKENS
 from app.core.memory import (
     InitiativeOpportunity,
     StateStore,
+    format_emotional_context,
     get_state_store,
 )
 from app.core.model_loader import (
@@ -221,21 +222,17 @@ def _life_context(profile, *, now: float) -> PromptContext:
     opinions = tuple(
         _profile_text(item) for item in profile.opinions[-3:] if _profile_text(item)
     )
-    emotion = ""
-    if profile.emotion.primary != "neutral" and profile.emotion.intensity >= 0.05:
-        emotion = (
-            f"{profile.emotion.primary}, intensity "
-            f"{profile.emotion.intensity:.2f}"
-        )
-        if profile.emotion.cause:
-            emotion += f"; cause: {profile.emotion.cause}"
     return PromptContext(
         memories=memories,
         relationship=relationship,
         preferences=preferences,
         interests=tuple(profile.interests[-8:]),
         opinions=opinions,
-        emotion=emotion,
+        emotion=format_emotional_context(
+            profile,
+            now=now,
+            include_unappraised=True,
+        ),
         presence=format_presence_context(
             profile.presence,
             now=now,
@@ -314,6 +311,7 @@ def run_life_turn(
             claim_token=claim_token,
             now=time.time() if now is None else current,
             grounded_context=grounded,
+            expected_emotion_updated_at=claimed.emotion.updated_at,
         )
         return accepted
     except InferenceCancelled:

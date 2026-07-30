@@ -365,6 +365,8 @@ class LifeDecision:
     detail: str | None = None
     interest_addition: str | None = None
     continuation_reason: str | None = None
+    emotion_update: dict[str, object] | None = None
+    mood_update: dict[str, object] | None = None
 
 
 def _unsupported_proper_nouns(value: str, grounded_context: str) -> bool:
@@ -405,7 +407,8 @@ def parse_life_decision(
         return None
     keys = {
         "mode", "activity", "category", "subject", "detail",
-        "interest_addition", "continuation_reason",
+        "interest_addition", "continuation_reason", "emotion_update",
+        "mood_update",
     }
     if not isinstance(payload, dict) or set(payload) != keys:
         return None
@@ -416,6 +419,8 @@ def parse_life_decision(
     detail = _optional_text(payload.get("detail"), _MAX_DETAIL_CHARS)
     addition = _optional_text(payload.get("interest_addition"), 100)
     reason = _optional_text(payload.get("continuation_reason"), _MAX_DETAIL_CHARS)
+    emotion_update = payload.get("emotion_update")
+    mood_update = payload.get("mood_update")
     optional = {
         "category": category,
         "subject": subject,
@@ -426,6 +431,8 @@ def parse_life_decision(
     if (
         mode not in _LIFE_MODES
         or any(payload[name] is not None and value is None for name, value in optional.items())
+        or not isinstance(emotion_update, dict)
+        or not isinstance(mood_update, dict)
     ):
         return None
     if mode == "new":
@@ -446,7 +453,17 @@ def parse_life_decision(
     )
     if _unsupported_proper_nouns(grounded, grounded_context):
         return None
-    return LifeDecision(mode, activity, category, subject, detail, addition, reason)
+    return LifeDecision(
+        mode,
+        activity,
+        category,
+        subject,
+        detail,
+        addition,
+        reason,
+        emotion_update,
+        mood_update,
+    )
 
 
 def life_decision_rejection(

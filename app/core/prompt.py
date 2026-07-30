@@ -8,21 +8,37 @@ from typing import Callable
 
 from app.core.config import LLAMA_CONTEXT_WINDOW, MAX_TOKENS
 
-PROMPT_BUILDER_VERSION = "5"
+PROMPT_BUILDER_VERSION = "7"
 _PROMPT_CHAR_BUDGET = max(
     2_000,
     (LLAMA_CONTEXT_WINDOW - MAX_TOKENS) * 5 // 2,
 )
-_MAX_RECENT_PAIRS = 6
+_MAX_RECENT_PAIRS = 4
 
 _STATE_PROTOCOL = (
+    "Respond as Akane to the current conversation. Use only relevant context "
+    "supplied below. Do not introduce implementation language, unrelated personal "
+    "state, or a generic follow-up question. "
     "After the visible reply, an optional <AKANE_STATE> JSON block may contain "
     "only grounded, durable changes. Allowed fields and shapes: "
-    "emotion {primary,intensity,cause}; memories [{subject,kind,text,confidence}]; "
+    'emotion_update is {"mode":"keep"}, {"mode":"settle"}, or '
+    '{"mode":"shift","primary":"<label>","intensity":0.0,'
+    '"cause":"<grounded cause>"}; mood_update is '
+    '{"valence_delta":0.0,"energy_delta":0.0,"cause":"<grounded cause>"}; memories '
+    "[{subject,kind,text,confidence}]; "
     "preferences [{topic,stance,reason}]; interests [text]; "
     "opinions [{topic,position,reason}]; relationship may contain patterns, "
     "shared_context, unresolved_events, or resolved_events as "
     "[{summary,confidence}]. "
+    "Emotion labels are neutral, calm, content, curious, interested, amused, "
+    "excited, inspired, affectionate, hopeful, uncertain, concerned, anxious, "
+    "lonely, tired, disappointed, sad, frustrated, irritated, or angry. "
+    "Use settle rather than shift for neutral. "
+    "Allow conversation to affect Akane only when personally meaningful to her. "
+    "Keep continuity when nothing important changes. Every shift or mood delta "
+    "needs a concise concrete cause from the supplied context. Emotion may shape "
+    "tone and judgment but never requires a fixed reaction. Do not explain these "
+    "state mechanics in the visible reply. "
     "For genuine silence or a short pause only, participation may be "
     '{"should_respond":false,"pause_seconds":null}. '
     "Omit unchanged fields and omit the block when nothing changed."
@@ -32,12 +48,26 @@ _LIFE_PROTOCOL = (
     "Choose Akane's next offscreen-life decision from her own judgment and the "
     "grounded context. Interests are context, not limits. Do not invent external "
     "events or proper nouns. Use lowercase ordinary activity wording; any proper "
-    "name must already appear in context. Return only one <AKANE_LIFE> JSON block with exactly "
+    "name must already appear in context. Appraise the activity, ongoing "
+    "concerns, and Akane's emotional continuity as part of this same decision. "
+    "Return only one <AKANE_LIFE> JSON block with exactly "
     "mode, activity, category, subject, detail, interest_addition, "
-    "continuation_reason. mode is new or continue. A new activity needs specific "
+    "continuation_reason, emotion_update, mood_update. mode is new or continue. "
+    'emotion_update must explicitly choose {"mode":"keep"}, {"mode":"settle"}, '
+    'or {"mode":"shift","primary":"<label>","intensity":0.0,'
+    '"cause":"<grounded cause>"}. primary must be one of neutral, '
+    "calm, content, curious, interested, amused, excited, inspired, affectionate, "
+    "hopeful, uncertain, concerned, anxious, lonely, tired, disappointed, sad, "
+    "frustrated, irritated, or angry. Use settle rather than shift for neutral. "
+    'mood_update is {"valence_delta":0.0,"energy_delta":0.0,'
+    '"cause":"<grounded cause>"}. A new '
+    "activity needs specific "
     "free-text activity and concrete detail; continuation_reason is null. For "
     "continue, all activity fields are null and continuation_reason explains why "
-    "continuing is meaningful. Duration is not model-controlled."
+    "continuing is meaningful. On the first appraisal, establish a grounded mood "
+    "from the chosen activity and existing context; immediate emotion may still "
+    "be kept or settled when appropriate. Do not create emotion merely from time "
+    "passing. Duration is not model-controlled."
 )
 
 _INITIATIVE_PROTOCOL = (
@@ -59,6 +89,7 @@ class PromptTokenCount:
 
 @dataclass(frozen=True, slots=True)
 class PromptContext:
+    response_focus: str = ""
     recent_turns: tuple[object, ...] = ()
     memories: tuple[str, ...] = ()
     relationship: tuple[str, ...] = ()
@@ -67,9 +98,11 @@ class PromptContext:
     opinions: tuple[str, ...] = ()
     emotion: str = ""
     presence: str = ""
+    user_context: tuple[str, ...] = ()
+    akane_context: tuple[str, ...] = ()
+    shared_context: tuple[str, ...] = ()
     reply_context: str = ""
-    external_context: str = ""
-    date_time: str = ""
+    tool_context: str = ""
     initiative_opportunity: str = ""
 
 
@@ -184,20 +217,43 @@ def _context_sections(context: PromptContext) -> tuple[tuple[str, str], ...]:
         if text:
             values.append((name, f"[{label}]\n{text}"))
 
-    add("reply_context", "REPLY CONTEXT", context.reply_context)
-    add("external_context", "AVAILABLE INTERFACE CONTEXT", context.external_context)
-    add("emotion", "CURRENT EMOTION", context.emotion)
+    add("response_focus", "RESPONSE FOCUS", context.response_focus)
+    add("reply_context", "RELEVANT QUOTED REPLY WITH AUTHOR", context.reply_context)
+    add("presence", "AKANE'S CURRENT ACTIVITY", context.presence)
+    add("emotion", "AKANE'S EMOTIONAL STATE", context.emotion)
     if context.relationship:
-        add("relationship", "RELATIONSHIP CONTINUITY", "\n".join(context.relationship))
+        add(
+            "relationship",
+            "AKANE AND ARCANE'S RELEVANT RELATIONSHIP",
+            "\n".join(context.relationship),
+        )
+    if context.user_context:
+        add(
+            "user_context",
+            "CONFIRMED INFORMATION ABOUT ARCANE",
+            "\n".join(context.user_context),
+        )
+    if context.akane_context:
+        add(
+            "akane_context",
+            "AKANE'S RELEVANT CONTEXT",
+            "\n".join(context.akane_context),
+        )
+    if context.shared_context:
+        add(
+            "shared_context",
+            "RELEVANT SHARED EXPERIENCES",
+            "\n".join(context.shared_context),
+        )
+    add("tool_context", "RELEVANT TOOL CONTEXT", context.tool_context)
     if context.memories:
-        add("memories", "RELEVANT DURABLE MEMORIES", "\n".join(context.memories))
+        add("memories", "AKANE'S RELEVANT MEMORIES", "\n".join(context.memories))
     if context.preferences:
-        add("preferences", "RELEVANT PREFERENCES", "\n".join(context.preferences))
+        add("preferences", "AKANE'S RELEVANT PREFERENCES", "\n".join(context.preferences))
     if context.opinions:
-        add("opinions", "RELEVANT OPINIONS", "\n".join(context.opinions))
+        add("opinions", "AKANE'S RELEVANT OPINIONS", "\n".join(context.opinions))
     if context.interests:
-        add("interests", "RELEVANT INTERESTS", ", ".join(context.interests))
-    add("date_time", "CURRENT TIME", context.date_time)
+        add("interests", "AKANE'S RELEVANT INTERESTS", ", ".join(context.interests))
     return tuple(values)
 
 
@@ -211,7 +267,8 @@ def _compile(
     retry_note: str = "",
 ) -> PromptPlan:
     stable = _character_parts()
-    system_parts = [*stable, f"[{mode.upper()}]\n{protocol}"]
+    protocol_label = "DIALOGUE" if mode == "conversation" else mode.upper()
+    system_parts = [*stable, f"[{protocol_label}]\n{protocol}"]
     included = ["identity", "soul", "hard_rules", "protocol"]
     trimmed: list[str] = []
     required_chars = sum(len(part) for part in system_parts) + len(current_input) + 128
@@ -219,7 +276,7 @@ def _compile(
 
     if initiative_message := _recent_initiative(context.recent_turns):
         initiative_context = (
-            "[RECENT INITIATIVE MESSAGE]\n" + initiative_message
+            "[AKANE'S RECENT INITIATIVE MESSAGE]\n" + initiative_message
         )
         if len(initiative_context) <= remaining:
             system_parts.append(initiative_context)
@@ -227,15 +284,6 @@ def _compile(
             remaining -= len(initiative_context)
         else:
             trimmed.append("recent_initiative:character_budget")
-
-    if context.presence:
-        presence = "[CURRENT PRESENCE]\n" + _text(context.presence)
-        if len(presence) <= remaining:
-            system_parts.append(presence)
-            included.append("presence")
-            remaining -= len(presence)
-        else:
-            trimmed.append("presence:character_budget")
 
     selected_groups: list[tuple[object, ...]] = []
     groups = _complete_context_groups(context.recent_turns)
@@ -259,7 +307,8 @@ def _compile(
             0,
             (
                 "initiative_opportunity",
-                "[GROUNDED OPPORTUNITY]\n" + _text(context.initiative_opportunity),
+                "[AKANE'S GROUNDED OUTREACH OPPORTUNITY]\n"
+                + _text(context.initiative_opportunity),
             ),
         )
     if retry_note:

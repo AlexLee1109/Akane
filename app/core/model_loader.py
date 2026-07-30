@@ -80,13 +80,6 @@ class InferenceReservation:
 
     llm: object
     priority: str
-    preempted: threading.Event
-
-    def raise_if_preempted(self) -> None:
-        if self.preempted.is_set():
-            raise InferenceCancelled(
-                "Background inference yielded to a visible reply."
-            )
 
 
 def content_to_text(content) -> str:
@@ -192,8 +185,6 @@ class ModelManager:
         self._inference_condition = threading.Condition()
         self._inference_active = False
         self._visible_waiters = 0
-        self._active_priority = ""
-        self._active_preemption: threading.Event | None = None
 
     @classmethod
     def get_instance(cls) -> "ModelManager":
@@ -349,7 +340,6 @@ class ModelManager:
 
         visible = priority != "background"
         normalized_priority = "visible" if visible else "background"
-        preempted = threading.Event()
         with self._inference_condition:
             if visible:
                 self._visible_waiters += 1
@@ -365,12 +355,6 @@ class ModelManager:
                     raise InferenceQueueTimeout(
                         "Generation timed out while waiting for the model."
                     )
-                if (
-                    visible
-                    and self._active_priority == "background"
-                    and self._active_preemption is not None
-                ):
-                    self._active_preemption.set()
                 while self._inference_active or (
                     not visible and self._visible_waiters
                 ):
@@ -387,8 +371,6 @@ class ModelManager:
                         )
                     self._inference_condition.wait(timeout=0.1)
                 self._inference_active = True
-                self._active_priority = normalized_priority
-                self._active_preemption = preempted
             finally:
                 if visible:
                     self._visible_waiters -= 1
@@ -398,15 +380,11 @@ class ModelManager:
             reservation = InferenceReservation(
                 self.llm,
                 normalized_priority,
-                preempted,
             )
-            reservation.raise_if_preempted()
             yield reservation
         finally:
             with self._inference_condition:
                 self._inference_active = False
-                self._active_priority = ""
-                self._active_preemption = None
                 self._inference_condition.notify_all()
 
     def tokenize_prompt(
@@ -420,7 +398,6 @@ class ModelManager:
         from app.core.prompt import PromptTokenCount
 
         def tokenize(llm):
-            reservation.raise_if_preempted()
             formatter = _resolved_chat_formatter(llm)
             if formatter is None:
                 raise RuntimeError(
@@ -450,7 +427,6 @@ class ModelManager:
                 add_bos=False,
                 special=True,
             )
-            reservation.raise_if_preempted()
             return PromptTokenCount(
                 tuple(tokens),
                 "exact_active_chat_template_enable_thinking_false",
@@ -504,7 +480,6 @@ class ModelManager:
                     raise InferenceCancelled(
                         "Generation was cancelled before inference."
                     )
-                reservation.raise_if_preempted()
                 options = completion_kwargs(max_tokens, True)
                 configured_stops = list(options.pop("stop", []))
                 stops = list(
@@ -523,7 +498,6 @@ class ModelManager:
                 for chunk in response:
                     if cancellation is not None and cancellation.is_set():
                         raise InferenceCancelled("Generation was cancelled during inference.")
-                    reservation.raise_if_preempted()
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue

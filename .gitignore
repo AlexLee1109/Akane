@@ -17,3 +17,10 @@ logs/
 static/
 hellaswag/
 app/secrets/local_secrets.py
+
+# Website build output and local dependencies
+website/node_modules/
+website/dist/
+website/*.tsbuildinfo
+website/vite.config.js
+website/vite.config.d.ts

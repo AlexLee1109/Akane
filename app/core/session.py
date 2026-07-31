@@ -55,26 +55,32 @@ _TIMING_ENABLED = str(os.environ.get("AKANE_TIMING", "")).strip().lower() in {
 _SECTION_DESCRIPTORS = (
     ("identity", "who you identity self yourself tell describe description person "
      "personality character values becoming changed change matters",
-     "Answer personally and concretely."),
-    ("activity", "current activity doing occupied working presence recent experience "
-     "continuing", "Answer from Akane's recorded current activity."),
+     "Respond from Akane's stable identity."),
+    ("activity", "current activity doing occupied occupying occupation working "
+     "presence recent experience continuing attention focus mind",
+     "Address Akane's recorded current activity."),
     ("emotion", "feel feeling emotion mood emotional bother bothered quieter affect",
-     "Describe Akane's current feeling naturally."),
+     "Address Akane's current emotional state."),
     ("relationship", "relationship between Akane Arcane trust conflict closeness "
-     "connection", "Reflect only from established relationship evidence."),
+     "connection", "Use established relationship evidence."),
     ("user_context", "Arcane user remember remembered facts taste prefer preference "
      "likes dislikes recommend recommendation care cares confirmed",
-     "Use only confirmed information about Arcane."),
+     "Use confirmed information about Arcane."),
     ("akane_context", "Akane interests likes taste preference preferences prefer "
      "opinion opinions think goals thoughts realizations uncertainties memories "
      "judgment values matters design designs",
-     "Give Akane's own judgment rather than automatic agreement."),
+     "Use Akane's relevant established preferences or opinions."),
     ("shared_context", "shared together our experience conversation event commitment "
      "disagreement unresolved",
-     "Use only relevant experiences Akane and Arcane actually shared."),
+     "Use relevant established shared experiences."),
     ("tool_context", "tool editor file code external technical explain compare "
      "algorithm model quantization",
-     "Answer the request directly without forcing personal state into it."),
+     "Use relevant technical context."),
+)
+_DIRECT_ACTIVITY_QUESTION = re.compile(
+    r"\b(?:what\s+(?:are\s+you\s+doing|have\s+you\s+been\s+(?:doing|up\s+to)|"
+    r"were\s+you\s+thinking\s+about)|how\s+has\s+your\s+day\s+been)\b",
+    re.IGNORECASE,
 )
 _SEMANTIC_STOPWORDS = {
     "a", "about", "an", "and", "are", "as", "at", "be", "been", "but", "did",
@@ -389,9 +395,11 @@ def _response_context_plan(
     reply_context: str = "",
     tool_requested: bool = False,
 ) -> tuple[tuple[str, ...], str, bool]:
-    """Select broad context concepts without classifying specific questions."""
+    """Select broad context concepts and explicit current-focus questions."""
 
-    current_terms = _semantic_terms(f"{message} {reply_context}")
+    direct_text = f"{message} {reply_context}"
+    current_terms = _semantic_terms(direct_text)
+    direct_activity = bool(_DIRECT_ACTIVITY_QUESTION.search(direct_text))
     recent_terms = _semantic_terms(
         " ".join(_item_text(turn) for turn in recent_turns[-2:])
     )
@@ -407,6 +415,8 @@ def _response_context_plan(
     directly_relevant_memory_sections: set[str] = set()
     for index, (name, descriptor, focus) in enumerate(_SECTION_DESCRIPTORS):
         direct_score = similarity(current_terms, descriptor)
+        if name == "activity" and direct_activity:
+            direct_score = max(direct_score, 1.0)
         score = direct_score
         score += recent_weight * similarity(recent_terms, descriptor)
         if name == "tool_context" and tool_requested:
@@ -487,18 +497,27 @@ def _prompt_context(
             return ()
         return _relevant_items(values, query, limit=limit, fallback=fallback)
 
-    activity = ""
+    presence_context = ""
     if "activity" in sections:
         current = profile.presence.current_activity
         if current is None:
-            activity = "Akane's current activity is not recorded."
+            presence_context = (
+                "Akane's current activity is not recorded. Say so naturally without "
+                "inventing one."
+            )
         else:
-            lines = [f"Akane's current activity: {current.activity}."]
-            if current.subject:
-                lines.append(f"Akane's recorded focus: {current.subject}.")
-            if current.detail:
-                lines.append(f"Grounded activity detail: {current.detail}.")
-            activity = "\n".join(lines)
+            presence_context = "\n".join(
+                (
+                    f"Broad activity: {current.summary}",
+                    f"Current focus: {current.focus}",
+                    "Treat these as first-person factual context. Combine and paraphrase "
+                    "them when useful; do not expose the labels, quote either field, or "
+                    "speak about Akane in third person. Do not invent settings, physical "
+                    "details, prior events, plans, outcomes, titles, people, places, or "
+                    "implementation details. Emotion may affect wording only; it must not "
+                    "add surroundings.",
+                )
+            )
 
     emotion = (
         format_emotional_context(profile, now=snapshot.now)
@@ -599,7 +618,7 @@ def _prompt_context(
         recent_turns=recent_turns,
         relationship=relationship,
         emotion=emotion,
-        presence=activity,
+        presence=presence_context,
         user_context=user_context,
         akane_context=akane_context,
         shared_context=shared_context,
@@ -766,7 +785,6 @@ def run_companion_turn(
             now=committed.now,
             conversation=True,
         )
-        store.wake_presence_if_due(chat.profile_id, now=time.time())
         _record_debug(chat, snapshot, plan, parsed, decision, timing, started_at)
         return CompanionTurnResult(decision, handle.generation_id)
     finally:
@@ -874,7 +892,7 @@ def session_state_snapshot(
     store = get_state_store()
     with _DEBUG_LOCK:
         debug = dict(_TURN_DEBUG.get((profile, conversation), {}))
-    from app.core.life_worker import life_worker_debug
+    from app.core.life_worker import presence_worker_debug
 
     return {
         "akane": store.public_internal_state(profile),
@@ -887,7 +905,7 @@ def session_state_snapshot(
             )
         ),
         "turn": debug,
-        "life_worker": life_worker_debug(),
+        "presence_worker": presence_worker_debug(),
     }
 
 
@@ -910,9 +928,9 @@ def debug_state_report(
             f"Canonical Profile: {canonical_profile_id(profile_id)}",
             f"State Revision: {profile.get('revision', 'None')}",
             f"Emotion: {(profile.get('emotion') or {}).get('primary', 'neutral')}",
-            f"Current Activity: {current.get('activity') or 'None'}",
-            f"Next Life Decision At: {presence.get('next_decision_at') or 'None'}",
-            f"Life Worker: {(snapshot.get('life_worker') or {}).get('Life Worker Started', False)}",
+            f"Current Focus: {current.get('summary') or 'None'}",
+            f"Next Presence Decision At: {presence.get('next_decision_at') or 'None'}",
+            f"Presence Worker: {(snapshot.get('presence_worker') or {}).get('Presence Worker Started', False)}",
             f"Prompt Tokens: {prompt.get('exact_tokens', 'None')}",
             f"Prompt System Characters: {prompt.get('system_characters', 'None')}",
             f"Model Context Window: {model['context_window']}",

@@ -12,6 +12,13 @@ export interface AkaneClient {
   cancel(sessionId: string): Promise<void>;
 }
 
+function requestHeaders() {
+  return {
+    "Content-Type": "application/json",
+    ...(projectConfig.apiToken ? { Authorization: `Bearer ${projectConfig.apiToken}` } : {}),
+  };
+}
+
 const mockReplies = [
   "I'm Akane, a local-first companion. I keep my character and ongoing context in the backend that hosts me, rather than inside this static demo.",
   "Right now, I'm here for a conversation. Outside a turn, Akane can maintain an offscreen activity and decide whether there is a grounded reason to reach out.",
@@ -45,11 +52,14 @@ export const akaneClient: AkaneClient = {
     if (!projectConfig.apiUrl) return mockStream(message, callbacks, signal);
     const response = await fetch(`${projectConfig.apiUrl.replace(/\/$/, "")}/api/chat/stream`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: requestHeaders(),
       body: JSON.stringify({ message, session_id: sessionId, conversation_id: sessionId, profile_id: sessionId, source: "web" }),
       signal,
     });
-    if (!response.ok || !response.body) throw new Error(response.status === 503 ? "Akane is busy. Please try again in a moment." : "The Akane backend is unavailable.");
+    if (!response.ok || !response.body) {
+      if (response.status === 401) throw new Error("The Akane API token is missing or invalid.");
+      throw new Error(response.status === 503 ? "Akane is busy. Please try again in a moment." : "The Akane backend is unavailable.");
+    }
     callbacks.onStart?.();
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -73,7 +83,7 @@ export const akaneClient: AkaneClient = {
   async cancel(sessionId) {
     if (!projectConfig.apiUrl) return;
     await fetch(`${projectConfig.apiUrl.replace(/\/$/, "")}/api/chat/cancel`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, profile_id: sessionId }),
+      method: "POST", headers: requestHeaders(), body: JSON.stringify({ session_id: sessionId, profile_id: sessionId }),
     });
   },
 };

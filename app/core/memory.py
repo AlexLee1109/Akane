@@ -24,22 +24,22 @@ from app.core.config import (
 from app.core.persistence import atomic_write_json, read_json
 from app.core.presence import (
     CLAIM_SECONDS,
-    EMOTION_UPDATE_FIELDS,
-    MOOD_UPDATE_FIELDS,
     RETRY_SECONDS,
-    LifeDecision,
     PresenceActivity,
+    PresenceProposal,
     PresenceState,
-    apply_life_decision,
-    life_decision_rejection,
-    normalize_presence,
-    validate_interest_addition,
+    ProposedEmotion,
+    apply_presence_proposal,
+    needs_bootstrap,
+    presence_proposal_rejection,
 )
 from app.core.time_context import build_time_context
 from app.core.utils import OWNER_PROFILE_ID, canonical_profile_id, compact_text, words
 
-STATE_SCHEMA_VERSION = 13
+STATE_SCHEMA_VERSION = 14
 STARTING_INTERESTS = ("anime", "manga", "VTubers")
+EMOTION_UPDATE_FIELDS = ("mode", "primary", "intensity", "cause")
+MOOD_UPDATE_FIELDS = ("valence_delta", "energy_delta", "cause")
 
 _MAX_RECENT_TURNS = 28
 _MAX_RELATIONSHIP_ENTRIES = 16
@@ -82,6 +82,7 @@ EMOTION_VOCABULARY = frozenset(
 _EMOTION_SOURCES = {
     "conversation",
     "offscreen_life",
+    "offscreen_presence",
     "memory",
     "relationship",
     "self_reflection",
@@ -222,14 +223,30 @@ def _legacy_activity_payload(
             _number(payload.get("ends_at"), fallback_end),
         ),
     )
+    summary = compact_text(
+        payload.get("summary") or payload.get("activity"),
+        120,
+    )
+    focus = compact_text(
+        payload.get("focus")
+        or payload.get("detail")
+        or payload.get("subject")
+        or payload.get("title")
+        or summary,
+        220,
+    )
+    summary = " ".join(summary.split()[:18])
+    focus = " ".join(focus.split()[:36])
+    activity_id = compact_text(payload.get("activity_id"), 80) or uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"akane-presence:{started:.6f}:{expected:.6f}:{summary}:{focus}",
+    ).hex
     migrated = {
-        "activity": payload.get("activity"),
-        "category": payload.get("category"),
-        "subject": payload.get("subject", payload.get("title")),
-        "detail": payload.get("detail"),
+        "activity_id": activity_id,
+        "summary": summary,
+        "focus": focus,
         "started_at": started,
         "expected_end_at": expected,
-        "source": payload.get("source") or "autonomous_life",
     }
     return (
         migrated
@@ -271,22 +288,45 @@ def _legacy_presence_payload(payload: object) -> dict[str, object]:
         (activity for activity in historical if activity != current),
         None,
     )
+    last_decision_at = max(
+        0.0,
+        _number(
+            values.get("last_decision_at"),
+            _number(values.get("life_last_run_at")),
+        ),
+    )
+    raw_pattern = values.get("activity_pattern")
+    repeat_count = (
+        int(_number(raw_pattern.get("repeat_count")))
+        if isinstance(raw_pattern, dict)
+        else 0
+    )
+    raw_continuations = values.get("continuation_count")
+    continuation_count = (
+        max(0, min(1, raw_continuations))
+        if type(raw_continuations) is int
+        else max(0, min(1, repeat_count - 1))
+    )
+    retry_at = max(0.0, _number(values.get("retry_at")))
+    claim_token = values.get("claim_token")
+    claim_expires_at = values.get("claim_expires_at")
+    last_error = values.get("last_error")
+    if current is None and last_decision_at <= 0.0:
+        next_at = 0.0
+        retry_at = 0.0
+        claim_token = None
+        claim_expires_at = 0.0
+        continuation_count = 0
     return {
         "current_activity": current,
         "previous_activity": previous,
-        "last_decision_at": max(
-            0.0,
-            _number(
-                values.get("last_decision_at"),
-                _number(values.get("life_last_run_at")),
-            ),
-        ),
+        "last_decision_at": last_decision_at,
         "next_decision_at": next_at,
-        "claim_token": values.get("claim_token"),
-        "claim_expires_at": values.get("claim_expires_at"),
-        "retry_at": values.get("retry_at"),
-        "last_error": values.get("last_error"),
-        "activity_pattern": values.get("activity_pattern"),
+        "retry_at": retry_at,
+        "last_error": last_error,
+        "claim_token": claim_token,
+        "claim_expires_at": claim_expires_at,
+        "continuation_count": continuation_count,
     }
 
 
@@ -1053,7 +1093,6 @@ class ProfileState:
         payload: object,
         *,
         now: float,
-        repair_presence: bool = False,
         migrating: bool = False,
     ) -> "ProfileState | None":
         if isinstance(payload, list):
@@ -1063,11 +1102,7 @@ class ProfileState:
                 if (memory := Memory.from_dict(item)) is not None
             )
             return cls(
-                presence=PresenceState.from_dict(
-                    {},
-                    now=now,
-                    repair_schedule=repair_presence,
-                ),
+                presence=PresenceState.from_dict({}, now=now),
                 memories=_merge_memories((), memories),
             )
         if not isinstance(payload, dict):
@@ -1115,7 +1150,6 @@ class ProfileState:
             presence=PresenceState.from_dict(
                 payload.get("presence"),
                 now=now,
-                repair_schedule=repair_presence,
             ),
             memories=_merge_memories((), memories),
             interests=interests,
@@ -1146,7 +1180,7 @@ class ProfileState:
 
 def _new_profile(now: float) -> ProfileState:
     return ProfileState(
-        presence=PresenceState.from_dict({}, now=now),
+        presence=PresenceState(),
         updated_at=0.0,
     )
 
@@ -1488,17 +1522,12 @@ def _merge_profiles(left: ProfileState, right: ProfileState, *, now: float) -> P
             item.next_decision_at,
         ),
     )
-    presence = normalize_presence(
-        replace(
-            source_presence,
-            current_activity=current,
-            previous_activity=previous,
-            claim_token=None,
-            claim_expires_at=0.0,
-        ),
-        now=now,
-        initialize_schedule=True,
-        repair_schedule=True,
+    presence = replace(
+        source_presence,
+        current_activity=current,
+        previous_activity=previous,
+        claim_token=None,
+        claim_expires_at=0.0,
     )
     initiative_source = max(
         (left.initiative, right.initiative),
@@ -1655,7 +1684,7 @@ def _profile_emotional_evidence(
     broad: bool,
 ) -> str:
     activities = tuple(
-        activity.fact()
+        f"{activity.summary} — {activity.focus}"
         for activity in (
             profile.presence.current_activity,
             profile.presence.previous_activity,
@@ -1797,7 +1826,7 @@ def _apply_emotional_updates(
     profile_evidence = _profile_emotional_evidence(
         profile,
         relevance=evidence,
-        broad=source == "offscreen_life",
+        broad=False,
     )
     emotional_evidence = f"{evidence} {profile_evidence}"
 
@@ -1808,10 +1837,6 @@ def _apply_emotional_updates(
         newer_emotion = (
             profile.emotion.updated_at > expected_emotion_updated_at
             and profile.emotion.source_id != source_id
-        )
-        stale = (
-            source == "offscreen_life"
-            and newer_emotion
         )
         grounded = True
         if mode == "shift":
@@ -1828,9 +1853,7 @@ def _apply_emotional_updates(
             if require_complete and not grounded:
                 return profile, False
 
-        if stale:
-            emotion = profile.emotion
-        elif mode == "keep":
+        if mode == "keep":
             emotion = replace(emotion, updated_at=now)
         elif mode == "settle":
             emotion = EmotionState(updated_at=now)
@@ -2028,7 +2051,6 @@ class StateStore:
                         else _legacy_profile_payload(raw_profile)
                     ),
                     now=now,
-                    repair_presence=schema != STATE_SCHEMA_VERSION,
                     migrating=schema != STATE_SCHEMA_VERSION,
                 )
                 if profile is None:
@@ -2279,27 +2301,7 @@ class StateStore:
             migrated = True
         normalized: dict[str, ProfileState] = {}
         for profile_id, profile in self._profiles.items():
-            repair_failed_bootstrap = (
-                profile.presence.current_activity is None
-                and profile.presence.last_decision_at == 0.0
-                and profile.presence.next_decision_at > now
-                and bool(profile.presence.last_error)
-            )
-            presence = normalize_presence(
-                profile.presence,
-                now=now,
-                initialize_schedule=True,
-                repair_schedule=migrated,
-            )
-            if repair_failed_bootstrap:
-                presence = replace(
-                    presence,
-                    next_decision_at=0.0,
-                    retry_at=now,
-                    claim_token=None,
-                    claim_expires_at=0.0,
-                )
-                migrated = True
+            presence = profile.presence
             if presence.claim_token is not None or presence.claim_expires_at:
                 presence = replace(
                     presence,
@@ -2928,13 +2930,9 @@ class StateStore:
             current = state.presence.current_activity
             activities = {}
             if current is not None:
-                activities[current.activity] = {
+                activities[current.summary] = {
                     "status": "active",
-                    "details": [
-                        value
-                        for value in (current.subject, current.detail)
-                        if value
-                    ],
+                    "details": [current.focus],
                 }
             return {
                 "user": {},
@@ -3467,13 +3465,11 @@ class StateStore:
 
     @staticmethod
     def _presence_due_at(presence: PresenceState, now: float) -> float:
-        unbootstrapped = (
-            presence.current_activity is None
-            and presence.last_decision_at == 0.0
-        )
         if presence.retry_at > 0.0:
             return presence.retry_at
-        return now if unbootstrapped else presence.next_decision_at
+        if needs_bootstrap(presence) or presence.next_decision_at <= 0.0:
+            return now
+        return presence.next_decision_at
 
     @staticmethod
     def _presence_due(presence: PresenceState, now: float) -> bool:
@@ -3481,19 +3477,6 @@ class StateStore:
             presence.claim_token is None
             and StateStore._presence_due_at(presence, now) <= now
         )
-
-    def wake_presence_if_due(self, profile_id: str, *, now: float) -> bool:
-        profile = canonical_profile_id(profile_id)
-        with self._lock:
-            state = self._profiles.get(profile)
-            callback = self._autonomy_wake
-            due = bool(
-                state is not None
-                and self._presence_due(state.presence, now)
-            )
-        if due and callback is not None:
-            callback(profile)
-        return due
 
     def presence_schedule(
         self,
@@ -3550,10 +3533,23 @@ class StateStore:
         current = max(0.0, float(now))
         with self._lock:
             state = self._profiles.get(profile)
-            if state is None or not self._presence_due(state.presence, current):
+            if state is None:
+                return None
+            candidate = state.presence
+            if (
+                candidate.claim_token is not None
+                and candidate.claim_expires_at <= current
+            ):
+                candidate = replace(
+                    candidate,
+                    claim_token=None,
+                    claim_expires_at=0.0,
+                    last_error="stale claim released",
+                )
+            if not self._presence_due(candidate, current):
                 return None
             presence = replace(
-                state.presence,
+                candidate,
                 claim_token=uuid.uuid4().hex,
                 claim_expires_at=current + CLAIM_SECONDS,
             )
@@ -3579,7 +3575,7 @@ class StateStore:
             claim_token=None,
             claim_expires_at=0.0,
             retry_at=now + RETRY_SECONDS,
-            last_error=compact_text(error, 120) or "life decision failed",
+            last_error=compact_text(error, 120) or "presence decision failed",
         )
 
     def fail_presence_decision(
@@ -3591,6 +3587,8 @@ class StateStore:
         error: str,
     ) -> bool:
         profile = canonical_profile_id(profile_id)
+        if profile != OWNER_PROFILE_ID:
+            return False
         current = max(0.0, float(now))
         with self._lock:
             state = self._profiles.get(profile)
@@ -3616,57 +3614,78 @@ class StateStore:
             callback(profile)
         return True
 
+    @staticmethod
+    def _presence_emotion(
+        state: ProfileState,
+        proposal: ProposedEmotion | None,
+        *,
+        activity_id: str,
+        bootstrap: bool,
+        expected_emotion_updated_at: float,
+        now: float,
+    ) -> EmotionState:
+        if state.emotion.updated_at > max(
+            0.0,
+            float(expected_emotion_updated_at),
+        ):
+            return state.emotion
+        if proposal is not None:
+            return EmotionState(
+                proposal.primary,
+                proposal.intensity,
+                proposal.cause,
+                "offscreen_presence",
+                activity_id,
+                now,
+                now,
+            )
+        if bootstrap:
+            return EmotionState(
+                "interested",
+                0.3,
+                "the activity gave Akane something small to focus on",
+                "offscreen_presence",
+                activity_id,
+                now,
+                now,
+            )
+        return state.emotion
+
     def commit_presence_decision(
         self,
         profile_id: str,
-        decision: LifeDecision,
+        proposal: PresenceProposal,
         *,
         claim_token: str,
         now: float,
-        grounded_context: str,
+        expected_activity_id: str | None,
+        expected_bootstrap: bool,
         expected_emotion_updated_at: float = 0.0,
     ) -> tuple[bool, str]:
         profile = canonical_profile_id(profile_id)
+        if profile != OWNER_PROFILE_ID:
+            return False, "presence claim is unavailable"
         current = max(0.0, float(now))
         with self._lock:
             state = self._profiles.get(profile)
             if state is None or state.presence.claim_token != claim_token:
-                return False, "life claim is unavailable"
-            rejection = life_decision_rejection(
-                state.presence,
-                decision,
-                grounded_context=grounded_context,
+                return False, "presence claim is unavailable"
+            actual_activity = state.presence.current_activity
+            actual_activity_id = (
+                actual_activity.activity_id if actual_activity is not None else None
             )
-            emotionally_updated = state
+            expected_id = compact_text(expected_activity_id, 80) or None
+            rejection = ""
+            if (
+                actual_activity_id != expected_id
+                or needs_bootstrap(state.presence) != bool(expected_bootstrap)
+            ):
+                rejection = "claimed presence activity changed"
             if not rejection:
-                activity = (
-                    state.presence.current_activity.fact()
-                    if decision.mode == "continue"
-                    and state.presence.current_activity is not None
-                    else " ".join(
-                        item
-                        for item in (
-                            decision.activity,
-                            decision.subject or "",
-                            decision.detail or "",
-                        )
-                        if item
-                    )
+                rejection = presence_proposal_rejection(
+                    state.presence,
+                    proposal,
                 )
-                emotionally_updated, appraisal_valid = _apply_emotional_updates(
-                    state,
-                    emotion_update=decision.emotion_update,
-                    mood_update=decision.mood_update,
-                    evidence=f"{activity} {decision.continuation_reason or ''}",
-                    source="offscreen_life",
-                    source_id=claim_token,
-                    now=current,
-                    mood_delta_limit=0.20,
-                    expected_emotion_updated_at=expected_emotion_updated_at,
-                    require_complete=True,
-                )
-                if not appraisal_valid:
-                    rejection = "life decision lacks a grounded emotional appraisal"
             if rejection:
                 presence = self._failed_presence(
                     state.presence,
@@ -3675,31 +3694,31 @@ class StateStore:
                 )
                 next_state = replace(state, presence=presence)
             else:
-                presence = apply_life_decision(
+                was_bootstrap = needs_bootstrap(state.presence)
+                activity_id = (
+                    uuid.uuid4().hex
+                    if proposal.decision == "new"
+                    else actual_activity.activity_id
+                )
+                presence = apply_presence_proposal(
                     state.presence,
-                    decision,
+                    proposal,
+                    now=current,
+                    activity_id=activity_id,
+                )
+                committed_activity = presence.current_activity
+                emotion = self._presence_emotion(
+                    state,
+                    proposal.emotion,
+                    activity_id=committed_activity.activity_id,
+                    bootstrap=was_bootstrap,
+                    expected_emotion_updated_at=expected_emotion_updated_at,
                     now=current,
                 )
-                interest = validate_interest_addition(
-                    decision.interest_addition,
-                    activity=decision.activity,
-                    subject=decision.subject,
-                    detail=decision.detail,
-                    existing_interests=emotionally_updated.interests,
-                    grounded_context=grounded_context,
-                )
-                interests = (
-                    _dedupe_text(
-                        (*emotionally_updated.interests, interest),
-                        limit=_MAX_INTERESTS,
-                    )
-                    if interest
-                    else emotionally_updated.interests
-                )
                 next_state = replace(
-                    emotionally_updated,
+                    state,
                     presence=presence,
-                    interests=interests,
+                    emotion=emotion,
                     updated_at=current,
                 )
             profiles = self._profiles.copy()

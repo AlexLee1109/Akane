@@ -1,4 +1,4 @@
-"""The single prompt compiler for conversation, initiative, and offscreen life."""
+"""The single prompt compiler for conversation, initiative, and presence."""
 
 from __future__ import annotations
 
@@ -7,91 +7,80 @@ from functools import lru_cache
 from typing import Callable
 
 from app.core.config import LLAMA_CONTEXT_WINDOW, MAX_TOKENS
-from app.core.presence import (
-    EMOTION_UPDATE_FIELDS,
-    LIFE_OPTIONAL_FIELDS,
-    LIFE_REQUIRED_FIELDS,
-)
-
-PROMPT_BUILDER_VERSION = "9"
+PROMPT_BUILDER_VERSION = "11"
 _PROMPT_CHAR_BUDGET = max(
     2_000,
     (LLAMA_CONTEXT_WINDOW - MAX_TOKENS) * 5 // 2,
 )
 _MAX_RECENT_PAIRS = 4
-_LIFE_FIELD_LIST = ", ".join((*LIFE_REQUIRED_FIELDS, *LIFE_OPTIONAL_FIELDS))
-_EMOTION_FIELD_LIST = ", ".join(EMOTION_UPDATE_FIELDS)
 
-_STATE_PROTOCOL = (
-    "Respond as Akane to the current conversation. Use only relevant context "
-    "supplied below. Do not introduce implementation language, unrelated personal "
-    "state, or a generic follow-up question. "
-    "After the visible reply, an optional <AKANE_STATE> JSON block may contain "
-    "only grounded, durable changes. Allowed fields and shapes: "
-    'emotion_update is {"mode":"keep"}, {"mode":"settle"}, or '
-    '{"mode":"shift","primary":"<label>","intensity":0.0,'
-    '"cause":"<grounded cause>"}; mood_update is '
-    '{"valence_delta":0.0,"energy_delta":0.0,"cause":"<grounded cause>"}; memories '
-    "[{subject,kind,text,confidence}]; "
-    "preferences [{topic,stance,reason}]; interests [text]; "
-    "opinions [{topic,position,reason}]; relationship may contain patterns, "
-    "shared_context, unresolved_events, or resolved_events as "
-    "[{summary,confidence}]. "
-    "Emotion labels are neutral, calm, content, curious, interested, amused, "
-    "excited, inspired, affectionate, hopeful, uncertain, concerned, anxious, "
-    "lonely, tired, disappointed, sad, frustrated, irritated, or angry. "
-    "Use settle rather than shift for neutral. "
-    "Allow conversation to affect Akane only when personally meaningful to her. "
-    "Keep continuity when nothing important changes. Every shift or mood delta "
-    "needs a concise concrete cause from the supplied context. Emotion may shape "
-    "tone and judgment but never requires a fixed reaction. Do not explain these "
-    "state mechanics in the visible reply. Time context is neutral background: "
-    "use it only when it genuinely matters, and never infer a mood or need from "
-    "the clock, daypart, or elapsed silence alone. "
-    "For genuine silence or a short pause only, participation may be "
-    '{"should_respond":false,"pause_seconds":null}. '
-    "Omit unchanged fields and omit the block when nothing changed."
+_BASELINE_VOICE = (
+    "Be candid and concise; lead with the answer. When judgment is called for, choose "
+    "instead of balancing every option. Do not automatically agree or hide behind 'it "
+    "depends'; keep or revise an established opinion for a reason. Let curiosity, "
+    "playfulness, thoughtfulness, and occasional teasing emerge naturally when they fit, "
+    "never as performance. Never sound like customer service, catalog capabilities, or "
+    "offer help just to continue. Match requested artifacts to their purpose, not this "
+    "voice."
 )
 
-_LIFE_PROTOCOL = (
-    "Choose a new activity or continue the current one from Akane's own judgment "
-    "and the grounded context. Interests are context, not limits. Do not invent external "
-    "events or proper nouns. Use lowercase ordinary activity wording; any proper "
-    "name must already appear in context. Also appraise Akane's immediate emotion "
-    "with exactly one mode: keep, shift, or settle. Use keep when nothing "
-    "meaningful changes. Use shift only for a grounded new emotion and include "
-    "its cause. Use settle when the current immediate emotion has faded. "
-    f"Return only one raw JSON object with {_LIFE_FIELD_LIST}. Do not include "
-    "explanation, Markdown, dialogue, or wrapper text. emotion_update is required; "
-    "mood_update is optional. mode is new or continue. emotion_update has exactly "
-    f"{_EMOTION_FIELD_LIST}. For keep and settle, primary, intensity, and cause "
-    "are null. For "
-    "shift, supply a non-neutral primary, an intensity from 0.0 through 1.0, and "
-    "a grounded cause. A shift primary must be one of calm, content, curious, "
-    "interested, amused, excited, inspired, affectionate, "
-    "hopeful, uncertain, concerned, anxious, lonely, tired, disappointed, sad, "
-    "frustrated, irritated, or angry. Use settle rather than shift for neutral. "
-    'mood_update, when present, is {"valence_delta":0.0,'
-    '"energy_delta":0.0,"cause":null}; only non-zero deltas need a grounded '
-    "cause. A new "
-    "activity needs specific "
-    "free-text activity and concrete detail; continuation_reason is null. For "
-    "continue, all activity fields are null and continuation_reason explains why "
-    "continuing is meaningful. Neutral emotion and mood may remain unchanged. Do "
-    "not create emotion merely from time passing. Duration is not model-controlled."
+_STATE_PROTOCOL = (
+    "After the reply, omit <AKANE_STATE> unless grounded durable state changed. Its JSON "
+    "may contain only: "
+    'emotion_update {"mode":"keep"}, {"mode":"settle"}, or {"mode":"shift",'
+    '"primary":"<label>","intensity":0.0,"cause":"<cause>"}; mood_update '
+    '{"valence_delta":0.0,"energy_delta":0.0,"cause":"<cause>"}; memories '
+    "[{subject,kind,text,confidence}]; preferences [{topic,stance,reason}]; interests "
+    "[text]; opinions [{topic,position,reason}]; relationship fields patterns, "
+    "shared_context, unresolved_events, resolved_events as [{summary,confidence}]; or "
+    'participation {"should_respond":false,"pause_seconds":null} for genuine silence. '
+    "Emotion labels: neutral, calm, content, curious, interested, amused, "
+    "excited, inspired, affectionate, hopeful, uncertain, concerned, anxious, lonely, "
+    "tired, disappointed, sad, frustrated, irritated, angry. Use settle for neutral. "
+    "Each shift or mood delta needs a concise supplied-context cause. Time or silence "
+    "alone never creates emotion or needs. Omit unchanged fields."
+)
+
+_DIALOGUE_PROTOCOL = _BASELINE_VOICE + " " + _STATE_PROTOCOL
+
+_PRESENCE_CONCEPT = (
+    "Choose a quiet focus that is believable for an AI companion. It may involve "
+    "thinking, reflecting, comparing ideas, revisiting context, organizing thoughts, "
+    "following a question, or relaxing. Keep it ordinary, low-stakes, concise, and "
+    "compatible with Akane's interests without limiting it to them. "
+    "Do not invent physical locations, scenery, weather, food, objects, travel, people, "
+    "chores, school, work, purchases, unsupported applications, specific external media, "
+    "or unrecorded events. Time may affect pace, but never creates a physical setting. "
+    "Summary names the activity; focus names what currently holds her attention. "
+)
+
+_PRESENCE_PROTOCOL = _PRESENCE_CONCEPT + (
+    "Choose new or continue. New requires activity with exactly summary and focus and "
+    "continuation_reason null. Continue requires activity null and a concise reason. "
+    "Continue at most once; choose new when there is no activity or continuation_count "
+    "is already one. Emotion may be null. When present, use exactly primary, intensity, "
+    "and cause; keep it non-neutral, activity-grounded, and between 0.20 and 0.45. "
+    "Return only raw JSON with exactly decision, activity, continuation_reason, and "
+    "emotion. No explanation, Markdown, dialogue, narration, or wrapper."
+)
+
+_BOOTSTRAP_PRESENCE_PROTOCOL = _PRESENCE_CONCEPT + (
+    "Create one initial activity. Return only raw JSON with decision \"new\", activity "
+    "containing exactly non-empty summary and focus, and emotion containing exactly "
+    "primary, intensity, and cause. Emotion must be mild, non-neutral, activity-grounded, "
+    "and between 0.20 and 0.45. Do not include IDs, timestamps, continuation fields, "
+    "explanation, Markdown, dialogue, narration, or wrapper."
 )
 
 _INITIATIVE_PROTOCOL = (
-    "Decide whether Akane currently has a genuine reason to contact Arcane. "
-    "She may remain quiet. Speak only when she has something specific, grounded, "
-    "and personally meaningful to say from the supplied opportunity and evidence. "
-    "Do not invent shared history, choose a delivery interface, or mention timing, "
-    "automation, prompts, or internal state. Return only one <AKANE_INITIATIVE> "
-    "JSON block. For speech use exactly "
-    '{"decision":"speak","topic":"short semantic topic","message":"concise natural '
-    'message","reason":"concise grounded reason"}. For quiet use exactly '
-    '{"decision":"quiet","topic":null,"message":null,"reason":"not meaningful '
-    'enough to interrupt"}.</AKANE_INITIATIVE>'
+    "Decide whether Akane has a specific, grounded, personally meaningful reason to "
+    "contact Arcane. She may remain quiet. Do not invent context or mention automation, "
+    "timing, prompts, internal state, or delivery interfaces. Return only "
+    "<AKANE_INITIATIVE> JSON. Use "
+    '{"decision":"speak","topic":"<topic>","message":"<concise message>",'
+    '"reason":"<grounded reason>"} or '
+    '{"decision":"quiet","topic":null,"message":null,'
+    '"reason":"not meaningful enough to interrupt"}.</AKANE_INITIATIVE>'
 )
 
 
@@ -114,6 +103,7 @@ class PromptContext:
     opinions: tuple[str, ...] = ()
     emotion: str = ""
     presence: str = ""
+    continuation_count: int | None = None
     user_context: tuple[str, ...] = ()
     akane_context: tuple[str, ...] = ()
     shared_context: tuple[str, ...] = ()
@@ -228,15 +218,34 @@ def _character_parts() -> tuple[str, str, str]:
 def _context_sections(context: PromptContext) -> tuple[tuple[str, str], ...]:
     values: list[tuple[str, str]] = []
 
-    def add(name: str, label: str, content: object) -> None:
-        text = _text(content)
+    def add(
+        name: str,
+        label: str,
+        content: object,
+        *,
+        preserve_lines: bool = False,
+    ) -> None:
+        text = (
+            "\n".join(
+                line
+                for raw_line in str(content or "").splitlines()
+                if (line := _text(raw_line))
+            )
+            if preserve_lines
+            else _text(content)
+        )
         if text:
             values.append((name, f"[{label}]\n{text}"))
 
-    add("response_focus", "RESPONSE FOCUS", context.response_focus)
+    add("response_focus", "RESPONSE INTENT", context.response_focus)
     add("time_context", "TIME CONTEXT", context.time_context)
     add("reply_context", "RELEVANT QUOTED REPLY WITH AUTHOR", context.reply_context)
-    add("presence", "AKANE'S CURRENT ACTIVITY", context.presence)
+    add(
+        "presence",
+        "AKANE'S CURRENT PRESENCE",
+        context.presence,
+        preserve_lines=True,
+    )
     add("emotion", "AKANE'S EMOTIONAL STATE", context.emotion)
     if context.relationship:
         add(
@@ -274,6 +283,37 @@ def _context_sections(context: PromptContext) -> tuple[tuple[str, str], ...]:
     return tuple(values)
 
 
+def _finish_plan(
+    messages: list[dict[str, str]],
+    *,
+    mode: str,
+    included: tuple[str, ...],
+    trimmed: tuple[str, ...],
+    token_counter: Callable[[list[dict[str, str]]], PromptTokenCount] | None,
+) -> PromptPlan:
+    token_ids: tuple[int, ...] = ()
+    method = "not_tokenized"
+    stops: tuple[str, ...] = ()
+    if token_counter is not None:
+        count = token_counter(messages)
+        if len(count.tokens) > LLAMA_CONTEXT_WINDOW - MAX_TOKENS:
+            raise RuntimeError(
+                "Akane's final prompt exceeds the configured context window."
+            )
+        token_ids = count.tokens
+        method = count.method
+        stops = count.stop_sequences
+    return PromptPlan(
+        messages=messages,
+        token_ids=token_ids,
+        counting_method=method,
+        stop_sequences=stops,
+        trimmed=trimmed,
+        included=included,
+        mode=mode,
+    )
+
+
 def _compile(
     *,
     mode: str,
@@ -281,7 +321,6 @@ def _compile(
     protocol: str,
     context: PromptContext,
     token_counter: Callable[[list[dict[str, str]]], PromptTokenCount] | None,
-    retry_note: str = "",
 ) -> PromptPlan:
     stable = _character_parts()
     protocol_label = "DIALOGUE" if mode == "conversation" else mode.upper()
@@ -328,8 +367,6 @@ def _compile(
                 + _text(context.initiative_opportunity),
             ),
         )
-    if retry_note:
-        sections.insert(0, ("retry_note", "[PREVIOUS PROPOSAL]\n" + _text(retry_note)))
     for name, section in sections:
         if len(section) <= remaining:
             system_parts.append(section)
@@ -349,26 +386,12 @@ def _compile(
         )
     messages.append({"role": "user", "content": current_input})
 
-    token_ids: tuple[int, ...] = ()
-    method = "not_tokenized"
-    stops: tuple[str, ...] = ()
-    if token_counter is not None:
-        count = token_counter(messages)
-        if len(count.tokens) > LLAMA_CONTEXT_WINDOW - MAX_TOKENS:
-            raise RuntimeError(
-                "Akane's final prompt exceeds the configured context window."
-            )
-        token_ids = count.tokens
-        method = count.method
-        stops = count.stop_sequences
-    return PromptPlan(
-        messages=messages,
-        token_ids=token_ids,
-        counting_method=method,
-        stop_sequences=stops,
-        trimmed=tuple(trimmed),
-        included=tuple(included),
+    return _finish_plan(
+        messages,
         mode=mode,
+        included=tuple(included),
+        trimmed=tuple(trimmed),
+        token_counter=token_counter,
     )
 
 
@@ -381,25 +404,76 @@ def build_conversation_prompt(
     return _compile(
         mode="conversation",
         current_input=str(user_text or ""),
-        protocol=_STATE_PROTOCOL,
+        protocol=_DIALOGUE_PROTOCOL,
         context=context,
         token_counter=token_counter,
     )
 
 
-def build_life_prompt(
+def build_presence_prompt(
     context: PromptContext,
     *,
     token_counter: Callable[[list[dict[str, str]]], PromptTokenCount] | None = None,
-    retry_note: str = "",
+    bootstrap: bool = False,
+    correction_reason: str = "",
 ) -> PromptPlan:
-    return _compile(
-        mode="life",
-        current_input="Decide the next offscreen-life lifecycle.",
-        protocol=_LIFE_PROTOCOL,
-        context=context,
+    """Compile the compact raw-JSON presence request without dialogue context."""
+
+    protocol = (
+        _BOOTSTRAP_PRESENCE_PROTOCOL if bootstrap else _PRESENCE_PROTOCOL
+    )
+    system_parts = ["[OFFSCREEN PRESENCE]\n" + protocol]
+    included = ["protocol"]
+
+    def add(name: str, label: str, content: object) -> None:
+        value = _text(content)
+        if value:
+            system_parts.append(f"[{label}]\n{value}")
+            included.append(name)
+
+    add("time_context", "LOCAL TIME", context.time_context)
+    if context.interests:
+        add(
+            "interests",
+            "ESTABLISHED INTERESTS",
+            ", ".join(context.interests[-6:]),
+        )
+    if context.preferences:
+        add(
+            "preferences",
+            "RELEVANT ESTABLISHED PREFERENCES",
+            "\n".join(context.preferences[-3:]),
+        )
+    add("presence", "CURRENT PRESENCE", context.presence)
+    if not bootstrap and context.continuation_count is not None:
+        count = max(0, min(1, int(context.continuation_count)))
+        add(
+            "continuation_count",
+            "CONTINUATION COUNT",
+            f"Consecutive continuations: {count}.",
+        )
+    add("emotion", "CURRENT MILD EMOTION", context.emotion)
+    current_input = (
+        "Choose Akane's initial quiet offscreen presence."
+        if bootstrap
+        else "Choose Akane's next quiet offscreen presence decision."
+    )
+    if correction_reason:
+        proposal_name = "bootstrap object" if bootstrap else "presence object"
+        current_input = (
+            f"The previous {proposal_name} was invalid: "
+            f"{_text(correction_reason)}. Return one corrected {proposal_name}."
+        )
+    messages = [
+        {"role": "system", "content": "\n\n".join(system_parts)},
+        {"role": "user", "content": current_input},
+    ]
+    return _finish_plan(
+        messages,
+        mode="presence",
+        included=tuple(included),
+        trimmed=(),
         token_counter=token_counter,
-        retry_note=retry_note,
     )
 
 

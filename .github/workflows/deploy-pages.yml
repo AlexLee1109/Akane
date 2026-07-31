@@ -35,6 +35,7 @@ jobs:
         working-directory: website
         env:
           VITE_BASE_PATH: /${{ github.event.repository.name }}/
+          VITE_AKANE_API_URL: ${{ vars.AKANE_API_URL }}
         run: |
           npm ci
           npm run build

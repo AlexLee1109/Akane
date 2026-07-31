@@ -1,4 +1,4 @@
-"""Authoritative schema and validation for Akane's persisted offscreen life."""
+"""Canonical state and proposal contract for Akane's offscreen presence."""
 
 from __future__ import annotations
 
@@ -7,234 +7,199 @@ import math
 import re
 import time
 from dataclasses import dataclass, replace
-from difflib import SequenceMatcher
 
 from app.core.utils import compact_text
 
-LIFE_INTERVAL_SECONDS = 3.0 * 60.0 * 60.0
-CLAIM_SECONDS = 10.0 * 60.0
-RETRY_SECONDS = 5.0 * 60.0
+PRESENCE_INTERVAL_SECONDS = 4 * 60 * 60
+CLAIM_SECONDS = 10 * 60
+RETRY_SECONDS = 5 * 60
 
-_MAX_ACTIVITY_CHARS = 160
-_MAX_DETAIL_CHARS = 240
-_LIFE_MODES = {"new", "continue"}
-LIFE_REQUIRED_FIELDS = (
-    "mode",
+PRESENCE_PROPOSAL_FIELDS = (
+    "decision",
     "activity",
-    "category",
-    "subject",
-    "detail",
-    "interest_addition",
     "continuation_reason",
-    "emotion_update",
+    "emotion",
 )
-LIFE_OPTIONAL_FIELDS = ("mood_update",)
-EMOTION_UPDATE_FIELDS = ("mode", "primary", "intensity", "cause")
-MOOD_UPDATE_FIELDS = ("valence_delta", "energy_delta", "cause")
+BOOTSTRAP_PRESENCE_FIELDS = ("decision", "activity", "emotion")
+PRESENCE_ACTIVITY_FIELDS = ("summary", "focus")
+PRESENCE_EMOTION_FIELDS = ("primary", "intensity", "cause")
+_DECISIONS = {"new", "continue"}
+_EMOTIONS = {
+    "calm",
+    "content",
+    "curious",
+    "interested",
+    "amused",
+    "excited",
+    "inspired",
+    "affectionate",
+    "hopeful",
+    "uncertain",
+    "concerned",
+    "anxious",
+    "lonely",
+    "tired",
+    "disappointed",
+    "sad",
+    "frustrated",
+    "irritated",
+    "angry",
+}
+UNSUPPORTED_PHYSICAL_ACTIVITY_REASON = (
+    "presence activity must be plausible for a digital AI companion and must not "
+    "invent a physical environment"
+)
+_DIRECT_UNSUPPORTED_ACTIVITY = re.compile(
+    r"\b(?:eat(?:s|ing)?|dr(?:ink|inks|inking|ank)|sip(?:s|ping)?|"
+    r"travel(?:s|ed|led|ing)|commut(?:e|es|ed|ing)|shop(?:s|ped|ping)?|"
+    r"purchas(?:e|es|ed|ing)|buy(?:s|ing)?|bought|cook(?:s|ed|ing)?|"
+    r"wash(?:es|ed|ing)?|vacuum(?:s|ed|ing)?|"
+    r"meet(?:s|ing)?\s+(?:someone|people|other\s+people|friends?|"
+    r"a\s+friends?|a\s+person)|"
+    r"do(?:es|ing)?\s+(?:laundry|dishes|chores)|breaking\s+news|"
+    r"new\s+release|chapter\s+\d+|episode\s+\d+)\b",
+    re.IGNORECASE,
+)
+_PHYSICAL_CONTEXT = re.compile(
+    r"\b(?:room|bed|sofa|couch|chair|desk|window|balcony|porch|garden|"
+    r"park|cafe|store|school|office|place|outside|indoors|weather|rain|"
+    r"snow|storm|clouds?|"
+    r"sun(?:light|rise|set)?|daylight|sky|scenery|landscape|tea|coffee|"
+    r"food|meal|snack|drink|cup|mug|glass|book|phone|pen|package|blinds|"
+    r"physical\s+object)\b",
+    re.IGNORECASE,
+)
+_PHYSICAL_CONTEXT_ACTION = re.compile(
+    r"\b(?:sit(?:s|ting)?|stand(?:s|ing)?|lie|lies|lying|sleep(?:s|ing)?|"
+    r"rest(?:s|ing)?|relax(?:es|ing)?|look(?:s|ing)?|watch(?:es|ing)?|"
+    r"observ(?:e|es|ing)|hold(?:s|ing)?|carr(?:y|ies|ying)|"
+    r"handl(?:e|es|ing)|hav(?:e|ing)|visit(?:s|ed|ing)?|"
+    r"clean(?:s|ed|ing)?|attend(?:s|ed|ing)?|taking\s+a\s+break)\b|"
+    r"\b(?:akane|she)\s+is\s+(?:in|at|by|outside)\b",
+    re.IGNORECASE,
+)
+_OBSOLETE_ERRORS = (
+    "life decision lacks a grounded emotional appraisal",
+    "invalid life block",
+    "invalid emotional appraisal",
+)
 
 
-def _nullable_schema(kind: str) -> dict[str, object]:
+def _nullable(kind: str) -> dict[str, object]:
     return {"type": [kind, "null"]}
 
 
-LIFE_JSON_SCHEMA = json.dumps(
+PRESENCE_JSON_SCHEMA = json.dumps(
     {
         "type": "object",
         "properties": {
-            "mode": {"type": "string", "enum": sorted(_LIFE_MODES)},
-            **{
-                name: _nullable_schema("string")
-                for name in LIFE_REQUIRED_FIELDS[1:7]
-            },
-            "emotion_update": {
-                "type": "object",
-                "properties": {
-                    "mode": {
-                        "type": "string",
-                        "enum": ["keep", "settle", "shift"],
-                    },
-                    "primary": _nullable_schema("string"),
-                    "intensity": _nullable_schema("number"),
-                    "cause": _nullable_schema("string"),
-                },
-                "required": list(EMOTION_UPDATE_FIELDS),
-                "additionalProperties": False,
-            },
-            "mood_update": {
+            "decision": {"type": "string", "enum": sorted(_DECISIONS)},
+            "activity": {
                 "type": ["object", "null"],
                 "properties": {
-                    "valence_delta": {"type": "number"},
-                    "energy_delta": {"type": "number"},
-                    "cause": _nullable_schema("string"),
+                    "summary": {"type": "string"},
+                    "focus": {"type": "string"},
                 },
-                "required": list(MOOD_UPDATE_FIELDS),
+                "required": list(PRESENCE_ACTIVITY_FIELDS),
+                "additionalProperties": False,
+            },
+            "continuation_reason": _nullable("string"),
+            "emotion": {
+                "type": ["object", "null"],
+                "properties": {
+                    "primary": {"type": "string", "enum": sorted(_EMOTIONS)},
+                    "intensity": {"type": "number"},
+                    "cause": {"type": "string"},
+                },
+                "required": list(PRESENCE_EMOTION_FIELDS),
                 "additionalProperties": False,
             },
         },
-        "required": list(LIFE_REQUIRED_FIELDS),
+        "required": list(PRESENCE_PROPOSAL_FIELDS),
         "additionalProperties": False,
     },
     separators=(",", ":"),
 )
-_KEY_STOPWORDS = {
-    "a", "about", "an", "and", "as", "at", "by", "for", "from", "her",
-    "herself", "in", "into", "it", "of", "on", "or", "some", "the", "to",
-    "up", "while", "with",
-}
-_GENERIC_ACTIVITY_TERMS = {
-    "brows", "listen", "read", "relax", "unwind", "view", "watch",
-}
+
+BOOTSTRAP_PRESENCE_JSON_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "decision": {"type": "string", "enum": ["new"]},
+            "activity": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "minLength": 1},
+                    "focus": {"type": "string", "minLength": 1},
+                },
+                "required": list(PRESENCE_ACTIVITY_FIELDS),
+                "additionalProperties": False,
+            },
+            "emotion": {
+                "type": ["object", "null"],
+                "properties": {
+                    "primary": {"type": "string", "enum": sorted(_EMOTIONS)},
+                    "intensity": {"type": "number"},
+                    "cause": {"type": "string", "minLength": 1},
+                },
+                "required": list(PRESENCE_EMOTION_FIELDS),
+                "additionalProperties": False,
+            },
+        },
+        "required": ["decision", "activity"],
+        "additionalProperties": False,
+    },
+    separators=(",", ":"),
+)
 
 
-def _timestamp(value: object, default: float = 0.0) -> float:
+def _timestamp(value: object) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
-        return default
-    return number if math.isfinite(number) and number >= 0.0 else default
+        return 0.0
+    return number if math.isfinite(number) and number >= 0.0 else 0.0
 
 
-def _optional_text(value: object, limit: int) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        return None
-    return compact_text(value, limit) or None
+def _text(value: object, limit: int) -> str:
+    return compact_text(value, limit) if isinstance(value, str) else ""
 
 
-def _activity_text(value: object) -> str:
-    if not isinstance(value, str):
-        return ""
-    activity = compact_text(value, _MAX_ACTIVITY_CHARS)
-    words = re.findall(r"[a-z0-9]+", activity.casefold())
-    return activity if 1 <= len(words) <= 24 else ""
-
-
-def next_decision_time(now: float) -> float:
-    return max(0.0, float(now)) + LIFE_INTERVAL_SECONDS
-
-
-def activity_key(value: object) -> str:
-    """Small comparison metadata; it is not an activity catalogue."""
-
-    tokens: list[str] = []
-    for token in re.findall(r"[a-z0-9]+", compact_text(value, 360).casefold()):
-        if token in _KEY_STOPWORDS:
-            continue
-        if len(token) > 5 and token.endswith("ing"):
-            token = token[:-3]
-        elif len(token) > 4 and token.endswith("ed"):
-            token = token[:-2]
-        elif len(token) > 4 and token.endswith("s"):
-            token = token[:-1]
-        if len(token) > 4 and token.endswith("e"):
-            token = token[:-1]
-        tokens.append(token)
-    return " ".join(tokens)[:120]
-
-
-def _near_key(left: str, right: str) -> bool:
-    if not left or not right:
-        return False
-    if left == right:
-        return True
-    left_tokens = set(left.split())
-    right_tokens = set(right.split())
-    union = left_tokens | right_tokens
-    overlap = len(left_tokens & right_tokens) / max(1, len(union))
-    if overlap >= 0.58 or SequenceMatcher(None, left, right).ratio() >= 0.84:
-        return True
-    left_focus = left_tokens - _GENERIC_ACTIVITY_TERMS
-    right_focus = right_tokens - _GENERIC_ACTIVITY_TERMS
-    return bool(
-        (left_tokens | right_tokens) & _GENERIC_ACTIVITY_TERMS
-        and left_focus
-        and left_focus == right_focus
-        and len(left_focus) <= 2
-    )
-
-
-def _meaningful_detail(detail: str | None, activity: str) -> bool:
-    detail_tokens = set(activity_key(detail).split())
-    activity_tokens = set(activity_key(activity).split())
-    return len(detail_tokens) >= 3 and len(detail_tokens - activity_tokens) >= 2
-
-
-@dataclass(frozen=True, slots=True)
-class ActivityPattern:
-    current_key: str = ""
-    previous_key: str = ""
-    repeat_count: int = 0
-
-    @classmethod
-    def from_dict(cls, payload: object) -> "ActivityPattern":
-        values = payload if isinstance(payload, dict) else {}
-        try:
-            repeats = max(0, min(100, int(values.get("repeat_count", 0))))
-        except (TypeError, ValueError):
-            repeats = 0
-        return cls(
-            activity_key(values.get("current_key")),
-            activity_key(values.get("previous_key") or values.get("prior_key")),
-            repeats,
-        )
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "current_key": self.current_key,
-            "previous_key": self.previous_key,
-            "repeat_count": self.repeat_count,
-        }
+def _activity_text(value: object, limit: int, maximum_words: int) -> str:
+    text = _text(value, limit)
+    count = len(re.findall(r"[a-z0-9]+", text.casefold()))
+    return text if 1 <= count <= maximum_words else ""
 
 
 @dataclass(frozen=True, slots=True)
 class PresenceActivity:
-    activity: str
-    category: str | None
-    subject: str | None
-    detail: str | None
+    activity_id: str
+    summary: str
+    focus: str
     started_at: float
     expected_end_at: float
-    source: str = "autonomous_life"
 
     @classmethod
     def from_dict(cls, payload: object) -> "PresenceActivity | None":
         if not isinstance(payload, dict):
             return None
-        activity = _activity_text(payload.get("activity"))
-        started = _timestamp(payload.get("started_at"))
-        expected = _timestamp(
-            payload.get("expected_end_at"),
-        )
-        if not activity or expected <= started:
+        activity_id = _text(payload.get("activity_id"), 80)
+        summary = _activity_text(payload.get("summary"), 120, 18)
+        focus = _activity_text(payload.get("focus"), 220, 36)
+        started_at = _timestamp(payload.get("started_at"))
+        expected_end_at = _timestamp(payload.get("expected_end_at"))
+        if not activity_id or not summary or not focus or expected_end_at <= started_at:
             return None
-        raw_detail = payload.get("detail")
-        detail = _optional_text(raw_detail, _MAX_DETAIL_CHARS)
-        if raw_detail is not None and detail is None:
-            return None
-        return cls(
-            activity=activity,
-            category=_optional_text(payload.get("category"), 48),
-            subject=_optional_text(payload.get("subject"), 160),
-            detail=detail,
-            started_at=started,
-            expected_end_at=expected,
-            source=compact_text(payload.get("source"), 48) or "autonomous_life",
-        )
+        return cls(activity_id, summary, focus, started_at, expected_end_at)
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "activity": self.activity,
-            "category": self.category,
-            "subject": self.subject,
-            "detail": self.detail,
+            "activity_id": self.activity_id,
+            "summary": self.summary,
+            "focus": self.focus,
             "started_at": self.started_at,
             "expected_end_at": self.expected_end_at,
-            "source": self.source,
         }
-
-    def fact(self) -> str:
-        return f"{self.activity} — {self.detail}" if self.detail else self.activity
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,11 +208,11 @@ class PresenceState:
     previous_activity: PresenceActivity | None = None
     last_decision_at: float = 0.0
     next_decision_at: float = 0.0
-    claim_token: str | None = None
-    claim_expires_at: float = 0.0
     retry_at: float = 0.0
     last_error: str | None = None
-    activity_pattern: ActivityPattern = ActivityPattern()
+    claim_token: str | None = None
+    claim_expires_at: float = 0.0
+    continuation_count: int = 0
 
     @classmethod
     def from_dict(
@@ -259,28 +224,29 @@ class PresenceState:
     ) -> "PresenceState":
         current_time = time.time() if now is None else max(0.0, float(now))
         values = payload if isinstance(payload, dict) else {}
-        token = _optional_text(values.get("claim_token"), 80)
-        claim_expires = _timestamp(values.get("claim_expires_at"))
-        if token is None or claim_expires <= current_time:
+        token = _text(values.get("claim_token"), 80) or None
+        claim_expires_at = _timestamp(values.get("claim_expires_at"))
+        if token is None or claim_expires_at <= current_time:
             token = None
-            claim_expires = 0.0
+            claim_expires_at = 0.0
+        raw_count = values.get("continuation_count", 0)
+        continuation_count = (
+            max(0, min(1, raw_count)) if type(raw_count) is int else 0
+        )
         state = cls(
             current_activity=PresenceActivity.from_dict(values.get("current_activity")),
-            previous_activity=PresenceActivity.from_dict(
-                values.get("previous_activity")
-            ),
+            previous_activity=PresenceActivity.from_dict(values.get("previous_activity")),
             last_decision_at=_timestamp(values.get("last_decision_at")),
             next_decision_at=_timestamp(values.get("next_decision_at")),
-            claim_token=token,
-            claim_expires_at=claim_expires,
             retry_at=_timestamp(values.get("retry_at")),
-            last_error=_optional_text(values.get("last_error"), 120),
-            activity_pattern=ActivityPattern.from_dict(values.get("activity_pattern")),
+            last_error=_text(values.get("last_error"), 120) or None,
+            claim_token=token,
+            claim_expires_at=claim_expires_at,
+            continuation_count=continuation_count,
         )
         return normalize_presence(
             state,
             now=current_time,
-            initialize_schedule=True,
             repair_schedule=repair_schedule,
         )
 
@@ -294,389 +260,294 @@ class PresenceState:
             ),
             "last_decision_at": self.last_decision_at,
             "next_decision_at": self.next_decision_at,
-            "claim_token": self.claim_token,
-            "claim_expires_at": self.claim_expires_at,
             "retry_at": self.retry_at,
             "last_error": self.last_error,
-            "activity_pattern": self.activity_pattern.as_dict(),
+            "claim_token": self.claim_token,
+            "claim_expires_at": self.claim_expires_at,
+            "continuation_count": self.continuation_count,
         }
 
 
-def _repaired_boundary(
-    current: PresenceActivity,
-    next_at: float,
-    last_decision_at: float,
-    now: float,
-) -> tuple[PresenceActivity, float]:
-    wrong_interval = LIFE_INTERVAL_SECONDS * 10.0
-
-    lifecycle_start = (
-        last_decision_at
-        if last_decision_at >= current.started_at
-        else current.started_at
-    )
-
-    def repair(candidate: float) -> float:
-        duration = candidate - lifecycle_start
-        if abs(duration - wrong_interval) <= 1.0:
-            return lifecycle_start + duration / 10.0
-        return candidate
-
-    scheduled = repair(next_at)
-    expected = repair(current.expected_end_at)
-    if abs(scheduled - lifecycle_start - LIFE_INTERVAL_SECONDS) <= 1.0:
-        boundary = scheduled
-    elif abs(expected - lifecycle_start - LIFE_INTERVAL_SECONDS) <= 1.0:
-        boundary = expected
-    else:
-        boundary = max(current.started_at + 1.0, now)
-    return replace(current, expected_end_at=boundary), boundary
+def needs_bootstrap(state: PresenceState) -> bool:
+    return state.current_activity is None or state.last_decision_at <= 0.0
 
 
 def normalize_presence(
     state: PresenceState,
     *,
     now: float,
-    initialize_schedule: bool,
+    initialize_schedule: bool = False,
     repair_schedule: bool = False,
 ) -> PresenceState:
-    """Repair lifecycle metadata without clearing the last valid activity."""
+    """Normalize claims and perform the one schema-migration bootstrap repair."""
 
-    current = state.current_activity
+    del initialize_schedule
     token = state.claim_token
-    claim_expires = state.claim_expires_at
-    error = state.last_error
-    if token is not None and claim_expires <= now:
+    claim_expires_at = state.claim_expires_at
+    if token is not None and claim_expires_at <= now:
         token = None
-        claim_expires = 0.0
-        error = "stale claim released"
-
-    next_at = state.next_decision_at
-    unbootstrapped = current is None and state.last_decision_at == 0.0
-    if current is None:
-        if unbootstrapped and repair_schedule:
-            next_at = 0.0
-        elif not unbootstrapped and initialize_schedule and (
-            next_at <= 0.0 or repair_schedule
-        ):
-            next_at = now
-    elif repair_schedule:
-        current, next_at = _repaired_boundary(
-            current,
-            next_at,
-            state.last_decision_at,
-            now,
-        )
-    elif initialize_schedule and next_at <= 0.0:
-        next_at = now
-
-    current_key = activity_key(
-        f"{current.activity} {current.subject or ''}" if current else ""
-    )
-    previous = state.previous_activity
-    previous_key = activity_key(
-        f"{previous.activity} {previous.subject or ''}" if previous else ""
-    )
-    pattern = state.activity_pattern
-    if (
-        pattern.current_key != current_key
-        or pattern.previous_key != previous_key
-    ):
-        pattern = ActivityPattern(
-            current_key,
-            previous_key,
-            pattern.repeat_count or int(bool(current_key)),
-        )
+        claim_expires_at = 0.0
+    next_decision_at = state.next_decision_at
+    retry_at = state.retry_at
+    last_error = state.last_error
+    if repair_schedule and needs_bootstrap(state):
+        next_decision_at = 0.0
+        retry_at = 0.0
+        token = None
+        claim_expires_at = 0.0
+    if last_error and any(error in last_error.casefold() for error in _OBSOLETE_ERRORS):
+        last_error = None
     return replace(
         state,
-        current_activity=current,
-        next_decision_at=next_at,
+        next_decision_at=next_decision_at,
+        retry_at=retry_at,
+        last_error=last_error,
         claim_token=token,
-        claim_expires_at=claim_expires,
-        last_error=error,
-        activity_pattern=pattern,
+        claim_expires_at=claim_expires_at,
     )
-
-
-def activity_continuity(
-    current: PresenceActivity | None,
-    last_assistant_at: float | None,
-) -> str:
-    if current is None:
-        return "none"
-    if last_assistant_at is None or current.started_at >= last_assistant_at:
-        return "new"
-    return "ongoing"
 
 
 @dataclass(frozen=True, slots=True)
-class LifeDecision:
-    mode: str
-    activity: str = ""
-    category: str | None = None
-    subject: str | None = None
-    detail: str | None = None
-    interest_addition: str | None = None
-    continuation_reason: str | None = None
-    emotion_update: dict[str, object] | None = None
-    mood_update: dict[str, object] | None = None
+class ProposedActivity:
+    summary: str
+    focus: str
 
 
-class LifeParseError(ValueError):
-    """A concise structural failure in a dedicated raw-JSON life completion."""
+@dataclass(frozen=True, slots=True)
+class ProposedEmotion:
+    primary: str
+    intensity: float
+    cause: str
 
 
-def _unsupported_proper_nouns(value: str, grounded_context: str) -> bool:
-    grounded = {
-        match.group(0).casefold()
-        for match in re.finditer(r"\b[A-Za-z0-9'-]+\b", grounded_context)
-    }
-    for match in re.finditer(r"\b[A-Z][A-Za-z0-9'-]*\b", value):
-        word = match.group(0)
-        if word == "I" or word.casefold() in grounded:
-            continue
-        prefix = value[: match.start()].rstrip()
-        sentence_initial_action = (
-            (not prefix or prefix.endswith((".", "!", "?")))
-            and len(word) > 4
-            and word.casefold().endswith(("ed", "ing"))
-        )
-        if not sentence_initial_action:
-            return True
-    return False
+@dataclass(frozen=True, slots=True)
+class PresenceProposal:
+    decision: str
+    activity: ProposedActivity | None
+    continuation_reason: str | None
+    emotion: ProposedEmotion | None
 
 
-def parse_life_decision(
+class PresenceParseError(ValueError):
+    """A concise failure in a dedicated raw-JSON presence completion."""
+
+    def __init__(self, message: str, *, decoded: object = None) -> None:
+        super().__init__(message)
+        self.decoded = decoded
+
+
+def _normalize_activity(
+    payload: object,
+    *,
+    bootstrap: bool,
+) -> ProposedActivity | None:
+    if not isinstance(payload, dict):
+        return None
+    summary = (
+        _text(payload.get("summary"), 120)
+        if bootstrap
+        else _activity_text(payload.get("summary"), 120, 18)
+    )
+    focus = (
+        _text(payload.get("focus"), 220)
+        if bootstrap
+        else _activity_text(payload.get("focus"), 220, 36)
+    )
+    return ProposedActivity(summary, focus) if summary and focus else None
+
+
+def _normalize_emotion(payload: object) -> ProposedEmotion | None:
+    if not isinstance(payload, dict) or set(payload) != set(PRESENCE_EMOTION_FIELDS):
+        return None
+    primary = _text(payload.get("primary"), 32).casefold()
+    intensity = payload.get("intensity")
+    cause = _text(payload.get("cause"), 160)
+    if (
+        primary not in _EMOTIONS
+        or type(intensity) not in {int, float}
+        or not math.isfinite(float(intensity))
+        or not 0.20 <= float(intensity) <= 0.45
+        or not cause
+    ):
+        return None
+    return ProposedEmotion(primary, float(intensity), cause)
+
+
+def presence_activity_rejection(activity: ProposedActivity | None) -> str:
+    if activity is None:
+        return ""
+    text = f"{activity.summary} {activity.focus}"
+    unsupported = _DIRECT_UNSUPPORTED_ACTIVITY.search(text) or (
+        _PHYSICAL_CONTEXT.search(text)
+        and _PHYSICAL_CONTEXT_ACTION.search(text)
+    )
+    return UNSUPPORTED_PHYSICAL_ACTIVITY_REASON if unsupported else ""
+
+
+def parse_presence_proposal(
     output: object,
-) -> LifeDecision:
+    *,
+    bootstrap: bool = False,
+) -> PresenceProposal:
+    """Decode one complete raw proposal and normalize its optional emotion once."""
+
     text = str(output or "").strip()
     if not text:
-        raise LifeParseError("empty life output")
+        raise PresenceParseError(
+            "presence JSON decode failed" if bootstrap else "empty presence output"
+        )
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise LifeParseError(
-            f"life JSON decode failed at line {exc.lineno}, column {exc.colno}"
+        raise PresenceParseError(
+            (
+                "presence JSON decode failed"
+                if bootstrap
+                else f"presence JSON decode failed at line {exc.lineno}, column {exc.colno}"
+            )
         ) from exc
     if not isinstance(payload, dict):
-        raise LifeParseError("life output must be a JSON object")
-    keys = set(payload)
-    decoded_keys = tuple(sorted(str(key) for key in keys))
-
-    def failure(message: str) -> LifeParseError:
-        error = LifeParseError(message)
-        error.decoded_keys = decoded_keys
-        return error
-
-    required = set(LIFE_REQUIRED_FIELDS)
-    missing = required - keys
-    if "mode" in missing:
-        raise failure("missing life mode")
-    if "emotion_update" in missing:
-        raise failure("missing emotion appraisal")
-    if missing:
-        raise failure(f"missing life fields: {', '.join(sorted(missing))}")
-    unexpected = keys - required - set(LIFE_OPTIONAL_FIELDS)
-    if unexpected:
-        raise failure("unexpected life fields")
-    mode = compact_text(payload.get("mode"), 16).casefold()
-    if mode not in _LIFE_MODES:
-        raise failure("invalid life mode")
-    activity = _activity_text(payload.get("activity"))
-    category = _optional_text(payload.get("category"), 48)
-    subject = _optional_text(payload.get("subject"), 160)
-    detail = _optional_text(payload.get("detail"), _MAX_DETAIL_CHARS)
-    addition = _optional_text(payload.get("interest_addition"), 100)
-    reason = _optional_text(payload.get("continuation_reason"), _MAX_DETAIL_CHARS)
-    emotion_update = payload.get("emotion_update")
-    mood_update = payload.get("mood_update")
-    optional = {
-        "category": category,
-        "subject": subject,
-        "detail": detail,
-        "interest_addition": addition,
-        "continuation_reason": reason,
-    }
-    invalid_optional = next(
-        (
-            name
-            for name, value in optional.items()
-            if payload[name] is not None and value is None
-        ),
-        None,
-    )
-    if invalid_optional is not None:
-        raise failure(f"invalid {invalid_optional} field")
-    if not isinstance(emotion_update, dict):
-        raise failure("invalid emotion appraisal structure")
-    if mood_update is not None and not isinstance(mood_update, dict):
-        raise failure("invalid mood appraisal structure")
-    if mode == "new":
-        if not activity:
-            raise failure("invalid activity structure")
-        if reason is not None:
-            raise failure("new activity cannot have a continuation reason")
-    elif (
-        payload.get("activity") is not None
-        or any(value is not None for name, value in optional.items() if name != "continuation_reason")
-    ):
-        raise failure("continue activity fields must be null")
-    if mode == "continue" and reason is None:
-        raise failure("missing continuation reason")
-    return LifeDecision(
-        mode,
-        activity,
-        category,
-        subject,
-        detail,
-        addition,
-        reason,
-        emotion_update,
-        mood_update,
-    )
-
-
-def life_decision_rejection(
-    state: PresenceState,
-    decision: LifeDecision,
-    *,
-    grounded_context: str = "",
-) -> str:
-    if decision.mode == "continue":
-        current = state.current_activity
-        if current is None or not _meaningful_detail(current.detail, current.activity):
-            return "no valid current activity to continue"
-        reason = set(activity_key(decision.continuation_reason).split())
-        existing = set(activity_key(current.fact()).split())
-        if len(reason) < 2 or not reason - existing:
-            return "continuation needs a meaningful reason"
-        return ""
-    proposed = activity_key(f"{decision.activity} {decision.subject or ''}")
-    grounded = ". ".join(
-        item
-        for item in (
-            decision.activity,
-            decision.category or "",
-            decision.subject or "",
-            decision.detail or "",
+        raise PresenceParseError(
+            (
+                "presence JSON decode failed"
+                if bootstrap
+                else "presence output must be a JSON object"
+            ),
+            decoded=payload,
         )
-        if item
+    allowed = set(
+        BOOTSTRAP_PRESENCE_FIELDS if bootstrap else PRESENCE_PROPOSAL_FIELDS
     )
-    if _unsupported_proper_nouns(grounded, grounded_context):
-        return "proposal contains unsupported activity context"
-    pattern = state.activity_pattern
-    if _near_key(proposed, pattern.current_key):
-        return "proposal repeats the current activity"
-    if _near_key(proposed, pattern.previous_key):
-        return "proposal repeats the previous activity"
-    if not _meaningful_detail(decision.detail, decision.activity):
-        return "proposal lacks concrete detail"
+    unexpected = set(payload) - allowed
+    if unexpected:
+        raise PresenceParseError("unexpected presence fields", decoded=payload)
+    if bootstrap:
+        if payload.get("decision") != "new":
+            raise PresenceParseError(
+                "bootstrap requires decision=new",
+                decoded=payload,
+            )
+        raw_activity = payload.get("activity")
+        if not isinstance(raw_activity, dict):
+            raise PresenceParseError(
+                "new decision requires activity object",
+                decoded=payload,
+            )
+    else:
+        missing = set(PRESENCE_PROPOSAL_FIELDS[:-1]) - set(payload)
+        if missing:
+            raise PresenceParseError(
+                f"missing presence fields: {', '.join(sorted(missing))}",
+                decoded=payload,
+            )
+        raw_activity = payload.get("activity")
+    if isinstance(raw_activity, dict):
+        summary = raw_activity.get("summary")
+        focus = raw_activity.get("focus")
+        if not isinstance(summary, str) or not summary.strip():
+            raise PresenceParseError(
+                "presence activity requires summary",
+                decoded=payload,
+            )
+        if not isinstance(focus, str) or not focus.strip():
+            raise PresenceParseError(
+                "presence activity requires focus",
+                decoded=payload,
+            )
+        if set(raw_activity) != set(PRESENCE_ACTIVITY_FIELDS):
+            raise PresenceParseError(
+                "unexpected presence activity fields",
+                decoded=payload,
+            )
+    reason = None
+    if not bootstrap and payload.get("continuation_reason") is not None:
+        reason = _text(payload.get("continuation_reason"), 180) or None
+    return PresenceProposal(
+        _text(payload.get("decision"), 16).casefold(),
+        _normalize_activity(raw_activity, bootstrap=bootstrap),
+        reason,
+        _normalize_emotion(payload.get("emotion")),
+    )
+
+
+def presence_proposal_rejection(
+    state: PresenceState,
+    proposal: PresenceProposal,
+    *,
+    bootstrap: bool | None = None,
+) -> str:
+    """Validate one normalized activity decision without appraising emotion."""
+
+    first_decision = needs_bootstrap(state) if bootstrap is None else bootstrap
+    if proposal.decision not in _DECISIONS:
+        return "invalid presence decision"
+    if first_decision and proposal.decision != "new":
+        return "bootstrap requires decision=new"
+    if proposal.decision == "new":
+        if proposal.activity is None:
+            return "new decision requires activity object"
+        if not first_decision and proposal.continuation_reason is not None:
+            return "new presence activity cannot have a continuation reason"
+        return presence_activity_rejection(proposal.activity)
+    if proposal.activity is not None:
+        return "continued presence activity must be null"
+    if state.current_activity is None:
+        return "no current presence activity to continue"
+    if state.continuation_count >= 1:
+        return "presence activity already continued once"
+    reason_words = re.findall(
+        r"[a-z0-9]+",
+        (proposal.continuation_reason or "").casefold(),
+    )
+    if len(reason_words) < 3:
+        return "continuation needs a meaningful reason"
     return ""
 
 
-def apply_life_decision(
+def apply_presence_proposal(
     state: PresenceState,
-    decision: LifeDecision,
+    proposal: PresenceProposal,
     *,
     now: float,
+    activity_id: str,
 ) -> PresenceState:
-    next_at = next_decision_time(now)
+    next_decision_at = max(0.0, float(now)) + PRESENCE_INTERVAL_SECONDS
     current = state.current_activity
     previous = state.previous_activity
-    pattern = state.activity_pattern
-    if decision.mode == "new":
+    continuation_count = state.continuation_count
+    if proposal.decision == "new" and proposal.activity is not None:
         previous = current or previous
         current = PresenceActivity(
-            decision.activity,
-            decision.category,
-            decision.subject,
-            decision.detail,
+            activity_id,
+            proposal.activity.summary,
+            proposal.activity.focus,
             now,
-            next_at,
+            next_decision_at,
         )
-        pattern = ActivityPattern(
-            activity_key(f"{current.activity} {current.subject or ''}"),
-            activity_key(
-                f"{previous.activity} {previous.subject or ''}" if previous else ""
-            ),
-            1,
-        )
+        continuation_count = 0
     elif current is not None:
-        current = replace(current, expected_end_at=next_at)
-        pattern = replace(
-            pattern,
-            current_key=activity_key(f"{current.activity} {current.subject or ''}"),
-            repeat_count=pattern.repeat_count + 1,
-        )
+        current = replace(current, expected_end_at=next_decision_at)
+        continuation_count = 1
     return PresenceState(
         current_activity=current,
         previous_activity=previous,
         last_decision_at=now,
-        next_decision_at=next_at,
-        claim_token=None,
-        claim_expires_at=0.0,
+        next_decision_at=next_decision_at,
         retry_at=0.0,
         last_error=None,
-        activity_pattern=pattern,
+        claim_token=None,
+        claim_expires_at=0.0,
+        continuation_count=continuation_count,
     )
 
 
-def validate_interest_addition(
-    addition: str | None,
-    *,
-    activity: str,
-    subject: str | None,
-    detail: str | None,
-    existing_interests: tuple[str, ...],
-    grounded_context: str,
-) -> str | None:
-    candidate = compact_text(addition, 100)
-    key = activity_key(candidate)
-    if (
-        not candidate
-        or not 1 <= len(key.split()) <= 5
-        or any(key == activity_key(item) for item in existing_interests)
-        or _unsupported_proper_nouns(candidate, grounded_context)
-    ):
-        return None
-    activity_terms = set(
-        activity_key(f"{activity} {subject or ''} {detail or ''}").split()
-    )
-    return candidate if set(key.split()) & activity_terms else None
-
-
-def format_presence_context(
-    state: PresenceState,
-    *,
-    now: float,
-    continuity: str = "none",
-    include_previous: bool = False,
-) -> str:
-    del now
+def format_presence_context(state: PresenceState) -> str:
     activity = state.current_activity
-    lines: list[str] = []
     if activity is None:
-        lines.append("Current activity: none recorded.")
-        if state.previous_activity is not None:
-            lines.append(
-                f"Previous activity: {state.previous_activity.activity}."
-            )
-    else:
-        lines.extend(
-            (
-                f"Current activity: {activity.activity}.",
-                f"Activity continuity: {continuity}.",
-            )
+        return "Current activity: none."
+    return "\n".join(
+        (
+            f"Current activity: {activity.summary}.",
+            f"Current focus: {activity.focus}.",
         )
-        if activity.subject:
-            lines.append(f"Recorded subject: {activity.subject}.")
-        if activity.detail:
-            lines.append(f"Recorded detail: {activity.detail}.")
-        if include_previous and state.previous_activity is not None:
-            lines.append(
-                f"Previous activity: {state.previous_activity.fact()}."
-            )
-    lines.append("Use only recorded activity details.")
-    if continuity == "new":
-        lines.append("This activity is new; do not describe it as still continuing.")
-    return "\n".join(lines)
+    )

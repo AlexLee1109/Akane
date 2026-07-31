@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import queue
 import secrets
 import threading
@@ -30,9 +31,8 @@ from app.core.memory import get_state_store
 from app.core.life_worker import (
     acknowledge_initiative_delivery,
     claim_initiative_delivery,
-    run_life_turn,
-    start_life_worker,
-    stop_life_worker,
+    start_presence_worker,
+    stop_presence_worker,
 )
 from app.core.model_loader import ModelManager
 from app.core.session import (
@@ -61,11 +61,13 @@ from app.integrations.vscode_workspace import (
 from app.ui.assets import resolve_ui_asset
 
 STATIC_DIR = Path(__file__).parent / "ui" / "static"
+WEBSITE_DIST_DIR = Path(__file__).resolve().parents[1] / "website" / "dist"
 DEFAULT_PROFILE_ID = OWNER_PROFILE_ID
 DEFAULT_CONVERSATION_ID = "popup:default"
 _DEBUG_STATE_COMMAND = "/debug_state"
 _MODEL_LOAD_LOCK = threading.Lock()
 _MODEL_LOAD_THREAD: threading.Thread | None = None
+_RUNTIME_SHUTDOWN = threading.Event()
 _STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
@@ -136,6 +138,34 @@ def _static_response_path(route: str) -> tuple[Path, str] | None:
         return STATIC_DIR / name, media_type
     asset = resolve_ui_asset(route)
     return (asset, "image/png") if asset else None
+
+
+def _website_response_path(route: str) -> tuple[Path, str] | None:
+    """Return a built React asset when the optional website build exists."""
+    if not (WEBSITE_DIST_DIR / "index.html").is_file():
+        return None
+    relative_path = "index.html" if route == "/" else route.lstrip("/")
+    candidate = (WEBSITE_DIST_DIR / relative_path).resolve()
+    try:
+        candidate.relative_to(WEBSITE_DIST_DIR.resolve())
+    except ValueError:
+        return None
+    if not candidate.is_file():
+        return None
+    media_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+    return candidate, media_type
+
+
+def _root_response_path(popup_role: str = "") -> tuple[Path, str] | None:
+    if not popup_role:
+        website = _website_response_path("/")
+        if website is not None:
+            return website
+    return _static_response_path("/")
+
+
+def _asset_response_path(route: str) -> tuple[Path, str] | None:
+    return _static_response_path(route) or _website_response_path(route)
 
 
 def _safe_error(exc: Exception) -> str:
@@ -312,7 +342,10 @@ def _start_model_loading() -> None:
     global _MODEL_LOAD_THREAD
     manager = ModelManager.get_instance()
     status = manager.status()
-    if status["loading"] or status["loaded"] or status["error"]:
+    if status["loaded"]:
+        start_presence_worker()
+        return
+    if status["error"]:
         return
     with _MODEL_LOAD_LOCK:
         if _MODEL_LOAD_THREAD is not None and _MODEL_LOAD_THREAD.is_alive():
@@ -321,6 +354,8 @@ def _start_model_loading() -> None:
         def load() -> None:
             try:
                 manager.ensure_loaded()
+                if not _RUNTIME_SHUTDOWN.is_set():
+                    start_presence_worker()
             except Exception as exc:
                 _log("model-error", str(exc))
 
@@ -336,12 +371,13 @@ def _start_model_loading() -> None:
 async def _lifespan(_app: FastAPI):
     load_character_profile()
     get_state_store()
+    _RUNTIME_SHUTDOWN.clear()
     _start_model_loading()
-    start_life_worker()
     try:
         yield
     finally:
-        stop_life_worker()
+        _RUNTIME_SHUTDOWN.set()
+        stop_presence_worker()
         cancel_all_generations()
 
 
@@ -376,8 +412,8 @@ def create_app() -> FastAPI:
         return await call_next(request)
 
     @app.get("/", include_in_schema=False)
-    async def root():
-        static = _static_response_path("/")
+    async def root(request: Request):
+        static = _root_response_path(request.query_params.get("popup_role", ""))
         if static is None:
             raise HTTPException(status_code=404)
         path, media_type = static
@@ -548,24 +584,9 @@ def create_app() -> FastAPI:
         )
         return JSONResponse({"ok": accepted})
 
-    @app.post("/api/life")
-    async def api_life(request: Request):
-        payload = await _request_payload(request)
-        profile = str(payload.get("profile_id") or DEFAULT_PROFILE_ID)
-        try:
-            changed = await asyncio.to_thread(
-                run_life_turn,
-                profile_id=profile,
-                now=payload.get("timestamp") or None,
-            )
-        except Exception as exc:
-            _log("error", f"type={type(exc).__name__} detail={exc}")
-            return JSONResponse({"error": _safe_error(exc)}, status_code=_error_status(exc))
-        return JSONResponse({"changed": changed, "akane": get_state_store().public_internal_state(profile)})
-
     @app.get("/{asset_path:path}", include_in_schema=False)
     async def static_assets(asset_path: str):
-        static = _static_response_path(unquote("/" + asset_path.lstrip("/")))
+        static = _asset_response_path(unquote("/" + asset_path.lstrip("/")))
         if static is None:
             raise HTTPException(status_code=404)
         path, media_type = static

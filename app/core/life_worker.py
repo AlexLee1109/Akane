@@ -1,4 +1,4 @@
-"""The single event-driven autonomous-presence worker for this process."""
+"""The single event-driven offscreen-presence worker for this process."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from app.core.config import MAX_TOKENS
 from app.core.memory import (
     InitiativeOpportunity,
     StateStore,
+    effective_emotion,
     format_emotional_context,
     get_state_store,
 )
@@ -26,15 +27,21 @@ from app.core.model_loader import (
     compile_json_grammar,
 )
 from app.core.presence import (
-    LIFE_JSON_SCHEMA,
-    LifeParseError,
+    BOOTSTRAP_PRESENCE_JSON_SCHEMA,
+    PRESENCE_JSON_SCHEMA,
+    UNSUPPORTED_PHYSICAL_ACTIVITY_REASON,
+    PresenceParseError,
+    PresenceProposal,
+    ProposedActivity,
     format_presence_context,
-    parse_life_decision,
+    needs_bootstrap,
+    presence_activity_rejection,
+    parse_presence_proposal,
 )
 from app.core.prompt import (
     PromptContext,
     build_initiative_prompt,
-    build_life_prompt,
+    build_presence_prompt,
 )
 from app.core.time_context import build_time_context, format_time_context
 from app.core.utils import OWNER_PROFILE_ID, canonical_profile_id, compact_text
@@ -42,9 +49,18 @@ from app.core.utils import OWNER_PROFILE_ID, canonical_profile_id, compact_text
 _MIN_ERROR_BACKOFF_SECONDS = 5.0
 _MAX_ERROR_BACKOFF_SECONDS = 60.0
 _LOGGER = logging.getLogger(__name__)
+_BOOTSTRAP_FALLBACK = PresenceProposal(
+    "new",
+    ProposedActivity(
+        "spending some quiet time with one of her interests",
+        "thinking about what currently holds her attention",
+    ),
+    None,
+    None,
+)
 
 
-class AutonomousLifeWorker:
+class OffscreenPresenceWorker:
     def __init__(
         self,
         store: StateStore,
@@ -74,7 +90,7 @@ class AutonomousLifeWorker:
             self._thread = threading.Thread(
                 target=self._run,
                 daemon=True,
-                name="AkaneAutonomousLife",
+                name="AkaneOffscreenPresence",
             )
             self._thread.start()
         self.wake()
@@ -100,7 +116,7 @@ class AutonomousLifeWorker:
         with self._lock:
             running = self._thread is not None and self._thread.is_alive()
             return {
-                "Life Worker Started": running,
+                "Presence Worker Started": running,
                 "Pending Profiles": self._pending_profiles,
                 "Active Profile": self._active_profile,
                 "Last Error": self._last_error,
@@ -143,7 +159,6 @@ class AutonomousLifeWorker:
                 self._delivery_condition.notify_all()
                 return None
             self._adapters[channel] = (conversation, time.time() + 35.0)
-            self.wake()
             while not self._stop.is_set():
                 current = time.time()
                 claimed = self._store.claim_initiative_delivery(
@@ -207,7 +222,7 @@ class AutonomousLifeWorker:
     def _run_profile(self, profile_id: str) -> bool:
         runner = self._runner
         if runner is None:
-            runner = run_life_turn
+            runner = run_presence_turn
         return runner(
             profile_id=profile_id,
             **self._runner_kwargs(runner),
@@ -323,81 +338,82 @@ class AutonomousLifeWorker:
 
 def _profile_text(item: object) -> str:
     for name in ("content", "text", "summary"):
-        value = compact_text(getattr(item, name, ""), 320)
+        value = compact_text(getattr(item, name, ""), 240)
         if value:
             return value
-    return compact_text(item, 320)
+    return compact_text(item, 240)
 
 
-def _life_context(
-    profile,
-    *,
-    now: float,
-    last_user_message_at: float,
-    last_akane_message_at: float,
-) -> PromptContext:
-    memories = tuple(
-        _profile_text(item)
-        for item in sorted(
-            profile.memories,
-            key=lambda item: (item.confidence, item.updated_at),
-            reverse=True,
-        )[:4]
-        if _profile_text(item)
-    )
-    relationship = tuple(
-        _profile_text(item)
-        for item in (
-            *profile.relationship.unresolved_events[-2:],
-            *profile.relationship.shared_context[-1:],
-            *profile.relationship.patterns[-1:],
+def _presence_context(profile, *, now: float) -> PromptContext:
+    activity = profile.presence.current_activity
+    emotion = effective_emotion(profile.emotion, now=now)
+    emotion_context = (
+        "Current immediate emotion: neutral."
+        if emotion.primary == "neutral"
+        else "\n".join(
+            (
+                f"Current immediate emotion: {emotion.primary} "
+                f"at intensity {emotion.intensity:.2f}.",
+                f"Cause: {emotion.cause}.",
+            )
         )
-        if _profile_text(item)
     )
-    preferences = tuple(
-        _profile_text(item) for item in profile.preferences[-3:] if _profile_text(item)
-    )
-    opinions = tuple(
-        _profile_text(item) for item in profile.opinions[-3:] if _profile_text(item)
-    )
-    current_activity = profile.presence.current_activity
     return PromptContext(
         time_context=format_time_context(
             build_time_context(
                 now=now,
-                last_user_message_at=last_user_message_at,
-                last_akane_message_at=last_akane_message_at,
                 current_activity_started_at=(
-                    current_activity.started_at if current_activity else None
+                    activity.started_at if activity else None
                 ),
             )
         ),
-        memories=memories,
-        relationship=relationship,
-        preferences=preferences,
+        preferences=tuple(
+            text
+            for item in profile.preferences[-3:]
+            if (text := _profile_text(item))
+        ),
         interests=tuple(profile.interests[-8:]),
-        opinions=opinions,
-        emotion=format_emotional_context(
-            profile,
-            now=now,
-            include_unappraised=True,
-        ),
-        presence=format_presence_context(
-            profile.presence,
-            now=now,
-            continuity="ongoing" if profile.presence.current_activity else "none",
-            include_previous=True,
-        ),
+        emotion=emotion_context,
+        presence=format_presence_context(profile.presence),
+        continuation_count=profile.presence.continuation_count,
     )
 
 
-def run_life_turn(
+def _log_bootstrap_failure(raw: str, error: PresenceParseError | str) -> None:
+    decoded = error.decoded if isinstance(error, PresenceParseError) else None
+    if decoded is None:
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            decoded = None
+    decoded_keys = tuple(sorted(decoded)[:32]) if isinstance(decoded, dict) else ()
+    decision = decoded.get("decision") if isinstance(decoded, dict) else None
+    activity = decoded.get("activity") if isinstance(decoded, dict) else None
+    activity_keys = tuple(sorted(activity)[:32]) if isinstance(activity, dict) else ()
+    activity_value: object = activity
+    if len(repr(activity_value)) > 1_000:
+        activity_value = repr(activity_value)[:1_000]
+    _LOGGER.warning(
+        "presence bootstrap failed entered=%s raw_length=%d raw=%r "
+        "decoded_keys=%r decision=%r activity=%r activity_keys=%r reason=%s",
+        True,
+        len(raw),
+        raw[:1_000],
+        decoded_keys,
+        decision,
+        activity_value,
+        activity_keys,
+        error,
+    )
+
+
+def run_presence_turn(
     *,
     profile_id: str,
     now: float | None = None,
     cancellation: threading.Event | None = None,
 ) -> bool:
-    """Run one claimed background decision without generating visible dialogue."""
+    """Run one claimed raw-JSON presence decision without visible dialogue."""
 
     current = time.time() if now is None else max(0.0, float(now))
     profile_key = canonical_profile_id(profile_id)
@@ -408,22 +424,12 @@ def run_life_turn(
     claim_token = claimed.presence.claim_token or ""
     if not claim_token:
         return False
-    prior_error = compact_text(claimed.presence.last_error, 120).casefold()
-    correcting_structure = prior_error.startswith(
-        ("invalid life block", "life parse:")
+    expected_activity_id = (
+        claimed.presence.current_activity.activity_id
+        if claimed.presence.current_activity is not None
+        else None
     )
-    retry_note = (
-        "Return one valid JSON object matching the required life-decision schema. "
-        "Do not include explanation, Markdown, dialogue, or wrapper text."
-        if correcting_structure
-        else "The corrected proposal must explicitly appraise emotion with mode keep, "
-        "shift, or settle."
-        if "appraisal" in prior_error
-        else "The previous proposal was too similar. Choose independently without "
-        "reusing that activity."
-        if "repeat" in prior_error
-        else ""
-    )
+    bootstrap = needs_bootstrap(claimed.presence)
     try:
         manager = ModelManager.get_instance()
         timing = InferenceTiming(requested_at=time.perf_counter())
@@ -432,88 +438,110 @@ def run_life_turn(
             cancellation=cancellation,
         ) as reservation:
             prompt_now = current if now is not None else time.time()
-            message_times = store.snapshot(
-                profile_key,
-                now=prompt_now,
-                include_memory=False,
-            )
-            context = _life_context(
+            context = _presence_context(
                 claimed,
                 now=prompt_now,
-                last_user_message_at=message_times.last_profile_user_at,
-                last_akane_message_at=message_times.last_profile_assistant_at,
             )
-            plan = build_life_prompt(
-                context,
-                retry_note=retry_note,
-                token_counter=lambda messages: manager.tokenize_prompt(
-                    messages,
-                    reservation=reservation,
-                ),
-            )
-            raw = "".join(
-                manager.stream(
-                    prompt_tokens=plan.token_ids,
-                    template_stop_sequences=plan.stop_sequences,
-                    max_tokens=MAX_TOKENS,
-                    cancellation=cancellation,
-                    timing=timing,
-                    grammar=compile_json_grammar(LIFE_JSON_SCHEMA),
-                    reservation=reservation,
+            correction_reason = ""
+            proposal = None
+            raw = ""
+            for attempt in range(2):
+                plan = build_presence_prompt(
+                    context,
+                    token_counter=lambda messages: manager.tokenize_prompt(
+                        messages,
+                        reservation=reservation,
+                    ),
+                    bootstrap=bootstrap,
+                    correction_reason=correction_reason,
                 )
-            )
-        grounded = "\n".join(
-            message["content"]
-            for message in plan.messages
-        )
-        try:
-            decision = parse_life_decision(raw)
-        except LifeParseError as exc:
-            _LOGGER.warning(
-                "life parse failed format=raw_json_schema chars=%d markers=%s/%s "
-                "keys=%s preview=%r error=%s",
-                len(raw),
-                "<AKANE_LIFE>" in raw,
-                "</AKANE_LIFE>" in raw,
-                getattr(exc, "decoded_keys", ()),
-                raw[:1500],
-                exc,
-            )
-            store.fail_presence_decision(
-                profile_key,
-                claim_token=claim_token,
-                now=current,
-                error=f"life parse: {exc}",
-            )
+                schema = (
+                    BOOTSTRAP_PRESENCE_JSON_SCHEMA
+                    if bootstrap
+                    else PRESENCE_JSON_SCHEMA
+                )
+                raw = "".join(
+                    manager.stream(
+                        prompt_tokens=plan.token_ids,
+                        template_stop_sequences=plan.stop_sequences,
+                        max_tokens=MAX_TOKENS,
+                        cancellation=cancellation,
+                        timing=timing,
+                        grammar=compile_json_grammar(schema),
+                        reservation=reservation,
+                    )
+                )
+                try:
+                    proposal = parse_presence_proposal(raw, bootstrap=bootstrap)
+                except PresenceParseError as exc:
+                    if bootstrap:
+                        _log_bootstrap_failure(raw, exc)
+                        correction_reason = str(exc)
+                        if attempt == 0:
+                            continue
+                        proposal = _BOOTSTRAP_FALLBACK
+                        break
+                    _LOGGER.warning(
+                        "presence parse failed format=raw_json_schema chars=%d "
+                        "preview=%r error=%s",
+                        len(raw),
+                        raw[:1_000],
+                        exc,
+                    )
+                    store.fail_presence_decision(
+                        profile_key,
+                        claim_token=claim_token,
+                        now=current,
+                        error=str(exc),
+                    )
+                    return False
+                activity_error = presence_activity_rejection(
+                    proposal.activity if proposal.decision == "new" else None
+                )
+                if activity_error:
+                    if bootstrap:
+                        _log_bootstrap_failure(raw, activity_error)
+                    else:
+                        _LOGGER.warning(
+                            "presence activity rejected chars=%d preview=%r reason=%s",
+                            len(raw),
+                            raw[:1_000],
+                            activity_error,
+                        )
+                    correction_reason = activity_error
+                    if attempt == 0:
+                        continue
+                    if bootstrap:
+                        proposal = _BOOTSTRAP_FALLBACK
+                        break
+                    store.fail_presence_decision(
+                        profile_key,
+                        claim_token=claim_token,
+                        now=time.time() if now is None else current,
+                        error=UNSUPPORTED_PHYSICAL_ACTIVITY_REASON,
+                    )
+                    return False
+                break
+        if proposal is None:
             return False
-        accepted, _reason = store.commit_presence_decision(
+        accepted, reason = store.commit_presence_decision(
             profile_key,
-            decision,
+            proposal,
             claim_token=claim_token,
             now=time.time() if now is None else current,
-            grounded_context=grounded,
+            expected_activity_id=expected_activity_id,
+            expected_bootstrap=bootstrap,
             expected_emotion_updated_at=claimed.emotion.updated_at,
         )
-        if accepted:
-            after = store.snapshot(
-                profile_key,
-                now=time.time() if now is None else current,
-                include_memory=False,
-            )
-            offer_initiative_from_change(
-                store,
-                claimed,
-                after.profile,
-                now=after.now,
-                conversation=False,
-            )
+        if bootstrap and not accepted:
+            _log_bootstrap_failure(raw, reason)
         return accepted
     except InferenceCancelled:
         store.fail_presence_decision(
             profile_key,
             claim_token=claim_token,
             now=current,
-            error="life inference cancelled",
+            error="presence inference cancelled",
         )
         return False
     except Exception:
@@ -521,7 +549,7 @@ def run_life_turn(
             profile_key,
             claim_token=claim_token,
             now=time.time() if now is None else current,
-            error="life inference failed",
+            error="presence inference failed",
         )
         raise
 
@@ -603,20 +631,6 @@ def offer_initiative_from_change(
                     f"{_topic_key(opinion.topic)[:60]}",
                     opinion.content,
                 )
-    else:
-        activity = after.presence.current_activity
-        prior = before.presence.current_activity
-        if (
-            activity is not None
-            and activity.detail
-            and (prior is None or prior.started_at != activity.started_at)
-        ):
-            source = (
-                "meaningful current offscreen activity",
-                "offscreen_life",
-                f"offscreen_life:{activity.started_at:.6f}",
-                activity.fact(),
-            )
     if source is None:
         return False
     reason, source_type, source_id, evidence = source
@@ -730,11 +744,7 @@ def _initiative_context(snapshot, opportunity, *, now: float) -> PromptContext:
         ),
         emotion=format_emotional_context(profile, now=now),
         presence=(
-            format_presence_context(
-                profile.presence,
-                now=now,
-                continuity="ongoing",
-            )
+            format_presence_context(profile.presence)
             if activity
             else "Current activity: none recorded."
         ),
@@ -820,19 +830,19 @@ def run_initiative_evaluation(
 
 
 _WORKER_LOCK = threading.Lock()
-_WORKER: AutonomousLifeWorker | None = None
+_WORKER: OffscreenPresenceWorker | None = None
 
 
-def start_life_worker() -> AutonomousLifeWorker:
+def start_presence_worker() -> OffscreenPresenceWorker:
     global _WORKER
     with _WORKER_LOCK:
         if _WORKER is None:
-            _WORKER = AutonomousLifeWorker(get_state_store())
+            _WORKER = OffscreenPresenceWorker(get_state_store())
         _WORKER.start()
         return _WORKER
 
 
-def stop_life_worker() -> None:
+def stop_presence_worker() -> None:
     with _WORKER_LOCK:
         worker = _WORKER
     if worker is not None:
@@ -881,12 +891,12 @@ def acknowledge_initiative_delivery(
     )
 
 
-def life_worker_debug() -> dict[str, object]:
+def presence_worker_debug() -> dict[str, object]:
     with _WORKER_LOCK:
         worker = _WORKER
     if worker is None:
         return {
-            "Life Worker Started": False,
+            "Presence Worker Started": False,
             "Pending Profiles": (),
             "Active Profile": "",
             "Last Error": "",

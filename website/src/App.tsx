@@ -6,6 +6,7 @@ import { canUseSpeech, speak, stopSpeech } from "./lib/speech";
 import { getWebSessionId, resetWebSessionId } from "./lib/session";
 
 const asset = `${import.meta.env.BASE_URL}assets/akane-hero.png`;
+const logo = `${import.meta.env.BASE_URL}assets/akane-logo.png`;
 const github = projectConfig.githubUrl;
 const features = [
   ["✦", "Memory", "Preserves meaningful facts, preferences, conversations, and shared events."],
@@ -20,6 +21,7 @@ const stack = [
 ];
 
 function Mark() { return <span className="mark" aria-hidden="true">✦</span>; }
+function Logo() { return <img className="logo" src={logo} alt="Akane logo" />; }
 function GithubLink({ children, className = "button secondary" }: { children: ReactNode; className?: string }) {
   return github ? <a className={className} href={github} target="_blank" rel="noreferrer">{children} <span aria-hidden="true">↗</span></a> : <span className={`${className} disabled`} aria-disabled="true">{children}</span>;
 }
@@ -28,13 +30,13 @@ function Navbar() {
   const [open, setOpen] = useState(false);
   const links = [["/", "Home"], ["/demo", "Demo"], ["/technology", "Technology"]] as const;
   return <header className="site-header"><nav className="nav shell" aria-label="Primary navigation">
-    <Link className="brand" to="/" onClick={() => setOpen(false)}><Mark /><strong>Akane</strong><span>AI COMPANION</span></Link>
+    <Link className="brand" to="/" onClick={() => setOpen(false)}><Logo /><strong>Akane</strong><span>AI COMPANION</span></Link>
     <button className="menu-button" aria-expanded={open} aria-controls="nav-links" onClick={() => setOpen(!open)}>{open ? "Close" : "Menu"}</button>
     <div id="nav-links" className={`nav-links ${open ? "open" : ""}`}>{links.map(([to, label]) => <NavLink key={to} to={to} end={to === "/"} onClick={() => setOpen(false)}>{label}</NavLink>)}<GithubLink className="nav-github">GitHub</GithubLink></div>
   </nav></header>;
 }
 
-function Footer() { return <footer className="footer shell"><div><strong>Akane</strong><p>Local-first privacy: the static site does not bundle a model or personal Akane state.</p></div><div className="footer-links"><Link to="/">Home</Link><Link to="/demo">Demo</Link><Link to="/technology">Technology</Link><GithubLink className="plain-link">GitHub</GithubLink></div><small>© {new Date().getFullYear()} Akane</small></footer>; }
+function Footer() { return <footer className="footer shell"><div className="footer-brand"><Logo /><div><strong>Akane</strong><p>Local-first privacy: the static site does not bundle a model or personal Akane state.</p></div></div><div className="footer-links"><Link to="/">Home</Link><Link to="/demo">Demo</Link><Link to="/technology">Technology</Link><GithubLink className="plain-link">GitHub</GithubLink></div><small>© {new Date().getFullYear()} Akane</small></footer>; }
 
 function Character({ compact = false }: { compact?: boolean }) { return <img className={`akane-image ${compact ? "compact" : ""}`} src={asset} alt="Akane, a blue-haired anime-style companion in a white jacket" />; }
 function Eyebrow({ children }: { children: ReactNode }) { return <p className="eyebrow"><Mark /> {children}</p>; }
@@ -44,7 +46,7 @@ function HomePage() { return <main>
   <section className="section shell"><div className="section-heading"><Eyebrow>Built to be more than a chatbot</Eyebrow><h2>Features that make Akane special</h2></div><div className="feature-grid">{features.map(([icon, title, text]) => <article className="feature-card" key={title}><i>{icon}</i><h3>{title}</h3><p>{text}</p><Link to="/technology">Learn more →</Link></article>)}</div></section>
   <section className="technology-strip shell"><div><h2>Local-first. Powerful. Yours.</h2><p>Akane runs as a small, focused project with a shared local runtime.</p></div><div className="tech-pills">{["Gemma 4 E4B", "llama.cpp", "Python", "Atomic JSON", "Discord"].map(item => <span key={item}>{item}</span>)}</div></section>
   <section className="architecture-teaser shell"><div><Eyebrow>One companion, several ways to connect</Eyebrow><h2>A shared backend, with a familiar presence.</h2><p>Web Demo, Popup, and Discord each send requests through the same Akane runtime.</p><Link className="text-link" to="/technology">Explore the architecture →</Link></div><div className="architecture-lines" aria-label="Web Demo, Popup, and Discord connect to the shared Akane backend, then Gemma through llama.cpp"><span>Web Demo</span><span>Popup</span><span>Discord</span><b>Shared Akane Backend</b><strong>Gemma 4 via llama.cpp</strong></div></section>
-  <section className="home-cta shell"><Mark /><div><h2>Open source. Built with care.</h2><p>Akane is a local-first companion project made for thoughtful experimentation.</p></div><GithubLink>View on GitHub</GithubLink><Link className="button primary" to="/demo">Try Demo →</Link></section>
+  <section className="home-cta shell"><Logo /><div><h2>Open source. Built with care.</h2><p>Akane is a local-first companion project made for thoughtful experimentation.</p></div><GithubLink>View on GitHub</GithubLink><Link className="button primary" to="/demo">Try Demo →</Link></section>
 </main>; }
 
 type Message = { id: string; role: "akane" | "you"; text: string; time: string };
@@ -84,7 +86,7 @@ function TechnologyPage() { const architecture: Array<[string, string[]]> = [["I
   <section className="flow-section shell panel"><Eyebrow>System flow</Eyebrow><div className="system-flow">{["User interface", "Shared backend", "Relevant context", "Gemma inference", "Streamed response", "Validated state update"].map((item, index) => <div key={item}><span>{item}</span>{index < 5 && <b>→</b>}</div>)}</div></section>
   <section className="stack-section shell"><div className="section-heading left"><Eyebrow>Technology stack</Eyebrow><h2>Small, confirmed building blocks</h2></div><div className="stack-grid">{stack.map(([category, name, detail]) => <article key={category}><span>{category}</span><h3>{name}</h3><p>{detail}</p></article>)}</div></section>
   <section className="engineering shell panel"><Eyebrow>Engineering focus</Eyebrow><h2>The constraints shape the work.</h2><div>{["Serializing conversation and autonomous inference on one Pi", "Preserving state safely across restarts", "Keeping companion context distinct from the user", "Coordinating popup, Discord, and web interfaces"].map(item => <p key={item}>✦ {item}</p>)}</div></section>
-  <section className="home-cta shell"><Mark /><div><h2>Build with Akane.</h2><p>Explore the browser demo or see the local-first project on GitHub.</p></div><GithubLink>View on GitHub</GithubLink><Link className="button primary" to="/demo">Try Demo →</Link></section>
+  <section className="home-cta shell"><Logo /><div><h2>Build with Akane.</h2><p>Explore the browser demo or see the local-first project on GitHub.</p></div><GithubLink>View on GitHub</GithubLink><Link className="button primary" to="/demo">Try Demo →</Link></section>
 </main>; }
 
 function App() { const location = useLocation(); useEffect(() => { window.scrollTo(0, 0); }, [location.pathname]); return <><Navbar /><Routes><Route path="/" element={<HomePage />} /><Route path="/demo" element={<DemoPage />} /><Route path="/technology" element={<TechnologyPage />} /><Route path="*" element={<HomePage />} /></Routes><Footer /></>; }

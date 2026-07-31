@@ -13,3 +13,8 @@
 @media (max-width:430px) { h1 { font-size:2.7rem; }.hero-art { min-height:350px; }.stage-badges { flex-wrap:wrap; }.stage-bubble { top:105px; max-width:145px; font-size:.68rem; }.stage-footer { display:none; }.runtime { grid-template-columns:1fr; }.stack-grid { grid-template-columns:1fr; }.architecture-lines { grid-template-columns:1fr; }.architecture-lines b,.architecture-lines strong { grid-column:1; grid-row:auto; }.architecture-lines b { order:-1; }.message-teaser { margin-top:18px; } }
 @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto!important; animation-duration:.01ms!important; animation-iteration-count:1!important; transition-duration:.01ms!important; } }
 .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+
+.logo { display:block; width:38px; height:38px; object-fit:contain; }
+.footer-brand { display:flex; align-items:flex-start; gap:12px; }
+.footer-brand .logo { width:34px; height:34px; }
+.home-cta > .logo { width:52px; height:52px; }

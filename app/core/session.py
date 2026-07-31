@@ -39,7 +39,7 @@ from app.core.time_context import (
     format_time_context,
 )
 from app.core.utils import canonical_profile_id, compact_text, words
-from app.integrations.vscode_context import code_context_for_message
+from app.integrations.vscode_context import CodeContext, code_context_for_message
 
 _STATE_BLOCK = re.compile(
     r"<AKANE_STATE>\s*(.*?)\s*</AKANE_STATE>",
@@ -172,6 +172,8 @@ class GenerationScheduler:
         profile_id: str,
         *,
         skip_if_busy: bool = False,
+        cancellation: threading.Event | None = None,
+        queue_deadline: float | None = None,
     ) -> GenerationHandle:
         with self._lock:
             if skip_if_busy and self._active:
@@ -188,8 +190,15 @@ class GenerationScheduler:
             uuid.uuid4().hex,
             conversation_id,
             profile_id,
-            threading.Event(),
-            time.monotonic() + GENERATION_QUEUE_TIMEOUT_SECONDS,
+            cancellation or threading.Event(),
+            (
+                min(
+                    queue_deadline,
+                    time.monotonic() + GENERATION_QUEUE_TIMEOUT_SECONDS,
+                )
+                if queue_deadline is not None
+                else time.monotonic() + GENERATION_QUEUE_TIMEOUT_SECONDS
+            ),
         )
         with self._lock:
             if conversation_id in self._active or any(
@@ -634,6 +643,7 @@ def _build_prompt(
     context_plan: tuple[tuple[str, ...], str, bool],
     editor,
     token_counter,
+    reserved_output_tokens: int = MAX_TOKENS,
 ) -> PromptPlan:
     sections, response_focus, _memory_relevant = context_plan
     context = _prompt_context(
@@ -647,6 +657,7 @@ def _build_prompt(
         chat.text,
         context,
         token_counter=token_counter,
+        reserved_output_tokens=reserved_output_tokens,
     )
 
 
@@ -672,6 +683,12 @@ def run_companion_turn(
     skip_memory: bool = False,
     skip_if_busy: bool = False,
     on_delta=None,
+    priority: str = "visible",
+    max_tokens: int = MAX_TOKENS,
+    cancellation: threading.Event | None = None,
+    queue_deadline: float | None = None,
+    allow_tool_context: bool = True,
+    allow_initiative: bool = True,
 ) -> CompanionTurnResult:
     if _pause_remaining(chat):
         return CompanionTurnResult(
@@ -682,6 +699,8 @@ def run_companion_turn(
         chat.conversation_id,
         chat.profile_id,
         skip_if_busy=skip_if_busy,
+        cancellation=cancellation,
+        queue_deadline=queue_deadline,
     )
     started_at = time.perf_counter()
     store = get_state_store()
@@ -692,7 +711,7 @@ def run_companion_turn(
         visible_stream = _VisibleReplyStream()
         try:
             with manager.reserve(
-                priority="visible",
+                priority=priority,
                 cancellation=handle.cancellation,
                 queue_deadline=handle.queue_deadline,
             ) as reservation:
@@ -703,7 +722,11 @@ def run_companion_turn(
                     now=time.time(),
                     include_memory=False,
                 )
-                editor = code_context_for_message(planning_text)
+                editor = (
+                    code_context_for_message(planning_text)
+                    if allow_tool_context
+                    else CodeContext(False, False)
+                )
                 context_plan = _response_context_plan(
                     planning_text,
                     tuple(snapshot.recent_turns),
@@ -739,11 +762,12 @@ def run_companion_turn(
                         messages,
                         reservation=reservation,
                     ),
+                    reserved_output_tokens=max(1, int(max_tokens)),
                 )
                 for chunk in manager.stream(
                     prompt_tokens=plan.token_ids,
                     template_stop_sequences=plan.stop_sequences,
-                    max_tokens=MAX_TOKENS,
+                    max_tokens=max(1, int(max_tokens)),
                     cancellation=handle.cancellation,
                     timing=timing,
                     reservation=reservation,
@@ -765,6 +789,7 @@ def run_companion_turn(
         handle.raise_if_cancelled()
         parsed = parse_akane_state(raw)
         decision = _decision_from_output(parsed)
+        handle.raise_if_cancelled()
         if decision.pause_seconds is not None:
             _apply_pause(chat, decision.pause_seconds)
         committed = store.commit_turn(
@@ -776,15 +801,16 @@ def run_companion_turn(
             proposals=parsed.proposals,
             now=time.time(),
         )
-        from app.core.life_worker import offer_initiative_from_change
+        if allow_initiative:
+            from app.core.life_worker import offer_initiative_from_change
 
-        offer_initiative_from_change(
-            store,
-            snapshot.profile,
-            committed.profile,
-            now=committed.now,
-            conversation=True,
-        )
+            offer_initiative_from_change(
+                store,
+                snapshot.profile,
+                committed.profile,
+                now=committed.now,
+                conversation=True,
+            )
         _record_debug(chat, snapshot, plan, parsed, decision, timing, started_at)
         return CompanionTurnResult(decision, handle.generation_id)
     finally:
@@ -858,7 +884,7 @@ def cancel_all_generations() -> None:
     _SCHEDULER.cancel_all()
 
 
-def reset_conversation(conversation_id: str, profile_id: str) -> None:
+def clear_conversation_caches(conversation_id: str, profile_id: str) -> None:
     conversation = compact_text(conversation_id, 160) or "popup:default"
     profile = canonical_profile_id(profile_id)
     _SCHEDULER.cancel(conversation, profile)
@@ -866,10 +892,9 @@ def reset_conversation(conversation_id: str, profile_id: str) -> None:
         _PAUSED_UNTIL.pop((profile, conversation), None)
     with _DEBUG_LOCK:
         _TURN_DEBUG.pop((profile, conversation), None)
-    get_state_store().clear_conversation(conversation, profile)
 
 
-def forget_profile(profile_id: str) -> None:
+def clear_profile_caches(profile_id: str) -> None:
     profile = canonical_profile_id(profile_id)
     _SCHEDULER.cancel_profile(profile)
     with _PAUSE_LOCK:
@@ -880,6 +905,18 @@ def forget_profile(profile_id: str) -> None:
         for key in tuple(_TURN_DEBUG):
             if key[0] == profile:
                 _TURN_DEBUG.pop(key, None)
+
+
+def reset_conversation(conversation_id: str, profile_id: str) -> None:
+    conversation = compact_text(conversation_id, 160) or "popup:default"
+    profile = canonical_profile_id(profile_id)
+    clear_conversation_caches(conversation, profile)
+    get_state_store().clear_conversation(conversation, profile)
+
+
+def forget_profile(profile_id: str) -> None:
+    profile = canonical_profile_id(profile_id)
+    clear_profile_caches(profile)
     get_state_store().clear_profile(profile)
 
 

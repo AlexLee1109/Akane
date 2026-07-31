@@ -98,7 +98,7 @@ def content_to_text(content) -> str:
 
 def completion_kwargs(max_tokens: int, stream: bool) -> dict[str, object]:
     options: dict[str, object] = {
-        "max_tokens": max(1, min(int(max_tokens), MAX_TOKENS)),
+        "max_tokens": max(1, min(int(max_tokens), LLAMA_CONTEXT_WINDOW - 1)),
         "temperature": TEMPERATURE,
         "top_k": TOP_K,
         "top_p": TOP_P,
@@ -192,6 +192,10 @@ class ModelManager:
         self._load_lock = threading.RLock()
         self._inference_condition = threading.Condition()
         self._inference_active = False
+        self._inference_active_priority = ""
+        self._inference_active_cancellation: threading.Event | None = None
+        self._inference_waiters: list[tuple[int, int]] = []
+        self._inference_waiter_sequence = 0
         self._visible_waiters = 0
 
     @classmethod
@@ -210,6 +214,10 @@ class ModelManager:
             "backend": "llama_cpp",
             "local_model_path": str(self._local_model_path),
         }
+
+    def inference_busy(self) -> bool:
+        with self._inference_condition:
+            return self._inference_active or bool(self._inference_waiters)
 
     def runtime_report(self, *, include_model_hash: bool = False) -> dict[str, object]:
         path = self._local_model_path.expanduser().resolve()
@@ -346,26 +354,33 @@ class ModelManager:
     ):
         """Reserve tokenization and generation as one priority-aware operation."""
 
-        visible = priority != "background"
-        normalized_priority = "visible" if visible else "background"
+        ranks = {"owner": 0, "visible": 0, "guest": 1, "background": 2}
+        normalized_priority = str(priority or "visible").strip().lower()
+        if normalized_priority not in ranks:
+            raise ValueError("Unknown inference priority.")
+        visible = normalized_priority != "background"
+        rank = ranks[normalized_priority]
+        waiter: tuple[int, int] | None = None
+        acquired = False
         with self._inference_condition:
+            if cancellation is not None and cancellation.is_set():
+                raise InferenceCancelled("Generation was cancelled before inference.")
+            if queue_deadline is not None and time.monotonic() >= queue_deadline:
+                raise InferenceQueueTimeout("Generation timed out while waiting for the model.")
+            self._inference_waiter_sequence += 1
+            waiter = (rank, self._inference_waiter_sequence)
+            self._inference_waiters.append(waiter)
             if visible:
                 self._visible_waiters += 1
+            active_rank = ranks.get(self._inference_active_priority, 99)
+            if (
+                self._inference_active
+                and rank < active_rank
+                and self._inference_active_cancellation is not None
+            ):
+                self._inference_active_cancellation.set()
             try:
-                if cancellation is not None and cancellation.is_set():
-                    raise InferenceCancelled(
-                        "Generation was cancelled before inference."
-                    )
-                if (
-                    queue_deadline is not None
-                    and time.monotonic() >= queue_deadline
-                ):
-                    raise InferenceQueueTimeout(
-                        "Generation timed out while waiting for the model."
-                    )
-                while self._inference_active or (
-                    not visible and self._visible_waiters
-                ):
+                while self._inference_active or waiter != min(self._inference_waiters):
                     if cancellation is not None and cancellation.is_set():
                         raise InferenceCancelled(
                             "Generation was cancelled before inference."
@@ -378,10 +393,19 @@ class ModelManager:
                             "Generation timed out while waiting for the model."
                         )
                     self._inference_condition.wait(timeout=0.1)
+                self._inference_waiters.remove(waiter)
+                waiter = None
                 self._inference_active = True
+                self._inference_active_priority = normalized_priority
+                self._inference_active_cancellation = cancellation
+                acquired = True
             finally:
+                if waiter is not None and waiter in self._inference_waiters:
+                    self._inference_waiters.remove(waiter)
                 if visible:
                     self._visible_waiters -= 1
+                if not acquired:
+                    self._inference_condition.notify_all()
         try:
             if cancellation is not None and cancellation.is_set():
                 raise InferenceCancelled("Generation was cancelled before inference.")
@@ -393,6 +417,8 @@ class ModelManager:
         finally:
             with self._inference_condition:
                 self._inference_active = False
+                self._inference_active_priority = ""
+                self._inference_active_cancellation = None
                 self._inference_condition.notify_all()
 
     def tokenize_prompt(

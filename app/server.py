@@ -21,10 +21,10 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.character import load_character_profile
 from app.core.config import (
+    APPLICATION_HOST,
+    APPLICATION_PORT,
     CORS_ALLOWED_ORIGINS,
     SERVER_API_TOKEN,
-    SERVER_HOST,
-    SERVER_PORT,
     _coerce_bool,
 )
 from app.core.memory import get_state_store
@@ -57,6 +57,11 @@ from app.integrations.vscode_workspace import (
     clear_workspace_context,
     update_editor_context,
     workspace_status,
+)
+from app.public_api import (
+    PUBLIC_API_SETTINGS,
+    PublicSessionManager,
+    register_public_routes,
 )
 from app.ui.assets import resolve_ui_asset
 
@@ -368,15 +373,23 @@ def _start_model_loading() -> None:
 
 
 @asynccontextmanager
-async def _lifespan(_app: FastAPI):
+async def _lifespan(app: FastAPI):
     load_character_profile()
-    get_state_store()
+    store = get_state_store()
+    public_sessions = None
+    if PUBLIC_API_SETTINGS.enabled:
+        public_sessions = PublicSessionManager(store, PUBLIC_API_SETTINGS)
+        public_sessions.start()
+    app.state.public_sessions = public_sessions
     _RUNTIME_SHUTDOWN.clear()
     _start_model_loading()
     try:
         yield
     finally:
         _RUNTIME_SHUTDOWN.set()
+        if public_sessions is not None:
+            public_sessions.shutdown()
+        app.state.public_sessions = None
         stop_presence_worker()
         cancel_all_generations()
 
@@ -389,25 +402,37 @@ def create_app() -> FastAPI:
         openapi_url=None,
         lifespan=_lifespan,
     )
+    public_mode = PUBLIC_API_SETTINGS.enabled
+    cors_origins = (
+        PUBLIC_API_SETTINGS.allowed_origins
+        if public_mode
+        else CORS_ALLOWED_ORIGINS
+    )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=list(CORS_ALLOWED_ORIGINS),
+        allow_origins=list(cors_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Akane-Token"],
+        allow_headers=(
+            ["Authorization", "Content-Type", "ngrok-skip-browser-warning"]
+            if public_mode
+            else ["Authorization", "Content-Type", "X-Akane-Token"]
+        ),
     )
 
     @app.middleware("http")
     async def authenticate_api(request: Request, call_next):
-        if (
-            SERVER_API_TOKEN
-            and request.method != "OPTIONS"
-            and request.url.path.startswith("/api/")
-        ):
+        path = request.url.path
+        private_request = path.startswith("/api/") and not path.startswith("/api/public/")
+        private_request = private_request or (
+            PUBLIC_API_SETTINGS.enabled and path == "/health"
+        )
+        require_private_token = bool(SERVER_API_TOKEN) or PUBLIC_API_SETTINGS.enabled
+        if request.method != "OPTIONS" and private_request and require_private_token:
             bearer = request.headers.get("authorization", "")
             supplied = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
             supplied = supplied or request.headers.get("x-akane-token", "")
-            if not secrets.compare_digest(supplied, SERVER_API_TOKEN):
+            if not SERVER_API_TOKEN or not secrets.compare_digest(supplied, SERVER_API_TOKEN):
                 return JSONResponse({"error": "Unauthorized."}, status_code=401)
         return await call_next(request)
 
@@ -584,6 +609,9 @@ def create_app() -> FastAPI:
         )
         return JSONResponse({"ok": accepted})
 
+    if PUBLIC_API_SETTINGS.enabled:
+        register_public_routes(app)
+
     @app.get("/{asset_path:path}", include_in_schema=False)
     async def static_assets(asset_path: str):
         static = _asset_response_path(unquote("/" + asset_path.lstrip("/")))
@@ -615,7 +643,7 @@ class BackgroundUvicornServer:
             self._thread.join(timeout=3.0)
 
 
-def serve(host: str = SERVER_HOST, port: int = SERVER_PORT) -> None:
+def serve(host: str = APPLICATION_HOST, port: int = APPLICATION_PORT) -> None:
     print(f"Akane web chat running at http://{host}:{port}", flush=True)
     try:
         BackgroundUvicornServer(host, port).run()
@@ -625,8 +653,8 @@ def serve(host: str = SERVER_HOST, port: int = SERVER_PORT) -> None:
 
 
 def serve_in_thread(
-    host: str = SERVER_HOST,
-    port: int = SERVER_PORT,
+    host: str = APPLICATION_HOST,
+    port: int = APPLICATION_PORT,
 ) -> tuple[BackgroundUvicornServer, threading.Thread]:
     server = BackgroundUvicornServer(host, port)
     thread = threading.Thread(target=server.run, daemon=True, name="AkaneAPIServer")

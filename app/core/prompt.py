@@ -8,10 +8,6 @@ from typing import Callable
 
 from app.core.config import LLAMA_CONTEXT_WINDOW, MAX_TOKENS
 PROMPT_BUILDER_VERSION = "11"
-_PROMPT_CHAR_BUDGET = max(
-    2_000,
-    (LLAMA_CONTEXT_WINDOW - MAX_TOKENS) * 5 // 2,
-)
 _MAX_RECENT_PAIRS = 4
 
 _BASELINE_VOICE = (
@@ -290,13 +286,14 @@ def _finish_plan(
     included: tuple[str, ...],
     trimmed: tuple[str, ...],
     token_counter: Callable[[list[dict[str, str]]], PromptTokenCount] | None,
+    reserved_output_tokens: int = MAX_TOKENS,
 ) -> PromptPlan:
     token_ids: tuple[int, ...] = ()
     method = "not_tokenized"
     stops: tuple[str, ...] = ()
     if token_counter is not None:
         count = token_counter(messages)
-        if len(count.tokens) > LLAMA_CONTEXT_WINDOW - MAX_TOKENS:
+        if len(count.tokens) > LLAMA_CONTEXT_WINDOW - reserved_output_tokens:
             raise RuntimeError(
                 "Akane's final prompt exceeds the configured context window."
             )
@@ -311,6 +308,7 @@ def _finish_plan(
         trimmed=trimmed,
         included=included,
         mode=mode,
+        reserved_output_tokens=reserved_output_tokens,
     )
 
 
@@ -321,14 +319,19 @@ def _compile(
     protocol: str,
     context: PromptContext,
     token_counter: Callable[[list[dict[str, str]]], PromptTokenCount] | None,
+    reserved_output_tokens: int = MAX_TOKENS,
 ) -> PromptPlan:
     stable = _character_parts()
     protocol_label = "DIALOGUE" if mode == "conversation" else mode.upper()
     system_parts = [*stable, f"[{protocol_label}]\n{protocol}"]
     included = ["identity", "soul", "hard_rules", "protocol"]
     trimmed: list[str] = []
+    prompt_char_budget = max(
+        2_000,
+        (LLAMA_CONTEXT_WINDOW - reserved_output_tokens) * 5 // 2,
+    )
     required_chars = sum(len(part) for part in system_parts) + len(current_input) + 128
-    remaining = max(0, _PROMPT_CHAR_BUDGET - required_chars)
+    remaining = max(0, prompt_char_budget - required_chars)
 
     if initiative_message := _recent_initiative(context.recent_turns):
         initiative_context = (
@@ -392,6 +395,7 @@ def _compile(
         included=tuple(included),
         trimmed=tuple(trimmed),
         token_counter=token_counter,
+        reserved_output_tokens=reserved_output_tokens,
     )
 
 
@@ -400,6 +404,7 @@ def build_conversation_prompt(
     context: PromptContext,
     *,
     token_counter: Callable[[list[dict[str, str]]], PromptTokenCount] | None = None,
+    reserved_output_tokens: int = MAX_TOKENS,
 ) -> PromptPlan:
     return _compile(
         mode="conversation",
@@ -407,6 +412,7 @@ def build_conversation_prompt(
         protocol=_DIALOGUE_PROTOCOL,
         context=context,
         token_counter=token_counter,
+        reserved_output_tokens=reserved_output_tokens,
     )
 
 

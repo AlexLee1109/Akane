@@ -1,15 +1,25 @@
-const sessionKey = "akane-web-demo-session";
+const guestTokenKey = "akane-public-guest-token";
 
-export function getWebSessionId() {
-  const existing = sessionStorage.getItem(sessionKey);
-  if (existing) return existing;
-  const id = `public:web:${crypto.randomUUID()}`;
-  sessionStorage.setItem(sessionKey, id);
-  return id;
+export function getGuestToken() {
+  try {
+    return sessionStorage.getItem(guestTokenKey)?.trim() || null;
+  } catch {
+    return null;
+  }
 }
 
-export function resetWebSessionId() {
-  const id = `public:web:${crypto.randomUUID()}`;
-  sessionStorage.setItem(sessionKey, id);
-  return id;
+export function storeGuestToken(token: string) {
+  try {
+    sessionStorage.setItem(guestTokenKey, token);
+  } catch {
+    // The active tab can still use the token when storage is unavailable.
+  }
+}
+
+export function clearGuestToken() {
+  try {
+    sessionStorage.removeItem(guestTokenKey);
+  } catch {
+    // There is no stored token to remove when storage is unavailable.
+  }
 }

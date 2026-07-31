@@ -2356,6 +2356,35 @@ class StateStore:
             return current
         return ConversationRecord(conversation_id, profile_id)
 
+    def ensure_profile(self, profile_id: str) -> None:
+        """Create one canonical empty profile without borrowing owner state."""
+
+        profile = canonical_profile_id(profile_id)
+        current = time.time()
+        with self._lock:
+            if profile in self._profiles:
+                return
+            profiles = self._profiles.copy()
+            profiles[profile] = _new_profile(current)
+            self._replace_all(
+                profiles,
+                self._conversations.copy(),
+                committed_at=current,
+            )
+
+    def profile_exists(self, profile_id: str) -> bool:
+        profile = canonical_profile_id(profile_id)
+        with self._lock:
+            return profile in self._profiles
+
+    def profile_ids(self, *, prefix: str = "") -> tuple[str, ...]:
+        with self._lock:
+            return tuple(
+                profile_id
+                for profile_id in self._profiles
+                if not prefix or profile_id.startswith(prefix)
+            )
+
     def snapshot(
         self,
         profile_id: str = OWNER_PROFILE_ID,

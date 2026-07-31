@@ -1,12 +1,14 @@
 import { FormEvent, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
+import { AkaneStage } from "./components/AkaneStage";
 import { projectConfig } from "./config/project";
-import { akaneClient } from "./lib/akaneClient";
+import { akaneClient, PublicApiError, type PublicHealth, type PublicSession } from "./lib/akaneClient";
 import { canUseSpeech, speak, stopSpeech } from "./lib/speech";
-import { getWebSessionId, resetWebSessionId } from "./lib/session";
+import { clearGuestToken, getGuestToken, storeGuestToken } from "./lib/session";
+import type { AkanePresentationState } from "./presentation";
 
-const asset = `${import.meta.env.BASE_URL}assets/akane-hero.png`;
-const logo = `${import.meta.env.BASE_URL}assets/akane-logo.png`;
+const asset = `${projectConfig.basePath}assets/akane-hero.png`;
+const logo = `${projectConfig.basePath}assets/akane-logo.png`;
 const github = projectConfig.githubUrl;
 const features = [
   ["✦", "Memory", "Preserves meaningful facts, preferences, conversations, and shared events."],
@@ -49,33 +51,346 @@ function HomePage() { return <main>
   <section className="home-cta shell"><Logo /><div><h2>Open source. Built with care.</h2><p>Akane is a local-first companion project made for thoughtful experimentation.</p></div><GithubLink>View on GitHub</GithubLink><Link className="button primary" to="/demo">Try Demo →</Link></section>
 </main>; }
 
-type Message = { id: string; role: "akane" | "you"; text: string; time: string };
-const greeting: Message = { id: "welcome", role: "akane", text: "I'm here. This demo keeps its temporary session separate from the owner's personal Akane state.", time: "Now" };
+type Message = { id: string; role: "akane" | "you"; text: string; time: string; preview?: boolean };
+type ConnectionState = "connecting" | "live" | "showcase";
+
+const greeting: Message = {
+  id: "welcome",
+  role: "akane",
+  text: "I'm here. Public profiles stay separate from the owner's personal Akane state.",
+  time: "Now",
+};
+const previewReplies = [
+  "This is a prerecorded preview. Live Akane can remember the active public profile and stream a response when the Raspberry Pi is available.",
+  "In live guest mode, memory and relationship continuity are real for this tab, but the temporary profile expires.",
+  "Akane's real conversation path uses the same prompt, memory, emotion, relationship, and shared model coordinator as her other interfaces.",
+];
+const retryDelays = [5_000, 15_000, 30_000, 60_000];
+
+function currentTime() {
+  return new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function sessionGreeting(): Message {
+  return {
+    ...greeting,
+    id: crypto.randomUUID(),
+    text: "Guest mode is live. Our memory and relationship continuity are real, but this temporary profile will expire.",
+  };
+}
 
 function DemoPage() {
-  const [messages, setMessages] = useState<Message[]>([greeting]); const [input, setInput] = useState(""); const [sessionId, setSessionId] = useState(() => getWebSessionId());
-  const [status, setStatus] = useState<"mock" | "connected" | "generating" | "error">(projectConfig.apiUrl ? "connected" : "mock"); const [error, setError] = useState(""); const [tts, setTts] = useState(false); const [volume, setVolume] = useState(.8); const aborter = useRef<AbortController | null>(null); const endRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { endRef.current?.scrollIntoView({ block: "nearest" }); }, [messages]);
-  const streaming = status === "generating";
-  const resetConversation = () => { aborter.current?.abort(); stopSpeech(); setMessages([greeting]); setError(""); setStatus(projectConfig.apiUrl ? "connected" : "mock"); };
-  const endSession = () => { resetConversation(); setSessionId(resetWebSessionId()); };
-  async function send(text = input) {
-    const message = text.trim(); if (!message || streaming) return; if (message.length > 800) { setError("Keep messages under 800 characters."); return; }
-    setInput(""); setError(""); setStatus("generating"); const now = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); const replyId = crypto.randomUUID();
-    setMessages(current => [...current, { id: crypto.randomUUID(), role: "you", text: message, time: now }, { id: replyId, role: "akane", text: "", time: now }]);
-    const controller = new AbortController(); aborter.current = controller; let completed = "";
-    try { await akaneClient.sendMessage(sessionId, message, { onToken: token => { completed += token; setMessages(current => current.map(item => item.id === replyId ? { ...item, text: completed } : item)); }, onComplete: () => { setStatus(projectConfig.apiUrl ? "connected" : "mock"); if (tts) speak(completed, volume); } }, controller.signal); }
-    catch (cause) { if ((cause as Error).name === "AbortError") { setMessages(current => current.filter(item => item.id !== replyId || item.text)); setStatus(projectConfig.apiUrl ? "connected" : "mock"); } else { setMessages(current => current.filter(item => item.id !== replyId)); setStatus("error"); setError((cause as Error).message); } }
-    finally { aborter.current = null; }
+  const initialConnection: ConnectionState =
+    projectConfig.demoMode === "showcase" || !projectConfig.apiUrl ? "showcase" : "connecting";
+  const [connection, setConnection] = useState<ConnectionState>(initialConnection);
+  const [health, setHealth] = useState<PublicHealth | null>(null);
+  const [messages, setMessages] = useState<Message[]>([greeting]);
+  const [input, setInput] = useState("");
+  const [activeSession, setActiveSession] = useState<PublicSession | null>(null);
+  const activeSessionRef = useRef<PublicSession | null>(null);
+  const [backendPresentation, setBackendPresentation] = useState<AkanePresentationState>();
+  const [generating, setGenerating] = useState(false);
+  const [actionPending, setActionPending] = useState(false);
+  const [error, setError] = useState("");
+  const [retryExhausted, setRetryExhausted] = useState(false);
+  const [reconnectKey, setReconnectKey] = useState(0);
+  const [tts, setTts] = useState(false);
+  const [volume, setVolume] = useState(.8);
+  const aborter = useRef<AbortController | null>(null);
+  const endRef = useRef<HTMLDivElement>(null);
+
+  function activateSession(session: PublicSession | null) {
+    activeSessionRef.current = session;
+    setActiveSession(session);
   }
-  function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }
-  return <main className="demo shell"><div className="demo-intro"><Eyebrow>Browser interface</Eyebrow><h1>Meet Akane</h1><p>Talk through a temporary web session. {projectConfig.apiUrl ? "Messages stream from the configured Akane backend." : "No backend is configured, so this is a clearly labeled mock stream."}</p></div>
-    <div className="demo-grid"><section className="conversation panel" aria-label="Conversation history"><div className="panel-title"><h2>Conversation</h2><span className={`status ${streaming ? "active" : ""}`}>{streaming ? "Streaming" : status === "mock" ? "Demo Mode" : status === "error" ? "Unavailable" : "Ready"}</span></div><div className="messages" aria-live="polite">{messages.map(message => <article className={`message ${message.role}`} key={message.id}><div className="avatar">{message.role === "akane" ? "A" : "Y"}</div><div><div className="message-meta"><strong>{message.role === "akane" ? "Akane" : "You"}</strong><time>{message.time}</time></div><p>{message.text || <span className="streaming-cursor">Thinking</span>}</p></div></article>)}<div ref={endRef} /></div><button className="quiet-button" onClick={resetConversation}>Clear conversation</button></section>
-      <section className="stage panel" aria-label="Akane stage"><div className="stage-badges"><span>{projectConfig.apiUrl ? "Backend connected" : "Demo Mode"}</span><span>{projectConfig.modelName}</span></div><div className="stage-bubble">{messages.at(-1)?.role === "akane" && messages.at(-1)?.text ? messages.at(-1)?.text : "I'm all ears. What’s on your mind?"}</div><Character /><div className="stage-footer"><span>✦ Static character presentation</span><span>Temporary web session</span></div></section>
-      <aside className="controls panel"><h2>Demo controls</h2><fieldset><legend>Voice</legend><label className="toggle"><span>Browser TTS <small>{canUseSpeech() ? "Optional" : "Unavailable"}</small></span><input type="checkbox" checked={tts} disabled={!canUseSpeech()} onChange={event => setTts(event.target.checked)} /></label><label>Volume<input type="range" min="0" max="1" step=".1" value={volume} disabled={!tts} onChange={event => setVolume(Number(event.target.value))} /></label></fieldset><fieldset><legend>Session</legend><p className="session-id">Temporary session active</p><button className="quiet-button" onClick={endSession}>New session</button><button className="quiet-button" onClick={resetConversation}>Clear conversation</button><button className="danger-button" onClick={endSession}>End session</button></fieldset><fieldset><legend>Connection</legend><p><span className={`dot ${status === "error" ? "bad" : ""}`} />{status === "mock" ? "Mock demo mode" : status === "error" ? "Backend unavailable" : streaming ? "Generating" : "Backend connected"}</p>{status === "error" && <button className="quiet-button" onClick={() => setStatus(projectConfig.apiUrl ? "connected" : "mock")}>Reconnect</button>}</fieldset></aside></div>
-    <section className="suggestions panel"><h2>Try saying something…</h2><div>{suggestions.map(prompt => <button key={prompt} onClick={() => void send(prompt)} disabled={streaming}>{prompt}</button>)}</div></section>
-    <form className="composer panel" onSubmit={(event: FormEvent) => { event.preventDefault(); void send(); }}><Mark /><label className="sr-only" htmlFor="message">Message Akane</label><textarea id="message" value={input} onChange={event => setInput(event.target.value)} onKeyDown={keyDown} maxLength={800} disabled={streaming} placeholder="Message Akane…" rows={2} /><div><small>{input.length}/800 · Enter to send, Shift + Enter for a new line</small>{error && <p className="form-error" role="alert">{error}</p>}</div>{streaming ? <button className="button secondary" type="button" onClick={() => { aborter.current?.abort(); void akaneClient.cancel(sessionId); stopSpeech(); }}>Stop</button> : <button className="button primary" disabled={!input.trim()}>Send →</button>}</form>
-    <section className="runtime panel" aria-label="Runtime status"><span>◈ {projectConfig.apiUrl ? "Backend configured" : "Demo Mode"}</span><span>▣ Model: {projectConfig.modelName}</span><span>◌ {tts ? "Browser TTS on" : "Voice off"}</span><span>◉ Temporary session active</span></section>
+
+  useEffect(() => { endRef.current?.scrollIntoView({ block: "nearest" }); }, [messages]);
+
+  useEffect(() => {
+    if (projectConfig.demoMode === "showcase" || !projectConfig.apiUrl) {
+      setConnection("showcase");
+      setHealth(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    let stopped = false;
+    let timer: number | undefined;
+    setConnection("connecting");
+    setRetryExhausted(false);
+
+    async function probe(attempt: number) {
+      try {
+        const result = await akaneClient.health(controller.signal);
+        if (stopped) return;
+        if (result.status === "offline" || !result.streaming) {
+          throw new PublicApiError("model_unavailable", "Live Akane is still starting up.");
+        }
+
+        const current = activeSessionRef.current;
+        if (current) {
+          try {
+            const resumed = await akaneClient.revalidateSession(current.sessionToken);
+            activateSession(resumed);
+          } catch (cause) {
+            if (cause instanceof PublicApiError && ["session_expired", "unauthorized"].includes(cause.code)) {
+              clearGuestToken();
+              activateSession(null);
+              setError("That temporary guest session expired. Start a new guest session when Akane reconnects.");
+            } else {
+              throw cause;
+            }
+          }
+        }
+
+        setHealth(result);
+        setConnection("live");
+        setRetryExhausted(false);
+      } catch (cause) {
+        if (stopped || (cause as Error).name === "AbortError") return;
+        setHealth(null);
+        setConnection("showcase");
+        if (attempt < retryDelays.length) {
+          timer = window.setTimeout(() => { void probe(attempt + 1); }, retryDelays[attempt]);
+        } else {
+          setRetryExhausted(true);
+        }
+      }
+    }
+
+    void probe(0);
+    return () => {
+      stopped = true;
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [reconnectKey]);
+
+  function reconnect() {
+    if (projectConfig.demoMode !== "live" || !projectConfig.apiUrl) return;
+    setError("");
+    setReconnectKey(current => current + 1);
+  }
+
+  function availabilityFailed(cause: unknown) {
+    return cause instanceof PublicApiError
+      && !["busy", "queue_full", "rate_limited", "generation_timeout"].includes(cause.code)
+      && (["offline", "model_unavailable", "invalid_response"].includes(cause.code) || cause.status >= 500);
+  }
+
+  function openPreview() {
+    setConnection("showcase");
+    setMessages([greeting]);
+    setError("");
+  }
+
+  async function startGuest() {
+    if (connection !== "live" || generating || actionPending) return;
+    setActionPending(true);
+    setError("");
+    try {
+      const storedToken = getGuestToken();
+      const session = storedToken
+        ? await akaneClient.revalidateSession(storedToken)
+        : await akaneClient.createSession();
+      storeGuestToken(session.sessionToken);
+      activateSession(session);
+      setMessages([sessionGreeting()]);
+    } catch (cause) {
+      if (cause instanceof PublicApiError && ["session_expired", "unauthorized"].includes(cause.code)) {
+        clearGuestToken();
+        try {
+          const session = await akaneClient.createSession();
+          storeGuestToken(session.sessionToken);
+          activateSession(session);
+          setMessages([sessionGreeting()]);
+          return;
+        } catch (renewalError) {
+          cause = renewalError;
+        }
+      }
+      setError((cause as Error).message);
+      if (availabilityFailed(cause)) reconnect();
+    } finally {
+      setActionPending(false);
+    }
+  }
+
+  async function resetConversation() {
+    if (generating) return;
+    aborter.current?.abort();
+    stopSpeech();
+    setError("");
+    if (!activeSession) {
+      setMessages([greeting]);
+      return;
+    }
+    if (connection !== "live") {
+      setError("Reconnect to live Akane before resetting this conversation.");
+      return;
+    }
+    setActionPending(true);
+    try {
+      await akaneClient.resetConversation(activeSession.sessionToken);
+      setMessages([sessionGreeting()]);
+    } catch (cause) {
+      setError((cause as Error).message);
+      if (availabilityFailed(cause)) reconnect();
+    } finally {
+      setActionPending(false);
+    }
+  }
+
+  async function endGuestSession() {
+    if (!activeSession || actionPending) return;
+    setActionPending(true);
+    setError("");
+    try {
+      if (connection === "live") await akaneClient.deleteSession(activeSession.sessionToken);
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      clearGuestToken();
+      activateSession(null);
+      setMessages([greeting]);
+      setActionPending(false);
+    }
+  }
+
+  function sendPreview(message: string) {
+    const reply = previewReplies[Math.abs([...message].reduce((sum, character) => sum + character.charCodeAt(0), 0)) % previewReplies.length];
+    const now = currentTime();
+    setMessages(current => [
+      ...current,
+      { id: crypto.randomUUID(), role: "you", text: message, time: now },
+      { id: crypto.randomUUID(), role: "akane", text: reply, time: now, preview: true },
+    ]);
+    if (tts) speak(reply, volume);
+  }
+
+  async function renewExpiredGuest() {
+    clearGuestToken();
+    const session = await akaneClient.createSession();
+    storeGuestToken(session.sessionToken);
+    activateSession(session);
+    setError("The temporary guest session expired, so a fresh guest session is ready. Please send that message again.");
+  }
+
+  async function send(text = input) {
+    const message = text.trim();
+    if (!message || generating) return;
+    if (message.length > 750) {
+      setError("Keep messages at or under 750 characters.");
+      return;
+    }
+    if (connection === "connecting") {
+      setError("Akane is still connecting. You can send once live mode or Preview Mode is ready.");
+      return;
+    }
+    if (connection === "showcase") {
+      setInput("");
+      setError("");
+      sendPreview(message);
+      return;
+    }
+    if (!activeSession) {
+      setError("Start a temporary guest session before sending a live message.");
+      return;
+    }
+
+    setInput("");
+    setError("");
+    setGenerating(true);
+    const now = currentTime();
+    const replyId = crypto.randomUUID();
+    setMessages(current => [
+      ...current,
+      { id: crypto.randomUUID(), role: "you", text: message, time: now },
+      { id: replyId, role: "akane", text: "", time: now },
+    ]);
+    const controller = new AbortController();
+    aborter.current = controller;
+    let completed = "";
+    try {
+      await akaneClient.streamChat(activeSession.sessionToken, message, {
+        onDelta: delta => {
+          completed += delta;
+          setMessages(current => current.map(item => item.id === replyId ? { ...item, text: completed } : item));
+        },
+        onDone: () => { if (tts) speak(completed, volume); },
+        onPresentation: setBackendPresentation,
+      }, controller.signal);
+    } catch (cause) {
+      setMessages(current => current.filter(item => item.id !== replyId));
+      if ((cause as Error).name !== "AbortError") {
+        if (cause instanceof PublicApiError && cause.code === "session_expired") {
+          try { await renewExpiredGuest(); }
+          catch (renewalError) {
+            clearGuestToken();
+            activateSession(null);
+            setError((renewalError as Error).message);
+          }
+        } else {
+          setError((cause as Error).message);
+          if (availabilityFailed(cause)) reconnect();
+        }
+      }
+    } finally {
+      aborter.current = null;
+      setGenerating(false);
+      setBackendPresentation(undefined);
+    }
+  }
+
+  function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void send();
+    }
+  }
+
+  const previewMode = connection === "showcase";
+  const needsSession = connection === "live" && !activeSession;
+  const inputDisabled = generating || actionPending || connection === "connecting" || needsSession;
+  const sessionLabel = activeSession ? "Temporary guest profile" : "No live profile selected";
+  const connectionLabel = connection === "connecting"
+    ? "Connecting"
+    : connection === "showcase" ? "Preview Mode" : health?.status === "busy" ? "Live · busy" : "Live";
+
+  return <main className="demo shell">
+    <div className="demo-intro"><Eyebrow>Browser interface</Eyebrow><h1>Meet Akane</h1><p>Use an isolated temporary guest profile, or explore the clearly labeled offline preview while the Raspberry Pi is unavailable.</p>
+      <div className={`mode-banner ${connection}`} role="status">
+        <strong>{connectionLabel}</strong>
+        <span>{connection === "connecting" ? "Checking the Raspberry Pi connection…" : previewMode ? "Replies are prerecorded, are not sent to Akane, and are not saved." : "Responses stream from the real Akane runtime through your isolated public profile."}</span>
+      </div>
+    </div>
+    <div className="demo-grid">
+      <section className="conversation panel" aria-label="Conversation history"><div className="panel-title"><h2>Conversation</h2><span className={`status ${generating ? "active" : ""}`}>{generating ? "Streaming" : connectionLabel}</span></div><div className="messages" aria-live="polite">{messages.map(message => <article className={`message ${message.role}`} key={message.id}><div className="avatar">{message.role === "akane" ? "A" : "Y"}</div><div><div className="message-meta"><strong>{message.role === "akane" ? "Akane" : "You"}</strong>{message.preview && <span className="preview-label">Prerecorded preview</span>}<time>{message.time}</time></div><p>{message.text || <span className="streaming-cursor">Thinking</span>}</p></div></article>)}<div ref={endRef} /></div><button className="quiet-button" disabled={actionPending || generating} onClick={() => { if (previewMode) openPreview(); else void resetConversation(); }}>{previewMode || !activeSession ? "Clear preview" : "Reset conversation"}</button></section>
+      <AkaneStage
+        imageSrc={asset}
+        bubbleText={messages.at(-1)?.role === "akane" && messages.at(-1)?.text ? messages.at(-1)!.text : "I'm all ears. What’s on your mind?"}
+        connection={connection}
+        connectionLabel={previewMode ? "Preview Mode" : connection === "connecting" ? "Connecting" : generating ? "Streaming live" : "Live Akane"}
+        generating={generating}
+        hasResponseText={Boolean(generating && messages.at(-1)?.role === "akane" && messages.at(-1)?.text)}
+        modelName={projectConfig.modelName}
+        sessionLabel={previewMode ? "Prerecorded showcase" : sessionLabel}
+        backendPresentation={backendPresentation}
+      />
+      <aside className="controls panel"><h2>Demo controls</h2>
+        <fieldset><legend>Voice</legend><label className="toggle"><span>Browser TTS <small>{canUseSpeech() ? "Optional" : "Unavailable"}</small></span><input type="checkbox" checked={tts} disabled={!canUseSpeech()} onChange={event => setTts(event.target.checked)} /></label><label>Volume<input type="range" min="0" max="1" step=".1" value={volume} disabled={!tts} onChange={event => setVolume(Number(event.target.value))} /></label></fieldset>
+        <fieldset><legend>Session</legend>
+          {connection === "connecting" && <p>Checking live availability…</p>}
+          {previewMode && <><p className="preview-note"><strong>Preview Mode</strong> is prerecorded and never persisted.</p><button className="quiet-button" onClick={openPreview}>Clear preview</button></>}
+          {connection === "live" && !activeSession && <div className="profile-choice"><p>Guest memory and relationship continuity are real but temporary and isolated from every other profile.</p><button className="quiet-button" disabled={actionPending || health?.guestEnabled !== true} onClick={() => void startGuest()}>Start guest session</button><button className="quiet-button" disabled={actionPending} onClick={openPreview}>Offline Preview</button></div>}
+          {activeSession && <div className="session-actions"><p className="session-id">Temporary guest continuity active</p><button className="quiet-button" disabled={actionPending || generating} onClick={() => void resetConversation()}>Reset conversation</button><button className="danger-button" disabled={actionPending || generating} onClick={() => void endGuestSession()}>End guest session</button></div>}
+        </fieldset>
+        <fieldset><legend>Connection</legend><p><span className={`dot ${previewMode ? "bad" : ""}`} />{connectionLabel}</p>{previewMode && projectConfig.demoMode === "live" && projectConfig.apiUrl && <button className="quiet-button" onClick={reconnect}>Reconnect now</button>}{retryExhausted && <p className="retry-note">Automatic retries finished. Manual reconnect remains available.</p>}</fieldset>
+      </aside>
+    </div>
+    <section className="suggestions panel"><h2>{previewMode ? "Try the prerecorded preview…" : "Try saying something…"}</h2><div>{suggestions.map(prompt => <button key={prompt} onClick={() => void send(prompt)} disabled={inputDisabled}>{prompt}</button>)}</div></section>
+    <form className="composer panel" onSubmit={(event: FormEvent) => { event.preventDefault(); void send(); }}><Mark /><label className="sr-only" htmlFor="message">Message Akane</label><textarea id="message" value={input} onChange={event => setInput(event.target.value)} onKeyDown={keyDown} maxLength={750} disabled={inputDisabled} placeholder={needsSession ? "Start a guest session first…" : connection === "connecting" ? "Connecting to Akane…" : previewMode ? "Try the prerecorded preview…" : "Message Akane…"} rows={2} /><div><small>{input.length}/750 · Enter to send, Shift + Enter for a new line</small>{error && <p className="form-error" role="alert">{error}</p>}</div>{generating ? <button className="button secondary" type="button" onClick={() => { aborter.current?.abort(); stopSpeech(); }}>Stop</button> : <button className="button primary" disabled={inputDisabled || !input.trim()}>Send →</button>}</form>
+    <section className="runtime panel" aria-label="Runtime status"><span>◈ {connectionLabel}</span><span>▣ Model: {projectConfig.modelName}</span><span>◌ {tts ? "Browser TTS on" : "Voice off"}</span><span>◉ {previewMode ? "Nothing saved" : sessionLabel}</span></section>
   </main>;
 }
 

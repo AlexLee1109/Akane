@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import math
-import random
 import re
 import time
 from dataclasses import dataclass, replace
@@ -12,14 +11,71 @@ from difflib import SequenceMatcher
 
 from app.core.utils import compact_text
 
-MIN_DECISION_MINUTES = 150.0
-MAX_DECISION_MINUTES = 210.0
+LIFE_INTERVAL_SECONDS = 3.0 * 60.0 * 60.0
 CLAIM_SECONDS = 10.0 * 60.0
 RETRY_SECONDS = 5.0 * 60.0
 
 _MAX_ACTIVITY_CHARS = 160
 _MAX_DETAIL_CHARS = 240
 _LIFE_MODES = {"new", "continue"}
+LIFE_REQUIRED_FIELDS = (
+    "mode",
+    "activity",
+    "category",
+    "subject",
+    "detail",
+    "interest_addition",
+    "continuation_reason",
+    "emotion_update",
+)
+LIFE_OPTIONAL_FIELDS = ("mood_update",)
+EMOTION_UPDATE_FIELDS = ("mode", "primary", "intensity", "cause")
+MOOD_UPDATE_FIELDS = ("valence_delta", "energy_delta", "cause")
+
+
+def _nullable_schema(kind: str) -> dict[str, object]:
+    return {"type": [kind, "null"]}
+
+
+LIFE_JSON_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "mode": {"type": "string", "enum": sorted(_LIFE_MODES)},
+            **{
+                name: _nullable_schema("string")
+                for name in LIFE_REQUIRED_FIELDS[1:7]
+            },
+            "emotion_update": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["keep", "settle", "shift"],
+                    },
+                    "primary": _nullable_schema("string"),
+                    "intensity": _nullable_schema("number"),
+                    "cause": _nullable_schema("string"),
+                },
+                "required": list(EMOTION_UPDATE_FIELDS),
+                "additionalProperties": False,
+            },
+            "mood_update": {
+                "type": ["object", "null"],
+                "properties": {
+                    "valence_delta": {"type": "number"},
+                    "energy_delta": {"type": "number"},
+                    "cause": _nullable_schema("string"),
+                },
+                "required": list(MOOD_UPDATE_FIELDS),
+                "additionalProperties": False,
+            },
+        },
+        "required": list(LIFE_REQUIRED_FIELDS),
+        "additionalProperties": False,
+    },
+    separators=(",", ":"),
+)
 _KEY_STOPWORDS = {
     "a", "about", "an", "and", "as", "at", "by", "for", "from", "her",
     "herself", "in", "into", "it", "of", "on", "or", "some", "the", "to",
@@ -54,13 +110,8 @@ def _activity_text(value: object) -> str:
     return activity if 1 <= len(words) <= 24 else ""
 
 
-def minutes_to_seconds(minutes: float) -> float:
-    return float(minutes) * 60.0
-
-
 def next_decision_time(now: float) -> float:
-    interval = random.uniform(MIN_DECISION_MINUTES, MAX_DECISION_MINUTES)
-    return max(0.0, float(now)) + minutes_to_seconds(interval)
+    return max(0.0, float(now)) + LIFE_INTERVAL_SECONDS
 
 
 def activity_key(value: object) -> str:
@@ -257,10 +308,7 @@ def _repaired_boundary(
     last_decision_at: float,
     now: float,
 ) -> tuple[PresenceActivity, float]:
-    wrong_minute_min = minutes_to_seconds(MIN_DECISION_MINUTES) * 10.0
-    wrong_minute_max = minutes_to_seconds(MAX_DECISION_MINUTES) * 10.0
-    valid_min = minutes_to_seconds(MIN_DECISION_MINUTES) - 1.0
-    valid_max = minutes_to_seconds(MAX_DECISION_MINUTES) + 1.0
+    wrong_interval = LIFE_INTERVAL_SECONDS * 10.0
 
     lifecycle_start = (
         last_decision_at
@@ -270,15 +318,15 @@ def _repaired_boundary(
 
     def repair(candidate: float) -> float:
         duration = candidate - lifecycle_start
-        if wrong_minute_min - 1.0 <= duration <= wrong_minute_max + 1.0:
+        if abs(duration - wrong_interval) <= 1.0:
             return lifecycle_start + duration / 10.0
         return candidate
 
     scheduled = repair(next_at)
     expected = repair(current.expected_end_at)
-    if valid_min <= scheduled - lifecycle_start <= valid_max:
+    if abs(scheduled - lifecycle_start - LIFE_INTERVAL_SECONDS) <= 1.0:
         boundary = scheduled
-    elif valid_min <= expected - lifecycle_start <= valid_max:
+    elif abs(expected - lifecycle_start - LIFE_INTERVAL_SECONDS) <= 1.0:
         boundary = expected
     else:
         boundary = max(current.started_at + 1.0, now)
@@ -304,8 +352,13 @@ def normalize_presence(
         error = "stale claim released"
 
     next_at = state.next_decision_at
+    unbootstrapped = current is None and state.last_decision_at == 0.0
     if current is None:
-        if initialize_schedule and (next_at <= 0.0 or repair_schedule):
+        if unbootstrapped and repair_schedule:
+            next_at = 0.0
+        elif not unbootstrapped and initialize_schedule and (
+            next_at <= 0.0 or repair_schedule
+        ):
             next_at = now
     elif repair_schedule:
         current, next_at = _repaired_boundary(
@@ -369,6 +422,10 @@ class LifeDecision:
     mood_update: dict[str, object] | None = None
 
 
+class LifeParseError(ValueError):
+    """A concise structural failure in a dedicated raw-JSON life completion."""
+
+
 def _unsupported_proper_nouns(value: str, grounded_context: str) -> bool:
     grounded = {
         match.group(0).casefold()
@@ -391,28 +448,40 @@ def _unsupported_proper_nouns(value: str, grounded_context: str) -> bool:
 
 def parse_life_decision(
     output: object,
-    *,
-    grounded_context: str = "",
-) -> LifeDecision | None:
-    matches = re.findall(
-        r"<AKANE_LIFE>\s*(.*?)\s*</AKANE_LIFE>",
-        str(output or ""),
-        re.DOTALL,
-    )
-    if len(matches) != 1:
-        return None
+) -> LifeDecision:
+    text = str(output or "").strip()
+    if not text:
+        raise LifeParseError("empty life output")
     try:
-        payload = json.loads(matches[0])
-    except (TypeError, ValueError):
-        return None
-    keys = {
-        "mode", "activity", "category", "subject", "detail",
-        "interest_addition", "continuation_reason", "emotion_update",
-        "mood_update",
-    }
-    if not isinstance(payload, dict) or set(payload) != keys:
-        return None
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise LifeParseError(
+            f"life JSON decode failed at line {exc.lineno}, column {exc.colno}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise LifeParseError("life output must be a JSON object")
+    keys = set(payload)
+    decoded_keys = tuple(sorted(str(key) for key in keys))
+
+    def failure(message: str) -> LifeParseError:
+        error = LifeParseError(message)
+        error.decoded_keys = decoded_keys
+        return error
+
+    required = set(LIFE_REQUIRED_FIELDS)
+    missing = required - keys
+    if "mode" in missing:
+        raise failure("missing life mode")
+    if "emotion_update" in missing:
+        raise failure("missing emotion appraisal")
+    if missing:
+        raise failure(f"missing life fields: {', '.join(sorted(missing))}")
+    unexpected = keys - required - set(LIFE_OPTIONAL_FIELDS)
+    if unexpected:
+        raise failure("unexpected life fields")
     mode = compact_text(payload.get("mode"), 16).casefold()
+    if mode not in _LIFE_MODES:
+        raise failure("invalid life mode")
     activity = _activity_text(payload.get("activity"))
     category = _optional_text(payload.get("category"), 48)
     subject = _optional_text(payload.get("subject"), 160)
@@ -428,31 +497,32 @@ def parse_life_decision(
         "interest_addition": addition,
         "continuation_reason": reason,
     }
-    if (
-        mode not in _LIFE_MODES
-        or any(payload[name] is not None and value is None for name, value in optional.items())
-        or not isinstance(emotion_update, dict)
-        or not isinstance(mood_update, dict)
-    ):
-        return None
+    invalid_optional = next(
+        (
+            name
+            for name, value in optional.items()
+            if payload[name] is not None and value is None
+        ),
+        None,
+    )
+    if invalid_optional is not None:
+        raise failure(f"invalid {invalid_optional} field")
+    if not isinstance(emotion_update, dict):
+        raise failure("invalid emotion appraisal structure")
+    if mood_update is not None and not isinstance(mood_update, dict):
+        raise failure("invalid mood appraisal structure")
     if mode == "new":
-        if (
-            not activity
-            or not _meaningful_detail(detail, activity)
-            or reason is not None
-        ):
-            return None
+        if not activity:
+            raise failure("invalid activity structure")
+        if reason is not None:
+            raise failure("new activity cannot have a continuation reason")
     elif (
         payload.get("activity") is not None
         or any(value is not None for name, value in optional.items() if name != "continuation_reason")
-        or reason is None
     ):
-        return None
-    grounded = ". ".join(
-        item for item in (activity, category or "", subject or "", detail or "") if item
-    )
-    if _unsupported_proper_nouns(grounded, grounded_context):
-        return None
+        raise failure("continue activity fields must be null")
+    if mode == "continue" and reason is None:
+        raise failure("missing continuation reason")
     return LifeDecision(
         mode,
         activity,
@@ -469,6 +539,8 @@ def parse_life_decision(
 def life_decision_rejection(
     state: PresenceState,
     decision: LifeDecision,
+    *,
+    grounded_context: str = "",
 ) -> str:
     if decision.mode == "continue":
         current = state.current_activity
@@ -480,6 +552,18 @@ def life_decision_rejection(
             return "continuation needs a meaningful reason"
         return ""
     proposed = activity_key(f"{decision.activity} {decision.subject or ''}")
+    grounded = ". ".join(
+        item
+        for item in (
+            decision.activity,
+            decision.category or "",
+            decision.subject or "",
+            decision.detail or "",
+        )
+        if item
+    )
+    if _unsupported_proper_nouns(grounded, grounded_context):
+        return "proposal contains unsupported activity context"
     pattern = state.activity_pattern
     if _near_key(proposed, pattern.current_key):
         return "proposal repeats the current activity"

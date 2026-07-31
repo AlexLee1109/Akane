@@ -28,7 +28,8 @@ from app.core.config import (
 )
 from app.core.memory import get_state_store
 from app.core.life_worker import (
-    run_initiative_turn,
+    acknowledge_initiative_delivery,
+    claim_initiative_delivery,
     run_life_turn,
     start_life_worker,
     stop_life_worker,
@@ -111,7 +112,6 @@ def _parse_chat_request(payload: dict) -> ChatRequestData:
             timestamp=payload.get("timestamp", 0.0),
             display_name=payload.get("display_name", ""),
             reply_context=payload.get("reply_context", ""),
-            autonomous=_coerce_bool(payload.get("autonomous", False)),
             request_id=payload.get("request_id", ""),
         ),
         skip_memory=_coerce_bool(payload.get("skip_memory", False)),
@@ -512,32 +512,41 @@ def create_app() -> FastAPI:
             headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
         )
 
-    @app.post("/api/initiative")
-    async def api_initiative(request: Request):
+    @app.post("/api/initiative/delivery/claim")
+    async def api_initiative_delivery_claim(request: Request):
         payload = await _request_payload(request)
-        profile = str(payload.get("profile_id") or DEFAULT_PROFILE_ID)
         conversation = str(
             payload.get("conversation_id") or payload.get("session_id") or DEFAULT_CONVERSATION_ID
         )
-        source = str(payload.get("source") or "web")
         try:
-            result = await asyncio.to_thread(
-                run_initiative_turn,
-                profile_id=profile,
-                conversation_id=conversation,
-                source=source,
-                display_name=str(payload.get("display_name") or ""),
-                now=payload.get("timestamp") or None,
-            )
-        except Exception as exc:
-            _log("error", f"type={type(exc).__name__} detail={exc}")
-            return JSONResponse({"error": _safe_error(exc)}, status_code=_error_status(exc))
-        return JSONResponse(
-            {
-                "reply": result.message if result.decision.should_respond else "",
-                "messages": _messages(conversation, profile),
-            }
+            wait_seconds = float(payload.get("wait_seconds", 25.0))
+        except (TypeError, ValueError):
+            wait_seconds = 25.0
+        delivery = await asyncio.to_thread(
+            claim_initiative_delivery,
+            adapter=str(payload.get("adapter") or ""),
+            conversation_id=conversation,
+            available=_coerce_bool(payload.get("available"), True),
+            wait_seconds=wait_seconds,
         )
+        return JSONResponse({"delivery": delivery})
+
+    @app.post("/api/initiative/delivery/ack")
+    async def api_initiative_delivery_ack(request: Request):
+        payload = await _request_payload(request)
+        conversation = str(
+            payload.get("conversation_id") or payload.get("session_id") or DEFAULT_CONVERSATION_ID
+        )
+        accepted = await asyncio.to_thread(
+            acknowledge_initiative_delivery,
+            opportunity_id=str(payload.get("opportunity_id") or ""),
+            claim_token=str(payload.get("claim_token") or ""),
+            adapter=str(payload.get("adapter") or ""),
+            conversation_id=conversation,
+            success=_coerce_bool(payload.get("success"), False),
+            message_id=str(payload.get("message_id") or ""),
+        )
+        return JSONResponse({"ok": accepted})
 
     @app.post("/api/life")
     async def api_life(request: Request):

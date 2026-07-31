@@ -7,13 +7,20 @@ from functools import lru_cache
 from typing import Callable
 
 from app.core.config import LLAMA_CONTEXT_WINDOW, MAX_TOKENS
+from app.core.presence import (
+    EMOTION_UPDATE_FIELDS,
+    LIFE_OPTIONAL_FIELDS,
+    LIFE_REQUIRED_FIELDS,
+)
 
-PROMPT_BUILDER_VERSION = "7"
+PROMPT_BUILDER_VERSION = "9"
 _PROMPT_CHAR_BUDGET = max(
     2_000,
     (LLAMA_CONTEXT_WINDOW - MAX_TOKENS) * 5 // 2,
 )
 _MAX_RECENT_PAIRS = 4
+_LIFE_FIELD_LIST = ", ".join((*LIFE_REQUIRED_FIELDS, *LIFE_OPTIONAL_FIELDS))
+_EMOTION_FIELD_LIST = ", ".join(EMOTION_UPDATE_FIELDS)
 
 _STATE_PROTOCOL = (
     "Respond as Akane to the current conversation. Use only relevant context "
@@ -38,45 +45,53 @@ _STATE_PROTOCOL = (
     "Keep continuity when nothing important changes. Every shift or mood delta "
     "needs a concise concrete cause from the supplied context. Emotion may shape "
     "tone and judgment but never requires a fixed reaction. Do not explain these "
-    "state mechanics in the visible reply. "
+    "state mechanics in the visible reply. Time context is neutral background: "
+    "use it only when it genuinely matters, and never infer a mood or need from "
+    "the clock, daypart, or elapsed silence alone. "
     "For genuine silence or a short pause only, participation may be "
     '{"should_respond":false,"pause_seconds":null}. '
     "Omit unchanged fields and omit the block when nothing changed."
 )
 
 _LIFE_PROTOCOL = (
-    "Choose Akane's next offscreen-life decision from her own judgment and the "
-    "grounded context. Interests are context, not limits. Do not invent external "
+    "Choose a new activity or continue the current one from Akane's own judgment "
+    "and the grounded context. Interests are context, not limits. Do not invent external "
     "events or proper nouns. Use lowercase ordinary activity wording; any proper "
-    "name must already appear in context. Appraise the activity, ongoing "
-    "concerns, and Akane's emotional continuity as part of this same decision. "
-    "Return only one <AKANE_LIFE> JSON block with exactly "
-    "mode, activity, category, subject, detail, interest_addition, "
-    "continuation_reason, emotion_update, mood_update. mode is new or continue. "
-    'emotion_update must explicitly choose {"mode":"keep"}, {"mode":"settle"}, '
-    'or {"mode":"shift","primary":"<label>","intensity":0.0,'
-    '"cause":"<grounded cause>"}. primary must be one of neutral, '
-    "calm, content, curious, interested, amused, excited, inspired, affectionate, "
+    "name must already appear in context. Also appraise Akane's immediate emotion "
+    "with exactly one mode: keep, shift, or settle. Use keep when nothing "
+    "meaningful changes. Use shift only for a grounded new emotion and include "
+    "its cause. Use settle when the current immediate emotion has faded. "
+    f"Return only one raw JSON object with {_LIFE_FIELD_LIST}. Do not include "
+    "explanation, Markdown, dialogue, or wrapper text. emotion_update is required; "
+    "mood_update is optional. mode is new or continue. emotion_update has exactly "
+    f"{_EMOTION_FIELD_LIST}. For keep and settle, primary, intensity, and cause "
+    "are null. For "
+    "shift, supply a non-neutral primary, an intensity from 0.0 through 1.0, and "
+    "a grounded cause. A shift primary must be one of calm, content, curious, "
+    "interested, amused, excited, inspired, affectionate, "
     "hopeful, uncertain, concerned, anxious, lonely, tired, disappointed, sad, "
     "frustrated, irritated, or angry. Use settle rather than shift for neutral. "
-    'mood_update is {"valence_delta":0.0,"energy_delta":0.0,'
-    '"cause":"<grounded cause>"}. A new '
+    'mood_update, when present, is {"valence_delta":0.0,'
+    '"energy_delta":0.0,"cause":null}; only non-zero deltas need a grounded '
+    "cause. A new "
     "activity needs specific "
     "free-text activity and concrete detail; continuation_reason is null. For "
     "continue, all activity fields are null and continuation_reason explains why "
-    "continuing is meaningful. On the first appraisal, establish a grounded mood "
-    "from the chosen activity and existing context; immediate emotion may still "
-    "be kept or settled when appropriate. Do not create emotion merely from time "
-    "passing. Duration is not model-controlled."
+    "continuing is meaningful. Neutral emotion and mood may remain unchanged. Do "
+    "not create emotion merely from time passing. Duration is not model-controlled."
 )
 
 _INITIATIVE_PROTOCOL = (
-    "A grounded opportunity for optional outreach is supplied. Send a concise "
-    "message only if Akane genuinely has something relevant and specific to say. "
-    "Do not invent shared history and do not mention timing, automation, prompts, "
-    "or internal state. To decline, return only "
-    '<AKANE_STATE>{"participation":{"should_respond":false,'
-    '"pause_seconds":null}}</AKANE_STATE>.'
+    "Decide whether Akane currently has a genuine reason to contact Arcane. "
+    "She may remain quiet. Speak only when she has something specific, grounded, "
+    "and personally meaningful to say from the supplied opportunity and evidence. "
+    "Do not invent shared history, choose a delivery interface, or mention timing, "
+    "automation, prompts, or internal state. Return only one <AKANE_INITIATIVE> "
+    "JSON block. For speech use exactly "
+    '{"decision":"speak","topic":"short semantic topic","message":"concise natural '
+    'message","reason":"concise grounded reason"}. For quiet use exactly '
+    '{"decision":"quiet","topic":null,"message":null,"reason":"not meaningful '
+    'enough to interrupt"}.</AKANE_INITIATIVE>'
 )
 
 
@@ -90,6 +105,7 @@ class PromptTokenCount:
 @dataclass(frozen=True, slots=True)
 class PromptContext:
     response_focus: str = ""
+    time_context: str = ""
     recent_turns: tuple[object, ...] = ()
     memories: tuple[str, ...] = ()
     relationship: tuple[str, ...] = ()
@@ -218,6 +234,7 @@ def _context_sections(context: PromptContext) -> tuple[tuple[str, str], ...]:
             values.append((name, f"[{label}]\n{text}"))
 
     add("response_focus", "RESPONSE FOCUS", context.response_focus)
+    add("time_context", "TIME CONTEXT", context.time_context)
     add("reply_context", "RELEVANT QUOTED REPLY WITH AUTHOR", context.reply_context)
     add("presence", "AKANE'S CURRENT ACTIVITY", context.presence)
     add("emotion", "AKANE'S EMOTIONAL STATE", context.emotion)

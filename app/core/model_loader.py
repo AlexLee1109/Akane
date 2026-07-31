@@ -10,6 +10,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -108,6 +109,13 @@ def completion_kwargs(max_tokens: int, stream: bool) -> dict[str, object]:
     if _STOP_SEQUENCES:
         options["stop"] = _STOP_SEQUENCES
     return options
+
+
+@lru_cache(maxsize=8)
+def compile_json_grammar(json_schema: str) -> object:
+    from llama_cpp import LlamaGrammar
+
+    return LlamaGrammar.from_json_schema(json_schema, verbose=False)
 
 
 def _model_identifier_text(llm, model_path: Path) -> str:
@@ -457,6 +465,7 @@ class ModelManager:
         cancellation: threading.Event | None = None,
         on_model_start: Callable[[], None] | None = None,
         timing: InferenceTiming | None = None,
+        grammar: object | None = None,
         reservation: InferenceReservation,
     ):
         output: queue.Queue[object] = queue.Queue(maxsize=_STREAM_QUEUE_SIZE)
@@ -481,6 +490,8 @@ class ModelManager:
                         "Generation was cancelled before inference."
                     )
                 options = completion_kwargs(max_tokens, True)
+                if grammar is not None:
+                    options["grammar"] = grammar
                 configured_stops = list(options.pop("stop", []))
                 stops = list(
                     dict.fromkeys(

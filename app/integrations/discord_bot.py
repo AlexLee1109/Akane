@@ -19,7 +19,6 @@ from app.core.config import (
 from app.core.utils import OWNER_PROFILE_ID, compact_text
 
 _CHAT_TIMEOUT_SECONDS = 300
-_UNPROMPTED_INTERVAL_SECONDS = 4 * 60 * 60  # 14,400 seconds
 _DISCORD_MESSAGE_LIMIT = 1900
 _RECENT_EVENT_LIMIT = 512
 _RECENT_EVENT_IDS: deque[int] = deque()
@@ -164,35 +163,6 @@ def _payload(message, text: str) -> dict[str, object]:
     }
 
 
-def _initiative_payload(target: dict[str, str]) -> dict[str, object]:
-    return {
-        "profile_id": target["profile_id"],
-        "conversation_id": target["conversation_id"],
-        "source": "discord",
-        "display_name": target.get("display_name", ""),
-        "timestamp": time.time(),
-    }
-
-
-def _valid_unprompted_message(text: str) -> bool:
-    value = " ".join(str(text or "").split()).strip()
-    lower = value.lower()
-    sentences = [part for part in re.split(r"(?<=[.!?])\s+", value) if part]
-    blocked = (
-        "@everyone",
-        "@here",
-        "<@",
-        "timer",
-        "schedule",
-        "automat",
-        "chat is quiet",
-        "chat's quiet",
-    )
-    return bool(value) and len(value) <= 500 and len(sentences) <= 3 and not any(
-        phrase in lower for phrase in blocked
-    )
-
-
 async def _post_chat(http, payload: dict[str, object]) -> dict:
     import aiohttp
 
@@ -221,14 +191,24 @@ async def _post_chat(http, payload: dict[str, object]) -> dict:
         return {"error": f"Could not reach the Akane server: {type(exc).__name__}."}
 
 
-async def _post_initiative(http, target: dict[str, str]) -> dict:
+async def _claim_delivery(
+    http,
+    *,
+    conversation_id: str,
+    available: bool = True,
+) -> dict:
     import aiohttp
 
-    timeout = aiohttp.ClientTimeout(total=_CHAT_TIMEOUT_SECONDS)
+    timeout = aiohttp.ClientTimeout(total=35)
     try:
         async with http.post(
-            f"{DISCORD_SERVER_URL}/api/initiative",
-            json=_initiative_payload(target),
+            f"{DISCORD_SERVER_URL}/api/initiative/delivery/claim",
+            json={
+                "adapter": "discord",
+                "conversation_id": conversation_id,
+                "available": available,
+                "wait_seconds": 25 if available else 0,
+            },
             headers=_headers(),
             timeout=timeout,
         ) as response:
@@ -238,10 +218,40 @@ async def _post_initiative(http, target: dict[str, str]) -> dict:
             except json.JSONDecodeError:
                 data = {"error": "Akane server returned invalid JSON."}
             if response.status >= 400:
-                return {"error": data.get("error") or f"Akane server returned HTTP {response.status}."}
+                return {
+                    "error": data.get("error")
+                    or f"Akane server returned HTTP {response.status}."
+                }
             return data if isinstance(data, dict) else {"error": "Akane server returned invalid JSON."}
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         return {"error": f"Could not reach the Akane server: {type(exc).__name__}."}
+
+
+async def _ack_delivery(
+    http,
+    *,
+    conversation_id: str,
+    delivery: dict,
+    success: bool,
+    message_id: str = "",
+) -> bool:
+    try:
+        async with http.post(
+            f"{DISCORD_SERVER_URL}/api/initiative/delivery/ack",
+            json={
+                "adapter": "discord",
+                "conversation_id": conversation_id,
+                "opportunity_id": delivery.get("opportunity_id", ""),
+                "claim_token": delivery.get("claim_token", ""),
+                "success": success,
+                "message_id": message_id,
+            },
+            headers=_headers(),
+        ) as response:
+            data = await response.json()
+            return response.status < 400 and bool(data.get("ok"))
+    except Exception:
+        return False
 
 
 async def _cancel_remote(http, conversation_id: str, profile_id: str) -> None:
@@ -304,18 +314,26 @@ def run_discord_bot() -> None:
 
     class AkaneDiscordClient(discord.Client):
         http_session: aiohttp.ClientSession
-        unprompted_task: asyncio.Task | None = None
-        initiative_targets: dict[int, dict[str, str]]
-        unprompted_channel = None
+        delivery_task: asyncio.Task | None = None
+        delivery_target: dict[str, object] | None = None
+        delivery_wake: asyncio.Event
 
         async def setup_hook(self) -> None:
             self.http_session = aiohttp.ClientSession()
+            self.delivery_wake = asyncio.Event()
 
         async def close(self) -> None:
-            if self.unprompted_task is not None:
-                self.unprompted_task.cancel()
-                await asyncio.gather(self.unprompted_task, return_exceptions=True)
-                self.unprompted_task = None
+            target = self.delivery_target
+            if target is not None and hasattr(self, "http_session"):
+                await _claim_delivery(
+                    self.http_session,
+                    conversation_id=str(target["conversation_id"]),
+                    available=False,
+                )
+            if self.delivery_task is not None:
+                self.delivery_task.cancel()
+                await asyncio.gather(self.delivery_task, return_exceptions=True)
+                self.delivery_task = None
             if hasattr(self, "http_session"):
                 await self.http_session.close()
             await super().close()
@@ -323,54 +341,77 @@ def run_discord_bot() -> None:
     intents = discord.Intents.default()
     intents.message_content = True
     client = AkaneDiscordClient(intents=intents)
-    client.initiative_targets = {}
     allowed_mentions = discord.AllowedMentions.none()
 
-    async def unprompted_loop(channel) -> None:
+    def configured_delivery_target() -> dict[str, object] | None:
+        for channel_id in DISCORD_ALLOWED_CHANNEL_IDS:
+            channel = client.get_channel(channel_id)
+            if channel is not None:
+                return {
+                    "channel": channel,
+                    "conversation_id": f"discord:initiative:channel:{channel_id}",
+                }
+        return None
+
+    async def delivery_loop() -> None:
         while True:
-            await asyncio.sleep(_UNPROMPTED_INTERVAL_SECONDS)
+            target = client.delivery_target or configured_delivery_target()
+            if target is None:
+                client.delivery_wake.clear()
+                await client.delivery_wake.wait()
+                continue
+            channel = target["channel"]
+            conversation_id = str(target["conversation_id"])
             try:
-                target = client.initiative_targets.get(int(channel.id))
-                if target is None:
-                    continue
-                result = await _post_initiative(client.http_session, target)
+                result = await _claim_delivery(
+                    client.http_session,
+                    conversation_id=conversation_id,
+                )
                 error = compact_text(result.get("error"), 240)
                 if error:
-                    _log("unprompted-skip", error)
+                    _log("delivery-wait", error)
+                    await asyncio.sleep(2.0)
                     continue
-                output = str(result.get("reply") or "").strip()
-                if _valid_unprompted_message(output):
-                    await channel.send(output, allowed_mentions=allowed_mentions)
-                    _log("unprompted-send", f"channel={channel.id} reply_chars={len(output)}")
-                elif output:
-                    _log("unprompted-skip", "generated message failed validation")
+                delivery = result.get("delivery")
+                if not isinstance(delivery, dict):
+                    continue
+                try:
+                    sent = await channel.send(
+                        str(delivery.get("message") or ""),
+                        allowed_mentions=allowed_mentions,
+                    )
+                except Exception:
+                    await _ack_delivery(
+                        client.http_session,
+                        conversation_id=conversation_id,
+                        delivery=delivery,
+                        success=False,
+                    )
+                    continue
+                acknowledged = await _ack_delivery(
+                    client.http_session,
+                    conversation_id=conversation_id,
+                    delivery=delivery,
+                    success=True,
+                    message_id=str(getattr(sent, "id", "") or ""),
+                )
+                if acknowledged:
+                    _log("initiative-send", f"channel={channel.id}")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                _log("unprompted-skip", f"{type(exc).__name__}: {exc}")
-
-    def reset_unprompted_task(channel=None) -> None:
-        if channel is not None and getattr(channel, "guild", None) is not None:
-            client.unprompted_channel = channel
-        elif client.unprompted_channel is not None:
-            channel = client.unprompted_channel
-        elif DISCORD_ALLOWED_CHANNEL_IDS:
-            channel = client.get_channel(DISCORD_ALLOWED_CHANNEL_IDS[0])
-        if channel is None:
-            _log("unprompted-skip", "no Discord channel is available yet")
-            return
-        client.unprompted_channel = channel
-        if client.unprompted_task is not None:
-            client.unprompted_task.cancel()
-        client.unprompted_task = asyncio.create_task(unprompted_loop(channel))
-        _log("unprompted", f"channel={channel.id} interval=4h")
+                _log("delivery-wait", f"{type(exc).__name__}: {exc}")
+                await asyncio.sleep(2.0)
 
     @client.event
     async def on_ready() -> None:
         _log("ready", f"logged in as {client.user}")
         _log("status", f"forwarding to {DISCORD_SERVER_URL}")
-        if client.unprompted_task is None or client.unprompted_task.done():
-            reset_unprompted_task()
+        if client.delivery_target is None:
+            client.delivery_target = configured_delivery_target()
+        if client.delivery_task is None or client.delivery_task.done():
+            client.delivery_task = asyncio.create_task(delivery_loop())
+        client.delivery_wake.set()
 
     @client.event
     async def on_message(message) -> None:
@@ -382,16 +423,14 @@ def run_discord_bot() -> None:
         text = _message_text(message, bot_user_id)
         if not text:
             return
-        reset_unprompted_task(message.channel)
-
         conversation_id = _conversation_id(message)
         profile_id = _profile_id(message)
         payload = _payload(message, text)
-        client.initiative_targets[int(message.channel.id)] = {
-            "profile_id": profile_id,
+        client.delivery_target = {
+            "channel": message.channel,
             "conversation_id": conversation_id,
-            "display_name": _display_name(message),
         }
+        client.delivery_wake.set()
         try:
             async with message.channel.typing():
                 result = await _post_chat(client.http_session, payload)

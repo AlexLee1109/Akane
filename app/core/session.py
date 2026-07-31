@@ -10,8 +10,6 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from app.core.config import (
     GENERATION_QUEUE_TIMEOUT_SECONDS,
@@ -19,10 +17,8 @@ from app.core.config import (
     MAX_PENDING_GENERATIONS,
     MAX_TOKENS,
     PROMPT_DEBUG,
-    TIMEZONE,
 )
 from app.core.memory import (
-    InitiativeOpportunity,
     StateSnapshot,
     format_emotional_context,
     get_state_store,
@@ -37,7 +33,10 @@ from app.core.prompt import (
     PromptContext,
     PromptPlan,
     build_conversation_prompt,
-    build_initiative_prompt,
+)
+from app.core.time_context import (
+    build_time_context,
+    format_time_context,
 )
 from app.core.utils import canonical_profile_id, compact_text, words
 from app.integrations.vscode_context import code_context_for_message
@@ -77,7 +76,6 @@ _SECTION_DESCRIPTORS = (
      "algorithm model quantization",
      "Answer the request directly without forcing personal state into it."),
 )
-_TIME_DESCRIPTOR = "current time date day calendar today tonight tomorrow morning evening"
 _SEMANTIC_STOPWORDS = {
     "a", "about", "an", "and", "are", "as", "at", "be", "been", "but", "did",
     "do", "does", "for", "from", "had", "has", "have", "how", "i", "in", "is",
@@ -107,7 +105,6 @@ class CompanionDecision:
     message: str = ""
     should_respond: bool = True
     pause_seconds: int | None = None
-    should_initiate: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,9 +136,7 @@ class ChatInput:
     timestamp: float
     display_name: str = ""
     reply_context: str = ""
-    autonomous: bool = False
     request_id: str = ""
-    initiative_opportunity: InitiativeOpportunity | None = None
 
 
 @dataclass(slots=True)
@@ -348,7 +343,6 @@ def normalize_chat_input(
     timestamp: object = 0.0,
     display_name: object = "",
     reply_context: object = "",
-    autonomous: bool = False,
     request_id: object = "",
 ) -> ChatInput:
     value = str(text or "").strip()
@@ -370,7 +364,6 @@ def normalize_chat_input(
         timestamp=sent_at,
         display_name=compact_text(display_name, 60),
         reply_context=compact_text(reply_context, 600),
-        autonomous=bool(autonomous),
         request_id=compact_text(request_id, 180),
     )
 
@@ -395,7 +388,7 @@ def _response_context_plan(
     *,
     reply_context: str = "",
     tool_requested: bool = False,
-) -> tuple[tuple[str, ...], str, bool, bool]:
+) -> tuple[tuple[str, ...], str, bool]:
     """Select broad context concepts without classifying specific questions."""
 
     current_terms = _semantic_terms(f"{message} {reply_context}")
@@ -410,13 +403,6 @@ def _response_context_plan(
             return 0.0
         return len(left & right) / math.sqrt(len(left) * len(right))
 
-    time_score = similarity(current_terms, _TIME_DESCRIPTOR)
-    time_score += recent_weight * similarity(recent_terms, _TIME_DESCRIPTOR)
-    time_overlap = current_terms & _semantic_terms(_TIME_DESCRIPTOR)
-    time_relevant = time_score >= 0.14 and (
-        len(time_overlap) >= 2 or len(current_terms) <= 2
-    )
-
     scored: list[tuple[float, int, str, str]] = []
     directly_relevant_memory_sections: set[str] = set()
     for index, (name, descriptor, focus) in enumerate(_SECTION_DESCRIPTORS):
@@ -425,8 +411,6 @@ def _response_context_plan(
         score += recent_weight * similarity(recent_terms, descriptor)
         if name == "tool_context" and tool_requested:
             score = max(score, 1.0)
-        if name == "tool_context" and time_relevant:
-            score = max(score, time_score)
         if score >= 0.14:
             scored.append((score, index, name, focus))
         if name in _MEMORY_SECTIONS and direct_score >= 0.14:
@@ -449,7 +433,6 @@ def _response_context_plan(
     return (
         tuple(item[2] for item in chosen),
         strongest[3] if strongest else "",
-        time_relevant,
         memory_relevant,
     )
 
@@ -478,34 +461,16 @@ def _relevant_items(
     return tuple(reversed(available[-limit:])) if fallback else ()
 
 
-def date_time_line(timestamp: float | None = None) -> str:
-    local = datetime.fromtimestamp(
-        time.time() if timestamp is None else timestamp,
-        ZoneInfo(TIMEZONE),
-    )
-    hour = local.strftime("%I").lstrip("0") or "0"
-    zone = local.tzname() or TIMEZONE
-    return (
-        f"{local.strftime('%A, %B')} {local.day}, {local.year}, "
-        f"{hour}:{local.strftime('%M %p')} {zone}"
-    )
-
-
 def _prompt_context(
     snapshot: StateSnapshot,
     chat: ChatInput,
     *,
     sections: tuple[str, ...],
     response_focus: str,
-    time_relevant: bool,
     editor,
 ) -> PromptContext:
     profile = snapshot.profile
-    planning_text = (
-        chat.initiative_opportunity.context
-        if chat.initiative_opportunity is not None
-        else chat.text
-    )
+    planning_text = chat.text
     query = " ".join(
         (
             planning_text,
@@ -605,12 +570,33 @@ def _prompt_context(
         tool_lines.append(editor.prompt_text)
     elif editor.requested:
         tool_lines.append("No current VS Code editor snapshot is available.")
-    if time_relevant:
-        tool_lines.append(f"Current local date and time: {date_time_line(snapshot.now)}")
+    current_activity = profile.presence.current_activity
+    time_context = format_time_context(
+        build_time_context(
+            last_user_message_at=snapshot.last_profile_user_at,
+            last_akane_message_at=snapshot.last_profile_assistant_at,
+            current_activity_started_at=(
+                current_activity.started_at if current_activity else None
+            ),
+        )
+    )
+
+    recent_turns = tuple(snapshot.recent_turns)
+    initiative = snapshot.last_profile_initiative
+    if (
+        initiative is not None
+        and all(turn.turn_id != initiative.turn_id for turn in recent_turns)
+        and (
+            not recent_turns
+            or initiative.timestamp >= recent_turns[-1].timestamp
+        )
+    ):
+        recent_turns = (*recent_turns, initiative)
 
     return PromptContext(
         response_focus=response_focus,
-        recent_turns=tuple(snapshot.recent_turns),
+        time_context=time_context,
+        recent_turns=recent_turns,
         relationship=relationship,
         emotion=emotion,
         presence=activity,
@@ -619,12 +605,6 @@ def _prompt_context(
         shared_context=shared_context,
         reply_context=chat.reply_context,
         tool_context="\n".join(tool_lines) if "tool_context" in sections else "",
-        initiative_opportunity=(
-            f"{chat.initiative_opportunity.reason}: "
-            f"{chat.initiative_opportunity.context}"
-            if chat.initiative_opportunity
-            else ""
-        ),
     )
 
 
@@ -632,21 +612,18 @@ def _build_prompt(
     snapshot: StateSnapshot,
     chat: ChatInput,
     *,
-    context_plan: tuple[tuple[str, ...], str, bool, bool],
+    context_plan: tuple[tuple[str, ...], str, bool],
     editor,
     token_counter,
 ) -> PromptPlan:
-    sections, response_focus, time_relevant, _memory_relevant = context_plan
+    sections, response_focus, _memory_relevant = context_plan
     context = _prompt_context(
         snapshot,
         chat,
         sections=sections,
         response_focus=response_focus,
-        time_relevant=time_relevant,
         editor=editor,
     )
-    if chat.initiative_opportunity is not None:
-        return build_initiative_prompt(context, token_counter=token_counter)
     return build_conversation_prompt(
         chat.text,
         context,
@@ -656,8 +633,6 @@ def _build_prompt(
 
 def _decision_from_output(
     parsed: ParsedStateOutput,
-    *,
-    initiative: bool,
 ) -> CompanionDecision:
     visible = parsed.message.strip()
     # A streamed visible reply cannot be retracted by contradictory trailing metadata.
@@ -669,7 +644,6 @@ def _decision_from_output(
         message=visible if should_respond else "",
         should_respond=should_respond,
         pause_seconds=pause,
-        should_initiate=initiative and should_respond,
     )
 
 
@@ -695,20 +669,15 @@ def run_companion_turn(
     try:
         timing = InferenceTiming(requested_at=started_at)
         manager = ModelManager.get_instance()
-        priority = "background" if chat.autonomous else "visible"
         parts: list[str] = []
         visible_stream = _VisibleReplyStream()
         try:
             with manager.reserve(
-                priority=priority,
+                priority="visible",
                 cancellation=handle.cancellation,
                 queue_deadline=handle.queue_deadline,
             ) as reservation:
-                planning_text = (
-                    chat.initiative_opportunity.context
-                    if chat.initiative_opportunity is not None
-                    else chat.text
-                )
+                planning_text = chat.text
                 snapshot = store.snapshot(
                     chat.profile_id,
                     chat.conversation_id,
@@ -722,7 +691,7 @@ def run_companion_turn(
                     reply_context=chat.reply_context,
                     tool_requested=editor.requested,
                 )
-                sections, _focus, _time_relevant, memory_relevant = context_plan
+                sections, _focus, memory_relevant = context_plan
                 if (
                     not skip_memory
                     and memory_relevant
@@ -776,32 +745,28 @@ def run_companion_turn(
             raise RuntimeError("Model returned no completion.")
         handle.raise_if_cancelled()
         parsed = parse_akane_state(raw)
-        decision = _decision_from_output(
-            parsed,
-            initiative=chat.initiative_opportunity is not None,
-        )
+        decision = _decision_from_output(parsed)
         if decision.pause_seconds is not None:
             _apply_pause(chat, decision.pause_seconds)
-        if chat.initiative_opportunity is not None:
-            store.commit_initiative(
-                snapshot,
-                opportunity=chat.initiative_opportunity,
-                message=decision.message,
-                used=decision.should_initiate,
-                proposals=parsed.proposals,
-                now=time.time(),
-            )
-        else:
-            store.commit_turn(
-                snapshot,
-                user_text=chat.text,
-                assistant_text=decision.message if decision.should_respond else "",
-                source=chat.source,
-                request_id=chat.request_id,
-                proposals=parsed.proposals,
-                now=time.time(),
-            )
-            store.wake_presence_if_due(chat.profile_id, now=time.time())
+        committed = store.commit_turn(
+            snapshot,
+            user_text=chat.text,
+            assistant_text=decision.message if decision.should_respond else "",
+            source=chat.source,
+            request_id=chat.request_id,
+            proposals=parsed.proposals,
+            now=time.time(),
+        )
+        from app.core.life_worker import offer_initiative_from_change
+
+        offer_initiative_from_change(
+            store,
+            snapshot.profile,
+            committed.profile,
+            now=committed.now,
+            conversation=True,
+        )
+        store.wake_presence_if_due(chat.profile_id, now=time.time())
         _record_debug(chat, snapshot, plan, parsed, decision, timing, started_at)
         return CompanionTurnResult(decision, handle.generation_id)
     finally:
@@ -873,19 +838,6 @@ def cancel_generation(
 
 def cancel_all_generations() -> None:
     _SCHEDULER.cancel_all()
-
-
-def autonomous_dialogue_available(
-    profile_id: str,
-    conversation_id: str,
-) -> bool:
-    profile = canonical_profile_id(profile_id)
-    conversation = compact_text(conversation_id, 160) or "popup:default"
-    chat = ChatInput(profile, conversation, "initiative", "autonomous", time.time())
-    return not _pause_remaining(chat) and not _SCHEDULER.is_active(
-        conversation,
-        profile,
-    )
 
 
 def reset_conversation(conversation_id: str, profile_id: str) -> None:

@@ -24,19 +24,21 @@ from app.core.config import (
 from app.core.persistence import atomic_write_json, read_json
 from app.core.presence import (
     CLAIM_SECONDS,
+    EMOTION_UPDATE_FIELDS,
+    MOOD_UPDATE_FIELDS,
     RETRY_SECONDS,
     LifeDecision,
     PresenceActivity,
     PresenceState,
     apply_life_decision,
     life_decision_rejection,
-    next_decision_time,
     normalize_presence,
     validate_interest_addition,
 )
+from app.core.time_context import build_time_context
 from app.core.utils import OWNER_PROFILE_ID, canonical_profile_id, compact_text, words
 
-STATE_SCHEMA_VERSION = 12
+STATE_SCHEMA_VERSION = 13
 STARTING_INTERESTS = ("anime", "manga", "VTubers")
 
 _MAX_RECENT_TURNS = 28
@@ -44,6 +46,10 @@ _MAX_RELATIONSHIP_ENTRIES = 16
 _MAX_PREFERENCES = 32
 _MAX_OPINIONS = 32
 _MAX_INTERESTS = 32
+_MAX_RECENT_INITIATIVES = 16
+_INITIATIVE_CLAIM_SECONDS = 60.0
+ORDINARY_INITIATIVE_COOLDOWN_SECONDS = 4.0 * 3600.0
+MAX_ORDINARY_INITIATIVES_PER_LOCAL_DAY = 2
 _MEMORY_SUBJECTS = {"user", "akane", "shared"}
 _MEMORY_KINDS = {"fact", "event", "commitment", "project", "concern"}
 _PREFERENCE_STANCES = {
@@ -89,6 +95,9 @@ _GENERIC_CAUSES = {
     "the model decided",
     "time passed",
 }
+_UNGROUNDED_CAUSE_LANGUAGE = re.compile(
+    r"\b(?:processing|systems?|models?|random(?:ly)?|time (?:passing|passed))\b"
+)
 _TRIVIAL_EMOTIONAL_INPUTS = {
     "hello", "hi", "hey", "okay", "ok", "thanks", "thank you", "hmm", "hm",
 }
@@ -418,29 +427,162 @@ def _complete_turns(turns: tuple[ChatTurn, ...]) -> tuple[ChatTurn, ...]:
 
 @dataclass(frozen=True, slots=True)
 class InitiativeOpportunity:
+    opportunity_id: str
     reason: str
+    source_type: str
+    source_id: str
     context: str
-    importance: float
+    topic_key: str
     created_at: float
+    not_before: float
     expires_at: float
+    status: str = "pending"
+    claim_token: str | None = None
+    claim_expires_at: float = 0.0
+    message: str | None = None
+    evaluated_at: float = 0.0
+    generated_at: float = 0.0
+    delivery_channel: str | None = None
+    delivered_at: float = 0.0
+    delivery_message_id: str | None = None
+    failed_channels: tuple[str, ...] = ()
 
     @classmethod
-    def from_dict(cls, payload: object) -> "InitiativeOpportunity | None":
+    def from_dict(
+        cls,
+        payload: object,
+        *,
+        now: float,
+    ) -> "InitiativeOpportunity | None":
         if not isinstance(payload, dict):
             return None
+        opportunity_id = compact_text(payload.get("opportunity_id"), 100)
         reason = compact_text(payload.get("reason"), 100)
+        source_type = compact_text(payload.get("source_type"), 40).casefold()
+        source_id = compact_text(payload.get("source_id"), 160)
         context = compact_text(payload.get("context"), 420)
+        topic_key = _key(payload.get("topic_key"))[:120]
         created = max(0.0, _number(payload.get("created_at")))
+        not_before = max(created, _number(payload.get("not_before"), created))
         expires = max(0.0, _number(payload.get("expires_at")))
-        if not reason or not context or expires <= created:
+        status = compact_text(payload.get("status"), 24).casefold()
+        if (
+            not opportunity_id
+            or not reason
+            or not source_type
+            or not source_id
+            or not context
+            or not topic_key
+            or expires <= created
+            or status
+            not in {"pending", "pending_delivery", "sent", "dismissed", "expired"}
+        ):
             return None
-        return cls(
-            reason,
-            context,
-            max(0.0, min(1.0, _number(payload.get("importance")))),
-            created,
-            expires,
+        claim_token = compact_text(payload.get("claim_token"), 100) or None
+        claim_expires = max(0.0, _number(payload.get("claim_expires_at")))
+        delivery_channel = compact_text(
+            payload.get("delivery_channel"),
+            16,
+        ).casefold() or None
+        failed_channels = tuple(
+            channel
+            for item in (payload.get("failed_channels") or ())
+            if (channel := compact_text(item, 16).casefold())
+            in {"popup", "discord"}
         )
+        if claim_token is None or claim_expires <= now:
+            if status == "pending_delivery" and delivery_channel:
+                failed_channels = tuple(
+                    dict.fromkeys((*failed_channels, delivery_channel))
+                )
+            claim_token = None
+            claim_expires = 0.0
+            if status != "sent":
+                delivery_channel = None
+        return cls(
+            opportunity_id,
+            reason,
+            source_type,
+            source_id,
+            context,
+            topic_key,
+            created,
+            not_before,
+            expires,
+            status,
+            claim_token,
+            claim_expires,
+            compact_text(payload.get("message"), 500) or None,
+            max(0.0, _number(payload.get("evaluated_at"))),
+            max(0.0, _number(payload.get("generated_at"))),
+            delivery_channel,
+            max(0.0, _number(payload.get("delivered_at"))),
+            compact_text(payload.get("delivery_message_id"), 160) or None,
+            failed_channels,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            **asdict(self),
+            "failed_channels": list(self.failed_channels),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SentInitiative:
+    topic_key: str
+    source_id: str
+    source_type: str
+    delivered_at: float
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "SentInitiative | None":
+        if not isinstance(payload, dict):
+            return None
+        topic = _key(payload.get("topic_key"))[:120]
+        source = compact_text(payload.get("source_id"), 160)
+        source_type = compact_text(payload.get("source_type"), 40).casefold()
+        delivered = max(0.0, _number(payload.get("delivered_at")))
+        return (
+            cls(topic, source, source_type, delivered)
+            if topic and source and source_type and delivered
+            else None
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class InitiativeState:
+    current: InitiativeOpportunity | None = None
+    cooldown_until: float = 0.0
+    recent: tuple[SentInitiative, ...] = ()
+    handled_source_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def from_dict(cls, payload: object, *, now: float) -> "InitiativeState":
+        values = payload if isinstance(payload, dict) else {}
+        recent = tuple(
+            item
+            for raw in (values.get("recent") or ())
+            if (item := SentInitiative.from_dict(raw)) is not None
+        )[-_MAX_RECENT_INITIATIVES:]
+        return cls(
+            InitiativeOpportunity.from_dict(values.get("current"), now=now),
+            max(0.0, _number(values.get("cooldown_until"))),
+            recent,
+            tuple(
+                source
+                for raw in (values.get("handled_source_ids") or ())
+                if (source := compact_text(raw, 160))
+            )[-_MAX_RECENT_INITIATIVES:],
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "current": self.current.as_dict() if self.current else None,
+            "cooldown_until": self.cooldown_until,
+            "recent": [asdict(item) for item in self.recent],
+            "handled_source_ids": list(self.handled_source_ids),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,9 +595,6 @@ class ConversationRecord:
     updated_at: float = 0.0
     committed_request_ids: tuple[str, ...] = ()
     request_replies: tuple[tuple[str, str], ...] = ()
-    initiative_opportunity: InitiativeOpportunity | None = None
-    initiative_cooldown_until: float = 0.0
-    initiative_handled_contexts: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(
@@ -539,18 +678,6 @@ class ConversationRecord:
             ),
             committed_request_ids=ids,
             request_replies=tuple(replies[-32:]),
-            initiative_opportunity=InitiativeOpportunity.from_dict(
-                payload.get("initiative_opportunity")
-            ),
-            initiative_cooldown_until=max(
-                0.0,
-                _number(payload.get("initiative_cooldown_until")),
-            ),
-            initiative_handled_contexts=tuple(
-                value
-                for item in (payload.get("initiative_handled_contexts") or [])
-                if (value := compact_text(item, 420))
-            )[-12:],
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -563,13 +690,6 @@ class ConversationRecord:
             "updated_at": self.updated_at,
             "committed_request_ids": list(self.committed_request_ids),
             "request_replies": dict(self.request_replies),
-            "initiative_opportunity": (
-                asdict(self.initiative_opportunity)
-                if self.initiative_opportunity
-                else None
-            ),
-            "initiative_cooldown_until": self.initiative_cooldown_until,
-            "initiative_handled_contexts": list(self.initiative_handled_contexts),
         }
 
 
@@ -924,6 +1044,7 @@ class ProfileState:
     preferences: tuple[AkanePreference, ...] = ()
     opinions: tuple[Opinion, ...] = ()
     relationship: RelationshipState = RelationshipState()
+    initiative: InitiativeState = InitiativeState()
     updated_at: float = 0.0
 
     @classmethod
@@ -1001,6 +1122,10 @@ class ProfileState:
             preferences=_merge_preferences((), preferences),
             opinions=_merge_opinions((), opinions),
             relationship=RelationshipState.from_dict(payload.get("relationship")),
+            initiative=InitiativeState.from_dict(
+                payload.get("initiative"),
+                now=now,
+            ),
             updated_at=updated,
         )
 
@@ -1015,6 +1140,7 @@ class ProfileState:
             "preferences": [asdict(item) for item in self.preferences],
             "opinions": [asdict(item) for item in self.opinions],
             "relationship": self.relationship.as_dict(),
+            "initiative": self.initiative.as_dict(),
         }
 
 
@@ -1023,6 +1149,106 @@ def _new_profile(now: float) -> ProfileState:
         presence=PresenceState.from_dict({}, now=now),
         updated_at=0.0,
     )
+
+
+def _handled_initiative(
+    state: InitiativeState,
+    opportunity: InitiativeOpportunity,
+) -> InitiativeState:
+    return replace(
+        state,
+        handled_source_ids=tuple(
+            dict.fromkeys((*state.handled_source_ids, opportunity.source_id))
+        )[-_MAX_RECENT_INITIATIVES:],
+    )
+
+
+def _settle_initiative(state: InitiativeState, *, now: float) -> InitiativeState:
+    opportunity = state.current
+    if opportunity is None:
+        return state
+    if (
+        opportunity.status in {"pending", "pending_delivery"}
+        and opportunity.expires_at <= now
+    ):
+        expired = replace(
+            opportunity,
+            status="expired",
+            evaluated_at=max(opportunity.evaluated_at, now),
+            claim_token=None,
+            claim_expires_at=0.0,
+            delivery_channel=None,
+        )
+        return _handled_initiative(replace(state, current=expired), expired)
+    if opportunity.claim_token and opportunity.claim_expires_at <= now:
+        failed = opportunity.failed_channels
+        if opportunity.status == "pending_delivery" and opportunity.delivery_channel:
+            failed = tuple(
+                dict.fromkeys((*failed, opportunity.delivery_channel))
+            )
+        return replace(
+            state,
+            current=replace(
+                opportunity,
+                claim_token=None,
+                claim_expires_at=0.0,
+                delivery_channel=None,
+                failed_channels=failed,
+            ),
+        )
+    return state
+
+
+def _initiative_source_exists(
+    profile: ProfileState,
+    opportunity: InitiativeOpportunity,
+) -> bool:
+    if opportunity.source_type == "offscreen_life":
+        return any(
+            opportunity.source_id == f"offscreen_life:{activity.started_at:.6f}"
+            for activity in (
+                profile.presence.current_activity,
+                profile.presence.previous_activity,
+            )
+            if activity is not None
+        )
+    if opportunity.source_type in {"memory", "reminder"}:
+        return any(item.id == opportunity.source_id for item in profile.memories)
+    if opportunity.source_type == "realization":
+        return any(
+            opportunity.source_id
+            == f"realization:{item.updated_at:.6f}:{_key(item.topic)[:60]}"
+            for item in profile.opinions
+        )
+    if opportunity.source_type == "relationship":
+        return any(
+            opportunity.source_id
+            == f"relationship:{item.updated_at:.6f}:{_key(item.summary)[:60]}"
+            for item in (
+                *profile.relationship.unresolved_events,
+                *profile.relationship.shared_context,
+            )
+        )
+    return False
+
+
+def _ordinary_delivery_allowed(
+    state: InitiativeState,
+    opportunity: InitiativeOpportunity,
+    *,
+    now: float,
+) -> bool:
+    if opportunity.source_type == "reminder":
+        return True
+    if state.cooldown_until > now:
+        return False
+    local_date = build_time_context(now=now).local_date
+    sent_today = sum(
+        item.source_type != "reminder"
+        and build_time_context(now=item.delivered_at).local_date == local_date
+        for item in state.recent
+    )
+    return sent_today < MAX_ORDINARY_INITIATIVES_PER_LOCAL_DAY
 
 
 def effective_emotional_state(profile: ProfileState, *, now: float) -> ProfileState:
@@ -1103,6 +1329,8 @@ class StateSnapshot:
     relevant_memories: tuple[Memory, ...]
     now: float
     last_profile_assistant_at: float = 0.0
+    last_profile_user_at: float = 0.0
+    last_profile_initiative: ChatTurn | None = None
 
 
 def _merge_memories(
@@ -1272,6 +1500,36 @@ def _merge_profiles(left: ProfileState, right: ProfileState, *, now: float) -> P
         initialize_schedule=True,
         repair_schedule=True,
     )
+    initiative_source = max(
+        (left.initiative, right.initiative),
+        key=lambda item: (
+            item.current.created_at if item.current else 0.0,
+            item.cooldown_until,
+        ),
+    )
+    recent = sorted(
+        {
+            (item.topic_key, item.source_id): item
+            for item in (*left.initiative.recent, *right.initiative.recent)
+        }.values(),
+        key=lambda item: item.delivered_at,
+    )[-_MAX_RECENT_INITIATIVES:]
+    initiative = replace(
+        initiative_source,
+        cooldown_until=max(
+            left.initiative.cooldown_until,
+            right.initiative.cooldown_until,
+        ),
+        recent=tuple(recent),
+        handled_source_ids=tuple(
+            dict.fromkeys(
+                (
+                    *left.initiative.handled_source_ids,
+                    *right.initiative.handled_source_ids,
+                )
+            )
+        )[-_MAX_RECENT_INITIATIVES:],
+    )
     return ProfileState(
         mood=mood,
         emotion=emotion,
@@ -1284,6 +1542,7 @@ def _merge_profiles(left: ProfileState, right: ProfileState, *, now: float) -> P
         preferences=_merge_preferences(left.preferences, right.preferences),
         opinions=_merge_opinions(left.opinions, right.opinions),
         relationship=_merge_relationship(left.relationship, right.relationship),
+        initiative=initiative,
         updated_at=max(left.updated_at, right.updated_at),
     )
 
@@ -1303,11 +1562,6 @@ def _merge_conversations(
             )
         )
     )
-    opportunity = (
-        right.initiative_opportunity
-        if right.updated_at >= left.updated_at
-        else left.initiative_opportunity
-    )
     return ConversationRecord(
         left.conversation_id,
         left.profile_id,
@@ -1317,13 +1571,6 @@ def _merge_conversations(
         max(left.updated_at, right.updated_at),
         tuple(dict.fromkeys((*left.committed_request_ids, *right.committed_request_ids)))[-32:],
         tuple(dict((*left.request_replies, *right.request_replies)).items())[-32:],
-        opportunity,
-        max(left.initiative_cooldown_until, right.initiative_cooldown_until),
-        tuple(
-            dict.fromkeys(
-                (*left.initiative_handled_contexts, *right.initiative_handled_contexts)
-            )
-        )[-12:],
     )
 
 
@@ -1345,6 +1592,33 @@ def _validate_canonical_profile(
             normalized_presence["claim_token"] = None
             normalized_presence["claim_expires_at"] = 0.0
         normalized["presence"] = normalized_presence
+    raw_initiative = payload.get("initiative")
+    if isinstance(raw_initiative, dict):
+        normalized_initiative = dict(raw_initiative)
+        raw_current = raw_initiative.get("current")
+        if isinstance(raw_current, dict):
+            normalized_current = dict(raw_current)
+            token = normalized_current.get("claim_token")
+            expires = _number(normalized_current.get("claim_expires_at"))
+            if isinstance(token, str) and token.strip() and expires <= now:
+                channel = compact_text(
+                    normalized_current.get("delivery_channel"),
+                    16,
+                ).casefold()
+                failed = list(normalized_current.get("failed_channels") or ())
+                if (
+                    normalized_current.get("status") == "pending_delivery"
+                    and channel in {"popup", "discord"}
+                    and channel not in failed
+                ):
+                    failed.append(channel)
+                normalized_current["claim_token"] = None
+                normalized_current["claim_expires_at"] = 0.0
+                if normalized_current.get("status") != "sent":
+                    normalized_current["delivery_channel"] = None
+                normalized_current["failed_channels"] = failed
+            normalized_initiative["current"] = normalized_current
+        normalized["initiative"] = normalized_initiative
     raw_mood = payload.get("mood")
     if isinstance(raw_mood, dict):
         normalized_mood = dict(raw_mood)
@@ -1424,7 +1698,11 @@ def _profile_emotional_evidence(
 
 def _grounded_emotional_cause(cause: str, evidence: str) -> bool:
     cause_key = _key(cause)
-    if not cause or any(item in cause_key for item in _GENERIC_CAUSES):
+    if (
+        not cause
+        or any(item in cause_key for item in _GENERIC_CAUSES)
+        or _UNGROUNDED_CAUSE_LANGUAGE.search(cause_key)
+    ):
         return False
     candidate_terms = _terms(cause)
     overlap = candidate_terms & _terms(evidence)
@@ -1452,15 +1730,22 @@ def _materialize_effective_state(
     return replace(profile, mood=mood, emotion=emotion)
 
 
-def _emotion_fields_valid(payload: object) -> bool:
+def _emotion_fields_valid(
+    payload: object,
+    *,
+    require_canonical: bool,
+) -> bool:
     if not isinstance(payload, dict):
         return False
     mode = compact_text(payload.get("mode"), 16).casefold()
     if mode in {"keep", "settle"}:
-        return set(payload) == {"mode"}
-    if mode != "shift" or set(payload) != {
-        "mode", "primary", "intensity", "cause",
-    }:
+        if not require_canonical and set(payload) == {"mode"}:
+            return True
+        return all(
+            payload.get(name) is None
+            for name in ("primary", "intensity", "cause")
+        ) and set(payload) == set(EMOTION_UPDATE_FIELDS)
+    if mode != "shift" or set(payload) != set(EMOTION_UPDATE_FIELDS):
         return False
     intensity = payload.get("intensity")
     return (
@@ -1473,15 +1758,14 @@ def _emotion_fields_valid(payload: object) -> bool:
 
 
 def _mood_fields_valid(payload: object) -> bool:
-    if not isinstance(payload, dict) or set(payload) != {
-        "valence_delta", "energy_delta", "cause",
-    }:
+    if not isinstance(payload, dict) or set(payload) != set(MOOD_UPDATE_FIELDS):
         return False
+    cause = payload.get("cause")
     return all(
         type(payload.get(name)) in {int, float}
         and math.isfinite(float(payload[name]))
         for name in ("valence_delta", "energy_delta")
-    ) and bool(compact_text(payload.get("cause"), 160))
+    ) and (cause is None or bool(compact_text(cause, 160)))
 
 
 def _apply_emotional_updates(
@@ -1496,14 +1780,20 @@ def _apply_emotional_updates(
     mood_delta_limit: float,
     expected_emotion_updated_at: float,
     require_complete: bool,
-    bootstrap: bool = False,
 ) -> tuple[ProfileState, bool]:
-    emotion_valid = _emotion_fields_valid(emotion_update)
+    emotion_valid = _emotion_fields_valid(
+        emotion_update,
+        require_canonical=require_complete,
+    )
     mood_valid = _mood_fields_valid(mood_update)
-    if require_complete and (not emotion_valid or not mood_valid):
+    if require_complete and (
+        not emotion_valid
+        or (mood_update is not None and not mood_valid)
+    ):
         return profile, False
 
-    next_profile = _materialize_effective_state(profile, now=now)
+    next_profile = profile
+    effective = effective_emotional_state(profile, now=now)
     profile_evidence = _profile_emotional_evidence(
         profile,
         relevance=evidence,
@@ -1514,25 +1804,37 @@ def _apply_emotional_updates(
     if emotion_valid:
         values = emotion_update
         mode = compact_text(values.get("mode"), 16).casefold()
-        emotion = next_profile.emotion
-        if mode == "keep":
-            emotion = replace(emotion, updated_at=now)
-        elif mode == "settle":
-            emotion = EmotionState(updated_at=now)
-        else:
+        emotion = effective.emotion
+        newer_emotion = (
+            profile.emotion.updated_at > expected_emotion_updated_at
+            and profile.emotion.source_id != source_id
+        )
+        stale = (
+            source == "offscreen_life"
+            and newer_emotion
+        )
+        grounded = True
+        if mode == "shift":
             primary = compact_text(values.get("primary"), 32).casefold()
             intensity = max(0.0, min(1.0, float(values["intensity"])))
             cause = compact_text(values.get("cause"), 160)
             grounded = (
-                intensity >= 0.08
-                and _grounded_emotional_cause(cause, emotional_evidence)
+                _grounded_emotional_cause(cause, emotional_evidence)
+                and (
+                    not require_complete
+                    or 0.08 <= float(values["intensity"]) <= 1.0
+                )
             )
             if require_complete and not grounded:
                 return profile, False
-            stale = (
-                profile.emotion.updated_at > expected_emotion_updated_at
-                and profile.emotion.source_id != source_id
-            )
+
+        if stale:
+            emotion = profile.emotion
+        elif mode == "keep":
+            emotion = replace(emotion, updated_at=now)
+        elif mode == "settle":
+            emotion = EmotionState(updated_at=now)
+        else:
             related_episode = (
                 primary == emotion.primary
                 or bool(emotion.cause)
@@ -1564,9 +1866,9 @@ def _apply_emotional_updates(
                 )
             elif (
                 grounded
-                and intensity >= 0.18
+                and (require_complete or intensity >= 0.18)
                 and (
-                    not stale
+                    not newer_emotion
                     or intensity >= emotion.intensity + 0.15
                 )
             ):
@@ -1593,25 +1895,21 @@ def _apply_emotional_updates(
             min(mood_delta_limit, float(values["energy_delta"])),
         )
         grounded = _grounded_emotional_cause(cause, emotional_evidence)
-        if bootstrap and valence_delta == 0.0 and energy_delta == 0.0:
-            grounded = False
-        if grounded:
-            mood = next_profile.mood
-            changed = valence_delta != 0.0 or energy_delta != 0.0
+        changed = valence_delta != 0.0 or energy_delta != 0.0
+        if changed and grounded:
+            mood = effective.mood
             next_profile = replace(
                 next_profile,
                 mood=MoodState(
                     max(-1.0, min(1.0, mood.valence + valence_delta)),
                     max(-1.0, min(1.0, mood.energy + energy_delta)),
-                    cause if changed or not mood.cause else mood.cause,
+                    cause,
                     now,
                 ),
             )
-        elif require_complete:
+        elif changed and require_complete:
             return profile, False
 
-    if require_complete and bootstrap and next_profile.mood.updated_at <= 0.0:
-        return profile, False
     return next_profile, True
 
 
@@ -1626,7 +1924,7 @@ class StateStore:
         self._conversations: dict[str, ConversationRecord] = {}
         self._revision = 0
         self._committed_at = 0.0
-        self._presence_wake: Callable[[str], None] | None = None
+        self._autonomy_wake: Callable[[str], None] | None = None
         self._load()
 
     def _document(
@@ -1917,6 +2215,22 @@ class StateStore:
                             for field_name in ("started_at", "updated_at")
                         )
                     )
+                    or bool(
+                        isinstance(raw_profile.get("initiative"), dict)
+                        and isinstance(
+                            raw_profile["initiative"].get("current"),
+                            dict,
+                        )
+                        and raw_profile["initiative"]["current"].get(
+                            "claim_token"
+                        )
+                        and _number(
+                            raw_profile["initiative"]["current"].get(
+                                "claim_expires_at"
+                            )
+                        )
+                        <= now
+                    )
                     for profile_id, raw_profile in raw_profiles.items()
                 )
                 migrated = migrated or set(raw_conversations) != set(conversations)
@@ -1965,12 +2279,27 @@ class StateStore:
             migrated = True
         normalized: dict[str, ProfileState] = {}
         for profile_id, profile in self._profiles.items():
+            repair_failed_bootstrap = (
+                profile.presence.current_activity is None
+                and profile.presence.last_decision_at == 0.0
+                and profile.presence.next_decision_at > now
+                and bool(profile.presence.last_error)
+            )
             presence = normalize_presence(
                 profile.presence,
                 now=now,
                 initialize_schedule=True,
                 repair_schedule=migrated,
             )
+            if repair_failed_bootstrap:
+                presence = replace(
+                    presence,
+                    next_decision_at=0.0,
+                    retry_at=now,
+                    claim_token=None,
+                    claim_expires_at=0.0,
+                )
+                migrated = True
             if presence.claim_token is not None or presence.claim_expires_at:
                 presence = replace(
                     presence,
@@ -2047,6 +2376,25 @@ class StateStore:
                 ),
                 default=0.0,
             )
+            last_profile_user_at = max(
+                (
+                    record.last_user_at
+                    for record in self._conversations.values()
+                    if record.profile_id == profile_key
+                ),
+                default=0.0,
+            )
+            last_profile_initiative = max(
+                (
+                    turn
+                    for record in self._conversations.values()
+                    if record.profile_id == profile_key
+                    for turn in record.recent_turns
+                    if turn.role == "assistant" and turn.source == "initiative"
+                ),
+                key=lambda item: item.timestamp,
+                default=None,
+            )
             recalled = (
                 self._retrieve(profile.memories, query, current)
                 if include_memory
@@ -2062,6 +2410,8 @@ class StateStore:
                 recalled,
                 current,
                 last_profile_assistant_at,
+                last_profile_user_at,
+                last_profile_initiative,
             )
 
     def _retrieve(
@@ -2467,81 +2817,11 @@ class StateStore:
                     snapshot.last_profile_assistant_at,
                     next_conversation.last_assistant_at,
                 ),
-            )
-
-    def commit_initiative(
-        self,
-        snapshot: StateSnapshot,
-        *,
-        opportunity: InitiativeOpportunity,
-        message: str,
-        used: bool,
-        proposals: object = None,
-        now: float | None = None,
-        cooldown_seconds: float = 4.0 * 3600.0,
-    ) -> StateSnapshot:
-        committed = time.time() if now is None else max(snapshot.now, float(now))
-        with self._lock:
-            profile = self._profiles.get(snapshot.profile_id) or snapshot.profile
-            conversation = self._conversation(
-                snapshot.profile_id,
-                snapshot.conversation_id,
-            )
-            next_profile = self._apply_proposals(
-                profile,
-                proposals,
-                user_text=opportunity.context,
-                assistant_text=message,
-                source="self_reflection",
-                source_id=_key(opportunity.context)[:120] or None,
-                expected_emotion_updated_at=snapshot.profile.emotion.updated_at,
-                now=committed,
-            )
-            turns = list(conversation.recent_turns)
-            if used and message:
-                turns.append(
-                    ChatTurn(
-                        uuid.uuid4().hex,
-                        "assistant",
-                        str(message).strip()[:8_000],
-                        committed,
-                        "initiative",
-                    )
-                )
-            handled = tuple(
-                dict.fromkeys(
-                    (*conversation.initiative_handled_contexts, _key(opportunity.context))
-                )
-            )[-12:]
-            next_conversation = replace(
-                conversation,
-                recent_turns=_trim_turns(tuple(turns)),
-                last_assistant_at=(
-                    max(conversation.last_assistant_at, committed)
-                    if used and message
-                    else conversation.last_assistant_at
+                max(
+                    snapshot.last_profile_user_at,
+                    next_conversation.last_user_at,
                 ),
-                updated_at=committed,
-                initiative_opportunity=None,
-                initiative_cooldown_until=committed + max(0.0, cooldown_seconds),
-                initiative_handled_contexts=handled,
-            )
-            profiles = self._profiles.copy()
-            conversations = self._conversations.copy()
-            profiles[snapshot.profile_id] = next_profile
-            conversations[snapshot.conversation_id] = next_conversation
-            self._replace_all(profiles, conversations, committed_at=committed)
-            return replace(
-                snapshot,
-                revision=self._revision,
-                profile=next_profile,
-                conversation=next_conversation,
-                recent_turns=_complete_turns(next_conversation.recent_turns),
-                now=committed,
-                last_profile_assistant_at=max(
-                    snapshot.last_profile_assistant_at,
-                    next_conversation.last_assistant_at,
-                ),
+                snapshot.last_profile_initiative,
             )
 
     def messages(
@@ -2591,12 +2871,6 @@ class StateStore:
                 "last_user_at": record.last_user_at,
                 "last_assistant_at": record.last_assistant_at,
                 "updated_at": record.updated_at,
-                "initiative_opportunity": (
-                    asdict(record.initiative_opportunity)
-                    if record.initiative_opportunity
-                    else None
-                ),
-                "initiative_cooldown_until": record.initiative_cooldown_until,
             }
 
     def clear_conversation(self, conversation_id: str, profile_id: str) -> None:
@@ -2628,7 +2902,7 @@ class StateStore:
                 if value.profile_id != profile
             }
             self._replace_all(profiles, conversations, committed_at=current)
-            callback = self._presence_wake if profile == OWNER_PROFILE_ID else None
+            callback = self._autonomy_wake if profile == OWNER_PROFILE_ID else None
         if callback is not None:
             callback(profile)
 
@@ -2701,73 +2975,518 @@ class StateStore:
                 "committed_at": self._committed_at,
             }
 
-    def claim_initiative_opportunity(
+    def offer_initiative(
         self,
+        opportunity: InitiativeOpportunity,
         *,
-        profile_id: str,
-        conversation_id: str,
-        candidates: tuple[InitiativeOpportunity, ...],
+        profile_id: str = OWNER_PROFILE_ID,
         now: float,
-        active_window_seconds: float,
-    ) -> InitiativeOpportunity | None:
+    ) -> bool:
         profile = canonical_profile_id(profile_id)
-        conversation_key = compact_text(conversation_id, 160) or "popup:default"
+        if profile != OWNER_PROFILE_ID or opportunity.status != "pending":
+            return False
         with self._lock:
-            record = self._conversation(profile, conversation_key)
+            current_profile = self._profiles.get(profile)
+            if current_profile is None:
+                return False
+            initiative = _settle_initiative(current_profile.initiative, now=now)
+            active = initiative.current
             if (
-                record.initiative_cooldown_until > now
-                or max(record.last_user_at, record.last_assistant_at)
-                > now - max(0.0, active_window_seconds)
+                active is not None
+                and active.status in {"pending", "pending_delivery"}
+                and active.expires_at > now
             ):
-                return None
-            pending = record.initiative_opportunity
-            if pending is not None and pending.expires_at > now:
-                return pending
-            handled = set(record.initiative_handled_contexts)
-            accepted = [
-                item
-                for item in candidates
-                if item.expires_at > now
-                and item.importance >= 0.5
-                and _key(item.context) not in handled
-            ]
-            if not accepted:
-                return None
-            chosen = max(accepted, key=lambda item: (item.importance, item.created_at))
-            next_record = replace(
-                record,
-                initiative_opportunity=chosen,
-                updated_at=max(record.updated_at, now),
+                return False
+            if (
+                opportunity.source_id in initiative.handled_source_ids
+                or any(
+                    recent.source_id == opportunity.source_id
+                    or (
+                        opportunity.source_type != "reminder"
+                        and recent.source_type != "reminder"
+                        and _similar(recent.topic_key, opportunity.topic_key)
+                        >= 0.78
+                    )
+                    for recent in initiative.recent
+                )
+            ):
+                return False
+            next_profile = replace(
+                current_profile,
+                initiative=replace(initiative, current=opportunity),
+                updated_at=max(current_profile.updated_at, now),
             )
-            conversations = self._conversations.copy()
-            conversations[conversation_key] = next_record
-            self._replace_all(
-                self._profiles.copy(),
-                conversations,
+            profiles = self._profiles.copy()
+            profiles[profile] = next_profile
+            changed = self._replace_all(
+                profiles,
+                self._conversations.copy(),
                 committed_at=now,
             )
-            return chosen
+            callback = self._autonomy_wake
+        if changed and callback is not None:
+            callback(profile)
+        return changed
 
-    def set_presence_wake(
+    def initiative_schedule(
+        self,
+        *,
+        now: float,
+    ) -> tuple[bool, float | None]:
+        current = max(0.0, float(now))
+        with self._lock:
+            profile = self._profiles.get(OWNER_PROFILE_ID)
+            if profile is None:
+                return False, None
+            initiative = _settle_initiative(profile.initiative, now=current)
+            opportunity = initiative.current
+            due = bool(
+                opportunity is not None
+                and opportunity.status == "pending"
+                and opportunity.claim_token is None
+                and opportunity.not_before <= current
+                and opportunity.expires_at > current
+            )
+            wakes: list[float] = []
+            if opportunity is not None and opportunity.status in {
+                "pending",
+                "pending_delivery",
+            }:
+                wakes.append(opportunity.expires_at)
+                if opportunity.claim_token:
+                    wakes.append(opportunity.claim_expires_at)
+                elif opportunity.status == "pending":
+                    wakes.append(opportunity.not_before)
+                elif initiative.cooldown_until > current:
+                    wakes.append(initiative.cooldown_until)
+            if initiative != profile.initiative:
+                profiles = self._profiles.copy()
+                profiles[OWNER_PROFILE_ID] = replace(profile, initiative=initiative)
+                self._replace_all(
+                    profiles,
+                    self._conversations.copy(),
+                    committed_at=current,
+                )
+            future = tuple(value for value in wakes if value > current)
+            return due, min(future, default=None)
+
+    def claim_initiative_evaluation(
+        self,
+        *,
+        now: float,
+    ) -> InitiativeOpportunity | None:
+        current = max(0.0, float(now))
+        with self._lock:
+            profile = self._profiles.get(OWNER_PROFILE_ID)
+            if profile is None:
+                return None
+            initiative = _settle_initiative(profile.initiative, now=current)
+            opportunity = initiative.current
+            if (
+                opportunity is None
+                or opportunity.status != "pending"
+                or opportunity.claim_token is not None
+                or opportunity.not_before > current
+                or opportunity.expires_at <= current
+            ):
+                return None
+            if not _initiative_source_exists(profile, opportunity):
+                dismissed = replace(
+                    opportunity,
+                    status="dismissed",
+                    evaluated_at=current,
+                )
+                initiative = _handled_initiative(
+                    replace(initiative, current=dismissed),
+                    dismissed,
+                )
+                profiles = self._profiles.copy()
+                profiles[OWNER_PROFILE_ID] = replace(profile, initiative=initiative)
+                self._replace_all(
+                    profiles,
+                    self._conversations.copy(),
+                    committed_at=current,
+                )
+                return None
+            claimed = replace(
+                opportunity,
+                claim_token=uuid.uuid4().hex,
+                claim_expires_at=current + _INITIATIVE_CLAIM_SECONDS,
+            )
+            profiles = self._profiles.copy()
+            profiles[OWNER_PROFILE_ID] = replace(
+                profile,
+                initiative=replace(initiative, current=claimed),
+            )
+            self._replace_all(
+                profiles,
+                self._conversations.copy(),
+                committed_at=current,
+            )
+            return claimed
+
+    def complete_initiative_evaluation(
+        self,
+        *,
+        claim_token: str,
+        decision: str,
+        topic: str | None,
+        message: str | None,
+        now: float,
+    ) -> InitiativeOpportunity | None:
+        current = max(0.0, float(now))
+        with self._lock:
+            profile = self._profiles.get(OWNER_PROFILE_ID)
+            opportunity = profile.initiative.current if profile else None
+            if (
+                profile is None
+                or opportunity is None
+                or opportunity.status != "pending"
+                or opportunity.claim_token != claim_token
+            ):
+                return None
+            initiative = profile.initiative
+            normalized_topic = _key(topic)[:120]
+            speak = (
+                decision == "speak"
+                and normalized_topic
+                and compact_text(message, 500)
+            )
+            duplicate = bool(
+                speak
+                and any(
+                    _similar(item.topic_key, normalized_topic) >= 0.78
+                    for item in initiative.recent
+                )
+            )
+            if not speak or duplicate:
+                completed = replace(
+                    opportunity,
+                    status="dismissed",
+                    evaluated_at=current,
+                    claim_token=None,
+                    claim_expires_at=0.0,
+                )
+                initiative = _handled_initiative(
+                    replace(initiative, current=completed),
+                    completed,
+                )
+            else:
+                completed = replace(
+                    opportunity,
+                    topic_key=normalized_topic,
+                    status="pending_delivery",
+                    message=compact_text(message, 500),
+                    evaluated_at=current,
+                    generated_at=current,
+                    claim_token=None,
+                    claim_expires_at=0.0,
+                )
+                initiative = replace(initiative, current=completed)
+            profiles = self._profiles.copy()
+            profiles[OWNER_PROFILE_ID] = replace(
+                profile,
+                initiative=initiative,
+                updated_at=max(profile.updated_at, current),
+            )
+            self._replace_all(
+                profiles,
+                self._conversations.copy(),
+                committed_at=current,
+            )
+            callback = self._autonomy_wake
+        if callback is not None:
+            callback(OWNER_PROFILE_ID)
+        return completed
+
+    def fail_initiative_evaluation(
+        self,
+        *,
+        claim_token: str,
+        now: float,
+    ) -> bool:
+        current = max(0.0, float(now))
+        with self._lock:
+            profile = self._profiles.get(OWNER_PROFILE_ID)
+            opportunity = profile.initiative.current if profile else None
+            if (
+                profile is None
+                or opportunity is None
+                or opportunity.status != "pending"
+                or opportunity.claim_token != claim_token
+            ):
+                return False
+            pending = replace(
+                opportunity,
+                not_before=min(opportunity.expires_at, current + RETRY_SECONDS),
+                claim_token=None,
+                claim_expires_at=0.0,
+            )
+            profiles = self._profiles.copy()
+            profiles[OWNER_PROFILE_ID] = replace(
+                profile,
+                initiative=replace(profile.initiative, current=pending),
+            )
+            return self._replace_all(
+                profiles,
+                self._conversations.copy(),
+                committed_at=current,
+            )
+
+    def claim_initiative_delivery(
+        self,
+        *,
+        adapter: str,
+        available_adapters: tuple[str, ...],
+        now: float,
+    ) -> InitiativeOpportunity | None:
+        current = max(0.0, float(now))
+        channel = compact_text(adapter, 16).casefold()
+        available = tuple(
+            value
+            for item in available_adapters
+            if (value := compact_text(item, 16).casefold())
+            in {"popup", "discord"}
+        )
+        with self._lock:
+            profile = self._profiles.get(OWNER_PROFILE_ID)
+            if profile is None:
+                return None
+            initiative = _settle_initiative(profile.initiative, now=current)
+            opportunity = initiative.current
+            if (
+                opportunity is None
+                or opportunity.status != "pending_delivery"
+                or opportunity.claim_token is not None
+                or not opportunity.message
+                or not _ordinary_delivery_allowed(
+                    initiative,
+                    opportunity,
+                    now=current,
+                )
+            ):
+                return None
+            eligible = tuple(
+                value
+                for value in available
+                if value not in opportunity.failed_channels
+            ) or available
+            selected = (
+                "popup"
+                if "popup" in eligible
+                else "discord"
+                if "discord" in eligible
+                else ""
+            )
+            if channel != selected:
+                return None
+            claimed = replace(
+                opportunity,
+                claim_token=uuid.uuid4().hex,
+                claim_expires_at=current + _INITIATIVE_CLAIM_SECONDS,
+                delivery_channel=channel,
+            )
+            profiles = self._profiles.copy()
+            profiles[OWNER_PROFILE_ID] = replace(
+                profile,
+                initiative=replace(initiative, current=claimed),
+            )
+            self._replace_all(
+                profiles,
+                self._conversations.copy(),
+                committed_at=current,
+            )
+            return claimed
+
+    def acknowledge_initiative_delivery(
+        self,
+        *,
+        opportunity_id: str,
+        claim_token: str,
+        adapter: str,
+        conversation_id: str,
+        success: bool,
+        message_id: str = "",
+        now: float,
+    ) -> bool:
+        current = max(0.0, float(now))
+        channel = compact_text(adapter, 16).casefold()
+        conversation_key = compact_text(conversation_id, 160) or "popup:default"
+        with self._lock:
+            profile = self._profiles.get(OWNER_PROFILE_ID)
+            opportunity = profile.initiative.current if profile else None
+            if (
+                profile is None
+                or opportunity is None
+                or opportunity.opportunity_id != compact_text(opportunity_id, 100)
+            ):
+                return False
+            if opportunity.status == "sent":
+                return (
+                    success
+                    and opportunity.delivery_channel == channel
+                    and opportunity.delivery_message_id
+                    == (compact_text(message_id, 160) or opportunity.opportunity_id)
+                )
+            if (
+                opportunity.status != "pending_delivery"
+                or opportunity.claim_token != claim_token
+                or opportunity.delivery_channel != channel
+            ):
+                return False
+            initiative = profile.initiative
+            profiles = self._profiles.copy()
+            conversations = self._conversations.copy()
+            if not success:
+                failed = tuple(
+                    dict.fromkeys((*opportunity.failed_channels, channel))
+                )
+                pending = replace(
+                    opportunity,
+                    claim_token=None,
+                    claim_expires_at=0.0,
+                    delivery_channel=None,
+                    failed_channels=failed,
+                )
+                profiles[OWNER_PROFILE_ID] = replace(
+                    profile,
+                    initiative=replace(initiative, current=pending),
+                )
+            else:
+                delivery_id = (
+                    compact_text(message_id, 160) or opportunity.opportunity_id
+                )
+                sent = replace(
+                    opportunity,
+                    status="sent",
+                    claim_token=None,
+                    claim_expires_at=0.0,
+                    delivered_at=current,
+                    delivery_message_id=delivery_id,
+                )
+                recent = (
+                    *initiative.recent,
+                    SentInitiative(
+                        sent.topic_key,
+                        sent.source_id,
+                        sent.source_type,
+                        current,
+                    ),
+                )[-_MAX_RECENT_INITIATIVES:]
+                initiative = _handled_initiative(
+                    replace(
+                        initiative,
+                        current=sent,
+                        cooldown_until=(
+                            initiative.cooldown_until
+                            if sent.source_type == "reminder"
+                            else current
+                            + ORDINARY_INITIATIVE_COOLDOWN_SECONDS
+                        ),
+                        recent=recent,
+                    ),
+                    sent,
+                )
+                profiles[OWNER_PROFILE_ID] = replace(
+                    profile,
+                    initiative=initiative,
+                    updated_at=max(profile.updated_at, current),
+                )
+                record = self._conversation(OWNER_PROFILE_ID, conversation_key)
+                turn_id = f"initiative:{opportunity.opportunity_id}"
+                if not any(turn.turn_id == turn_id for turn in record.recent_turns):
+                    turn = ChatTurn(
+                        turn_id,
+                        "assistant",
+                        opportunity.message or "",
+                        current,
+                        "initiative",
+                    )
+                    record = replace(
+                        record,
+                        recent_turns=_trim_turns((*record.recent_turns, turn)),
+                        last_assistant_at=max(record.last_assistant_at, current),
+                        updated_at=max(record.updated_at, current),
+                    )
+                    conversations[conversation_key] = record
+            self._replace_all(
+                profiles,
+                conversations,
+                committed_at=current,
+            )
+            callback = self._autonomy_wake
+        if callback is not None:
+            callback(OWNER_PROFILE_ID)
+        return True
+
+    def release_initiative_delivery(
+        self,
+        *,
+        adapter: str,
+        now: float,
+    ) -> bool:
+        channel = compact_text(adapter, 16).casefold()
+        with self._lock:
+            profile = self._profiles.get(OWNER_PROFILE_ID)
+            opportunity = profile.initiative.current if profile else None
+            if (
+                profile is None
+                or opportunity is None
+                or opportunity.status != "pending_delivery"
+                or opportunity.delivery_channel != channel
+                or opportunity.claim_token is None
+            ):
+                return False
+            failed = tuple(
+                dict.fromkeys((*opportunity.failed_channels, channel))
+            )
+            pending = replace(
+                opportunity,
+                claim_token=None,
+                claim_expires_at=0.0,
+                delivery_channel=None,
+                failed_channels=failed,
+            )
+            profiles = self._profiles.copy()
+            profiles[OWNER_PROFILE_ID] = replace(
+                profile,
+                initiative=replace(profile.initiative, current=pending),
+            )
+            return self._replace_all(
+                profiles,
+                self._conversations.copy(),
+                committed_at=max(0.0, float(now)),
+            )
+
+    def set_autonomy_wake(
         self,
         callback: Callable[[str], None] | None,
     ) -> None:
         with self._lock:
-            self._presence_wake = callback
+            self._autonomy_wake = callback
+
+    @staticmethod
+    def _presence_due_at(presence: PresenceState, now: float) -> float:
+        unbootstrapped = (
+            presence.current_activity is None
+            and presence.last_decision_at == 0.0
+        )
+        if presence.retry_at > 0.0:
+            return presence.retry_at
+        return now if unbootstrapped else presence.next_decision_at
 
     @staticmethod
     def _presence_due(presence: PresenceState, now: float) -> bool:
         return (
             presence.claim_token is None
-            and presence.retry_at <= now
-            and presence.next_decision_at <= now
+            and StateStore._presence_due_at(presence, now) <= now
         )
 
     def wake_presence_if_due(self, profile_id: str, *, now: float) -> bool:
         profile = canonical_profile_id(profile_id)
         with self._lock:
             state = self._profiles.get(profile)
-            callback = self._presence_wake
+            callback = self._autonomy_wake
             due = bool(
                 state is not None
                 and self._presence_due(state.presence, now)
@@ -2805,12 +3524,12 @@ class StateStore:
                     changed = True
                 if presence.claim_token is not None:
                     wakes.append(presence.claim_expires_at)
-                elif presence.retry_at > current:
-                    wakes.append(presence.retry_at)
-                elif presence.next_decision_at <= current:
-                    due.append(profile_id)
                 else:
-                    wakes.append(presence.next_decision_at)
+                    due_at = self._presence_due_at(presence, current)
+                    if due_at <= current:
+                        due.append(profile_id)
+                    else:
+                        wakes.append(due_at)
             if changed:
                 self._replace_all(
                     profiles,
@@ -2854,28 +3573,12 @@ class StateStore:
         *,
         now: float,
         error: str,
-        retryable: bool,
     ) -> PresenceState:
-        first_failure = presence.retry_at <= 0.0
-        if retryable and first_failure:
-            return replace(
-                presence,
-                claim_token=None,
-                claim_expires_at=0.0,
-                retry_at=now + RETRY_SECONDS,
-                last_error=compact_text(error, 120) or "life decision failed",
-            )
-        next_at = next_decision_time(now)
-        activity = presence.current_activity
-        if activity is not None:
-            activity = replace(activity, expected_end_at=next_at)
         return replace(
             presence,
-            current_activity=activity,
             claim_token=None,
             claim_expires_at=0.0,
-            retry_at=0.0,
-            next_decision_at=next_at,
+            retry_at=now + RETRY_SECONDS,
             last_error=compact_text(error, 120) or "life decision failed",
         )
 
@@ -2886,7 +3589,6 @@ class StateStore:
         claim_token: str,
         now: float,
         error: str,
-        retryable: bool = True,
     ) -> bool:
         profile = canonical_profile_id(profile_id)
         current = max(0.0, float(now))
@@ -2900,7 +3602,6 @@ class StateStore:
                     state.presence,
                     now=current,
                     error=error,
-                    retryable=retryable,
                 ),
             )
             profiles = self._profiles.copy()
@@ -2910,7 +3611,7 @@ class StateStore:
                 self._conversations.copy(),
                 committed_at=current,
             )
-            callback = self._presence_wake
+            callback = self._autonomy_wake
         if callback is not None:
             callback(profile)
         return True
@@ -2931,7 +3632,11 @@ class StateStore:
             state = self._profiles.get(profile)
             if state is None or state.presence.claim_token != claim_token:
                 return False, "life claim is unavailable"
-            rejection = life_decision_rejection(state.presence, decision)
+            rejection = life_decision_rejection(
+                state.presence,
+                decision,
+                grounded_context=grounded_context,
+            )
             emotionally_updated = state
             if not rejection:
                 activity = (
@@ -2959,10 +3664,6 @@ class StateStore:
                     mood_delta_limit=0.20,
                     expected_emotion_updated_at=expected_emotion_updated_at,
                     require_complete=True,
-                    bootstrap=(
-                        state.mood.updated_at == 0.0
-                        and state.emotion.updated_at == 0.0
-                    ),
                 )
                 if not appraisal_valid:
                     rejection = "life decision lacks a grounded emotional appraisal"
@@ -2971,7 +3672,6 @@ class StateStore:
                     state.presence,
                     now=current,
                     error=rejection,
-                    retryable=True,
                 )
                 next_state = replace(state, presence=presence)
             else:
@@ -3009,7 +3709,7 @@ class StateStore:
                 self._conversations.copy(),
                 committed_at=current,
             )
-            callback = self._presence_wake
+            callback = self._autonomy_wake
         if callback is not None:
             callback(profile)
         return not bool(rejection), rejection

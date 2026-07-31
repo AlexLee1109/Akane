@@ -31,6 +31,7 @@ let isSending = false;
 let preservePreview = false;
 let lastRenderedMessagesKey = "";
 let lastKnownStateVersion = -1;
+let lastInitiativeDeliveryId = "";
 
 let bubbleVisible = false;
 let bubbleHideTimer = null;
@@ -1024,27 +1025,106 @@ async function refreshStatus() {
   }
 }
 
-async function checkInitiative() {
-  if (isSending) {
+async function reportPopupAvailability(available) {
+  return apiFetch("/api/initiative/delivery/claim", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    keepalive: !available,
+    body: JSON.stringify({
+      adapter: "popup",
+      conversation_id: SESSION_ID,
+      available,
+      wait_seconds: available ? 25 : 0,
+    }),
+  });
+}
+
+async function acknowledgeInitiative(
+  delivery,
+  success,
+) {
+  const response = await apiFetch(
+    "/api/initiative/delivery/ack",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        adapter: "popup",
+        conversation_id: SESSION_ID,
+        opportunity_id:
+          delivery.opportunity_id,
+        claim_token: delivery.claim_token,
+        success,
+        message_id:
+          delivery.opportunity_id,
+      }),
+    },
+  );
+  return response.ok;
+}
+
+async function initiativeDeliveryLoop() {
+  if (POPUP_ROLE !== "companion") {
     return;
   }
-
-  try {
-    const response = await apiFetch("/api/initiative", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        conversation_id: SESSION_ID,
-        source: "popup",
-      }),
-    });
-    const payload = await response.json();
-    if (Array.isArray(payload.messages) && payload.reply) {
-      renderMessages(payload.messages);
-      lastKnownStateVersion = -1;
+  while (true) {
+    if (document.visibilityState !== "visible") {
+      try {
+        await reportPopupAvailability(false);
+      } catch {}
+      await new Promise((resolve) => {
+        document.addEventListener(
+          "visibilitychange",
+          resolve,
+          { once: true },
+        );
+      });
+      continue;
     }
-  } catch {
-    return;
+    try {
+      const response =
+        await reportPopupAvailability(true);
+      const payload = await response.json();
+      const delivery = payload.delivery;
+      if (!delivery?.message) {
+        continue;
+      }
+      if (document.visibilityState !== "visible") {
+        await acknowledgeInitiative(
+          delivery,
+          false,
+        );
+        continue;
+      }
+      if (
+        lastInitiativeDeliveryId !==
+        delivery.opportunity_id
+      ) {
+        lastInitiativeDeliveryId =
+          delivery.opportunity_id;
+        rememberMessages([
+          ...currentMessages,
+          {
+            role: "assistant",
+            content: delivery.message,
+          },
+        ]);
+        bubbleStreaming = false;
+        setBubbleText(delivery.message);
+        hideBubbleSoon(10000);
+      }
+      await acknowledgeInitiative(
+        delivery,
+        true,
+      );
+      lastKnownStateVersion = -1;
+    } catch {
+      await new Promise((resolve) => {
+        window.setTimeout(resolve, 1000);
+      });
+    }
   }
 }
 
@@ -1370,10 +1450,11 @@ async function boot() {
     2500,
   );
 
-  window.setInterval(
-    checkInitiative,
-    5 * 60 * 1000,
-  );
+  void initiativeDeliveryLoop();
+
+  window.addEventListener("pagehide", () => {
+    void reportPopupAvailability(false);
+  });
 
   focusComposerInput();
   syncInteractiveRegions();

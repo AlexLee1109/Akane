@@ -108,21 +108,6 @@
   height: 18px;
 }
 
-.tech-button-primary {
-  border-color: transparent;
-  background: var(--akane-blue-deep);
-  color: white;
-}
-
-.tech-button-primary:hover {
-  background: #103dbb;
-}
-
-.tech-button-secondary {
-  background: white;
-  color: var(--akane-text);
-}
-
 .tech-section {
   padding-block: 82px;
 }
@@ -652,11 +637,6 @@
   border-color: white;
   background: white;
   color: var(--akane-blue-deep);
-}
-
-.tech-button-outline {
-  border-color: rgba(255, 255, 255, 0.4);
-  color: white;
 }
 
 @media (max-width: 1100px) {

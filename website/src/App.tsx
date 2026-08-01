@@ -100,7 +100,7 @@ function Logo() {
   return <img className="logo" src={logo} alt="Akane logo" />;
 }
 
-function GithubLink({ children, className = "button secondary" }: { children: ReactNode; className?: string }) {
+function GithubLink({ children, className }: { children: ReactNode; className: string }) {
   return projectConfig.githubUrl
     ? <a className={className} href={projectConfig.githubUrl} target="_blank" rel="noreferrer">{children}<span aria-hidden="true">↗</span></a>
     : <span className={`${className} disabled`} aria-disabled="true">{children}</span>;
@@ -212,7 +212,6 @@ function HomeHero() {
       <p className="home-lead">Akane develops through conversation, remembers meaningful experiences, and stays present across the desktop, Discord, and the web—powered by a local model running on a Raspberry Pi 5.</p>
       <div className="actions hero-actions">
         <Link className="button primary" to="/demo">Try the Demo<span aria-hidden="true">→</span></Link>
-        <GithubLink>View on GitHub</GithubLink>
       </div>
       <ul className="trust-list" aria-label="Project facts">
         {trustItems.map(([icon, label]) => <li key={label}><HomeIcon name={icon} />{label}</li>)}
@@ -307,7 +306,6 @@ function HomeCallToAction() {
       </div>
       <div className="actions">
         <Link className="button cta-primary" to="/demo">Try the Demo</Link>
-        <GithubLink className="button cta-secondary">View on GitHub</GithubLink>
       </div>
     </div>
   </section>;

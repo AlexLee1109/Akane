@@ -259,12 +259,6 @@ function SectionHeading({ eyebrow, title, description, id }: { eyebrow: string; 
   </div>;
 }
 
-function GithubAction({ className = "tech-button tech-button-secondary" }: { className?: string }) {
-  return projectConfig.githubUrl
-    ? <a className={className} href={projectConfig.githubUrl} target="_blank" rel="noreferrer">View on GitHub<span aria-hidden="true">↗</span></a>
-    : <span className={`${className} disabled`} aria-disabled="true">View on GitHub</span>;
-}
-
 function TechnologyHero() {
   return <section className="tech-hero" aria-labelledby="technology-title">
     <div className="shell tech-hero-inner">
@@ -272,10 +266,6 @@ function TechnologyHero() {
       <h1 id="technology-title">How Akane works</h1>
       <p className="tech-hero-accent">One companion. One coordinated runtime.</p>
       <p className="tech-hero-lead">Akane combines local language-model inference with persistent memory, relationship continuity, grounded emotion, and multiple interfaces through one shared backend running on a Raspberry Pi 5.</p>
-      <div className="tech-actions">
-        <a className="tech-button tech-button-primary" href="#architecture">Explore the Architecture<TechIcon name="arrow" /></a>
-        <GithubAction />
-      </div>
     </div>
   </section>;
 }
@@ -458,8 +448,8 @@ function PlannedPresentation() {
 function TechnologyCTA() {
   return <section className="tech-cta" aria-labelledby="technology-cta-title">
     <div className="shell tech-cta-inner">
-      <div><p className="tech-eyebrow">Explore Akane</p><h2 id="technology-cta-title">See the real pipeline in action.</h2><p>Try the isolated guest demo or inspect the project on GitHub.</p></div>
-      <div className="tech-actions"><Link className="tech-button tech-button-light" to="/demo">Try the Demo<TechIcon name="arrow" /></Link><GithubAction className="tech-button tech-button-outline" /></div>
+      <div><p className="tech-eyebrow">Explore Akane</p><h2 id="technology-cta-title">See the real pipeline in action.</h2><p>Try the isolated guest demo to experience the shared runtime.</p></div>
+      <div className="tech-actions"><Link className="tech-button tech-button-light" to="/demo">Try the Demo<TechIcon name="arrow" /></Link></div>
     </div>
   </section>;
 }

@@ -273,16 +273,6 @@ p {
   background: #103dbb;
 }
 
-.button.secondary {
-  background: rgba(255, 255, 255, 0.88);
-  color: var(--akane-text);
-}
-
-.button.secondary:hover {
-  border-color: var(--akane-border-strong);
-  background: white;
-}
-
 .disabled {
   cursor: not-allowed;
   opacity: 0.58;
@@ -337,7 +327,7 @@ p {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  object-position: 64% center;
+  object-position: 64% top;
 }
 
 .home-hero-copy {
@@ -757,16 +747,6 @@ p {
 
 .cta-primary:hover {
   background: #eef4ff;
-}
-
-.cta-secondary {
-  border-color: rgba(255, 255, 255, 0.38);
-  background: transparent;
-  color: white;
-}
-
-.cta-secondary:hover {
-  border-color: white;
 }
 
 .footer {

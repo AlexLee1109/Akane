@@ -37,6 +37,7 @@ export function AkaneStage(props: AkaneStageProps) {
     props.backendPresentation,
   );
   return <section className="akane-stage demo-panel" aria-label="Akane stage">
+    {props.connection !== "connecting" && <span className={`akane-stage-mode ${props.connection}`}>{props.connection === "live" ? "Live" : "Preview"}</span>}
     {props.responseText?.trim() && <ConversationView text={props.responseText} />}
     <CharacterRenderer imageSrc={props.imageSrc} state={state} />
   </section>;

@@ -128,6 +128,12 @@ export function DemoPage() {
     setError("");
   }
 
+  function clearPreview() {
+    setMessages([]);
+    setBackendPresentation(undefined);
+    setError("");
+  }
+
   async function createOrRevalidateGuest() {
     const storedToken = getGuestToken();
     let session: PublicSession;
@@ -332,7 +338,7 @@ export function DemoPage() {
     <section className="demo-intro shell" aria-labelledby="demo-title">
       <p className="demo-eyebrow"><span aria-hidden="true" />Live Demo</p>
       <h1 id="demo-title">Chat with Akane <em>in real time.</em></h1>
-      <p>Start an isolated temporary guest session and talk to the real Akane runtime running on the Raspberry Pi. When the Pi is unavailable, the page switches to a clearly labeled prerecorded preview.</p>
+      <p>Start an isolated temporary guest session and talk to the real Akane runtime on the Raspberry Pi. When the Pi is unavailable, the page uses a clearly labeled prerecorded preview.</p>
     </section>
 
     <section className="demo-status-strip shell" aria-label="Demo status" aria-live="polite">
@@ -341,7 +347,7 @@ export function DemoPage() {
     </section>
 
     <section className="demo-workspace shell" aria-label="Akane demo workspace">
-      <DemoConversation messages={messages} connectionLabel={connectionLabel} generating={generating} />
+      <DemoConversation messages={messages} generating={generating} />
       <AkaneStage
         imageSrc={characterAsset}
         responseText={responseText}
@@ -352,7 +358,6 @@ export function DemoPage() {
       />
       <DemoControls
         connection={connection}
-        connectionLabel={connectionLabel}
         guestEnabled={health?.guestEnabled === true}
         activeSession={Boolean(activeSession)}
         generating={generating}
@@ -364,6 +369,7 @@ export function DemoPage() {
         onReconnect={reconnect}
         onReset={() => { void resetConversation(); }}
         onEndSession={() => { void endGuestSession(); }}
+        onClearPreview={clearPreview}
       />
     </section>
 

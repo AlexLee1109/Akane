@@ -10,11 +10,10 @@ export interface DemoMessage {
 
 interface DemoConversationProps {
   messages: readonly DemoMessage[];
-  connectionLabel: string;
   generating: boolean;
 }
 
-export function DemoConversation({ messages, connectionLabel, generating }: DemoConversationProps) {
+export function DemoConversation({ messages, generating }: DemoConversationProps) {
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -23,8 +22,8 @@ export function DemoConversation({ messages, connectionLabel, generating }: Demo
 
   return <section className="demo-conversation demo-panel" aria-labelledby="demo-conversation-title">
     <header className="demo-panel-header">
-      <div><span>Active browser session</span><h2 id="demo-conversation-title">Current conversation</h2></div>
-      <span className="demo-connection-badge">{connectionLabel}</span>
+      <h2 id="demo-conversation-title">Current conversation</h2>
+      {generating && <span className="demo-streaming-label">Streaming</span>}
     </header>
     <div
       className="demo-messages"

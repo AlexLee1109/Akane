@@ -315,12 +315,10 @@ function TechIcon({ name, className = "" }: { name: IconName; className?: string
   return <svg className={`tech-icon ${className}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">{paths[name]}</svg>;
 }
 
-function SectionHeading({ eyebrow, title, description, id, as = "h2" }: { eyebrow: string; title: string; description?: string; id: string; as?: "h1" | "h2" }) {
-  const Heading = as;
-
+function SectionHeading({ eyebrow, title, description, id }: { eyebrow: string; title: string; description?: string; id: string }) {
   return <div className="tech-section-heading">
     <p className="tech-eyebrow"><span aria-hidden="true" />{eyebrow}</p>
-    <Heading id={id}>{title}</Heading>
+    <h2 id={id}>{title}</h2>
     {description && <p>{description}</p>}
   </div>;
 }
@@ -335,6 +333,26 @@ function FlowArrow() {
   return <span className="tech-flow-arrow" aria-hidden="true"><TechIcon name="arrow" /></span>;
 }
 
+function TechnologyIntro() {
+  return <section className="tech-intro" aria-labelledby="technology-title">
+    <div className="shell tech-intro-inner">
+      <div className="tech-intro-copy">
+        <p className="tech-eyebrow"><span aria-hidden="true" />Technology</p>
+        <h1 id="technology-title">How Akane works</h1>
+        <p className="tech-intro-accent">Local intelligence. Shared continuity.</p>
+        <p className="tech-intro-lead">Akane is designed as one companion system, not a collection of disconnected AI features. A shared local runtime carries identity and continuity across every interface.</p>
+      </div>
+      <div className="tech-intro-visual" aria-hidden="true">
+        <span className="tech-intro-ring" />
+        <div className="tech-intro-hub"><TechIcon name="coordinator" /><strong>One runtime</strong><span>Akane core</span></div>
+        <div className="tech-intro-node tech-intro-node-interface"><TechIcon name="browser" /><span>Interfaces</span></div>
+        <div className="tech-intro-node tech-intro-node-context"><TechIcon name="brain" /><span>Context</span></div>
+        <div className="tech-intro-node tech-intro-node-model"><TechIcon name="model" /><span>Local model</span></div>
+      </div>
+    </div>
+  </section>;
+}
+
 function ArchitectureOverview() {
   return <section id="architecture" className="tech-section tech-architecture-section" aria-labelledby="architecture-title">
     <div className="shell">
@@ -343,7 +361,6 @@ function ArchitectureOverview() {
         title="One coordinated companion"
         description="Every interface enters the same conversation path. The backend resolves the active profile, gathers relevant context, coordinates local inference, streams the response, and commits validated state."
         id="architecture-title"
-        as="h1"
       />
       <figure className="tech-architecture" aria-describedby="architecture-summary">
         <figcaption id="architecture-summary" className="sr-only">Desktop popup, Discord, and the public website enter one shared request pipeline. Selected context feeds prompt compilation. The Gemma runtime streams visible text before validated conversation and companion state is committed to atomic JSON persistence.</figcaption>
@@ -577,6 +594,7 @@ function TechnologyCTA() {
 
 export function TechnologyPage() {
   return <main className="technology-page">
+    <TechnologyIntro />
     <ArchitectureOverview />
     <RequestLifecycle />
     <CoreSystems />

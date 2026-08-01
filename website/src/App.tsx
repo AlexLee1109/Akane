@@ -77,7 +77,6 @@ function HomePage() { return <main className="home-page">
       />
       <img src={homepageImage} width="1448" height="1086" fetchPriority="high" decoding="async" alt="Akane, a blue-haired AI companion, standing in a bright room overlooking a city." />
     </picture>
-    <div className="hero-atmosphere" aria-hidden="true"><span /><span /><span /></div>
     <div className="home-hero-copy">
       <p className="hero-badge"><span aria-hidden="true">♢</span> Local-first <b>•</b> Private <b>•</b> Always yours</p>
       <h1 id="home-title">Your local<br />AI companion.</h1>

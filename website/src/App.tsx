@@ -49,8 +49,9 @@ function GithubLink({ children, className = "button secondary" }: { children: Re
 
 function Navbar() {
   const [open, setOpen] = useState(false);
+  const location = useLocation();
   const links = [["/", "Home"], ["/demo", "Demo"], ["/technology", "Technology"]] as const;
-  return <header className="site-header"><nav className="nav shell" aria-label="Primary navigation">
+  return <header className={`site-header ${location.pathname === "/" ? "home-header" : ""}`}><nav className="nav shell" aria-label="Primary navigation">
     <Link className="brand" to="/" onClick={() => setOpen(false)}><Logo /><strong>Akane</strong><span>AI COMPANION</span></Link>
     <button className="menu-button" aria-expanded={open} aria-controls="nav-links" onClick={() => setOpen(!open)}>{open ? "Close" : "Menu"}</button>
     <div id="nav-links" className={`nav-links ${open ? "open" : ""}`}>{links.map(([to, label]) => <NavLink key={to} to={to} end={to === "/"} onClick={() => setOpen(false)}>{label}</NavLink>)}<GithubLink className="nav-github">GitHub</GithubLink></div>
@@ -72,7 +73,7 @@ function HomePage() { return <main className="home-page">
       <source
         type="image/jpeg"
         srcSet={`${projectConfig.basePath}assets/homepage-image-720.jpg 720w, ${projectConfig.basePath}assets/homepage-image-1100.jpg 1100w, ${projectConfig.basePath}assets/homepage-image-1448.jpg 1448w`}
-        sizes="(max-width: 760px) calc(100vw - 28px), (max-width: 1440px) calc(100vw - 48px), 1380px"
+        sizes="100vw"
       />
       <img src={homepageImage} width="1448" height="1086" fetchPriority="high" decoding="async" alt="Akane, a blue-haired AI companion, standing in a bright room overlooking a city." />
     </picture>

@@ -4,6 +4,7 @@ import { AkaneStage } from "./components/AkaneStage";
 import { projectConfig } from "./config/project";
 import { akaneClient, PublicApiError, type PublicHealth, type PublicSession } from "./lib/akaneClient";
 import { clearGuestToken, getGuestToken, storeGuestToken } from "./lib/session";
+import { TechnologyPage } from "./pages/TechnologyPage";
 import type { AkanePresentationState } from "./presentation";
 
 const asset = `${projectConfig.basePath}assets/akane-hero.png`;
@@ -27,10 +28,6 @@ const plannedWork = [
   "Live2D",
   "Expression synchronization",
 ];
-const stack = [
-  ["Inference", "Gemma 4 E4B", "llama.cpp · GGUF"], ["Backend", "Python", "FastAPI streaming"], ["Persistence", "Atomic JSON", "state and history"], ["Interfaces", "React + Vite", "Popup · Discord"], ["Deployment", "Raspberry Pi 5", "local runtime"],
-];
-
 function Mark() { return <span className="mark" aria-hidden="true">✦</span>; }
 function Logo() { return <img className="logo" src={logo} alt="Akane logo" />; }
 function GithubLink({ children, className = "button secondary" }: { children: ReactNode; className?: string }) {
@@ -465,16 +462,6 @@ function DemoPage() {
     <section className="runtime panel" aria-label="Runtime status"><span>◈ {connectionLabel}</span><span>▣ Model: {projectConfig.modelName}</span><span>◉ {previewMode ? "Nothing saved" : sessionLabel}</span></section>
   </main>;
 }
-
-function TechnologyPage() { const architecture: Array<[string, string[]]> = [["Interfaces", ["Web Demo", "Desktop Popup", "Discord"]], ["Shared Akane Backend", ["Prompt Compiler", "Conversation Memory", "Canonical Profile State", "Emotion System", "Offscreen Life", "Autonomous Initiative", "Time Context", "Inference Coordinator"]], ["Model Runtime", ["Gemma 4 E4B", "llama.cpp", "Quantized GGUF"]], ["Persistence", ["Atomic state writes", "Conversation history", "Validated profile state"]]]; return <main>
-  <section className="technology-hero shell"><div><Eyebrow>Local first · Privacy minded · Always yours</Eyebrow><h1>How <em>Akane</em> works</h1><p className="lead">Akane combines a local language model with persistent state, memory, autonomous life, emotional continuity, and multiple user interfaces.</p><p className="detail">Akane’s primary backend runs locally on a Raspberry Pi 5. This static frontend connects to that backend when an endpoint is configured.</p><div className="actions"><Link className="button primary" to="/demo">Try Demo →</Link><GithubLink>View on GitHub</GithubLink></div></div><div className="tech-hero-art"><div className="speech-bubble">A local companion<br /><strong>with a shared runtime.</strong></div><Character /></div></section>
-  <section className="architecture shell panel"><div className="section-heading left"><Eyebrow>System architecture</Eyebrow><h2>One coordinated companion</h2></div><div className="architecture-grid">{architecture.map(([title, items], index) => <article key={title} className="architecture-column"><h3>{title}</h3><div>{items.map(item => <span key={item}>{item}</span>)}</div>{index < architecture.length - 1 && <b className="flow-arrow" aria-hidden="true">↓</b>}</article>)}</div><p className="flow-caption">Interfaces → shared request handling → prompt and context compilation → serialized inference → response streaming → state persistence</p></section>
-  <section className="section shell"><div className="section-heading"><Eyebrow>Core capabilities</Eyebrow><h2>Built for continuity, not just replies</h2></div><div className="feature-grid">{[["◈", "Local Model Inference", "A single llama.cpp runtime serializes visible and background work on constrained hardware."], ["✦", "Persistent Memory and State", "Atomic JSON writes preserve validated conversations, memory, emotion, and presence."], ["♡", "Emotional Continuity", "Recent context informs a grounded emotional state without a second model pass."], ["◔", "Autonomous Life and Initiative", "A process-owned worker maintains activities and avoids duplicate autonomous messages."], ["↗", "Streaming Multi-Interface UI", "The popup, Discord adapter, and web demo all use the shared request path."]].map(([i, t, p]) => <article className="feature-card" key={t}><i>{i}</i><h3>{t}</h3><p>{p}</p><span className="implemented">Implemented</span></article>)}</div></section>
-  <section className="flow-section shell panel"><Eyebrow>System flow</Eyebrow><div className="system-flow">{["User interface", "Shared backend", "Relevant context", "Gemma inference", "Streamed response", "Validated state update"].map((item, index) => <div key={item}><span>{item}</span>{index < 5 && <b>→</b>}</div>)}</div></section>
-  <section className="stack-section shell"><div className="section-heading left"><Eyebrow>Technology stack</Eyebrow><h2>Small, confirmed building blocks</h2></div><div className="stack-grid">{stack.map(([category, name, detail]) => <article key={category}><span>{category}</span><h3>{name}</h3><p>{detail}</p></article>)}</div></section>
-  <section className="engineering shell panel"><Eyebrow>Engineering focus</Eyebrow><h2>The constraints shape the work.</h2><div>{["Serializing conversation and autonomous inference on one Pi", "Preserving state safely across restarts", "Keeping companion context distinct from the user", "Coordinating popup, Discord, and web interfaces"].map(item => <p key={item}>✦ {item}</p>)}</div></section>
-  <section className="home-cta shell"><Logo /><div><h2>Build with Akane.</h2><p>Explore the browser demo or see the local-first project on GitHub.</p></div><GithubLink>View on GitHub</GithubLink><Link className="button primary" to="/demo">Try Demo →</Link></section>
-</main>; }
 
 function App() { const location = useLocation(); useEffect(() => { window.scrollTo(0, 0); }, [location.pathname]); return <><Navbar /><Routes><Route path="/" element={<HomePage />} /><Route path="/demo" element={<DemoPage />} /><Route path="/technology" element={<TechnologyPage />} /><Route path="*" element={<HomePage />} /></Routes><Footer /></>; }
 export default App;

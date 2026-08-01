@@ -128,31 +128,33 @@ export function DemoPage() {
     setError("");
   }
 
+  async function createOrRevalidateGuest() {
+    const storedToken = getGuestToken();
+    let session: PublicSession;
+    try {
+      session = storedToken
+        ? await akaneClient.revalidateSession(storedToken)
+        : await akaneClient.createSession();
+    } catch (cause) {
+      if (!(cause instanceof PublicApiError) || !["session_expired", "unauthorized"].includes(cause.code)) {
+        throw cause;
+      }
+      clearGuestToken();
+      session = await akaneClient.createSession();
+    }
+    storeGuestToken(session.sessionToken);
+    activateSession(session);
+    return session;
+  }
+
   async function startGuest() {
     if (connection !== "live" || generating || actionPending) return;
     setActionPending(true);
     setError("");
     try {
-      const storedToken = getGuestToken();
-      const session = storedToken
-        ? await akaneClient.revalidateSession(storedToken)
-        : await akaneClient.createSession();
-      storeGuestToken(session.sessionToken);
-      activateSession(session);
+      await createOrRevalidateGuest();
       setMessages([]);
     } catch (cause) {
-      if (cause instanceof PublicApiError && ["session_expired", "unauthorized"].includes(cause.code)) {
-        clearGuestToken();
-        try {
-          const session = await akaneClient.createSession();
-          storeGuestToken(session.sessionToken);
-          activateSession(session);
-          setMessages([]);
-          return;
-        } catch (renewalError) {
-          cause = renewalError;
-        }
-      }
       setError((cause as Error).message);
       if (availabilityFailed(cause)) reconnect();
     } finally {
@@ -225,7 +227,7 @@ export function DemoPage() {
 
   async function send() {
     const message = input.trim();
-    if (!message || generating) return;
+    if (!message || generating || actionPending) return;
     if (message.length > 750) {
       setError("Keep messages at or under 750 characters.");
       return;
@@ -240,9 +242,23 @@ export function DemoPage() {
       sendPreview(message);
       return;
     }
-    if (!activeSession) {
-      setError("Start a temporary guest session before sending a live message.");
-      return;
+    let session = activeSession;
+    if (!session) {
+      if (health?.guestEnabled !== true) {
+        setError("Temporary guest sessions are not available right now.");
+        return;
+      }
+      setActionPending(true);
+      setError("");
+      try {
+        session = await createOrRevalidateGuest();
+      } catch (cause) {
+        setError((cause as Error).message);
+        if (availabilityFailed(cause)) reconnect();
+        return;
+      } finally {
+        setActionPending(false);
+      }
     }
 
     setInput("");
@@ -259,7 +275,7 @@ export function DemoPage() {
     aborter.current = controller;
     let completed = "";
     try {
-      await akaneClient.streamChat(activeSession.sessionToken, message, {
+      await akaneClient.streamChat(session.sessionToken, message, {
         onDelta: delta => {
           completed += delta;
           setMessages(current => current.map(item => item.id === replyId ? { ...item, text: completed } : item));
@@ -291,17 +307,23 @@ export function DemoPage() {
 
   const previewMode = connection === "showcase";
   const needsSession = connection === "live" && !activeSession;
-  const inputDisabled = generating || actionPending || connection === "connecting" || needsSession;
+  const inputDisabled = generating || actionPending || connection === "connecting"
+    || (needsSession && health?.guestEnabled !== true);
   const connectionLabel = connection === "connecting"
     ? "Connecting"
-    : previewMode ? "Preview Mode" : health?.status === "busy" ? "Live · busy" : "Live";
-  const sessionLabel = activeSession ? "Temporary guest session active" : "No guest session";
+    : previewMode
+      ? "Preview Mode · Prerecorded"
+      : health?.status === "busy"
+        ? "Live · Busy"
+        : activeSession
+          ? "Live · Temporary guest session"
+          : "Live · No guest session";
   const lastMessage = messages.at(-1);
   const responseText = lastMessage?.role === "akane" && lastMessage.text.trim() ? lastMessage.text : undefined;
   const composerPlaceholder = connection === "connecting"
     ? "Connecting to Akane…"
     : needsSession
-      ? "Start a guest session to message Akane…"
+      ? "Message Akane to begin a guest session…"
       : previewMode
         ? "Message the prerecorded preview…"
         : "Message Akane…";
@@ -314,9 +336,8 @@ export function DemoPage() {
     </section>
 
     <section className="demo-status-strip shell" aria-label="Demo status" aria-live="polite">
-      <div><span className={`demo-status-dot ${connection}`} aria-hidden="true" /><p><span>Connection</span><strong>{connectionLabel}</strong></p></div>
-      <div><span className="demo-status-symbol" aria-hidden="true">◇</span><p><span>Runtime</span><strong>{projectConfig.modelName}</strong></p></div>
-      <div><span className="demo-status-symbol" aria-hidden="true">○</span><p><span>Session</span><strong>{sessionLabel}</strong></p></div>
+      <div><span className={`demo-status-dot ${connection}`} aria-hidden="true" /><p><span>Demo status</span><strong>{connectionLabel}</strong></p></div>
+      <small>Model: {projectConfig.modelName}</small>
     </section>
 
     <section className="demo-workspace shell" aria-label="Akane demo workspace">
@@ -325,11 +346,8 @@ export function DemoPage() {
         imageSrc={characterAsset}
         responseText={responseText}
         connection={connection}
-        connectionLabel={connectionLabel}
         generating={generating}
         hasResponseText={Boolean(responseText)}
-        modelName={projectConfig.modelName}
-        sessionLabel={previewMode && !activeSession ? "Prerecorded preview" : sessionLabel}
         backendPresentation={backendPresentation}
       />
       <DemoControls
@@ -343,7 +361,6 @@ export function DemoPage() {
         canReconnect={previewMode && projectConfig.demoMode === "live" && Boolean(projectConfig.apiUrl)}
         onStartGuest={() => { void startGuest(); }}
         onOpenPreview={openPreview}
-        onClearPreview={openPreview}
         onReconnect={reconnect}
         onReset={() => { void resetConversation(); }}
         onEndSession={() => { void endGuestSession(); }}

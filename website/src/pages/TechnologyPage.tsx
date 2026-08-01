@@ -21,33 +21,37 @@ type IconName =
   | "shield"
   | "stream";
 
-type RoadmapStatus = "In development" | "Planned" | "Exploratory";
+type RoadmapStatus = "Available" | "In development" | "Planned";
 
 interface ArchitectureStage {
   icon: IconName;
-  label: string;
-  detail: string;
-  emphasis?: boolean;
+  title: string;
+  description: string;
+}
+
+interface LifecycleStage {
+  title: string;
+  description: string;
 }
 
 interface CoreSystem {
   icon: IconName;
   title: string;
   description: string;
-  systems: readonly string[];
+  details: readonly string[];
 }
 
-interface StackItem {
+interface StackGroup {
   category: string;
-  technology: string;
-  purpose: string;
+  title: string;
+  items: readonly string[];
 }
 
 interface Tradeoff {
-  number: string;
   title: string;
   constraint: string;
-  consequence: string;
+  response: string;
+  importance: string;
 }
 
 interface RoadmapItem {
@@ -60,239 +64,171 @@ interface RoadmapItem {
 const architectureStages: readonly ArchitectureStage[] = [
   {
     icon: "browser",
-    label: "Interfaces",
-    detail: "Desktop popup · Discord · website guest demo",
-  },
-  {
-    icon: "shield",
-    label: "Adapters and public API",
-    detail: "Authenticated owner routes and a narrow guest-session API",
+    title: "Interfaces",
+    description: "Desktop popup, Discord, and website guest demo.",
   },
   {
     icon: "profile",
-    label: "Profile and request resolution",
-    detail: "Canonical owner identity or server-resolved temporary guest",
+    title: "Profile and context",
+    description: "Resolve the owner or guest profile and select relevant conversation, memory, relationship, emotion, and time context.",
   },
   {
     icon: "brain",
-    label: "Context and prompt compilation",
-    detail: "StateStore snapshot · relevance plan · PromptPlan",
-  },
-  {
-    icon: "coordinator",
-    label: "Shared inference coordinator",
-    detail: "GenerationScheduler · priority-aware ModelManager reservation",
-    emphasis: true,
+    title: "Prompt compilation",
+    description: "Combine identity, behavioral rules, current input, and selected context within the available token budget.",
   },
   {
     icon: "model",
-    label: "Gemma 3n E4B through llama.cpp",
-    detail: "Exact embedded-template tokenization · Q4_K_M GGUF",
-    emphasis: true,
+    title: "Local inference",
+    description: `Coordinate one ${projectConfig.modelName} runtime through llama.cpp on the Raspberry Pi.`,
   },
   {
     icon: "stream",
-    label: "Streamed response",
-    detail: "Visible text is released while structured state stays hidden",
-  },
-  {
-    icon: "persistence",
-    label: "Validated state commit",
-    detail: "Accepted changes and the completed turn are written atomically",
+    title: "Streaming and state commit",
+    description: "Stream visible text, then validate and persist completed state changes.",
   },
 ];
 
-const contextInputs = [
-  "Identity, soul, and hard rules",
-  "Complete recent conversation pairs",
-  "Selected durable memories",
-  "Relationship continuity",
-  "Grounded emotion and mood",
-  "Time and recorded presence",
+const implementationDetails = [
+  ["StateStore", "Owns schema-versioned profile, conversation, memory, relationship, emotion, and presence state."],
+  ["PromptPlan", "Budgets character policy, current input, complete recent pairs, and selected context before final tokenization."],
+  ["GenerationScheduler", "Bounds visible work and coordinates foreground requests around one constrained model."],
+  ["ModelManager", "Owns the singleton llama.cpp runtime, reservations, tokenization, and streamed generation."],
+  ["Atomic JSON commit", "Validates state, writes a temporary document, flushes it, and atomically replaces the authoritative file."],
+  ["NDJSON streaming", "Carries start, text delta, presentation, completion, and safe error events over streamed HTTP."],
+  ["OffscreenPresenceWorker", "Coordinates event-driven background presence through the same model and state authorities."],
 ] as const;
 
-const persistedState = [
-  "Conversation records",
-  "Durable memories",
-  "Canonical profile state",
-  "Relationship, emotion, and mood",
-  "Presence and initiative metadata",
-] as const;
-
-const responseLifecycle = [
-  {
-    title: "Receive",
-    text: "The active adapter normalizes the message. Private routes resolve to the canonical owner; the public API resolves a bearer session to one temporary guest profile.",
-  },
-  {
-    title: "Select context",
-    text: "StateStore publishes an immutable snapshot. Recent complete pairs are retained, while durable memory and companion state are selected only when relevant.",
-  },
-  {
-    title: "Compile",
-    text: "Identity, behavioral constraints, the current message, and optional context are budgeted into one PromptPlan, then tokenized with the GGUF’s embedded chat template.",
-  },
-  {
-    title: "Coordinate inference",
-    text: "GenerationScheduler bounds visible work and ModelManager reserves the singleton runtime. Owner requests rank ahead of guests, which rank ahead of background work.",
-  },
-  {
-    title: "Stream",
-    text: "One Gemma completion releases visible text incrementally. Potential structured-state prefixes are retained so internal metadata never becomes dialogue.",
-  },
-  {
-    title: "Validate and commit",
-    text: "After successful generation, proposed fields are validated independently and the completed turn is committed atomically. Failed, cancelled, or partial generations are not saved.",
-  },
-] as const;
+const lifecycleStages: readonly LifecycleStage[] = [
+  { title: "Receive", description: "The active interface validates the message and resolves its server-authorized profile." },
+  { title: "Select context", description: "A stable snapshot supplies complete recent pairs and only the durable context relevant to this turn." },
+  { title: "Compile", description: "Identity, rules, the current message, and selected context are assembled within the prompt budget." },
+  { title: "Coordinate inference", description: "Visible work reserves the shared local runtime, with owner requests ahead of guests and background activity." },
+  { title: "Stream", description: "Akane’s visible text reaches the active interface incrementally while internal state proposals remain hidden." },
+  { title: "Validate and commit", description: "Only a completed turn and independently accepted state changes become durable; partial or cancelled generations do not." },
+];
 
 const coreSystems: readonly CoreSystem[] = [
   {
     icon: "identity",
-    title: "Context and identity",
-    description: "Controls who Akane is, how she speaks, and which information earns space in the current prompt.",
-    systems: [
-      "CharacterProfile",
-      "PromptPlan compiler",
-      "Complete recent-pair window",
-      "Relevant-context planner",
-      "TimeContext and requested editor context",
-    ],
+    title: "Identity and behavior",
+    description: "One character definition and one set of behavioral boundaries shape every interface.",
+    details: ["Validated identity and soul files", "Hard behavioral rules", "Interface-neutral response pipeline"],
   },
   {
     icon: "memory",
-    title: "Continuity",
-    description: "Preserves meaningful personal and companion state without inserting every stored detail into every response.",
-    systems: [
-      "StateStore durable memory",
-      "Canonical profile state",
-      "Relationship continuity",
-      "Grounded emotion and mood",
-      "Offscreen presence and initiative",
-    ],
+    title: "Memory and continuity",
+    description: "Recent dialogue and selected durable memories inform a turn without placing every stored detail into the prompt.",
+    details: ["Complete recent conversation pairs", "Selective durable recall", "Meaningful preferences and experiences"],
   },
   {
-    icon: "coordinator",
-    title: "Runtime coordination",
-    description: "Keeps foreground conversation, background activity, and state changes safe around one constrained model runtime.",
-    systems: [
-      "GenerationScheduler",
-      "ModelManager reservations",
-      "Visible-response stream filter",
-      "Independent proposal validation",
-      "AutonomousLifeWorker",
-    ],
+    icon: "emotion",
+    title: "Relationship and emotion",
+    description: "Validated profile state preserves relationship, grounded emotion, mood, interests, preferences, and opinions.",
+    details: ["Profile-scoped relationship state", "Grounded emotional continuity", "Validated state proposals"],
+  },
+  {
+    icon: "clock",
+    title: "Presence and initiative",
+    description: "Time and offscreen-life state can support continuity without creating a second personality or model runtime.",
+    details: ["Local time context", "Recorded presence state", "Coordinated background work"],
   },
 ];
 
-const stackItems: readonly StackItem[] = [
+const stackGroups: readonly StackGroup[] = [
   {
-    category: "Local model",
-    technology: "Gemma 3n E4B IT",
-    purpose: "The configured instruction-tuned model, loaded from a Q4_K_M GGUF on the Raspberry Pi.",
-  },
-  {
-    category: "Inference runtime",
-    technology: "llama.cpp · llama-cpp-python",
-    purpose: "Loads the GGUF, applies its embedded chat template, tokenizes exactly, and streams generation.",
+    category: "Model",
+    title: projectConfig.modelName,
+    items: ["Instruction-tuned Gemma generation", "llama.cpp via llama-cpp-python", "Q4_K_M GGUF", "4,096-token configured context"],
   },
   {
     category: "Backend",
-    technology: "Python · FastAPI · Uvicorn",
-    purpose: "Owns the shared state, request orchestration, local API, and public guest-session boundary.",
+    title: "Shared Python runtime",
+    items: ["Python", "FastAPI", "Uvicorn", "Streaming HTTP transport"],
   },
   {
-    category: "Streaming transport",
-    technology: "NDJSON over streamed HTTP",
-    purpose: "Carries start, text-delta, completion, and error events; the private popup stream also exposes cancellation.",
-  },
-  {
-    category: "Website",
-    technology: "React · TypeScript · Vite",
-    purpose: "Builds the static HashRouter site and offline preview for deployment under a GitHub Pages base path.",
-  },
-  {
-    category: "Desktop interface",
-    technology: "pywebview · HTML · CSS · JavaScript",
-    purpose: "Hosts the transparent companion popup and bridges its streamed HTTP conversation to the window.",
-  },
-  {
-    category: "Discord interface",
-    technology: "discord.py · aiohttp",
-    purpose: "Normalizes Discord events and calls the authenticated backend without loading another model or state store.",
+    category: "Interfaces",
+    title: "One companion, three surfaces",
+    items: ["Desktop popup", "Discord", "React and TypeScript website"],
   },
   {
     category: "Persistence",
-    technology: "Schema-versioned atomic JSON",
-    purpose: "Stores validated profiles and conversations through one temporary-file, fsync, and atomic-replace path.",
+    title: "Validated local state",
+    items: ["Schema-versioned atomic JSON", "Conversation records", "Memory and companion state"],
   },
   {
-    category: "Developer context",
-    technology: "VS Code extension · Node.js",
-    purpose: "Offers bounded, read-only editor context when explicitly requested; it is not a separate companion runtime.",
+    category: "Developer integration",
+    title: "Bounded editor context",
+    items: ["VS Code extension", "Explicitly requested context", "Read-only workspace boundary"],
   },
   {
     category: "Deployment",
-    technology: "Raspberry Pi 5 · ngrok · GitHub Pages",
-    purpose: "Runs inference and the API on the Pi while the static site is hosted separately and reaches it through HTTPS.",
+    title: "Pi runtime, static website",
+    items: ["Raspberry Pi 5", "ngrok HTTPS endpoint", "GitHub Pages"],
   },
 ];
 
 const tradeoffs: readonly Tradeoff[] = [
   {
-    number: "01",
-    title: "One shared model runtime",
-    constraint: "Foreground conversation and background work compete for one memory-constrained local model.",
-    consequence: "A priority-aware reservation serializes tokenization and inference; owner work can cooperatively displace lower-priority background work.",
+    title: "One shared runtime",
+    constraint: "Foreground and background work compete for one constrained local model.",
+    response: "A shared scheduler and model reservation coordinate work by priority.",
+    importance: "Conversation stays responsive without loading duplicate runtimes on the Pi.",
   },
   {
-    number: "02",
     title: "Context must earn its tokens",
-    constraint: "A 4,096-token window cannot hold every conversation, memory, emotion, relationship entry, and presence detail.",
-    consequence: "Protected identity and the current input stay fixed while recent complete pairs and optional context are selected and budgeted.",
+    constraint: "A 4,096-token window cannot hold every conversation and every piece of companion state.",
+    response: "The prompt compiler protects identity and current input, keeps complete recent pairs, and selects optional context by relevance.",
+    importance: "Continuity remains useful without crowding out the current conversation.",
   },
   {
-    number: "03",
     title: "State must survive interruption",
-    constraint: "Streaming can begin before a local completion finishes, and a client may disconnect partway through.",
-    consequence: "Visible deltas are provisional. Only a successful completion reaches validated proposal handling and the atomic commit path.",
+    constraint: "Streaming can be stopped, time out, or lose its connection before a response finishes.",
+    response: "The system previews state for inference and commits only after successful completion and validation.",
+    importance: "Partial replies do not silently become permanent history or memory.",
   },
   {
-    number: "04",
-    title: "Interfaces must not become separate companions",
-    constraint: "Popup, Discord, the public website, and editor context need different adapter behavior without duplicating personality or memory logic.",
-    consequence: "Thin adapters share the same orchestration core, while profile resolution keeps private owner continuity separate from every guest.",
+    title: "Interfaces must remain one companion",
+    constraint: "Popup, Discord, and the website need different adapter behavior and privacy boundaries.",
+    response: "Thin interfaces share personality, memory, and inference ownership while profile resolution isolates guests.",
+    importance: "Akane stays consistent without leaking private owner continuity to the public demo.",
   },
 ];
 
 const roadmapItems: readonly RoadmapItem[] = [
   {
     icon: "stream",
-    title: "Streaming speech output",
+    title: "Speech output",
     status: "Planned",
-    description: "Akane currently communicates through text. Speech and audio output remain outside the implemented conversation path.",
+    description: "Akane currently communicates through text; no website voice or TTS controls are implemented.",
   },
   {
     icon: "identity",
     title: "Live2D presentation",
     status: "Planned",
-    description: "The current website and popup render static character artwork; no Live2D model or Cubism runtime is shipped.",
+    description: "The current popup and website use approved static character artwork; no Live2D renderer ships today.",
   },
   {
     icon: "emotion",
     title: "Expression synchronization",
     status: "In development",
-    description: "A typed presentation state machine and renderer boundary exist, but static artwork does not yet render expression changes.",
+    description: "Typed presentation-state plumbing is available, but visual expression rendering is not yet implemented.",
   },
   {
-    icon: "clock",
+    icon: "coordinator",
     title: "Lip synchronization",
-    status: "Exploratory",
-    description: "The presentation boundary anticipates mouth state, but there is no implemented audio-driven lip-sync pipeline today.",
+    status: "Planned",
+    description: "Mouth-state boundaries exist in presentation state, but there is no audio-driven lip-sync pipeline.",
+  },
+  {
+    icon: "desktop",
+    title: "Deeper desktop integration",
+    status: "Planned",
+    description: "Future desktop work can build on the existing popup without moving personality or continuity into the interface.",
   },
 ];
 
-function TechIcon({ name, className = "" }: { name: IconName; className?: string }) {
+function TechIcon({ name }: { name: IconName }) {
   const paths: Record<IconName, ReactNode> = {
     arrow: <><path d="M5 12h13" /><path d="m14 8 4 4-4 4" /></>,
     brain: <><path d="M9.5 4.5A3.5 3.5 0 0 0 6 8v.3A3.2 3.2 0 0 0 4 11.2 3.1 3.1 0 0 0 6.2 14 3.5 3.5 0 0 0 9.5 19.5" /><path d="M14.5 4.5A3.5 3.5 0 0 1 18 8v.3a3.2 3.2 0 0 1 2 2.9 3.1 3.1 0 0 1-2.2 2.8 3.5 3.5 0 0 1-3.3 5.5M12 4v16M8 9.5h4M12 14.5h4" /></>,
@@ -312,42 +248,33 @@ function TechIcon({ name, className = "" }: { name: IconName; className?: string
     stream: <><path d="M4 7h10M4 12h16M4 17h10" /><path d="m16 5 4 2-4 2M16 15l4 2-4 2" /></>,
   };
 
-  return <svg className={`tech-icon ${className}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">{paths[name]}</svg>;
+  return <svg className="tech-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">{paths[name]}</svg>;
 }
 
 function SectionHeading({ eyebrow, title, description, id }: { eyebrow: string; title: string; description?: string; id: string }) {
   return <div className="tech-section-heading">
-    <p className="tech-eyebrow"><span aria-hidden="true" />{eyebrow}</p>
+    <p className="tech-eyebrow">{eyebrow}</p>
     <h2 id={id}>{title}</h2>
     {description && <p>{description}</p>}
   </div>;
 }
 
-function GithubAction({ className = "tech-button tech-button-secondary", children = "View on GitHub" }: { className?: string; children?: ReactNode }) {
+function GithubAction({ className = "tech-button tech-button-secondary" }: { className?: string }) {
   return projectConfig.githubUrl
-    ? <a className={className} href={projectConfig.githubUrl} target="_blank" rel="noreferrer">{children}<span aria-hidden="true">↗</span></a>
-    : <span className={`${className} disabled`} aria-disabled="true">{children}</span>;
+    ? <a className={className} href={projectConfig.githubUrl} target="_blank" rel="noreferrer">View on GitHub<span aria-hidden="true">↗</span></a>
+    : <span className={`${className} disabled`} aria-disabled="true">View on GitHub</span>;
 }
 
-function FlowArrow() {
-  return <span className="tech-flow-arrow" aria-hidden="true"><TechIcon name="arrow" /></span>;
-}
-
-function TechnologyIntro() {
-  return <section className="tech-intro" aria-labelledby="technology-title">
-    <div className="shell tech-intro-inner">
-      <div className="tech-intro-copy">
-        <p className="tech-eyebrow"><span aria-hidden="true" />Technology</p>
-        <h1 id="technology-title">How Akane works</h1>
-        <p className="tech-intro-accent">Local intelligence. Shared continuity.</p>
-        <p className="tech-intro-lead">Akane is designed as one companion system, not a collection of disconnected AI features. A shared local runtime carries identity and continuity across every interface.</p>
-      </div>
-      <div className="tech-intro-visual" aria-hidden="true">
-        <span className="tech-intro-ring" />
-        <div className="tech-intro-hub"><TechIcon name="coordinator" /><strong>One runtime</strong><span>Akane core</span></div>
-        <div className="tech-intro-node tech-intro-node-interface"><TechIcon name="browser" /><span>Interfaces</span></div>
-        <div className="tech-intro-node tech-intro-node-context"><TechIcon name="brain" /><span>Context</span></div>
-        <div className="tech-intro-node tech-intro-node-model"><TechIcon name="model" /><span>Local model</span></div>
+function TechnologyHero() {
+  return <section className="tech-hero" aria-labelledby="technology-title">
+    <div className="shell tech-hero-inner">
+      <p className="tech-eyebrow">Local runtime <span>•</span> Shared continuity <span>•</span> Multiple interfaces</p>
+      <h1 id="technology-title">How Akane works</h1>
+      <p className="tech-hero-accent">One companion. One coordinated runtime.</p>
+      <p className="tech-hero-lead">Akane combines local language-model inference with persistent memory, relationship continuity, grounded emotion, and multiple interfaces through one shared backend running on a Raspberry Pi 5.</p>
+      <div className="tech-actions">
+        <a className="tech-button tech-button-primary" href="#architecture">Explore the Architecture<TechIcon name="arrow" /></a>
+        <GithubAction />
       </div>
     </div>
   </section>;
@@ -358,63 +285,83 @@ function ArchitectureOverview() {
     <div className="shell">
       <SectionHeading
         eyebrow="System architecture"
-        title="One coordinated companion"
-        description="Every interface enters the same conversation path. The backend resolves the active profile, gathers relevant context, coordinates local inference, streams the response, and commits validated state."
+        title="Five stages, one coordinated path"
+        description="Each interface enters the same understandable request flow before implementation details come into view."
         id="architecture-title"
       />
       <figure className="tech-architecture" aria-describedby="architecture-summary">
-        <figcaption id="architecture-summary" className="sr-only">Desktop popup, Discord, and the public website enter one shared request pipeline. Selected context feeds prompt compilation. The Gemma runtime streams visible text before validated conversation and companion state is committed to atomic JSON persistence.</figcaption>
-        <div className="tech-architecture-legend" aria-label="Diagram legend">
-          <span><i className="request" aria-hidden="true" />Request flow</span>
-          <span><i className="context" aria-hidden="true">C</i>Context input</span>
-          <span><i className="persistent" aria-hidden="true">P</i>Persistent state</span>
-        </div>
-        <div className="tech-architecture-layout">
-          <div className="tech-request-lane">
-            <p className="tech-lane-label">Request path</p>
-            <ol>
-              {architectureStages.map((stage, index) => <li key={stage.label}>
-                <article className={stage.emphasis ? "emphasis" : ""}>
-                  <TechIcon name={stage.icon} />
-                  <div><h3>{stage.label}</h3><p>{stage.detail}</p></div>
-                </article>
-                {index < architectureStages.length - 1 && <span className="tech-down-connector" aria-hidden="true"><i /><TechIcon name="arrow" /></span>}
-              </li>)}
-            </ol>
-          </div>
-          <aside className="tech-context-rail" aria-labelledby="context-rail-title">
-            <div className="tech-rail-heading"><TechIcon name="brain" /><div><span>Context input</span><h3 id="context-rail-title">Selected for this turn</h3></div></div>
-            <p>These inputs feed PromptPlan compilation. They are not independent model services.</p>
-            <ul>{contextInputs.map(item => <li key={item}><span aria-hidden="true">C</span>{item}</li>)}</ul>
-            <div className="tech-rail-feed" aria-hidden="true"><span>feeds prompt</span><TechIcon name="arrow" /></div>
-          </aside>
-          <aside className="tech-persistence-rail" aria-labelledby="persistence-rail-title">
-            <div className="tech-rail-heading"><TechIcon name="persistence" /><div><span>Persistent state</span><h3 id="persistence-rail-title">StateStore authority</h3></div></div>
-            <p>A schema-versioned JSON document holds validated state. Runtime-only values are not presented as permanent.</p>
-            <ul>{persistedState.map(item => <li key={item}><span aria-hidden="true">P</span>{item}</li>)}</ul>
-            <div className="tech-rail-feed reverse" aria-hidden="true"><TechIcon name="arrow" /><span>snapshot / commit</span></div>
-          </aside>
-        </div>
+        <figcaption id="architecture-summary" className="sr-only">Desktop popup, Discord, and the website resolve a profile and relevant context, compile one prompt, use the local Gemma runtime, then stream visible text and commit validated state.</figcaption>
+        <ol>
+          {architectureStages.map((stage, index) => <li key={stage.title}>
+            <article>
+              <span className="tech-stage-index">0{index + 1}</span>
+              <TechIcon name={stage.icon} />
+              <div><h3>{stage.title}</h3><p>{stage.description}</p></div>
+            </article>
+            {index < architectureStages.length - 1 && <span className="tech-stage-arrow" aria-hidden="true">↓</span>}
+          </li>)}
+        </ol>
       </figure>
+      <details className="tech-implementation-details">
+        <summary>View implementation details</summary>
+        <dl>
+          {implementationDetails.map(([name, description]) => <div key={name}><dt>{name}</dt><dd>{description}</dd></div>)}
+        </dl>
+      </details>
     </div>
   </section>;
 }
 
-function RequestLifecycle() {
+function ResponseLifecycle() {
   return <section className="tech-section tech-lifecycle-section" aria-labelledby="lifecycle-title">
     <div className="shell">
       <SectionHeading
         eyebrow="Response lifecycle"
         title="From message to continuity"
-        description="A normal request performs one coordinated inference, then makes one explicit decision about what becomes durable."
+        description="One request becomes visible text, then one explicit decision about what becomes durable."
         id="lifecycle-title"
       />
       <ol className="tech-lifecycle">
-        {responseLifecycle.map((stage, index) => <li key={stage.title}>
-          <span className="tech-step-number">{String(index + 1).padStart(2, "0")}</span>
-          <div><h3>{stage.title}</h3><p>{stage.text}</p></div>
+        {lifecycleStages.map((stage, index) => <li key={stage.title}>
+          <span>{String(index + 1).padStart(2, "0")}</span>
+          <div><h3>{stage.title}</h3><p>{stage.description}</p></div>
         </li>)}
       </ol>
+    </div>
+  </section>;
+}
+
+function ProfileIsolation() {
+  const shared = ["Shared request pipeline", "Shared inference coordinator", "Same local model runtime"];
+  const isolated = ["Conversation history", "Memory", "Relationship", "Private profile state"];
+
+  return <section className="tech-section tech-isolation-section" aria-labelledby="isolation-title">
+    <div className="shell tech-isolation-inner">
+      <div className="tech-isolation-copy">
+        <p className="tech-eyebrow">Profile isolation</p>
+        <h2 id="isolation-title">One runtime without mixed identities</h2>
+        <p>Desktop and Discord share the owner’s private continuity. Every website visitor receives a separate temporary guest profile.</p>
+      </div>
+      <figure className="tech-profile-diagram" aria-describedby="profile-summary">
+        <figcaption id="profile-summary" className="sr-only">Desktop popup and Discord share owner continuity. The website demo uses temporary guest continuity. Both use the same request pipeline, inference coordinator, and local model without sharing history, memory, relationship, or private profile state.</figcaption>
+        <div className="tech-profile-branches">
+          <article>
+            <TechIcon name="profile" />
+            <span>Owner continuity</span>
+            <h3>Desktop popup</h3>
+            <h3>Discord</h3>
+          </article>
+          <article>
+            <TechIcon name="shield" />
+            <span>Temporary guest continuity</span>
+            <h3>Website demo</h3>
+          </article>
+        </div>
+        <div className="tech-boundary-lists">
+          <div><strong>Both use</strong><ul>{shared.map(item => <li key={item}>{item}</li>)}</ul></div>
+          <div><strong>They do not share</strong><ul>{isolated.map(item => <li key={item}>{item}</li>)}</ul></div>
+        </div>
+      </figure>
     </div>
   </section>;
 }
@@ -423,95 +370,18 @@ function CoreSystems() {
   return <section className="tech-section tech-core-section" aria-labelledby="core-title">
     <div className="shell">
       <SectionHeading
-        eyebrow="Companion core"
-        title="Systems that preserve Akane across conversations"
-        description="Stable character policy, selected context, evolving continuity, and runtime control each have a distinct responsibility."
+        eyebrow="Core systems"
+        title="What keeps Akane consistent"
+        description="Each system has a narrow responsibility, while the backend remains the authority for personality, state, and inference."
         id="core-title"
       />
       <div className="tech-core-grid">
-        {coreSystems.map((group, index) => <article key={group.title}>
-          <header><span className="tech-core-index">0{index + 1}</span><TechIcon name={group.icon} /></header>
-          <h3>{group.title}</h3>
-          <p>{group.description}</p>
-          <ul>{group.systems.map(system => <li key={system}>{system}</li>)}</ul>
+        {coreSystems.map(system => <article key={system.title}>
+          <TechIcon name={system.icon} />
+          <h3>{system.title}</h3>
+          <p>{system.description}</p>
+          <ul>{system.details.map(detail => <li key={detail}>{detail}</li>)}</ul>
         </article>)}
-      </div>
-    </div>
-  </section>;
-}
-
-function ProfileIsolation() {
-  return <section className="tech-section tech-isolation-section" aria-labelledby="isolation-title">
-    <div className="shell tech-isolation-shell">
-      <div className="tech-isolation-copy">
-        <p className="tech-eyebrow"><span aria-hidden="true" />Multiple interfaces</p>
-        <h2 id="isolation-title">One backend without mixing identities</h2>
-        <p>Desktop and Discord share the owner’s private continuity. Each website visitor receives an isolated temporary guest profile that cannot access the owner’s conversation history, memories, relationship, emotion, mood, presence, or private state.</p>
-        <p className="tech-vscode-note"><TechIcon name="code" /><span><strong>The VS Code bridge is context, not another companion.</strong> It offers bounded read-only editor context only when a message requests it and a bridge is connected.</span></p>
-      </div>
-      <figure className="tech-profile-diagram" aria-describedby="profile-summary">
-        <figcaption id="profile-summary" className="sr-only">The desktop popup and Discord use one private owner profile. The website demo uses a separate temporary guest profile. Both enter the shared conversation pipeline and local runtime without sharing personal continuity.</figcaption>
-        <div className="tech-profile-branches">
-          <article className="tech-profile-card owner">
-            <header><TechIcon name="profile" /><div><span>Private continuity</span><h3>Owner profile</h3></div></header>
-            <ul><li><TechIcon name="desktop" />Desktop popup</li><li><TechIcon name="discord" />Discord</li></ul>
-          </article>
-          <article className="tech-profile-card guest">
-            <header><TechIcon name="shield" /><div><span>Isolated continuity</span><h3>Temporary guest</h3></div></header>
-            <ul><li><TechIcon name="browser" />Website demo</li></ul>
-          </article>
-        </div>
-        <div className="tech-profile-join" aria-hidden="true"><span /><span /></div>
-        <div className="tech-shared-pipeline"><TechIcon name="coordinator" /><div><span>Shared infrastructure</span><strong>Conversation pipeline · ModelManager · local Gemma runtime</strong></div></div>
-      </figure>
-      <dl className="tech-session-facts">
-        <div><dt>Idle expiration</dt><dd>30 minutes</dd></div>
-        <div><dt>Maximum lifetime</dt><dd>2 hours</dd></div>
-        <div><dt>Public capacity</dt><dd>1 active · 2 queued</dd></div>
-        <div><dt>Guest response cap</dt><dd>256 tokens</dd></div>
-        <div><dt>Scheduling</dt><dd>Owner before guest</dd></div>
-      </dl>
-      <p className="tech-config-note">Configured defaults shown. Session tokens and internal profile identifiers are intentionally omitted.</p>
-    </div>
-  </section>;
-}
-
-function RuntimeAndPersistence() {
-  const runtimeFacts = [
-    ["Hardware", "Raspberry Pi 5"],
-    ["Model", "Gemma 3n E4B Instruct"],
-    ["Runtime", "llama.cpp via llama-cpp-python"],
-    ["Format", "Q4_K_M quantized GGUF"],
-    ["Context", "4,096 tokens"],
-    ["Generation", "One coordinated local inference path"],
-  ] as const;
-  const reliability = [
-    ["Atomic replacement", "Writes go to a temporary file, flush to disk, then replace the authoritative JSON document."],
-    ["Validated state", "Current-schema headers, profiles, conversations, and proposed state fields are checked before publication."],
-    ["Preview before commit", "A snapshot feeds inference; successful completion and accepted state changes are committed afterward."],
-    ["Explicit recovery", "Corrupt or unsupported authoritative state raises a recovery error instead of silently resetting continuity."],
-    ["Schema migration", "Validated legacy sources can be merged and rewritten once into the current canonical document."],
-  ] as const;
-
-  return <section className="tech-section tech-runtime-section" aria-labelledby="runtime-title">
-    <div className="shell">
-      <SectionHeading
-        eyebrow="Local runtime"
-        title="Designed around constrained hardware"
-        description="Akane favors a small number of explicit authorities and controlled state transitions over distributed services the hardware does not need."
-        id="runtime-title"
-      />
-      <div className="tech-runtime-grid">
-        <article className="tech-runtime-card">
-          <header><TechIcon name="model" /><div><span>Configured deployment</span><h3>Inference runtime</h3></div></header>
-          <dl>{runtimeFacts.map(([term, value]) => <div key={term}><dt>{term}</dt><dd>{value}</dd></div>)}</dl>
-        </article>
-        <article className="tech-reliability-card">
-          <header><TechIcon name="persistence" /><div><span>StateStore</span><h3>Persistence and reliability</h3></div></header>
-          <p>State moves through controlled commit paths so an interrupted generation does not silently become permanent companion history.</p>
-          <ul>{reliability.map(([title, text]) => <li key={title}><strong>{title}</strong><span>{text}</span></li>)}</ul>
-          <small>Persistence is JSON-based. No transactional database guarantee is implied.</small>
-        </article>
       </div>
     </div>
   </section>;
@@ -521,17 +391,16 @@ function TechnologyStack() {
   return <section className="tech-section tech-stack-section" aria-labelledby="stack-title">
     <div className="shell">
       <SectionHeading
-        eyebrow="Technology stack"
-        title="Small, deliberate building blocks"
-        description="Every item below is present in current source, manifests, configuration, or the documented deployment path."
+        eyebrow="Confirmed technology stack"
+        title="Six deliberate groups"
+        description="The runtime stays local while the static website and HTTPS bridge remain separate deployment concerns."
         id="stack-title"
       />
       <div className="tech-stack-grid">
-        {stackItems.map(item => <article key={item.category}>
-          <span className="tech-stack-category">{item.category}</span>
-          <h3>{item.technology}</h3>
-          <p>{item.purpose}</p>
-          <span className="tech-implemented"><span aria-hidden="true">✓</span>Implemented</span>
+        {stackGroups.map(group => <article key={group.category}>
+          <span>{group.category}</span>
+          <h3>{group.title}</h3>
+          <ul>{group.items.map(item => <li key={item}>{item}</li>)}</ul>
         </article>)}
       </div>
     </div>
@@ -544,38 +413,40 @@ function EngineeringTradeoffs() {
       <SectionHeading
         eyebrow="Engineering tradeoffs"
         title="The hardware shapes the architecture"
-        description="These are deliberate constraints, not claims of a perfectly solved system. Each one changes how Akane selects context, schedules work, and protects continuity."
+        description="Akane’s constraints lead to explicit scheduling, budgeting, commit, and isolation decisions."
         id="tradeoffs-title"
       />
       <div className="tech-tradeoffs-grid">
-        {tradeoffs.map(item => <article key={item.number}>
-          <span>{item.number}</span>
+        {tradeoffs.map(item => <article key={item.title}>
           <h3>{item.title}</h3>
-          <p>{item.constraint}</p>
-          <div><strong>Why it matters</strong><p>{item.consequence}</p></div>
+          <dl>
+            <div><dt>Constraint</dt><dd>{item.constraint}</dd></div>
+            <div><dt>Engineering response</dt><dd>{item.response}</dd></div>
+            <div><dt>Why it matters</dt><dd>{item.importance}</dd></div>
+          </dl>
         </article>)}
       </div>
     </div>
   </section>;
 }
 
-function TechnologyRoadmap() {
+function PlannedPresentation() {
   return <section className="tech-section tech-roadmap-section" aria-labelledby="roadmap-title">
     <div className="shell">
       <SectionHeading
-        eyebrow="What comes next"
-        title="Giving the same intelligence a richer presence"
-        description="Presentation work stays visibly outside the implemented architecture until it can render the existing backend state without becoming a second source of personality."
+        eyebrow="Planned presentation layer"
+        title="A richer presence, not a second personality"
+        description="The backend owns personality, memory, emotion, and conversation state. The future presentation layer will render voice, expression, movement, and lip synchronization."
         id="roadmap-title"
       />
       <div className="tech-roadmap-principle">
         <TechIcon name="shield" />
-        <div><span>Architectural principle</span><p>The backend owns personality, memory, emotion, and conversation state. The future presentation layer will render voice, expression, motion, and lip synchronization without redefining Akane.</p></div>
+        <div><span className="tech-status available">Available</span><p><strong>Presentation-state plumbing is implemented.</strong> Visual expression rendering, voice, and lip synchronization are not.</p></div>
       </div>
       <div className="tech-roadmap-grid">
         {roadmapItems.map(item => <article key={item.title}>
           <TechIcon name={item.icon} />
-          <span className={`tech-roadmap-status ${item.status.toLowerCase().replace(" ", "-")}`}>{item.status}</span>
+          <span className={`tech-status ${item.status.toLowerCase().replace(" ", "-")}`}>{item.status}</span>
           <h3>{item.title}</h3>
           <p>{item.description}</p>
         </article>)}
@@ -585,24 +456,24 @@ function TechnologyRoadmap() {
 }
 
 function TechnologyCTA() {
-  return <section className="tech-cta shell" aria-labelledby="technology-cta-title">
-    <div className="tech-cta-star" aria-hidden="true">✦</div>
-    <div><p className="tech-eyebrow"><span aria-hidden="true" />Explore Akane</p><h2 id="technology-cta-title">See the architecture in motion.</h2><p>Try the isolated live guest experience, inspect the implementation, or follow the presentation layer as it develops.</p></div>
-    <div className="tech-actions"><Link className="tech-button tech-button-light" to="/demo">Try the Demo<TechIcon name="arrow" /></Link><GithubAction className="tech-button tech-button-outline" /></div>
+  return <section className="tech-cta" aria-labelledby="technology-cta-title">
+    <div className="shell tech-cta-inner">
+      <div><p className="tech-eyebrow">Explore Akane</p><h2 id="technology-cta-title">See the real pipeline in action.</h2><p>Try the isolated guest demo or inspect the project on GitHub.</p></div>
+      <div className="tech-actions"><Link className="tech-button tech-button-light" to="/demo">Try the Demo<TechIcon name="arrow" /></Link><GithubAction className="tech-button tech-button-outline" /></div>
+    </div>
   </section>;
 }
 
 export function TechnologyPage() {
   return <main className="technology-page">
-    <TechnologyIntro />
+    <TechnologyHero />
     <ArchitectureOverview />
-    <RequestLifecycle />
-    <CoreSystems />
+    <ResponseLifecycle />
     <ProfileIsolation />
-    <RuntimeAndPersistence />
+    <CoreSystems />
     <TechnologyStack />
     <EngineeringTradeoffs />
-    <TechnologyRoadmap />
+    <PlannedPresentation />
     <TechnologyCTA />
   </main>;
 }

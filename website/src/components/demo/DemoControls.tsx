@@ -13,7 +13,6 @@ interface DemoControlsProps {
   canReconnect: boolean;
   onStartGuest: () => void;
   onOpenPreview: () => void;
-  onClearPreview: () => void;
   onReconnect: () => void;
   onReset: () => void;
   onEndSession: () => void;
@@ -39,7 +38,6 @@ export function DemoControls(props: DemoControlsProps) {
       {props.connection === "connecting" && <p>Checking the configured Raspberry Pi connection.</p>}
       {props.connection === "live" && <p>Connected to the real Akane runtime on the Raspberry Pi.</p>}
       {props.connection === "showcase" && <p><strong>Preview Mode uses prerecorded responses.</strong> Messages are not sent to Akane and are not saved.</p>}
-      {props.connection === "showcase" && <button className="demo-control-button" type="button" onClick={props.onClearPreview} aria-label="Clear the prerecorded preview conversation">Clear preview</button>}
       {props.canReconnect && <button className="demo-control-button" type="button" onClick={props.onReconnect} aria-label="Reconnect to live Akane">Reconnect</button>}
       {props.retryExhausted && <p className="demo-retry-note">Automatic retries have finished. Manual reconnect remains available.</p>}
     </section>

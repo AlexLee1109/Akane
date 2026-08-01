@@ -116,231 +116,6 @@
   gap: 12px;
 }
 
-.tech-hero {
-  position: relative;
-  min-height: 680px;
-  border-bottom: 1px solid var(--tech-line);
-  overflow: hidden;
-  isolation: isolate;
-  background:
-    radial-gradient(circle at 77% 24%, rgba(87, 147, 255, 0.25), transparent 25rem),
-    radial-gradient(circle at 12% 5%, #ffffff 0, rgba(255, 255, 255, 0) 31rem),
-    linear-gradient(112deg, #ffffff 0%, #f4f8ff 48%, #d5e8ff 100%);
-}
-
-.tech-hero::before,
-.tech-hero::after {
-  position: absolute;
-  z-index: -1;
-  content: "";
-  pointer-events: none;
-}
-
-.tech-hero::before {
-  inset: 0;
-  background:
-    radial-gradient(circle, rgba(42, 103, 230, 0.5) 0 1px, transparent 1.5px) 0 0 / 88px 88px,
-    linear-gradient(124deg, transparent 0 59%, rgba(255, 255, 255, 0.72) 59.2% 59.5%, transparent 59.7%);
-  mask-image: linear-gradient(90deg, transparent 0 35%, #000 60% 100%);
-  opacity: 0.45;
-}
-
-.tech-hero::after {
-  width: 620px;
-  height: 620px;
-  right: -180px;
-  bottom: -420px;
-  border: 1px solid rgba(38, 102, 237, 0.28);
-  border-radius: 50%;
-  box-shadow: 0 0 0 70px rgba(38, 102, 237, 0.035), 0 0 0 145px rgba(38, 102, 237, 0.025);
-}
-
-.tech-hero-grid {
-  position: absolute;
-  z-index: -1;
-  inset: 0 0 0 50%;
-  background-image:
-    linear-gradient(rgba(45, 100, 210, 0.07) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(45, 100, 210, 0.07) 1px, transparent 1px);
-  background-size: 44px 44px;
-  mask-image: linear-gradient(90deg, transparent, #000 28%, transparent 92%);
-}
-
-.tech-hero-inner {
-  display: grid;
-  min-height: 680px;
-  grid-template-columns: minmax(0, 1.08fr) minmax(350px, 0.92fr);
-  gap: clamp(28px, 4vw, 70px);
-  align-items: center;
-}
-
-.tech-hero-copy {
-  position: relative;
-  z-index: 2;
-  padding: 72px 0 66px;
-  animation: tech-rise 620ms ease-out both;
-}
-
-.tech-hero-copy h1 {
-  max-width: 780px;
-  margin-bottom: 8px;
-  font-size: clamp(3.5rem, 7vw, 6.6rem);
-  letter-spacing: -0.065em;
-  line-height: 0.94;
-}
-
-.tech-hero-accent {
-  max-width: 750px;
-  margin-bottom: 26px;
-  color: var(--tech-blue) !important;
-  font-family: Georgia, "Times New Roman", serif;
-  font-size: clamp(1.35rem, 2.6vw, 2.2rem);
-  font-style: italic;
-  line-height: 1.15;
-}
-
-.tech-hero-lead {
-  max-width: 720px;
-  margin-bottom: 13px;
-  color: #344a78 !important;
-  font-size: clamp(1rem, 1.4vw, 1.15rem);
-  line-height: 1.72;
-}
-
-.tech-boundary-note {
-  max-width: 670px;
-  margin-bottom: 29px;
-  padding-left: 15px;
-  border-left: 2px solid #8eb8ff;
-  font-size: 0.86rem;
-  line-height: 1.62;
-}
-
-.tech-hero-facts {
-  display: grid;
-  grid-template-columns: repeat(4, max-content);
-  gap: 9px 23px;
-  margin: 40px 0 0;
-  padding: 20px 0 0;
-  border-top: 1px solid var(--tech-line);
-  list-style: none;
-}
-
-.tech-hero-facts li {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--tech-ink);
-  font-size: 0.76rem;
-  font-weight: 780;
-}
-
-.tech-hero-facts li span {
-  color: var(--tech-blue);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.75rem;
-}
-
-.tech-artwork {
-  position: relative;
-  align-self: stretch;
-  min-height: 680px;
-}
-
-.tech-artwork::before {
-  position: absolute;
-  width: 500px;
-  height: 500px;
-  top: 70px;
-  left: 50%;
-  border: 1px solid rgba(35, 97, 224, 0.27);
-  border-radius: 50%;
-  box-shadow: inset 0 0 70px rgba(255, 255, 255, 0.58), 0 0 0 34px rgba(255, 255, 255, 0.15);
-  content: "";
-  transform: translateX(-50%);
-}
-
-.tech-artwork img {
-  position: absolute;
-  z-index: 2;
-  width: min(430px, 86%);
-  height: 690px;
-  right: 2%;
-  bottom: -48px;
-  object-fit: contain;
-  object-position: center top;
-  filter: drop-shadow(0 24px 25px rgba(32, 77, 154, 0.2));
-}
-
-.tech-local-badge {
-  position: absolute;
-  z-index: 4;
-  top: 19%;
-  left: -5%;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 15px;
-  border: 1px solid rgba(75, 127, 230, 0.28);
-  border-radius: 13px;
-  background: rgba(255, 255, 255, 0.84);
-  box-shadow: 0 15px 36px rgba(35, 76, 147, 0.14);
-  backdrop-filter: blur(15px);
-  color: var(--tech-blue);
-}
-
-.tech-local-badge span {
-  color: #617198;
-  font-size: 0.75rem;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.tech-local-badge strong {
-  display: block;
-  margin-top: 2px;
-  color: var(--tech-navy);
-  font-size: 0.76rem;
-  letter-spacing: 0;
-  text-transform: none;
-}
-
-.tech-star {
-  position: absolute;
-  z-index: 3;
-  color: #ffffff;
-  filter: drop-shadow(0 0 6px #4b8fff);
-}
-
-.tech-star-one { top: 14%; right: 4%; font-size: 1.25rem; }
-.tech-star-two { top: 42%; left: 0; font-size: 0.7rem; }
-.tech-star-three { right: 0; bottom: 26%; font-size: 0.85rem; }
-
-.tech-hero-orbit {
-  position: absolute;
-  z-index: -1;
-  border: 1px solid rgba(48, 105, 220, 0.17);
-  border-radius: 50%;
-  pointer-events: none;
-}
-
-.tech-hero-orbit-one {
-  width: 440px;
-  height: 180px;
-  top: 90px;
-  right: -90px;
-  transform: rotate(28deg);
-}
-
-.tech-hero-orbit-two {
-  width: 260px;
-  height: 620px;
-  right: 10%;
-  bottom: -240px;
-  transform: rotate(52deg);
-}
-
 .tech-section {
   padding: 112px 0;
 }
@@ -350,6 +125,7 @@
   margin-bottom: 44px;
 }
 
+.tech-section-heading h1,
 .tech-section-heading h2,
 .tech-isolation-copy h2 {
   margin-bottom: 15px;
@@ -381,10 +157,6 @@
   background-size: 56px 56px;
   content: "";
   pointer-events: none;
-}
-
-#architecture {
-  scroll-margin-top: 104px;
 }
 
 .tech-architecture {
@@ -1517,16 +1289,7 @@
   color: #fff;
 }
 
-@keyframes tech-rise {
-  from { opacity: 0; transform: translateY(18px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
 @media (max-width: 1180px) {
-  .tech-hero-facts {
-    grid-template-columns: repeat(2, max-content);
-  }
-
   .tech-architecture-layout {
     grid-template-columns: minmax(190px, 0.68fr) minmax(390px, 1.35fr) minmax(190px, 0.68fr);
     gap: 18px;
@@ -1568,28 +1331,6 @@
 @media (max-width: 980px) {
   .tech-section {
     padding: 88px 0;
-  }
-
-  .tech-hero-inner {
-    min-height: 640px;
-    grid-template-columns: minmax(0, 1fr) minmax(280px, 0.68fr);
-  }
-
-  .tech-hero-copy {
-    padding-top: 58px;
-  }
-
-  .tech-hero-copy h1 {
-    font-size: clamp(3.4rem, 8vw, 5.3rem);
-  }
-
-  .tech-artwork img {
-    width: min(360px, 100%);
-    right: -8%;
-  }
-
-  .tech-local-badge {
-    left: -14%;
   }
 
   .tech-architecture-layout {
@@ -1660,6 +1401,7 @@
     margin-bottom: 31px;
   }
 
+  .tech-section-heading h1,
   .tech-section-heading h2,
   .tech-isolation-copy h2 {
     font-size: clamp(2.15rem, 11vw, 3.25rem);
@@ -1668,64 +1410,6 @@
   .tech-section-heading > p:last-child,
   .tech-isolation-copy > p:not(.tech-eyebrow):not(.tech-vscode-note) {
     font-size: 1rem;
-  }
-
-  .tech-hero {
-    min-height: auto;
-  }
-
-  .tech-hero::before {
-    mask-image: linear-gradient(180deg, transparent 15%, #000 55%, transparent);
-  }
-
-  .tech-hero-inner {
-    min-height: auto;
-    grid-template-columns: 1fr;
-    gap: 0;
-  }
-
-  .tech-hero-copy {
-    padding: 46px 0 0;
-  }
-
-  .tech-hero-copy h1 {
-    font-size: clamp(3.15rem, 15vw, 4.7rem);
-  }
-
-  .tech-hero-accent {
-    font-size: 1.55rem;
-  }
-
-  .tech-hero-lead {
-    font-size: 1rem;
-  }
-
-  .tech-hero-facts {
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-  }
-
-  .tech-artwork {
-    min-height: 510px;
-  }
-
-  .tech-artwork::before {
-    width: 390px;
-    height: 390px;
-    top: 70px;
-  }
-
-  .tech-artwork img {
-    width: min(345px, 86vw);
-    height: 540px;
-    right: 50%;
-    bottom: -65px;
-    transform: translateX(50%);
-  }
-
-  .tech-local-badge {
-    top: 58px;
-    left: 2px;
   }
 
   .tech-architecture {
@@ -1866,19 +1550,9 @@
     width: 100%;
   }
 
-  .tech-hero-facts,
   .tech-session-facts,
   .tech-stack-grid {
     grid-template-columns: 1fr;
-  }
-
-  .tech-artwork {
-    min-height: 470px;
-  }
-
-  .tech-local-badge {
-    transform: scale(0.92);
-    transform-origin: left top;
   }
 
   .tech-architecture-legend {
@@ -1909,10 +1583,6 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .tech-hero-copy {
-    animation: none;
-  }
-
   .technology-page *,
   .technology-page *::before,
   .technology-page *::after {

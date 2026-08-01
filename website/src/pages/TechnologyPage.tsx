@@ -315,10 +315,12 @@ function TechIcon({ name, className = "" }: { name: IconName; className?: string
   return <svg className={`tech-icon ${className}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">{paths[name]}</svg>;
 }
 
-function SectionHeading({ eyebrow, title, description, id }: { eyebrow: string; title: string; description?: string; id: string }) {
+function SectionHeading({ eyebrow, title, description, id, as = "h2" }: { eyebrow: string; title: string; description?: string; id: string; as?: "h1" | "h2" }) {
+  const Heading = as;
+
   return <div className="tech-section-heading">
     <p className="tech-eyebrow"><span aria-hidden="true" />{eyebrow}</p>
-    <h2 id={id}>{title}</h2>
+    <Heading id={id}>{title}</Heading>
     {description && <p>{description}</p>}
   </div>;
 }
@@ -333,40 +335,6 @@ function FlowArrow() {
   return <span className="tech-flow-arrow" aria-hidden="true"><TechIcon name="arrow" /></span>;
 }
 
-function TechnologyHero() {
-  const character = `${projectConfig.basePath}assets/akane-hero.png`;
-  const facts = ["Raspberry Pi 5", "Gemma 3n E4B IT", "llama.cpp", "Python"] as const;
-
-  return <section className="tech-hero" aria-labelledby="technology-title">
-    <div className="tech-hero-grid" aria-hidden="true" />
-    <div className="tech-hero-orbit tech-hero-orbit-one" aria-hidden="true" />
-    <div className="tech-hero-orbit tech-hero-orbit-two" aria-hidden="true" />
-    <div className="shell tech-hero-inner">
-      <div className="tech-hero-copy">
-        <p className="tech-eyebrow"><span aria-hidden="true" />Local runtime <b>•</b> Shared continuity <b>•</b> Multiple interfaces</p>
-        <h1 id="technology-title">How Akane works</h1>
-        <p className="tech-hero-accent">One companion. One coordinated runtime.</p>
-        <p className="tech-hero-lead">Akane combines local language-model inference with persistent memory, relationship continuity, grounded emotion, and multiple interfaces through one shared backend running on a Raspberry Pi 5.</p>
-        <p className="tech-boundary-note">The model and private owner state run on the Pi. This static website is hosted separately and reaches a narrow public API through a configured HTTPS endpoint.</p>
-        <div className="tech-actions">
-          <button className="tech-button tech-button-primary" type="button" onClick={() => document.getElementById("architecture")?.scrollIntoView()}>Explore the architecture<TechIcon name="arrow" /></button>
-          <GithubAction />
-        </div>
-        <ul className="tech-hero-facts" aria-label="Configured runtime facts">
-          {facts.map((fact, index) => <li key={fact}><span>{String(index + 1).padStart(2, "0")}</span>{fact}</li>)}
-        </ul>
-      </div>
-      <div className="tech-artwork" aria-hidden="true">
-        <div className="tech-local-badge"><TechIcon name="model" /><span>Configured runtime<strong>Local inference on Pi</strong></span></div>
-        <span className="tech-star tech-star-one">✦</span>
-        <span className="tech-star tech-star-two">✦</span>
-        <span className="tech-star tech-star-three">✦</span>
-        <img src={character} width="333" height="1146" alt="" fetchPriority="high" decoding="async" />
-      </div>
-    </div>
-  </section>;
-}
-
 function ArchitectureOverview() {
   return <section id="architecture" className="tech-section tech-architecture-section" aria-labelledby="architecture-title">
     <div className="shell">
@@ -375,6 +343,7 @@ function ArchitectureOverview() {
         title="One coordinated companion"
         description="Every interface enters the same conversation path. The backend resolves the active profile, gathers relevant context, coordinates local inference, streams the response, and commits validated state."
         id="architecture-title"
+        as="h1"
       />
       <figure className="tech-architecture" aria-describedby="architecture-summary">
         <figcaption id="architecture-summary" className="sr-only">Desktop popup, Discord, and the public website enter one shared request pipeline. Selected context feeds prompt compilation. The Gemma runtime streams visible text before validated conversation and companion state is committed to atomic JSON persistence.</figcaption>
@@ -608,7 +577,6 @@ function TechnologyCTA() {
 
 export function TechnologyPage() {
   return <main className="technology-page">
-    <TechnologyHero />
     <ArchitectureOverview />
     <RequestLifecycle />
     <CoreSystems />

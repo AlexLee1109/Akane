@@ -3,21 +3,40 @@ import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { AkaneStage } from "./components/AkaneStage";
 import { projectConfig } from "./config/project";
 import { akaneClient, PublicApiError, type PublicHealth, type PublicSession } from "./lib/akaneClient";
-import { canUseSpeech, speak, stopSpeech } from "./lib/speech";
 import { clearGuestToken, getGuestToken, storeGuestToken } from "./lib/session";
 import type { AkanePresentationState } from "./presentation";
 
 const asset = `${projectConfig.basePath}assets/akane-hero.png`;
 const logo = `${projectConfig.basePath}assets/akane-logo.png`;
+const homepageImage = `${projectConfig.basePath}assets/homepage-image.png`;
 const github = projectConfig.githubUrl;
 const features = [
-  ["✦", "Memory", "Preserves meaningful facts, preferences, conversations, and shared events."],
-  ["♡", "Emotion", "Maintains a grounded emotional state that develops through conversation and experience."],
-  ["◔", "Offscreen Life", "Chooses persistent activities and thoughts while you are away."],
-  ["↗", "Autonomous Initiative", "Can decide when it has a grounded reason to begin a conversation."],
-  ["◌", "Multi-Interface Companion", "Shares one identity and state across the popup, Discord, and web demo."],
+  ["✦", "Memory", "Remembers meaningful conversations, preferences, shared context, and important details over time."],
+  ["♡", "Emotional continuity", "Maintains grounded emotion, mood, and relationship context without forcing it into every reply."],
+  ["◔", "Ambient presence", "Keeps a quiet sense of focus between conversations without inventing a complete physical world."],
+  ["⌁", "Natural conversation", "Responds with direct judgment, personality, continuity, and context-aware reasoning."],
+  ["◎", "Companion interfaces", "Shares one backend across the desktop popup, Discord, and the web."],
 ];
-const suggestions = ["Tell me about yourself.", "What are you doing right now?", "What is something you have been thinking about?", "Tell me an opinion you genuinely have."];
+const continuitySteps = [
+  ["01", "Remember", "Meaningful facts, preferences, decisions, and shared experiences."],
+  ["02", "Understand", "Relevant context influences her judgment without overwhelming the reply."],
+  ["03", "Continue", "Future conversations build from established memory and relationship state."],
+];
+const availableNow = [
+  "Local Gemma inference",
+  "Discord conversation",
+  "Desktop popup",
+  "Streaming text generation",
+  "Persistent owner memory",
+  "Emotion and relationship continuity",
+  "Ambient presence",
+  "Read-only VS Code context",
+];
+const plannedWork = [
+  "Speech output",
+  "Live2D presentation layer",
+  "Expression synchronization",
+];
 const stack = [
   ["Inference", "Gemma 4 E4B", "llama.cpp · GGUF"], ["Backend", "Python", "FastAPI streaming"], ["Persistence", "Atomic JSON", "state and history"], ["Interfaces", "React + Vite", "Popup · Discord"], ["Deployment", "Raspberry Pi 5", "local runtime"],
 ];
@@ -38,28 +57,76 @@ function Navbar() {
   </nav></header>;
 }
 
-function Footer() { return <footer className="footer shell"><div className="footer-brand"><Logo /><div><strong>Akane</strong><p>Local-first privacy: the static site does not bundle a model or personal Akane state.</p></div></div><div className="footer-links"><Link to="/">Home</Link><Link to="/demo">Demo</Link><Link to="/technology">Technology</Link><GithubLink className="plain-link">GitHub</GithubLink></div><small>© {new Date().getFullYear()} Akane</small></footer>; }
+function Footer() { return <footer className="footer shell"><div className="footer-brand"><Logo /><div><strong>Akane</strong><p>A local-first AI companion built around memory, continuity, and personal presence.</p><small>Open source under the MIT License.</small></div></div><div className="footer-links"><Link to="/">Home</Link><Link to="/demo">Demo</Link><Link to="/technology">Technology</Link><GithubLink className="plain-link">GitHub</GithubLink></div><small>© {new Date().getFullYear()} Akane</small></footer>; }
 
 function Character({ compact = false }: { compact?: boolean }) { return <img className={`akane-image ${compact ? "compact" : ""}`} src={asset} alt="Akane, a blue-haired anime-style companion in a white jacket" />; }
 function Eyebrow({ children }: { children: ReactNode }) { return <p className="eyebrow"><Mark /> {children}</p>; }
 
-function HomePage() { return <main>
-  <section className="hero shell"><div className="hero-copy"><Eyebrow>Open source · Local first · Privacy minded</Eyebrow><h1>Your local<br />AI companion,<br /><em>brought to life.</em></h1><p className="lead">Akane is a locally hosted AI companion with persistent memory, emotional continuity, autonomous activities, and natural conversation.</p><div className="actions"><Link className="button primary" to="/demo">Try Demo <span>→</span></Link><Link className="button secondary" to="/technology">View Technology</Link></div><Link className="message-teaser" to="/demo"><Mark /><span>Message Akane…<small>Try the browser demo</small></span><b>→</b></Link></div><div className="hero-art"><div className="speech-bubble">Good morning!<br /><strong>What would you like to talk about?</strong></div><Character /></div></section>
-  <section className="section shell"><div className="section-heading"><Eyebrow>Built to be more than a chatbot</Eyebrow><h2>Features that make Akane special</h2></div><div className="feature-grid">{features.map(([icon, title, text]) => <article className="feature-card" key={title}><i>{icon}</i><h3>{title}</h3><p>{text}</p><Link to="/technology">Learn more →</Link></article>)}</div></section>
-  <section className="technology-strip shell"><div><h2>Local-first. Powerful. Yours.</h2><p>Akane runs as a small, focused project with a shared local runtime.</p></div><div className="tech-pills">{["Gemma 4 E4B", "llama.cpp", "Python", "Atomic JSON", "Discord"].map(item => <span key={item}>{item}</span>)}</div></section>
-  <section className="architecture-teaser shell"><div><Eyebrow>One companion, several ways to connect</Eyebrow><h2>A shared backend, with a familiar presence.</h2><p>Web Demo, Popup, and Discord each send requests through the same Akane runtime.</p><Link className="text-link" to="/technology">Explore the architecture →</Link></div><div className="architecture-lines" aria-label="Web Demo, Popup, and Discord connect to the shared Akane backend, then Gemma through llama.cpp"><span>Web Demo</span><span>Popup</span><span>Discord</span><b>Shared Akane Backend</b><strong>Gemma 4 via llama.cpp</strong></div></section>
-  <section className="home-cta shell"><Logo /><div><h2>Open source. Built with care.</h2><p>Akane is a local-first companion project made for thoughtful experimentation.</p></div><GithubLink>View on GitHub</GithubLink><Link className="button primary" to="/demo">Try Demo →</Link></section>
+function StatusBadge({ kind = "available" }: { kind?: "available" | "planned" }) {
+  return <span className={`status-badge ${kind}`}><span aria-hidden="true">{kind === "available" ? "✓" : "○"}</span>{kind === "available" ? "Available" : "Planned"}</span>;
+}
+
+function HomePage() { return <main className="home-page">
+  <section className="home-hero shell" aria-labelledby="home-title">
+    <picture className="home-hero-media">
+      <source
+        type="image/jpeg"
+        srcSet={`${projectConfig.basePath}assets/homepage-image-720.jpg 720w, ${projectConfig.basePath}assets/homepage-image-1100.jpg 1100w, ${projectConfig.basePath}assets/homepage-image-1448.jpg 1448w`}
+        sizes="(max-width: 760px) calc(100vw - 28px), (max-width: 1440px) calc(100vw - 48px), 1380px"
+      />
+      <img src={homepageImage} width="1448" height="1086" fetchPriority="high" decoding="async" alt="Akane, a blue-haired AI companion, standing in a bright room overlooking a city." />
+    </picture>
+    <div className="hero-atmosphere" aria-hidden="true"><span /><span /><span /></div>
+    <div className="home-hero-copy">
+      <p className="hero-badge"><span aria-hidden="true">♢</span> Local-first <b>•</b> Private <b>•</b> Always yours</p>
+      <h1 id="home-title">Your local<br />AI companion.</h1>
+      <p className="hero-accent">Always by your side.</p>
+      <p className="home-lead">Akane remembers what matters, develops through conversation, and stays present across your desktop, Discord, and the web.</p>
+      <div className="actions hero-actions"><Link className="button primary" to="/demo"><span aria-hidden="true">✦</span> Try the Demo <span aria-hidden="true">→</span></Link><GithubLink>View on GitHub</GithubLink></div>
+      <ul className="trust-list" aria-label="Project facts"><li><span aria-hidden="true">▣</span> Runs on Raspberry Pi</li><li><span aria-hidden="true">♢</span> Private owner profile</li><li><span aria-hidden="true">〈/〉</span> Open source</li></ul>
+    </div>
+  </section>
+
+  <section className="home-section capability-section shell" aria-labelledby="capability-title">
+    <div className="section-heading"><Eyebrow>Made to understand you</Eyebrow><h2 id="capability-title">Features that make Akane <em>feel real</em></h2></div>
+    <div className="feature-grid">{features.map(([icon, title, text]) => <article className="feature-card" key={title}><i aria-hidden="true">{icon}</i><h3>{title}</h3><p>{text}</p><StatusBadge /></article>)}</div>
+  </section>
+
+  <section className="home-section continuity-section shell" aria-labelledby="continuity-title">
+    <div className="continuity-intro"><Eyebrow>Built through continuity</Eyebrow><h2 id="continuity-title">A companion that develops with every meaningful interaction</h2><p>Akane does more than retain isolated facts. Conversations can shape what she remembers, how she understands you, and how the relationship develops over time.</p></div>
+    <ol className="continuity-flow">{continuitySteps.map(([number, title, text]) => <li key={title}><span className="step-number">{number}</span><div><h3>{title}</h3><p>{text}</p></div></li>)}</ol>
+  </section>
+
+  <section className="home-section interface-section shell" aria-labelledby="interface-title">
+    <div className="section-heading"><Eyebrow>One shared companion</Eyebrow><h2 id="interface-title">Meet Akane wherever the conversation happens</h2><p>Discord, the desktop popup, and the website connect to the same conversation architecture while keeping personal and guest profiles isolated.</p></div>
+    <div className="interface-diagram" role="group" aria-label="Desktop popup and Discord use the owner profile, while the website uses a temporary guest profile. All connect to the shared Akane backend and Gemma on the Raspberry Pi.">
+      <div className="interface-sources">
+        <article><div><span className="interface-icon" aria-hidden="true">▣</span><h3>Desktop popup</h3><StatusBadge /></div><p>Akane’s primary companion experience, designed for an always-present desktop form.</p><small>Owner profile</small></article>
+        <article><div><span className="interface-icon" aria-hidden="true">⌁</span><h3>Discord</h3><StatusBadge /></div><p>Remote and mobile conversation through the same owner profile and shared backend.</p><small>Owner profile</small></article>
+        <article><div><span className="interface-icon" aria-hidden="true">◎</span><h3>Website</h3><StatusBadge /></div><p>A browser-based guest experience connected to the real model running on the Raspberry Pi.</p><small>Temporary guest profile</small></article>
+      </div>
+      <div className="diagram-arrow" aria-hidden="true">→</div>
+      <article className="backend-node"><span aria-hidden="true">✦</span><h3>Shared Akane backend</h3><ul><li>Conversation</li><li>Memory</li><li>Emotion</li><li>Relationship</li><li>Inference</li></ul></article>
+      <div className="diagram-arrow" aria-hidden="true">→</div>
+      <article className="runtime-node"><span aria-hidden="true">◈</span><h3>Gemma</h3><p>Runs on the owner’s Raspberry Pi</p></article>
+    </div>
+    <p className="profile-note"><strong>Private continuity:</strong> Desktop and Discord share the owner profile. Website guests receive a separate temporary profile.</p>
+  </section>
+
+  <section className="home-section development-section shell" aria-labelledby="development-title">
+    <div className="section-heading"><Eyebrow>Current development</Eyebrow><h2 id="development-title">What Akane can do today—and what comes next</h2></div>
+    <div className="development-grid">
+      <article><div className="status-heading"><span aria-hidden="true">✓</span><div><h3>Available now</h3><p>Implemented in the current repository.</p></div></div><ul>{availableNow.map(item => <li key={item}><span>{item}</span><StatusBadge /></li>)}</ul></article>
+      <article><div className="status-heading planned"><span aria-hidden="true">○</span><div><h3>Being developed</h3><p>Planned directions, without promised dates.</p></div></div><ul>{plannedWork.map(item => <li key={item}><span>{item}</span><StatusBadge kind="planned" /></li>)}</ul></article>
+    </div>
+  </section>
+
+  <section className="home-cta shell" aria-labelledby="cta-title"><Mark /><div><h2 id="cta-title">Ready to meet Akane?</h2><p>Experience the real companion pipeline through the live demo, or explore the project on GitHub.</p></div><div className="actions"><Link className="button cta-primary" to="/demo">Try the Demo <span aria-hidden="true">→</span></Link><GithubLink className="button cta-secondary">View on GitHub</GithubLink></div></section>
 </main>; }
 
 type Message = { id: string; role: "akane" | "you"; text: string; time: string; preview?: boolean };
 type ConnectionState = "connecting" | "live" | "showcase";
 
-const greeting: Message = {
-  id: "welcome",
-  role: "akane",
-  text: "I'm here. Public profiles stay separate from the owner's personal Akane state.",
-  time: "Now",
-};
 const previewReplies = [
   "This is a prerecorded preview. Live Akane can remember the active public profile and stream a response when the Raspberry Pi is available.",
   "In live guest mode, memory and relationship continuity are real for this tab, but the temporary profile expires.",
@@ -73,9 +140,10 @@ function currentTime() {
 
 function sessionGreeting(): Message {
   return {
-    ...greeting,
     id: crypto.randomUUID(),
+    role: "akane",
     text: "Guest mode is live. Our memory and relationship continuity are real, but this temporary profile will expire.",
+    time: "Now",
   };
 }
 
@@ -84,7 +152,7 @@ function DemoPage() {
     projectConfig.demoMode === "showcase" || !projectConfig.apiUrl ? "showcase" : "connecting";
   const [connection, setConnection] = useState<ConnectionState>(initialConnection);
   const [health, setHealth] = useState<PublicHealth | null>(null);
-  const [messages, setMessages] = useState<Message[]>([greeting]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [activeSession, setActiveSession] = useState<PublicSession | null>(null);
   const activeSessionRef = useRef<PublicSession | null>(null);
@@ -94,8 +162,6 @@ function DemoPage() {
   const [error, setError] = useState("");
   const [retryExhausted, setRetryExhausted] = useState(false);
   const [reconnectKey, setReconnectKey] = useState(0);
-  const [tts, setTts] = useState(false);
-  const [volume, setVolume] = useState(.8);
   const aborter = useRef<AbortController | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -180,7 +246,7 @@ function DemoPage() {
 
   function openPreview() {
     setConnection("showcase");
-    setMessages([greeting]);
+    setMessages([]);
     setError("");
   }
 
@@ -219,10 +285,9 @@ function DemoPage() {
   async function resetConversation() {
     if (generating) return;
     aborter.current?.abort();
-    stopSpeech();
     setError("");
     if (!activeSession) {
-      setMessages([greeting]);
+      setMessages([]);
       return;
     }
     if (connection !== "live") {
@@ -252,7 +317,7 @@ function DemoPage() {
     } finally {
       clearGuestToken();
       activateSession(null);
-      setMessages([greeting]);
+      setMessages([]);
       setActionPending(false);
     }
   }
@@ -265,7 +330,6 @@ function DemoPage() {
       { id: crypto.randomUUID(), role: "you", text: message, time: now },
       { id: crypto.randomUUID(), role: "akane", text: reply, time: now, preview: true },
     ]);
-    if (tts) speak(reply, volume);
   }
 
   async function renewExpiredGuest() {
@@ -317,7 +381,6 @@ function DemoPage() {
           completed += delta;
           setMessages(current => current.map(item => item.id === replyId ? { ...item, text: completed } : item));
         },
-        onDone: () => { if (tts) speak(completed, volume); },
         onPresentation: setBackendPresentation,
       }, controller.signal);
     } catch (cause) {
@@ -378,7 +441,6 @@ function DemoPage() {
         backendPresentation={backendPresentation}
       />
       <aside className="controls panel"><h2>Demo controls</h2>
-        <fieldset><legend>Voice</legend><label className="toggle"><span>Browser TTS <small>{canUseSpeech() ? "Optional" : "Unavailable"}</small></span><input type="checkbox" checked={tts} disabled={!canUseSpeech()} onChange={event => setTts(event.target.checked)} /></label><label>Volume<input type="range" min="0" max="1" step=".1" value={volume} disabled={!tts} onChange={event => setVolume(Number(event.target.value))} /></label></fieldset>
         <fieldset><legend>Session</legend>
           {connection === "connecting" && <p>Checking live availability…</p>}
           {previewMode && <><p className="preview-note"><strong>Preview Mode</strong> is prerecorded and never persisted.</p><button className="quiet-button" onClick={openPreview}>Clear preview</button></>}
@@ -388,9 +450,8 @@ function DemoPage() {
         <fieldset><legend>Connection</legend><p><span className={`dot ${previewMode ? "bad" : ""}`} />{connectionLabel}</p>{previewMode && projectConfig.demoMode === "live" && projectConfig.apiUrl && <button className="quiet-button" onClick={reconnect}>Reconnect now</button>}{retryExhausted && <p className="retry-note">Automatic retries finished. Manual reconnect remains available.</p>}</fieldset>
       </aside>
     </div>
-    <section className="suggestions panel"><h2>{previewMode ? "Try the prerecorded preview…" : "Try saying something…"}</h2><div>{suggestions.map(prompt => <button key={prompt} onClick={() => void send(prompt)} disabled={inputDisabled}>{prompt}</button>)}</div></section>
-    <form className="composer panel" onSubmit={(event: FormEvent) => { event.preventDefault(); void send(); }}><Mark /><label className="sr-only" htmlFor="message">Message Akane</label><textarea id="message" value={input} onChange={event => setInput(event.target.value)} onKeyDown={keyDown} maxLength={750} disabled={inputDisabled} placeholder={needsSession ? "Start a guest session first…" : connection === "connecting" ? "Connecting to Akane…" : previewMode ? "Try the prerecorded preview…" : "Message Akane…"} rows={2} /><div><small>{input.length}/750 · Enter to send, Shift + Enter for a new line</small>{error && <p className="form-error" role="alert">{error}</p>}</div>{generating ? <button className="button secondary" type="button" onClick={() => { aborter.current?.abort(); stopSpeech(); }}>Stop</button> : <button className="button primary" disabled={inputDisabled || !input.trim()}>Send →</button>}</form>
-    <section className="runtime panel" aria-label="Runtime status"><span>◈ {connectionLabel}</span><span>▣ Model: {projectConfig.modelName}</span><span>◌ {tts ? "Browser TTS on" : "Voice off"}</span><span>◉ {previewMode ? "Nothing saved" : sessionLabel}</span></section>
+    <form className="composer panel" onSubmit={(event: FormEvent) => { event.preventDefault(); void send(); }}><Mark /><label className="sr-only" htmlFor="message">Message Akane</label><textarea id="message" value={input} onChange={event => setInput(event.target.value)} onKeyDown={keyDown} maxLength={750} disabled={inputDisabled} placeholder={needsSession ? "Start a guest session first…" : connection === "connecting" ? "Connecting to Akane…" : previewMode ? "Try the prerecorded preview…" : "Message Akane…"} rows={2} /><div><small>{input.length}/750 · Enter to send, Shift + Enter for a new line</small>{error && <p className="form-error" role="alert">{error}</p>}</div>{generating ? <button className="button secondary" type="button" onClick={() => { aborter.current?.abort(); }}>Stop</button> : <button className="button primary" disabled={inputDisabled || !input.trim()}>Send →</button>}</form>
+    <section className="runtime panel" aria-label="Runtime status"><span>◈ {connectionLabel}</span><span>▣ Model: {projectConfig.modelName}</span><span>◉ {previewMode ? "Nothing saved" : sessionLabel}</span></section>
   </main>;
 }
 

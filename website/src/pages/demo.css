@@ -216,7 +216,7 @@
 @media (max-width: 430px) {
   .demo-page { --demo-workspace-height: 430px; }
   .demo-workspace { width: min(100% - 24px, 1380px); }
-  .akane-stage-image { width: 64%; height: 67%; }
+  .akane-stage-image { width: 62%; height: 65%; }
   .akane-stage-bubble { top: 11%; left: 5%; max-width: 55%; font-size: 0.72rem; }
   .demo-send-button { min-width: 63px; padding: 0 8px; }
 }

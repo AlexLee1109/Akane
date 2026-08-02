@@ -17,7 +17,7 @@ function normalizeBasePath(value: string | undefined) {
 
 function normalizeApiUrl(value: string | undefined, isProduction: boolean) {
   const trimmed = value?.trim();
-  if (!trimmed) return null;
+  if (!trimmed) return isProduction ? null : window.location.origin;
 
   try {
     if (isProduction && trimmed.startsWith("/")) {

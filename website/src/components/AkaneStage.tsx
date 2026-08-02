@@ -6,6 +6,7 @@ interface AkaneStageProps {
   connection: "connecting" | "live" | "showcase";
   generating: boolean;
   hasResponseText: boolean;
+  isThinking: boolean;
   backendPresentation?: AkanePresentationState;
 }
 
@@ -21,12 +22,16 @@ function CharacterRenderer({ imageSrc, state }: { imageSrc: string; state: Akane
   />;
 }
 
-function SpeechBubble({ text }: { text: string }) {
-  return <div className="akane-stage-bubble">{text}</div>;
+function SpeechBubble({ text, thinking }: { text?: string; thinking: boolean }) {
+  return <div className={`akane-stage-bubble ${thinking ? "thinking" : ""}`}>
+    {thinking
+      ? <><span className="akane-thinking-dots" aria-hidden="true"><i /><i /><i /></span><span className="sr-only">Akane is thinking</span></>
+      : text}
+  </div>;
 }
 
-function ConversationView({ text }: { text: string }) {
-  return <SpeechBubble text={text} />;
+function ConversationView({ text, thinking }: { text?: string; thinking: boolean }) {
+  return <SpeechBubble text={text} thinking={thinking} />;
 }
 
 export function AkaneStage(props: AkaneStageProps) {
@@ -38,7 +43,7 @@ export function AkaneStage(props: AkaneStageProps) {
   );
   return <section className="akane-stage demo-panel" aria-label="Akane stage">
     {props.connection !== "connecting" && <span className={`akane-stage-mode ${props.connection}`}>{props.connection === "live" ? "Live" : "Preview"}</span>}
-    {props.responseText?.trim() && <ConversationView text={props.responseText} />}
+    {(props.responseText?.trim() || props.isThinking) && <ConversationView text={props.responseText} thinking={props.isThinking} />}
     <CharacterRenderer imageSrc={props.imageSrc} state={state} />
   </section>;
 }

@@ -326,6 +326,7 @@ export function DemoPage() {
           : "Live · No guest session";
   const lastMessage = messages.at(-1);
   const responseText = lastMessage?.role === "akane" && lastMessage.text.trim() ? lastMessage.text : undefined;
+  const isThinking = generating && lastMessage?.role === "akane" && !lastMessage.text.trim();
   const composerPlaceholder = connection === "connecting"
     ? "Connecting to Akane…"
     : needsSession
@@ -336,26 +337,33 @@ export function DemoPage() {
 
   return <main className="demo-page">
     <section className="demo-intro shell" aria-labelledby="demo-title">
-      <p className="demo-eyebrow"><span aria-hidden="true" />Live Demo</p>
-      <h1 id="demo-title">Chat with Akane <em>in real time.</em></h1>
-      <p>Start an isolated temporary guest session and talk to the real Akane runtime on the Raspberry Pi. When the Pi is unavailable, the page uses a clearly labeled prerecorded preview.</p>
-    </section>
-
-    <section className="demo-status-strip shell" aria-label="Demo status" aria-live="polite">
-      <div><span className={`demo-status-dot ${connection}`} aria-hidden="true" /><p><span>Demo status</span><strong>{connectionLabel}</strong></p></div>
-      <small>Model: {projectConfig.modelName}</small>
+      <div><p className="demo-eyebrow">Akane Live Demo</p><h1 id="demo-title">Your local AI companion</h1><p>Talk with the same local companion running directly on my Raspberry Pi.</p></div>
+      <div className="demo-header-status" aria-label="Demo status" aria-live="polite"><span className={`demo-status-dot ${connection}`} aria-hidden="true" /><div><strong>{connectionLabel}</strong><small>Temporary Guest Session</small></div></div>
     </section>
 
     <section className="demo-workspace shell" aria-label="Akane demo workspace">
       <DemoConversation messages={messages} generating={generating} />
-      <AkaneStage
-        imageSrc={characterAsset}
-        responseText={responseText}
-        connection={connection}
-        generating={generating}
-        hasResponseText={Boolean(responseText)}
-        backendPresentation={backendPresentation}
-      />
+      <div className="demo-center">
+        <AkaneStage
+          imageSrc={characterAsset}
+          responseText={responseText}
+          connection={connection}
+          generating={generating}
+          hasResponseText={Boolean(responseText)}
+          isThinking={Boolean(isThinking)}
+          backendPresentation={backendPresentation}
+        />
+        <DemoComposer
+          value={input}
+          placeholder={composerPlaceholder}
+          disabled={inputDisabled}
+          generating={generating}
+          error={error}
+          onChange={setInput}
+          onSend={() => { void send(); }}
+          onStop={() => { aborter.current?.abort(); }}
+        />
+      </div>
       <DemoControls
         connection={connection}
         guestEnabled={health?.guestEnabled === true}
@@ -373,18 +381,6 @@ export function DemoPage() {
       />
     </section>
 
-    <div className="shell">
-      <DemoComposer
-        value={input}
-        placeholder={composerPlaceholder}
-        disabled={inputDisabled}
-        generating={generating}
-        error={error}
-        onChange={setInput}
-        onSend={() => { void send(); }}
-        onStop={() => { aborter.current?.abort(); }}
-      />
-      <p className="demo-privacy-note"><strong>Private guest boundary:</strong> Live messages use a temporary guest profile isolated from the owner profile. Preview Mode is prerecorded and sends nothing to Akane.</p>
-    </div>
+    <p className="demo-privacy-note shell"><strong>Private guest boundary:</strong> Live messages use a temporary guest profile isolated from the owner profile. Preview Mode is prerecorded and sends nothing to Akane.</p>
   </main>;
 }

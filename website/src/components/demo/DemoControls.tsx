@@ -18,45 +18,28 @@ interface DemoControlsProps {
 
 export function DemoControls(props: DemoControlsProps) {
   const busy = props.generating || props.actionPending;
+  const live = props.connection === "live";
+  const preview = props.connection === "showcase";
 
   return <aside className="demo-controls demo-panel" aria-labelledby="demo-controls-title">
-    {props.connection === "connecting" && <>
-      <header className="demo-control-header"><h2 id="demo-controls-title">Preparing the demo</h2></header>
-      <div className="demo-control-body"><p>Checking the configured Raspberry Pi connection.</p></div>
-    </>}
-
-    {props.connection === "live" && props.activeSession && <>
-      <header className="demo-control-header"><h2 id="demo-controls-title">Temporary guest session active</h2></header>
-      <div className="demo-control-body">
-        <p>Your conversation is temporary and isolated from the owner profile.</p>
-        <div className="demo-control-actions">
-          <button className="demo-control-button" type="button" disabled={busy} onClick={props.onReset}>Reset</button>
-          <button className="demo-control-button danger" type="button" disabled={busy} onClick={props.onEndSession}>End session</button>
-        </div>
-      </div>
-    </>}
-
-    {props.connection === "live" && !props.activeSession && <>
-      <header className="demo-control-header"><h2 id="demo-controls-title">Start a guest session</h2></header>
-      <div className="demo-control-body">
-        <p>Guest sessions are temporary and isolated from the owner profile.</p>
-        <div className="demo-control-actions">
-          <button className="demo-control-button primary" type="button" disabled={busy || !props.guestEnabled} onClick={props.onStartGuest}>Start guest session</button>
-          <button className="demo-control-button" type="button" disabled={busy} onClick={props.onOpenPreview}>Use prerecorded Preview</button>
-        </div>
-      </div>
-    </>}
-
-    {props.connection === "showcase" && <>
-      <header className="demo-control-header"><h2 id="demo-controls-title">Prerecorded Preview</h2></header>
-      <div className="demo-control-body">
-        <p>Messages are not sent to Akane or saved.</p>
-        <div className="demo-control-actions">
-          <button className="demo-control-button" type="button" disabled={busy} onClick={props.onClearPreview}>Clear preview</button>
-          {props.canReconnect && <button className="demo-control-button primary" type="button" disabled={busy} onClick={props.onReconnect}>Reconnect</button>}
-        </div>
-        {props.retryExhausted && props.canReconnect && <p className="demo-retry-note">Automatic retries have finished. Manual reconnect remains available.</p>}
-      </div>
-    </>}
+    <header className="demo-control-header"><p>Session</p><h2 id="demo-controls-title">Connection</h2></header>
+    <div className="demo-control-body">
+      <section className="demo-control-section">
+        <ul className="demo-connection-list">
+          <li><i className={`demo-status-dot ${live ? "live" : props.connection}`} aria-hidden="true" />{live ? "Connected" : preview ? "Preview mode" : "Connecting"}</li>
+          <li>Running on Raspberry Pi</li>
+          <li>{live ? "Live stream active" : preview ? "Messages stay on this page" : "Checking live stream"}</li>
+        </ul>
+      </section>
+      <section className="demo-control-section"><h3>Guest Session</h3><p>{preview ? "Preview messages are never sent to Akane." : "Isolated temporary memory. The owner profile is never modified and this session is automatically deleted."}</p></section>
+      <section className="demo-control-section"><h3>Session Actions</h3><div className="demo-control-actions">
+        {live && !props.activeSession && <button className="demo-control-button primary" type="button" disabled={busy || !props.guestEnabled} onClick={props.onStartGuest}>Start Guest Session</button>}
+        {live && !props.activeSession && <button className="demo-control-button" type="button" disabled={busy} onClick={props.onOpenPreview}>Use Preview</button>}
+        {preview && <button className="demo-control-button" type="button" disabled={busy} onClick={props.onClearPreview}>Clear Preview</button>}
+        {props.canReconnect && <button className="demo-control-button" type="button" disabled={busy} onClick={props.onReconnect}>Reconnect</button>}
+        {live && <button className="demo-control-button" type="button" disabled={busy || !props.activeSession} onClick={props.onReset}>Reset Conversation</button>}
+        {live && <button className="demo-control-button danger" type="button" disabled={busy || !props.activeSession} onClick={props.onEndSession}>End Guest Session</button>}
+      </div>{props.retryExhausted && props.canReconnect && <p className="demo-retry-note">Automatic retries have finished. Reconnect remains available.</p>}</section>
+    </div>
   </aside>;
 }

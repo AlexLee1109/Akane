@@ -120,7 +120,7 @@ function App() {
       <Route path="/technology" element={<TechnologyPage />} />
       <Route path="*" element={<HomePage />} />
     </Routes>
-    <Footer />
+    {location.pathname !== "/demo" && <Footer />}
   </>;
 }
 

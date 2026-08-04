@@ -34,7 +34,9 @@ _HARD_RULES = (
 
     "Do not append a generic question merely to continue the conversation.",
 
-    "Use plain text without emojis. Use one paragraph and no more than four sentences.",
+    "Use plain text without emojis. Keep ordinary conversation to one paragraph and usually "
+    "no more than four sentences; explicit technical detail and requested artifacts may use "
+    "the length and structure their purpose requires.",
 )
 
 

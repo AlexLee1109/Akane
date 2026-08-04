@@ -31,8 +31,8 @@ from app.core.memory import get_state_store
 from app.core.life_worker import (
     acknowledge_initiative_delivery,
     claim_initiative_delivery,
-    start_presence_worker,
-    stop_presence_worker,
+    start_background_service,
+    stop_background_service,
 )
 from app.core.model_loader import ModelManager
 from app.core.session import (
@@ -108,12 +108,11 @@ async def _request_payload(request: Request) -> dict:
 
 def _parse_chat_request(payload: dict) -> ChatRequestData:
     source = str(payload.get("source") or "web")
-    default_profile = DEFAULT_PROFILE_ID
     default_conversation = DEFAULT_CONVERSATION_ID
     return ChatRequestData(
         chat_input=normalize_chat_input(
             text=payload.get("message", ""),
-            profile_id=payload.get("profile_id", default_profile),
+            profile_id=OWNER_PROFILE_ID,
             conversation_id=payload.get("conversation_id", payload.get("session_id", default_conversation)),
             source=source,
             timestamp=payload.get("timestamp", 0.0),
@@ -230,6 +229,9 @@ def _review_vscode_context(decision: ReviewDecision | None = None) -> str:
 def _stream_chat_events(chat: ChatRequestData):
     item = chat.chat_input
     generation_id = ""
+    cancellation = threading.Event()
+    worker: threading.Thread | None = None
+    finished = False
     try:
         yield _json_line(
             {
@@ -247,6 +249,7 @@ def _stream_chat_events(chat: ChatRequestData):
                     skip_memory=chat.skip_memory,
                     skip_if_busy=chat.skip_if_busy,
                     on_delta=lambda text: stream_queue.put(("delta", text)),
+                    cancellation=cancellation,
                 )
                 stream_queue.put(("done", result))
             except Exception as exc:
@@ -275,6 +278,7 @@ def _stream_chat_events(chat: ChatRequestData):
                     raise RuntimeError("Streaming worker failed.")
                 raise value
             result = value
+            finished = True
         worker.join()
         generation_id = result.generation_id
         yield _json_line(
@@ -302,6 +306,10 @@ def _stream_chat_events(chat: ChatRequestData):
                 "error": _safe_error(exc),
             }
         )
+    finally:
+        if worker is not None and worker.is_alive() and not finished:
+            cancellation.set()
+            worker.join(timeout=0.25)
 
 
 def handle_builtin_command(chat_input: ChatInput) -> dict | None:
@@ -348,7 +356,6 @@ def _start_model_loading() -> None:
     manager = ModelManager.get_instance()
     status = manager.status()
     if status["loaded"]:
-        start_presence_worker()
         return
     if status["error"]:
         return
@@ -359,8 +366,6 @@ def _start_model_loading() -> None:
         def load() -> None:
             try:
                 manager.ensure_loaded()
-                if not _RUNTIME_SHUTDOWN.is_set():
-                    start_presence_worker()
             except Exception as exc:
                 _log("model-error", str(exc))
 
@@ -382,6 +387,7 @@ async def _lifespan(app: FastAPI):
         public_sessions.start()
     app.state.public_sessions = public_sessions
     _RUNTIME_SHUTDOWN.clear()
+    start_background_service()
     _start_model_loading()
     try:
         yield
@@ -390,7 +396,7 @@ async def _lifespan(app: FastAPI):
         if public_sessions is not None:
             public_sessions.shutdown()
         app.state.public_sessions = None
-        stop_presence_worker()
+        stop_background_service()
         cancel_all_generations()
 
 
@@ -498,14 +504,14 @@ def create_app() -> FastAPI:
         return JSONResponse(
             _app_state_payload(
                 conversation,
-                profile_id,
+                OWNER_PROFILE_ID,
                 include_messages=_coerce_bool(include_messages, True),
             )
         )
 
     @app.get("/api/memory")
     async def api_memory(profile_id: str = DEFAULT_PROFILE_ID):
-        return JSONResponse(get_state_store().public_memory(profile_id))
+        return JSONResponse(get_state_store().public_memory(OWNER_PROFILE_ID))
 
     @app.post("/api/chat/cancel")
     async def api_cancel(request: Request):
@@ -513,9 +519,11 @@ def create_app() -> FastAPI:
         conversation = str(
             payload.get("conversation_id") or payload.get("session_id") or DEFAULT_CONVERSATION_ID
         )
-        profile = str(payload.get("profile_id") or DEFAULT_PROFILE_ID)
         return JSONResponse(
-            {"ok": True, "cancelled": cancel_generation(conversation, profile)}
+            {
+                "ok": True,
+                "cancelled": cancel_generation(conversation, OWNER_PROFILE_ID),
+            }
         )
 
     @app.post("/api/chat")

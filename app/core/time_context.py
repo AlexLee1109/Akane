@@ -99,6 +99,7 @@ def format_time_context(context: TimeContext) -> str:
         f"Local date: {context.weekday}, {local.strftime('%B')} "
         f"{local.day}, {local.year}.",
         f"Local time: {context.weekday} {context.daypart}, {clock}.",
+        "Time context is neutral background unless the current message makes it relevant.",
     ]
     if context.seconds_since_user_message is not None:
         lines.append(

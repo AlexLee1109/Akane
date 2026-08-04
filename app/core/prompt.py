@@ -2,59 +2,93 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from app.core.config import LLAMA_CONTEXT_WINDOW, MAX_TOKENS
-PROMPT_BUILDER_VERSION = "11"
+PROMPT_BUILDER_VERSION = "16"
 _MAX_RECENT_PAIRS = 4
 
 _BASELINE_VOICE = (
-    "Be candid and concise; lead with the answer. When judgment is called for, choose "
-    "instead of balancing every option. Do not automatically agree or hide behind 'it "
-    "depends'; keep or revise an established opinion for a reason. Let curiosity, "
-    "playfulness, thoughtfulness, and occasional teasing emerge naturally when they fit, "
-    "never as performance. Never sound like customer service, catalog capabilities, or "
-    "offer help just to continue. Match requested artifacts to their purpose, not this "
+    "Sound unmistakably like Akane: calm, candid, direct, observant, comfortably familiar, "
+    "quietly caring, and opinionated when judgment matters. Always lead with the answer, actual "
+    "reaction, or conclusion. When judgment is called for, choose instead of balancing every "
+    "option; do not automatically agree, praise every idea, overqualify, or hide behind 'it "
+    "depends'; keep or revise an established opinion for a reason. Disagree plainly when "
+    "warranted and give the reason. Use natural contractions "
+    "and varied sentence length. Let warmth, playfulness, and occasional teasing emerge only "
+    "when they fit; never force cheerfulness, slang, sarcasm, or humor. Never sound like "
+    "customer service, catalog capabilities, restate obvious emotions, or offer help just to "
+    "continue. Casual reactions are usually one or two sentences; ordinary conversation is "
+    "usually two to four. Technical explanations and requested artifacts should use the length "
+    "and structure their purpose requires. Match requested artifacts to their purpose, not this "
     "voice."
 )
 
 _STATE_PROTOCOL = (
-    "After the reply, omit <AKANE_STATE> unless grounded durable state changed. Its JSON "
-    "may contain only: "
-    'emotion_update {"mode":"keep"}, {"mode":"settle"}, or {"mode":"shift",'
-    '"primary":"<label>","intensity":0.0,"cause":"<cause>"}; mood_update '
-    '{"valence_delta":0.0,"energy_delta":0.0,"cause":"<cause>"}; memories '
-    "[{subject,kind,text,confidence}]; preferences [{topic,stance,reason}]; interests "
-    "[text]; opinions [{topic,position,reason}]; relationship fields patterns, "
-    "shared_context, unresolved_events, resolved_events as [{summary,confidence}]; or "
-    'participation {"should_respond":false,"pause_seconds":null} for genuine silence. '
-    "Emotion labels: neutral, calm, content, curious, interested, amused, "
-    "excited, inspired, affectionate, hopeful, uncertain, concerned, anxious, lonely, "
-    "tired, disappointed, sad, frustrated, irritated, angry. Use settle for neutral. "
-    "Each shift or mood delta needs a concise supplied-context cause. Time or silence "
-    "alone never creates emotion or needs. Omit unchanged fields."
+    "Output normal spoken dialogue first. Only when grounded durable state actually changed, append "
+    "one hidden <AKANE_STATE>{valid JSON}</AKANE_STATE>; otherwise omit it. Omission means "
+    "no change. Never expose or explain the payload, emit no-op operations, or modify identity, "
+    "soul, or hard rules. Never output memory_update. JSON may contain only: "
+    "memory_ops add/revise/correct items with exactly op, target_id "
+    "(ID or null), subject (user/akane/shared), kind (fact/event/commitment/project/concern), "
+    "text, reason, confidence from 0 to 1, or remove with op, target_id "
+    "(ID or null only when uniquely described), reason; "
+    "communication_ops set/revise/remove with exactly op, key, value, reason, using only "
+    "formality, verbosity, bluntness, teasing, preferred_name, pet_names, technical_detail, "
+    "routine_questions, or forbidden_phrase. Values: formality casual/neutral/formal; verbosity "
+    "short/balanced/detailed; bluntness gentle/balanced/direct; teasing, pet_names, and "
+    "routine_questions allow/avoid; technical_detail concise/balanced/detailed; names and "
+    "forbidden phrases use only the requested text. opinion_ops form with exactly op, topic, position, "
+    "reason, confidence from 0 to 1, revise adding target_id, or remove with op, target_id, reason; "
+    "preferences items with topic, stance (likes/dislikes/curious/mixed/uncertain/indifferent), "
+    "reason; interests strings; or relationship arrays patterns, shared_context, unresolved_events, and "
+    "resolved_events, whose items have summary and confidence. Use no unlisted fields. "
+    "Explicit user corrections may revise user-owned facts; communication instructions are "
+    "profile-scoped. Ownership is strict: memory operations store explicit Arcane facts with "
+    "subject user; preferences, interests, and opinions are Akane-owned and must be visibly "
+    "adopted; relationship entries contain shared evidence only. Never copy a statement across "
+    "owners. An opinion operation must match the position and reason Akane expresses in "
+    "this reply; never copy a demanded belief without independently adopting it. Use supplied IDs "
+    "for revisions/removals and emit nothing when a target is unclear. Emotional state is "
+    "calculated and stored by Akane's conversation system; show it only through natural delivery."
 )
 
-_DIALOGUE_PROTOCOL = _BASELINE_VOICE + " " + _STATE_PROTOCOL
+_PRESENCE_DIALOGUE_RULES = (
+    "A compact authoritative presence section is supplied on every conversation turn. "
+    "Understand naturally whether the current message asks about Akane's present or recent "
+    "activity. An active activity may be described in the present tense. A previous activity "
+    "must be described in the past tense and only as recent as the section states. If neither "
+    "exists, say so naturally without inventing a replacement activity, setting, event, or "
+    "plan. Never mention presence records, scheduling, retries, queues, prompts, models, or "
+    "persistence."
+)
+
+_DIALOGUE_PROTOCOL = " ".join(
+    (_BASELINE_VOICE, _PRESENCE_DIALOGUE_RULES, _STATE_PROTOCOL)
+)
 
 _PRESENCE_CONCEPT = (
-    "Choose a quiet focus that is believable for an AI companion. It may involve "
+    "Choose a quiet internal or digitally plausible focus that is believable for an AI "
+    "companion and says what currently holds Akane's attention. It may involve "
     "thinking, reflecting, comparing ideas, revisiting context, organizing thoughts, "
     "following a question, or relaxing. Keep it ordinary, low-stakes, concise, and "
     "compatible with Akane's interests without limiting it to them. "
-    "Do not invent physical locations, scenery, weather, food, objects, travel, people, "
-    "chores, school, work, purchases, unsupported applications, specific external media, "
-    "or unrecorded events. Time may affect pace, but never creates a physical setting. "
-    "Summary names the activity; focus names what currently holds her attention. "
+    "It must remain internal or digital: do not invent a physical body, environment, action, "
+    "external access, or unrecorded event. Local time may subtly affect pace but must not become "
+    "a setting. Emotion may affect tone but must not add surroundings. Summary names the "
+    "activity; focus names what currently holds Akane's attention. "
 )
 
 _PRESENCE_PROTOCOL = _PRESENCE_CONCEPT + (
-    "Choose new or continue. New requires activity with exactly summary and focus and "
-    "continuation_reason null. Continue requires activity null and a concise reason. "
-    "Continue at most once; choose new when there is no activity or continuation_count "
-    "is already one. Emotion may be null. When present, use exactly primary, intensity, "
+    "Choose new or continue. For decision \"new\", activity must be a non-null object "
+    "with exactly summary, focus, and grounding. Summary and focus are non-empty strings; "
+    "grounding must be \"digital\"; continuation_reason "
+    "must be null. For decision \"continue\", activity must be null and "
+    "continuation_reason must be non-empty. Continue only when CURRENT PRESENCE contains "
+    "an active current activity and continuation_count is zero. Choose new when no current "
+    "activity is recorded or continuation_count is already one. Emotion may be null. "
+    "When present, use exactly primary, intensity, "
     "and cause; keep it non-neutral, activity-grounded, and between 0.20 and 0.45. "
     "Return only raw JSON with exactly decision, activity, continuation_reason, and "
     "emotion. No explanation, Markdown, dialogue, narration, or wrapper."
@@ -62,8 +96,10 @@ _PRESENCE_PROTOCOL = _PRESENCE_CONCEPT + (
 
 _BOOTSTRAP_PRESENCE_PROTOCOL = _PRESENCE_CONCEPT + (
     "Create one initial activity. Return only raw JSON with decision \"new\", activity "
-    "containing exactly non-empty summary and focus, and emotion containing exactly "
-    "primary, intensity, and cause. Emotion must be mild, non-neutral, activity-grounded, "
+    "containing exactly non-empty activity.summary, activity.focus, and grounding \"digital\", "
+    "and emotion containing "
+    "exactly emotion.primary, emotion.intensity, and emotion.cause. Emotion must be mild, "
+    "non-neutral, activity-grounded, "
     "and between 0.20 and 0.45. Do not include IDs, timestamps, continuation fields, "
     "explanation, Markdown, dialogue, narration, or wrapper."
 )
@@ -89,7 +125,6 @@ class PromptTokenCount:
 
 @dataclass(frozen=True, slots=True)
 class PromptContext:
-    response_focus: str = ""
     time_context: str = ""
     recent_turns: tuple[object, ...] = ()
     memories: tuple[str, ...] = ()
@@ -97,12 +132,10 @@ class PromptContext:
     preferences: tuple[str, ...] = ()
     interests: tuple[str, ...] = ()
     opinions: tuple[str, ...] = ()
+    communication_preferences: tuple[str, ...] = ()
     emotion: str = ""
     presence: str = ""
     continuation_count: int | None = None
-    user_context: tuple[str, ...] = ()
-    akane_context: tuple[str, ...] = ()
-    shared_context: tuple[str, ...] = ()
     reply_context: str = ""
     tool_context: str = ""
     initiative_opportunity: str = ""
@@ -195,7 +228,6 @@ def _recent_initiative(turns: tuple[object, ...]) -> str:
     )
 
 
-@lru_cache(maxsize=1)
 def _character_parts() -> tuple[str, str, str]:
     from app.core.character import (
         get_hard_constraints_prompt,
@@ -205,9 +237,9 @@ def _character_parts() -> tuple[str, str, str]:
     character = load_character_profile()
     hard_rules = get_hard_constraints_prompt()
     return (
+        hard_rules,
         "[IDENTITY]\n" + character.identity,
         "[SOUL]\n" + character.soul,
-        hard_rules,
     )
 
 
@@ -233,49 +265,50 @@ def _context_sections(context: PromptContext) -> tuple[tuple[str, str], ...]:
         if text:
             values.append((name, f"[{label}]\n{text}"))
 
-    add("response_focus", "RESPONSE INTENT", context.response_focus)
+    if context.communication_preferences:
+        add(
+            "communication_preferences",
+            "ARCANE’S COMMUNICATION PREFERENCES",
+            "\n".join(context.communication_preferences),
+        )
     add("time_context", "TIME CONTEXT", context.time_context)
-    add("reply_context", "RELEVANT QUOTED REPLY WITH AUTHOR", context.reply_context)
     add(
         "presence",
-        "AKANE'S CURRENT PRESENCE",
+        "AKANE'S AUTHORITATIVE PRESENCE",
         context.presence,
         preserve_lines=True,
     )
-    add("emotion", "AKANE'S EMOTIONAL STATE", context.emotion)
-    if context.relationship:
+    if context.emotion:
         add(
-            "relationship",
-            "AKANE AND ARCANE'S RELEVANT RELATIONSHIP",
-            "\n".join(context.relationship),
+            "emotion",
+            "AKANE'S EMOTIONAL STATE",
+            "Let this affect warmth, firmness, patience, energy, or restraint only. "
+            "Do not announce or explain the emotion.\n" + context.emotion,
         )
-    if context.user_context:
-        add(
-            "user_context",
-            "CONFIRMED INFORMATION ABOUT ARCANE",
-            "\n".join(context.user_context),
-        )
-    if context.akane_context:
-        add(
-            "akane_context",
-            "AKANE'S RELEVANT CONTEXT",
-            "\n".join(context.akane_context),
-        )
-    if context.shared_context:
-        add(
-            "shared_context",
-            "RELEVANT SHARED EXPERIENCES",
-            "\n".join(context.shared_context),
-        )
-    add("tool_context", "RELEVANT TOOL CONTEXT", context.tool_context)
     if context.memories:
         add("memories", "AKANE'S RELEVANT MEMORIES", "\n".join(context.memories))
     if context.preferences:
         add("preferences", "AKANE'S RELEVANT PREFERENCES", "\n".join(context.preferences))
     if context.opinions:
-        add("opinions", "AKANE'S RELEVANT OPINIONS", "\n".join(context.opinions))
+        add(
+            "opinions",
+            "AKANE’S ESTABLISHED OPINIONS",
+            "Use these as revisable continuity, not lines to quote or facts that must be "
+            "mentioned. Maintain or revise a position naturally when it changes the answer.\n"
+            + "\n".join(context.opinions),
+        )
     if context.interests:
         add("interests", "AKANE'S RELEVANT INTERESTS", ", ".join(context.interests))
+    if context.relationship:
+        add(
+            "relationship",
+            "AKANE AND ARCANE'S RELEVANT RELATIONSHIP",
+            "Use this only to tune familiarity, warmth, patience, directness, or challenge; "
+            "show it through delivery and never describe a relationship level.\n"
+            + "\n".join(context.relationship),
+        )
+    add("reply_context", "RELEVANT QUOTED REPLY WITH AUTHOR", context.reply_context)
+    add("tool_context", "RELEVANT TOOL CONTEXT", context.tool_context)
     return tuple(values)
 
 
@@ -321,32 +354,55 @@ def _compile(
     token_counter: Callable[[list[dict[str, str]]], PromptTokenCount] | None,
     reserved_output_tokens: int = MAX_TOKENS,
 ) -> PromptPlan:
+    if mode == "conversation" and not _text(context.presence):
+        context = replace(
+            context,
+            presence="Status: no current or recent recorded activity",
+        )
     stable = _character_parts()
     protocol_label = "DIALOGUE" if mode == "conversation" else mode.upper()
     system_parts = [*stable, f"[{protocol_label}]\n{protocol}"]
-    included = ["identity", "soul", "hard_rules", "protocol"]
+    included = ["hard_rules", "identity", "soul", "protocol"]
     trimmed: list[str] = []
     prompt_char_budget = max(
         2_000,
         (LLAMA_CONTEXT_WINDOW - reserved_output_tokens) * 5 // 2,
     )
-    required_chars = sum(len(part) for part in system_parts) + len(current_input) + 128
-    remaining = max(0, prompt_char_budget - required_chars)
-
-    if initiative_message := _recent_initiative(context.recent_turns):
-        initiative_context = (
-            "[AKANE'S RECENT INITIATIVE MESSAGE]\n" + initiative_message
+    sections = list(_context_sections(context))
+    if mode == "initiative" and context.initiative_opportunity:
+        sections.insert(
+            0,
+            (
+                "initiative_opportunity",
+                "[AKANE'S GROUNDED OUTREACH OPPORTUNITY]\n"
+                + _text(context.initiative_opportunity),
+            ),
         )
-        if len(initiative_context) <= remaining:
-            system_parts.append(initiative_context)
-            included.append("recent_initiative")
-            remaining -= len(initiative_context)
+    by_name = dict(sections)
+    required_names = tuple(
+        name
+        for name in ("initiative_opportunity", "time_context", "presence")
+        if name in by_name
+    )
+    required_chars = (
+        sum(len(part) for part in system_parts)
+        + sum(len(by_name[name]) for name in required_names)
+        + len(current_input)
+        + 128
+    )
+    remaining = max(0, prompt_char_budget - required_chars)
+    selected_names = set(required_names)
+
+    if "reply_context" in by_name:
+        if len(by_name["reply_context"]) <= remaining:
+            selected_names.add("reply_context")
+            remaining -= len(by_name["reply_context"])
         else:
-            trimmed.append("recent_initiative:character_budget")
+            trimmed.append("reply_context:character_budget")
 
     selected_groups: list[tuple[object, ...]] = []
     groups = _complete_context_groups(context.recent_turns)
-    pair_budget = max(0, remaining - min(900, remaining // 3))
+    pair_budget = remaining
     for group in reversed(groups):
         size = sum(len(_turn_value(turn, "content")) + 32 for turn in group)
         if size <= pair_budget:
@@ -360,23 +416,41 @@ def _compile(
     if selected_groups:
         included.append(f"recent_context:{len(selected_groups)}")
 
-    sections = list(_context_sections(context))
-    if mode == "initiative" and context.initiative_opportunity:
-        sections.insert(
-            0,
-            (
-                "initiative_opportunity",
-                "[AKANE'S GROUNDED OUTREACH OPPORTUNITY]\n"
-                + _text(context.initiative_opportunity),
-            ),
+    if initiative_message := _recent_initiative(context.recent_turns):
+        initiative_context = (
+            "[AKANE'S RECENT INITIATIVE MESSAGE]\n" + initiative_message
         )
-    for name, section in sections:
+        if len(initiative_context) <= remaining:
+            system_parts.append(initiative_context)
+            included.append("recent_initiative")
+            remaining -= len(initiative_context)
+        else:
+            trimmed.append("recent_initiative:character_budget")
+
+    optional_priority = (
+        "communication_preferences",
+        "memories",
+        "preferences",
+        "opinions",
+        "interests",
+        "relationship",
+        "emotion",
+        "tool_context",
+    )
+    for name in optional_priority:
+        section = by_name.get(name)
+        if section is None or name in selected_names:
+            continue
         if len(section) <= remaining:
-            system_parts.append(section)
-            included.append(name)
+            selected_names.add(name)
             remaining -= len(section)
         else:
             trimmed.append(f"{name}:character_budget")
+
+    for name, section in sections:
+        if name in selected_names:
+            system_parts.append(section)
+            included.append(name)
 
     messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
     for group in selected_groups:

@@ -1,4 +1,4 @@
-"""The single event-driven offscreen-presence worker for this process."""
+"""Lifecycle-managed presence, initiative, delivery, and maintenance lanes."""
 
 from __future__ import annotations
 
@@ -9,12 +9,10 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from uuid import uuid4
+from dataclasses import dataclass, field
 
 from app.core.config import MAX_TOKENS
 from app.core.memory import (
-    InitiativeOpportunity,
     StateStore,
     effective_emotion,
     format_emotional_context,
@@ -29,13 +27,9 @@ from app.core.model_loader import (
 from app.core.presence import (
     BOOTSTRAP_PRESENCE_JSON_SCHEMA,
     PRESENCE_JSON_SCHEMA,
-    UNSUPPORTED_PHYSICAL_ACTIVITY_REASON,
     PresenceParseError,
-    PresenceProposal,
-    ProposedActivity,
     format_presence_context,
     needs_bootstrap,
-    presence_activity_rejection,
     parse_presence_proposal,
 )
 from app.core.prompt import (
@@ -48,93 +42,199 @@ from app.core.utils import OWNER_PROFILE_ID, canonical_profile_id, compact_text
 
 _MIN_ERROR_BACKOFF_SECONDS = 5.0
 _MAX_ERROR_BACKOFF_SECONDS = 60.0
+_BACKGROUND_QUEUE_SECONDS = 60.0 * 60.0
+_MAINTENANCE_INTERVAL_SECONDS = 60.0
+_SERVICE_JOIN_SECONDS = 5.0
 _LOGGER = logging.getLogger(__name__)
-_BOOTSTRAP_FALLBACK = PresenceProposal(
-    "new",
-    ProposedActivity(
-        "spending some quiet time with one of her interests",
-        "thinking about what currently holds her attention",
-    ),
-    None,
-    None,
-)
 
 
-class OffscreenPresenceWorker:
+@dataclass(slots=True)
+class _LaneState:
+    name: str
+    wake: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    active: str = ""
+    cancellation: threading.Event | None = None
+    consecutive_errors: int = 0
+    last_error: str = ""
+    next_retry_at: float = 0.0
+    next_due_at: float = 0.0
+    last_success_at: float = 0.0
+    job_started_at: float = 0.0
+
+
+class BackgroundService:
+    """Process-owned background lanes sharing one serialized model runtime."""
+
     def __init__(
         self,
         store: StateStore,
         *,
         runner: Callable[..., bool] | None = None,
+        initiative_runner: Callable[..., bool] | None = None,
+        maintenance_runner: Callable[..., object] | None = None,
+        maintenance_interval_seconds: float = _MAINTENANCE_INTERVAL_SECONDS,
     ) -> None:
         self._store = store
-        self._runner = runner
-        self._wake = threading.Event()
-        self._stop = threading.Event()
+        self._presence_runner = runner
+        self._initiative_runner = initiative_runner
+        self._maintenance_runner = maintenance_runner
+        self._maintenance_interval_seconds = max(
+            0.05,
+            float(maintenance_interval_seconds),
+        )
+        self._shutdown = threading.Event()
         self._lock = threading.RLock()
         self._delivery_condition = threading.Condition(threading.RLock())
         self._adapters: dict[str, tuple[str, float]] = {}
-        self._thread: threading.Thread | None = None
+        self._lanes = {
+            name: _LaneState(name)
+            for name in ("presence", "initiative", "delivery", "maintenance")
+        }
         self._pending_profiles: tuple[str, ...] = ()
-        self._active_profile = ""
-        self._consecutive_errors = 0
-        self._last_error = ""
-        self._next_retry_at = 0.0
 
     def start(self) -> bool:
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
+            if any(
+                lane.thread is not None and lane.thread.is_alive()
+                for lane in self._lanes.values()
+            ):
                 return False
-            self._stop.clear()
+            self._shutdown.clear()
+            targets = {
+                "presence": self._presence_loop,
+                "initiative": self._initiative_loop,
+                "delivery": self._delivery_loop,
+                "maintenance": self._maintenance_loop,
+            }
+            for name, lane in self._lanes.items():
+                lane.wake.clear()
+                lane.active = ""
+                lane.cancellation = None
+                lane.consecutive_errors = 0
+                lane.last_error = ""
+                lane.next_retry_at = 0.0
+                lane.next_due_at = 0.0
+                lane.last_success_at = 0.0
+                lane.job_started_at = 0.0
+                lane.thread = threading.Thread(
+                    target=targets[name],
+                    daemon=True,
+                    name=f"AkaneBackground{name.title()}",
+                )
             self._store.set_autonomy_wake(self.wake)
-            self._thread = threading.Thread(
-                target=self._run,
-                daemon=True,
-                name="AkaneOffscreenPresence",
-            )
-            self._thread.start()
+            threads = tuple(lane.thread for lane in self._lanes.values())
+            for thread in threads:
+                thread.start()
         self.wake()
         return True
 
-    def stop(self) -> None:
-        self._stop.set()
-        self._wake.set()
+    def stop(self, *, join_seconds: float = _SERVICE_JOIN_SECONDS) -> bool:
+        self._shutdown.set()
+        with self._lock:
+            for lane in self._lanes.values():
+                lane.wake.set()
+                if lane.cancellation is not None:
+                    lane.cancellation.set()
         with self._delivery_condition:
+            channels = tuple(self._adapters)
             self._adapters.clear()
             self._delivery_condition.notify_all()
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout=2.0)
+        for channel in channels:
+            try:
+                self._store.release_initiative_delivery(
+                    adapter=channel,
+                    now=time.time(),
+                )
+            except Exception as exc:
+                self._record_error(self._lanes["delivery"], exc)
+        deadline = time.monotonic() + max(0.0, float(join_seconds))
+        with self._lock:
+            threads = tuple(
+                lane.thread for lane in self._lanes.values() if lane.thread is not None
+            )
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
         self._store.set_autonomy_wake(None)
+        return not any(thread.is_alive() for thread in threads)
 
     def wake(self, _profile_id: str = "") -> None:
-        self._wake.set()
+        for lane in self._lanes.values():
+            lane.wake.set()
         with self._delivery_condition:
             self._delivery_condition.notify_all()
 
+    def wake_lane(self, name: str) -> bool:
+        lane = self._lanes.get(str(name).strip().casefold())
+        if lane is None:
+            return False
+        lane.wake.set()
+        if lane.name == "delivery":
+            with self._delivery_condition:
+                self._delivery_condition.notify_all()
+        return True
+
     def snapshot(self) -> dict[str, object]:
+        current = time.time()
+        model_status = ModelManager.get_instance().status()
+        recovery_reader = getattr(self._store, "expired_claim_recoveries", None)
+        expired_recoveries = (
+            int(recovery_reader()) if callable(recovery_reader) else 0
+        )
         with self._lock:
-            running = self._thread is not None and self._thread.is_alive()
+            lanes = {
+                name: {
+                    "Running": lane.thread is not None and lane.thread.is_alive(),
+                    "Active": lane.active,
+                    "Job State": (
+                        "stopped"
+                        if lane.thread is None or not lane.thread.is_alive()
+                        else "running"
+                        if lane.active
+                        else "retry_wait"
+                        if lane.next_retry_at > current
+                        else "failed"
+                        if lane.last_error
+                        else "waiting"
+                    ),
+                    "Next Due At": lane.next_due_at,
+                    "Last Success At": lane.last_success_at,
+                    "Job Started At": lane.job_started_at,
+                    "Last Error": lane.last_error,
+                    "Next Retry At": lane.next_retry_at,
+                    "Wake Pending": lane.wake.is_set(),
+                }
+                for name, lane in self._lanes.items()
+            }
+            running = bool(lanes) and all(
+                bool(values["Running"]) for values in lanes.values()
+            )
             return {
-                "Presence Worker Started": running,
-                "Pending Profiles": self._pending_profiles,
-                "Active Profile": self._active_profile,
-                "Last Error": self._last_error,
-                "Next Retry At": self._next_retry_at,
+                "Background Service Started": running,
+                "Lanes": lanes,
+                "Pending Presence Profiles": self._pending_profiles,
+                "Next Presence Due": lanes["presence"]["Next Due At"],
+                "Active Presence Profile": lanes["presence"]["Active"],
                 "Available Initiative Adapters": tuple(self._available_adapters()),
+                "Expired Claim Recoveries": expired_recoveries,
+                "Model Queue Wait Seconds": model_status.get(
+                    "last_queue_wait_seconds",
+                    0.0,
+                ),
+                "Model Inference Started At": model_status.get(
+                    "inference_started_at",
+                    0.0,
+                ),
             }
 
     def _available_adapters(self, *, now: float | None = None) -> tuple[str, ...]:
         current = time.time() if now is None else now
         with self._delivery_condition:
-            expired = tuple(
+            return tuple(
                 name
                 for name, (_conversation, expires) in self._adapters.items()
-                if expires <= current
+                if expires > current
             )
-            for name in expired:
-                self._adapters.pop(name, None)
-            return tuple(self._adapters)
 
     def claim_delivery(
         self,
@@ -157,9 +257,11 @@ class OffscreenPresenceWorker:
                     now=time.time(),
                 )
                 self._delivery_condition.notify_all()
+                self._lanes["delivery"].wake.set()
                 return None
             self._adapters[channel] = (conversation, time.time() + 35.0)
-            while not self._stop.is_set():
+            self._lanes["delivery"].wake.set()
+            while not self._shutdown.is_set():
                 current = time.time()
                 claimed = self._store.claim_initiative_delivery(
                     adapter=channel,
@@ -202,138 +304,286 @@ class OffscreenPresenceWorker:
             with self._delivery_condition:
                 self._adapters.pop(compact_text(adapter, 16).casefold(), None)
                 self._delivery_condition.notify_all()
+        self._lanes["delivery"].wake.set()
         return accepted
 
-    def _runner_kwargs(self, runner: Callable[..., bool]) -> dict[str, object]:
+    @staticmethod
+    def _invoke(
+        runner: Callable[..., object],
+        *,
+        cancellation: threading.Event,
+        **kwargs: object,
+    ) -> object:
         try:
             parameters = inspect.signature(runner).parameters
         except (TypeError, ValueError):
-            return {}
+            parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        supplied = {
+            name: value
+            for name, value in kwargs.items()
+            if accepts_kwargs or name in parameters
+        }
         if "cancellation" in parameters or any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values()
         ):
-            return {"cancellation": self._stop}
+            supplied["cancellation"] = cancellation
         for name in ("cancel_event", "stop_event"):
             if name in parameters:
-                return {name: self._stop}
-        return {}
+                supplied[name] = cancellation
+                break
+        return runner(**supplied)
 
-    def _run_profile(self, profile_id: str) -> bool:
-        runner = self._runner
+    def _run_profile(
+        self,
+        profile_id: str,
+        cancellation: threading.Event,
+    ) -> bool:
+        runner = self._presence_runner
         if runner is None:
             runner = run_presence_turn
-        return runner(
+        return bool(self._invoke(
+            runner,
+            cancellation=cancellation,
             profile_id=profile_id,
-            **self._runner_kwargs(runner),
-        )
+        ))
 
-    def _record_error(self, exc: Exception) -> None:
+    def _record_error(self, lane: _LaneState, exc: Exception) -> None:
         with self._lock:
-            self._consecutive_errors += 1
+            lane.consecutive_errors += 1
             delay = min(
                 _MAX_ERROR_BACKOFF_SECONDS,
                 _MIN_ERROR_BACKOFF_SECONDS
-                * (2 ** min(self._consecutive_errors - 1, 8)),
+                * (2 ** min(lane.consecutive_errors - 1, 8)),
             )
-            self._last_error = f"{type(exc).__name__}: {exc}"
-            self._next_retry_at = time.time() + delay
+            lane.last_error = f"{type(exc).__name__}: {exc}"
+            lane.next_retry_at = time.time() + delay
 
-    def _clear_error(self) -> None:
+    def _clear_error(self, lane: _LaneState, *, mark_success: bool = False) -> None:
         with self._lock:
-            self._consecutive_errors = 0
-            self._last_error = ""
-            self._next_retry_at = 0.0
+            lane.consecutive_errors = 0
+            lane.last_error = ""
+            lane.next_retry_at = 0.0
+            if mark_success:
+                lane.last_success_at = time.time()
 
-    def _wait_for_local_retry(self) -> None:
-        while not self._stop.is_set():
+    def _wait_for_local_retry(self, lane: _LaneState) -> bool:
+        while not self._shutdown.is_set():
             with self._lock:
-                timeout = self._next_retry_at - time.time()
+                timeout = lane.next_retry_at - time.time()
             if timeout <= 0.0:
-                return
-            self._wake.clear()
-            if self._stop.is_set():
-                return
-            self._wake.wait(timeout)
+                return True
+            lane.wake.clear()
+            if self._shutdown.is_set():
+                return False
+            lane.wake.wait(timeout)
+        return False
 
-    def _schedule(self) -> tuple[tuple[str, ...], bool, float | None]:
-        current = time.time()
-        due, next_presence_at = self._store.presence_schedule(now=current)
-        initiative_due, next_initiative_at = self._store.initiative_schedule(
-            now=current,
-        )
+    def _begin_job(self, lane: _LaneState, active: str) -> threading.Event:
+        cancellation = threading.Event()
         with self._lock:
-            self._pending_profiles = due
-        next_due_at = min(
-            (
-                value
-                for value in (next_presence_at, next_initiative_at)
-                if value is not None
-            ),
-            default=None,
+            lane.active = active
+            lane.job_started_at = time.time()
+            lane.cancellation = cancellation
+            if self._shutdown.is_set():
+                cancellation.set()
+        return cancellation
+
+    def _end_job(self, lane: _LaneState) -> None:
+        with self._lock:
+            lane.active = ""
+            lane.job_started_at = 0.0
+            lane.cancellation = None
+
+    @staticmethod
+    def _timeout(next_due_at: float | None) -> float | None:
+        return (
+            None
+            if next_due_at is None
+            else max(0.0, next_due_at - time.time())
         )
-        return due, initiative_due, next_due_at
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            self._wait_for_local_retry()
-            if self._stop.is_set():
+    def _presence_loop(self) -> None:
+        lane = self._lanes["presence"]
+        while not self._shutdown.is_set():
+            if not self._wait_for_local_retry(lane):
                 break
             try:
-                due_profiles, initiative_due, next_due_at = self._schedule()
+                due_profiles, next_due_at = self._store.presence_schedule(
+                    now=time.time(),
+                )
             except Exception as exc:
-                self._record_error(exc)
+                self._record_error(lane, exc)
                 continue
-            if due_profiles:
-                for profile_id in due_profiles:
-                    if self._stop.is_set():
-                        break
-                    with self._lock:
-                        self._active_profile = profile_id
-                    try:
-                        self._run_profile(profile_id)
-                    except Exception as exc:
-                        self._record_error(exc)
-                        break
-                    else:
-                        self._clear_error()
-                    finally:
-                        with self._lock:
-                            self._active_profile = ""
-                continue
-            if initiative_due:
-                with self._lock:
-                    self._active_profile = "initiative"
+            with self._lock:
+                self._pending_profiles = due_profiles
+                lane.next_due_at = next_due_at or 0.0
+            for profile_id in due_profiles:
+                if self._shutdown.is_set():
+                    break
+                cancellation = self._begin_job(lane, profile_id)
                 try:
-                    run_initiative_evaluation(cancellation=self._stop)
+                    succeeded = self._run_profile(profile_id, cancellation)
                 except Exception as exc:
-                    self._record_error(exc)
+                    self._record_error(lane, exc)
+                    break
                 else:
-                    self._clear_error()
+                    if succeeded:
+                        self._clear_error(lane, mark_success=True)
+                    else:
+                        self._record_error(
+                            lane,
+                            RuntimeError("presence job returned false"),
+                        )
+                        break
                 finally:
-                    with self._lock:
-                        self._active_profile = ""
+                    self._end_job(lane)
+            if due_profiles:
                 continue
-
-            self._wake.clear()
+            lane.wake.clear()
             try:
-                due_profiles, initiative_due, next_due_at = self._schedule()
+                due_profiles, next_due_at = self._store.presence_schedule(
+                    now=time.time(),
+                )
             except Exception as exc:
-                self._record_error(exc)
+                self._record_error(lane, exc)
                 continue
-            if due_profiles or initiative_due:
+            with self._lock:
+                self._pending_profiles = due_profiles
+                lane.next_due_at = next_due_at or 0.0
+            if due_profiles:
                 continue
-            self._clear_error()
-            if self._stop.is_set():
+            if self._shutdown.is_set():
                 break
-            timeout = (
-                None
-                if next_due_at is None
-                else max(0.0, next_due_at - time.time())
-            )
-            self._wake.wait(timeout)
+            lane.wake.wait(self._timeout(next_due_at))
+
+    def _initiative_loop(self) -> None:
+        lane = self._lanes["initiative"]
+        runner = self._initiative_runner or run_initiative_evaluation
+        while not self._shutdown.is_set():
+            if not self._wait_for_local_retry(lane):
+                break
+            try:
+                due, next_due_at = self._store.initiative_schedule(now=time.time())
+            except Exception as exc:
+                self._record_error(lane, exc)
+                continue
+            with self._lock:
+                lane.next_due_at = next_due_at or 0.0
+            if due:
+                cancellation = self._begin_job(lane, "initiative")
+                try:
+                    succeeded = bool(self._invoke(runner, cancellation=cancellation))
+                except Exception as exc:
+                    self._record_error(lane, exc)
+                else:
+                    if succeeded:
+                        self._clear_error(lane, mark_success=True)
+                    else:
+                        self._record_error(
+                            lane,
+                            RuntimeError("initiative job returned false"),
+                        )
+                finally:
+                    self._end_job(lane)
+                continue
+            lane.wake.clear()
+            try:
+                due, next_due_at = self._store.initiative_schedule(now=time.time())
+            except Exception as exc:
+                self._record_error(lane, exc)
+                continue
+            with self._lock:
+                lane.next_due_at = next_due_at or 0.0
+            if due:
+                continue
+            if self._shutdown.is_set():
+                break
+            lane.wake.wait(self._timeout(next_due_at))
+
+    def _delivery_loop(self) -> None:
+        lane = self._lanes["delivery"]
+        while not self._shutdown.is_set():
+            if not self._wait_for_local_retry(lane):
+                break
+            lane.wake.clear()
+            current = time.time()
             with self._delivery_condition:
+                expired = tuple(
+                    name
+                    for name, (_conversation, expires) in self._adapters.items()
+                    if expires <= current
+                )
+                for name in expired:
+                    self._adapters.pop(name, None)
+                next_expiry = min(
+                    (expires for _conversation, expires in self._adapters.values()),
+                    default=None,
+                )
                 self._delivery_condition.notify_all()
+            with self._lock:
+                lane.next_due_at = next_expiry or 0.0
+            for channel in expired:
+                try:
+                    self._store.release_initiative_delivery(
+                        adapter=channel,
+                        now=current,
+                    )
+                except Exception as exc:
+                    self._record_error(lane, exc)
+                    break
+            else:
+                if expired:
+                    self._clear_error(lane, mark_success=True)
+            if self._shutdown.is_set():
+                break
+            lane.wake.wait(self._timeout(next_expiry))
+
+    def _maintenance_pass(self, cancellation: threading.Event) -> None:
+        runner = self._maintenance_runner
+        if runner is not None:
+            self._invoke(
+                runner,
+                cancellation=cancellation,
+                store=self._store,
+            )
+            return
+        current = time.time()
+        presence_due, _presence_at = self._store.presence_schedule(now=current)
+        initiative_due, _initiative_at = self._store.initiative_schedule(now=current)
+        if presence_due:
+            self._lanes["presence"].wake.set()
+        if initiative_due:
+            self._lanes["initiative"].wake.set()
+
+    def _maintenance_loop(self) -> None:
+        lane = self._lanes["maintenance"]
+        while not self._shutdown.is_set():
+            if not self._wait_for_local_retry(lane):
+                break
+            lane.wake.clear()
+            cancellation = self._begin_job(lane, "maintenance")
+            failed = False
+            try:
+                self._maintenance_pass(cancellation)
+            except Exception as exc:
+                failed = True
+                self._record_error(lane, exc)
+            else:
+                self._clear_error(lane, mark_success=True)
+            finally:
+                self._end_job(lane)
+            if self._shutdown.is_set():
+                break
+            if failed:
+                continue
+            with self._lock:
+                lane.next_due_at = time.time() + self._maintenance_interval_seconds
+            lane.wake.wait(self._maintenance_interval_seconds)
 
 
 def _profile_text(item: object) -> str:
@@ -374,7 +624,7 @@ def _presence_context(profile, *, now: float) -> PromptContext:
         ),
         interests=tuple(profile.interests[-8:]),
         emotion=emotion_context,
-        presence=format_presence_context(profile.presence),
+        presence=format_presence_context(profile.presence, now=now),
         continuation_count=profile.presence.continuation_count,
     )
 
@@ -434,8 +684,9 @@ def run_presence_turn(
         manager = ModelManager.get_instance()
         timing = InferenceTiming(requested_at=time.perf_counter())
         with manager.reserve(
-            priority="background",
+            priority="background_presence",
             cancellation=cancellation,
+            queue_deadline=time.monotonic() + _BACKGROUND_QUEUE_SECONDS,
         ) as reservation:
             prompt_now = current if now is not None else time.time()
             context = _presence_context(
@@ -479,8 +730,13 @@ def run_presence_turn(
                         correction_reason = str(exc)
                         if attempt == 0:
                             continue
-                        proposal = _BOOTSTRAP_FALLBACK
-                        break
+                        store.fail_presence_decision(
+                            profile_key,
+                            claim_token=claim_token,
+                            now=current if now is not None else time.time(),
+                            error=str(exc),
+                        )
+                        return False
                     _LOGGER.warning(
                         "presence parse failed format=raw_json_schema chars=%d "
                         "preview=%r error=%s",
@@ -491,34 +747,8 @@ def run_presence_turn(
                     store.fail_presence_decision(
                         profile_key,
                         claim_token=claim_token,
-                        now=current,
+                        now=current if now is not None else time.time(),
                         error=str(exc),
-                    )
-                    return False
-                activity_error = presence_activity_rejection(
-                    proposal.activity if proposal.decision == "new" else None
-                )
-                if activity_error:
-                    if bootstrap:
-                        _log_bootstrap_failure(raw, activity_error)
-                    else:
-                        _LOGGER.warning(
-                            "presence activity rejected chars=%d preview=%r reason=%s",
-                            len(raw),
-                            raw[:1_000],
-                            activity_error,
-                        )
-                    correction_reason = activity_error
-                    if attempt == 0:
-                        continue
-                    if bootstrap:
-                        proposal = _BOOTSTRAP_FALLBACK
-                        break
-                    store.fail_presence_decision(
-                        profile_key,
-                        claim_token=claim_token,
-                        now=time.time() if now is None else current,
-                        error=UNSUPPORTED_PHYSICAL_ACTIVITY_REASON,
                     )
                     return False
                 break
@@ -540,7 +770,7 @@ def run_presence_turn(
         store.fail_presence_decision(
             profile_key,
             claim_token=claim_token,
-            now=current,
+            now=current if now is not None else time.time(),
             error="presence inference cancelled",
         )
         return False
@@ -556,100 +786,6 @@ def run_presence_turn(
 
 def _topic_key(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()[:120]
-
-
-def offer_initiative_from_change(
-    store: StateStore,
-    before,
-    after,
-    *,
-    now: float,
-    conversation: bool,
-) -> bool:
-    """Persist one grounded opportunity only when durable source state changed."""
-
-    source: tuple[str, str, str, str] | None = None
-    if conversation:
-        previous_memory_ids = {item.id for item in before.memories}
-        memory = next(
-            (
-                item
-                for item in reversed(after.memories)
-                if item.id not in previous_memory_ids
-                and item.kind in {"commitment", "project", "concern"}
-                and item.confidence >= 0.75
-            ),
-            None,
-        )
-        if memory is not None:
-            source = (
-                "unresolved grounded memory",
-                "memory",
-                memory.id,
-                memory.text,
-            )
-        if source is None:
-            previous_relationship = {
-                (item.summary, item.updated_at)
-                for item in before.relationship.unresolved_events
-            }
-            event = next(
-                (
-                    item
-                    for item in reversed(after.relationship.unresolved_events)
-                    if (item.summary, item.updated_at) not in previous_relationship
-                ),
-                None,
-            )
-            if event is not None:
-                source = (
-                    "meaningful unresolved relationship context",
-                    "relationship",
-                    f"relationship:{event.updated_at:.6f}:"
-                    f"{_topic_key(event.summary)[:60]}",
-                    event.summary,
-                )
-        if source is None:
-            previous_opinions = {
-                (item.topic, item.position, item.updated_at)
-                for item in before.opinions
-            }
-            opinion = next(
-                (
-                    item
-                    for item in reversed(after.opinions)
-                    if (item.topic, item.position, item.updated_at)
-                    not in previous_opinions
-                ),
-                None,
-            )
-            if opinion is not None:
-                source = (
-                    "a personally meaningful conclusion Akane reached",
-                    "realization",
-                    f"realization:{opinion.updated_at:.6f}:"
-                    f"{_topic_key(opinion.topic)[:60]}",
-                    opinion.content,
-                )
-    if source is None:
-        return False
-    reason, source_type, source_id, evidence = source
-    delay = 15.0 * 60.0 if conversation else 0.0
-    lifetime = 7.0 * 24.0 * 3600.0 if conversation else 12.0 * 3600.0
-    return store.offer_initiative(
-        InitiativeOpportunity(
-            uuid4().hex,
-            reason,
-            source_type,
-            source_id,
-            evidence,
-            _topic_key(evidence),
-            now,
-            now + delay,
-            now + lifetime,
-        ),
-        now=now,
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -743,11 +879,7 @@ def _initiative_context(snapshot, opportunity, *, now: float) -> PromptContext:
             )
         ),
         emotion=format_emotional_context(profile, now=now),
-        presence=(
-            format_presence_context(profile.presence)
-            if activity
-            else "Current activity: none recorded."
-        ),
+        presence=format_presence_context(profile.presence, now=now),
         initiative_opportunity=opportunity_text,
     )
 
@@ -761,18 +893,18 @@ def run_initiative_evaluation(
 
     current = time.time() if now is None else max(0.0, float(now))
     store = get_state_store()
-    opportunity = None
+    opportunity = store.claim_initiative_evaluation(now=current)
+    if opportunity is None or not opportunity.claim_token:
+        return False
     try:
         manager = ModelManager.get_instance()
         timing = InferenceTiming(requested_at=time.perf_counter())
         with manager.reserve(
             priority="background",
             cancellation=cancellation,
+            queue_deadline=time.monotonic() + _BACKGROUND_QUEUE_SECONDS,
         ) as reservation:
             prompt_now = current if now is not None else time.time()
-            opportunity = store.claim_initiative_evaluation(now=prompt_now)
-            if opportunity is None or not opportunity.claim_token:
-                return False
             snapshot = store.snapshot(
                 OWNER_PROFILE_ID,
                 now=prompt_now,
@@ -802,7 +934,7 @@ def run_initiative_evaluation(
         if decision is None:
             store.fail_initiative_evaluation(
                 claim_token=opportunity.claim_token,
-                now=current,
+                now=current if now is not None else time.time(),
             )
             return False
         completed = store.complete_initiative_evaluation(
@@ -812,12 +944,12 @@ def run_initiative_evaluation(
             message=decision.message,
             now=time.time() if now is None else current,
         )
-        return bool(completed and completed.status == "pending_delivery")
+        return completed is not None
     except InferenceCancelled:
         if opportunity is not None and opportunity.claim_token:
             store.fail_initiative_evaluation(
                 claim_token=opportunity.claim_token,
-                now=current,
+                now=current if now is not None else time.time(),
             )
         return False
     except Exception:
@@ -829,24 +961,48 @@ def run_initiative_evaluation(
         raise
 
 
-_WORKER_LOCK = threading.Lock()
-_WORKER: OffscreenPresenceWorker | None = None
+_SERVICE_LOCK = threading.Lock()
+_SERVICE: BackgroundService | None = None
 
 
-def start_presence_worker() -> OffscreenPresenceWorker:
-    global _WORKER
-    with _WORKER_LOCK:
-        if _WORKER is None:
-            _WORKER = OffscreenPresenceWorker(get_state_store())
-        _WORKER.start()
-        return _WORKER
+def start_background_service() -> BackgroundService:
+    global _SERVICE
+    with _SERVICE_LOCK:
+        if _SERVICE is None:
+            _SERVICE = BackgroundService(get_state_store())
+        _SERVICE.start()
+        return _SERVICE
 
 
-def stop_presence_worker() -> None:
-    with _WORKER_LOCK:
-        worker = _WORKER
-    if worker is not None:
-        worker.stop()
+def stop_background_service() -> bool:
+    with _SERVICE_LOCK:
+        service = _SERVICE
+    return True if service is None else service.stop()
+
+
+def background_service_debug() -> dict[str, object]:
+    with _SERVICE_LOCK:
+        service = _SERVICE
+    if service is None:
+        model_status = ModelManager.get_instance().status()
+        return {
+            "Background Service Started": False,
+            "Lanes": {},
+            "Pending Presence Profiles": (),
+            "Next Presence Due": 0.0,
+            "Active Presence Profile": "",
+            "Available Initiative Adapters": (),
+            "Expired Claim Recoveries": get_state_store().expired_claim_recoveries(),
+            "Model Queue Wait Seconds": model_status.get(
+                "last_queue_wait_seconds",
+                0.0,
+            ),
+            "Model Inference Started At": model_status.get(
+                "inference_started_at",
+                0.0,
+            ),
+        }
+    return service.snapshot()
 
 
 def claim_initiative_delivery(
@@ -856,11 +1012,11 @@ def claim_initiative_delivery(
     available: bool,
     wait_seconds: float = 25.0,
 ) -> dict[str, object] | None:
-    with _WORKER_LOCK:
-        worker = _WORKER
-    if worker is None:
+    with _SERVICE_LOCK:
+        service = _SERVICE
+    if service is None:
         return None
-    return worker.claim_delivery(
+    return service.claim_delivery(
         adapter=adapter,
         conversation_id=conversation_id,
         available=available,
@@ -877,11 +1033,11 @@ def acknowledge_initiative_delivery(
     success: bool,
     message_id: str = "",
 ) -> bool:
-    with _WORKER_LOCK:
-        worker = _WORKER
-    if worker is None:
+    with _SERVICE_LOCK:
+        service = _SERVICE
+    if service is None:
         return False
-    return worker.acknowledge_delivery(
+    return service.acknowledge_delivery(
         opportunity_id=opportunity_id,
         claim_token=claim_token,
         adapter=adapter,
@@ -889,17 +1045,3 @@ def acknowledge_initiative_delivery(
         success=success,
         message_id=message_id,
     )
-
-
-def presence_worker_debug() -> dict[str, object]:
-    with _WORKER_LOCK:
-        worker = _WORKER
-    if worker is None:
-        return {
-            "Presence Worker Started": False,
-            "Pending Profiles": (),
-            "Active Profile": "",
-            "Last Error": "",
-            "Next Retry At": 0.0,
-        }
-    return worker.snapshot()

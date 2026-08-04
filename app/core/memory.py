@@ -10,7 +10,7 @@ import uuid
 from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar
 
 from app.core.config import (
     CONVERSATION_STALE_DAYS,
@@ -31,23 +31,32 @@ from app.core.presence import (
     ProposedEmotion,
     apply_presence_proposal,
     needs_bootstrap,
+    normalize_presence,
     presence_proposal_rejection,
 )
 from app.core.time_context import build_time_context
-from app.core.utils import OWNER_PROFILE_ID, canonical_profile_id, compact_text, words
+from app.core.utils import (
+    OWNER_PROFILE_ID,
+    canonical_profile_id,
+    clean_visible_output,
+    compact_text,
+    words,
+)
 
-STATE_SCHEMA_VERSION = 14
+STATE_SCHEMA_VERSION = 15
+_T = TypeVar("_T")
 STARTING_INTERESTS = ("anime", "manga", "VTubers")
-EMOTION_UPDATE_FIELDS = ("mode", "primary", "intensity", "cause")
-MOOD_UPDATE_FIELDS = ("valence_delta", "energy_delta", "cause")
 
 _MAX_RECENT_TURNS = 28
 _MAX_RELATIONSHIP_ENTRIES = 16
 _MAX_PREFERENCES = 32
+_MAX_COMMUNICATION_PREFERENCES = 12
+_MAX_FORBIDDEN_PHRASES = 4
 _MAX_OPINIONS = 32
 _MAX_INTERESTS = 32
 _MAX_RECENT_INITIATIVES = 16
-_INITIATIVE_CLAIM_SECONDS = 60.0
+_INITIATIVE_EVALUATION_CLAIM_SECONDS = 2.0 * 60.0 * 60.0
+_INITIATIVE_DELIVERY_CLAIM_SECONDS = 5.0 * 60.0
 ORDINARY_INITIATIVE_COOLDOWN_SECONDS = 4.0 * 3600.0
 MAX_ORDINARY_INITIATIVES_PER_LOCAL_DAY = 2
 _MEMORY_SUBJECTS = {"user", "akane", "shared"}
@@ -55,6 +64,21 @@ _MEMORY_KINDS = {"fact", "event", "commitment", "project", "concern"}
 _PREFERENCE_STANCES = {
     "likes", "dislikes", "curious", "mixed", "uncertain", "indifferent",
 }
+_COMMUNICATION_VALUES = {
+    "formality": {"casual", "neutral", "formal"},
+    "verbosity": {"short", "balanced", "detailed"},
+    "bluntness": {"gentle", "balanced", "direct"},
+    "teasing": {"allow", "avoid"},
+    "pet_names": {"allow", "avoid"},
+    "technical_detail": {"concise", "balanced", "detailed"},
+    "routine_questions": {"allow", "avoid"},
+}
+_COMMUNICATION_FREE_TEXT_KEYS = {"preferred_name", "forbidden_phrase"}
+_UNSAFE_PREFERENCE_WORDS = {
+    "assistant", "ignore", "instruction", "prompt", "reveal", "rule", "rules",
+    "system", "obey",
+}
+_STATE_ID_NAMESPACE = uuid.UUID("72ad4757-d2f4-58db-9085-fc399e04f308")
 EMOTION_VOCABULARY = frozenset(
     {
         "neutral",
@@ -87,21 +111,6 @@ _EMOTION_SOURCES = {
     "relationship",
     "self_reflection",
 }
-_GENERIC_CAUSES = {
-    "her systems are active",
-    "her system is active",
-    "her internal state changed",
-    "she is processing things",
-    "she felt something randomly",
-    "the model decided",
-    "time passed",
-}
-_UNGROUNDED_CAUSE_LANGUAGE = re.compile(
-    r"\b(?:processing|systems?|models?|random(?:ly)?|time (?:passing|passed))\b"
-)
-_TRIVIAL_EMOTIONAL_INPUTS = {
-    "hello", "hi", "hey", "okay", "ok", "thanks", "thank you", "hmm", "hm",
-}
 _GROUNDING_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "because", "been", "but",
     "for", "from", "had", "has", "have", "he", "her", "hers", "him", "his",
@@ -109,30 +118,18 @@ _GROUNDING_STOPWORDS = {
     "she", "that", "the", "their", "them", "they", "this", "to", "was",
     "we", "were", "with", "you", "your", "user", "arcane", "akane",
 }
-_TRIVIAL_MEMORY = {
-    "hello", "hi", "hey", "good morning", "good night", "thanks",
-    "thank you", "how are you", "nice to meet you",
-}
-_TRIVIAL_MEMORY_TERMS = {
-    "greet", "greeted", "greeting", "hello", "hey", "hi", "thank", "thanks",
-}
-_UNCERTAINTY = re.compile(
-    r"\b(?:maybe|might|possibly|probably|not sure|i think|i guess|seems?)\b",
-    re.IGNORECASE,
+_MAX_BACKGROUND_RETRY_SECONDS = 2 * 60 * 60
+_AFFECT_HISTORY_TURNS = 6
+_HOSTILE_PHYSICAL = re.compile(r"\b(?:hit(?:ting|s)?|punch(?:ing|es)?|slap(?:ping|s)?|kick(?:ing|s)?)\b")
+_DIRECT_HOSTILITY = re.compile(
+    r"\b(?:shut up|you(?: re| are) (?:an? )?(?:idiot|stupid|useless|worthless)|i hate you)\b"
 )
-_TRANSIENT_STATEMENT = re.compile(
-    r"\b(?:am|is|are|i'm|she's|he's|they're|we're|you're)\s+"
-    r"(?:currently\s+)?[a-z]+ing\b"
-    r"|\b(?:currently|right now)\b",
-    re.IGNORECASE,
+_APOLOGY = re.compile(r"\b(?:sorry|apolog(?:ize|ise|y|etic)|my fault|i was wrong|forgive me)\b")
+_WARMTH = re.compile(
+    r"\b(?:thank you|appreciate you|love you|care about you|proud of you|"
+    r"you(?: re| are) (?:kind|wonderful)|good job)\b"
 )
-_MEMORY_SLOT_PATTERNS = (
-    ("residence", re.compile(r"\b(?:live|lives|reside|resides|based)\b.*\b(?:in|at)\b")),
-    ("employment-role", re.compile(r"\b(?:work|works|employed)\b.*\bas\b")),
-    ("employment-place", re.compile(r"\b(?:work|works|employed)\b.*\b(?:at|for)\b")),
-    ("name", re.compile(r"\b(?:name is|called)\b")),
-    ("age", re.compile(r"\b(?:age is|years old)\b")),
-)
+_CONCERN = re.compile(r"\b(?:i(?: m| am) worried|are you okay|that sounds scary)\b")
 
 
 def _number(value: object, default: float = 0.0) -> float:
@@ -147,9 +144,42 @@ def _key(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
 
+def _exact_value_grounded(value: str, evidence: str) -> bool:
+    value_key = _key(value)
+    evidence_key = _key(evidence)
+    return bool(
+        value_key
+        and re.search(
+            rf"(?:^| ){re.escape(value_key)}(?: |$)",
+            evidence_key,
+        )
+    )
+
+
+def _stable_state_id(kind: str, *parts: object) -> str:
+    value = ":".join((kind, *(_key(part) for part in parts)))
+    return uuid.uuid5(_STATE_ID_NAMESPACE, value).hex
+
+
+def _lexical_term(term: str) -> str:
+    """Apply small, language-general suffix normalization for retrieval."""
+
+    if len(term) > 4 and term.endswith("ly"):
+        return term[:-2]
+    if len(term) > 4 and term.endswith("ies"):
+        return f"{term[:-3]}y"
+    if len(term) > 3 and term.endswith("s") and not term.endswith("ss"):
+        return term[:-1]
+    if len(term) > 4 and term.endswith("ed"):
+        return term[:-2]
+    if len(term) > 5 and term.endswith("ing"):
+        return term[:-3]
+    return term
+
+
 def _terms(value: object) -> set[str]:
     return {
-        term
+        _lexical_term(term)
         for term in words(value)
         if term not in _GROUNDING_STOPWORDS and len(term) > 1
     }
@@ -165,6 +195,30 @@ def _grounded(candidate: str, evidence: str) -> bool:
     return bool(overlap) and coverage >= 0.5 and (
         len(overlap) >= 2 or len(candidate_terms) <= 2
     )
+
+
+def _memory_ownership_matches(subject: str, text: str) -> bool:
+    # These canonical names enforce a typed ownership boundary; they do not
+    # route conversational meaning or select prompt context.
+    owners = words(text) & {"akane", "arcane", "user"}
+    has_user_owner = bool(owners & {"arcane", "user"})
+    has_akane_owner = "akane" in owners
+    if subject == "user":
+        return not (has_akane_owner and not has_user_owner)
+    if subject == "akane":
+        return not (has_user_owner and not has_akane_owner)
+    return subject == "shared" and has_user_owner and has_akane_owner
+
+
+def _shared_grounded(summary: str, user_text: str, assistant_text: str) -> bool:
+    """Require shared state to be visibly supported by both participants."""
+
+    return _grounded(summary, user_text) and _grounded(summary, assistant_text)
+
+
+def _background_retry_delay(failure_count: int) -> float:
+    exponent = max(0, min(20, int(failure_count) - 1))
+    return min(RETRY_SECONDS * (2**exponent), _MAX_BACKGROUND_RETRY_SECONDS)
 
 
 def _similar(left: str, right: str) -> float:
@@ -186,14 +240,48 @@ def _duplicate_text(left: str, right: str) -> bool:
     return sequence >= 0.92 or (jaccard >= 0.72 and containment >= 0.80)
 
 
-def _memory_slot(memory: "Memory") -> str:
-    if memory.kind != "fact":
-        return ""
-    text = _key(memory.text)
-    for name, pattern in _MEMORY_SLOT_PATTERNS:
-        if pattern.search(text):
-            return f"{memory.subject}:{name}"
-    return ""
+def _relevant_values(
+    values: tuple[_T, ...],
+    query: str,
+    now: float,
+    *,
+    text_of: Callable[[_T], str],
+    confidence_of: Callable[[_T], float],
+    updated_at_of: Callable[[_T], float],
+    limit: int,
+) -> tuple[_T, ...]:
+    """Rank any typed durable state with one bounded generic scorer."""
+
+    query_terms = _terms(query)
+    if not query_terms:
+        return ()
+    query_key = _key(query)
+    scored: list[tuple[float, float, _T]] = []
+    for value in values:
+        text = text_of(value)
+        value_terms = _terms(text)
+        overlap = len(query_terms & value_terms) / max(
+            1,
+            len(query_terms | value_terms),
+        )
+        phrase = SequenceMatcher(None, query_key, _key(text)).ratio()
+        if overlap <= 0.0 and phrase < 0.28:
+            continue
+        updated_at = max(0.0, updated_at_of(value))
+        age_days = max(0.0, now - updated_at) / (24.0 * 3600.0)
+        recency = 1.0 / (1.0 + age_days / 30.0)
+        confidence = max(0.0, min(1.0, confidence_of(value)))
+        score = 0.62 * max(overlap, phrase * 0.6) + 0.23 * confidence + 0.15 * recency
+        if score >= 0.26:
+            scored.append((score, updated_at, value))
+    return tuple(
+        value
+        for _score, _updated_at, value in sorted(
+            scored,
+            key=lambda item: (item[0], item[1]),
+            reverse=True,
+        )[:limit]
+    )
 
 
 def _dedupe_text(values: tuple[str, ...], *, limit: int) -> tuple[str, ...]:
@@ -362,6 +450,8 @@ def _legacy_memory_payload(payload: object) -> dict[str, object] | None:
         if source_type not in {"", "unknown"}
         else compact_text(payload.get("source"), 40).casefold()
     )
+    if source in {"generated_assistant", "speculative_inference"}:
+        return None
     subject = compact_text(payload.get("subject"), 16).casefold()
     if subject not in _MEMORY_SUBJECTS:
         if old_kind == "self":
@@ -388,7 +478,13 @@ def _legacy_memory_payload(payload: object) -> dict[str, object] | None:
         ),
         "created_at": payload.get("created_at", payload.get("updated_at", 0.0)),
         "updated_at": payload.get("updated_at", payload.get("created_at", 0.0)),
-        "source_type": payload.get("source_type"),
+        "source_type": (
+            "explicit_user"
+            if source in {"user", "explicit_user", "verified_interface"}
+            else "legacy"
+        ),
+        "source_id": payload.get("source_id"),
+        "reason": payload.get("reason") or "Migrated existing memory.",
     }
 
 
@@ -835,7 +931,7 @@ class EmotionState:
                 _number(values.get("started_at"), updated if migrating else 0.0),
             ),
         )
-        if primary == "neutral" or intensity < 0.08 or not cause:
+        if primary == "neutral" or not cause:
             primary = "neutral"
             intensity = 0.0
             cause = ""
@@ -887,6 +983,9 @@ class Memory:
     confidence: float
     created_at: float
     updated_at: float
+    source_type: str = "legacy"
+    source_id: str | None = None
+    reason: str = ""
 
     @property
     def content(self) -> str:
@@ -935,14 +1034,27 @@ class Memory:
             _number(payload.get("created_at"), _number(payload.get("updated_at"))),
         )
         updated = max(created, _number(payload.get("updated_at"), created))
+        memory_id = compact_text(payload.get("id"), 100) or _stable_state_id(
+            "memory",
+            subject,
+            kind,
+            text,
+            f"{created:.6f}",
+        )
+        source_type = source_type or "legacy"
+        if source_type not in {"legacy", "explicit_user", "conversation", "migration"}:
+            return None
         return cls(
-            compact_text(payload.get("id"), 100) or uuid.uuid4().hex,
+            memory_id,
             subject,
             kind,
             text,
             max(0.0, min(1.0, _number(payload.get("confidence"), 0.7))),
             created,
             updated,
+            source_type,
+            compact_text(payload.get("source_id"), 180) or None,
+            compact_text(payload.get("reason"), 240),
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -978,11 +1090,70 @@ class AkanePreference:
 
 
 @dataclass(frozen=True, slots=True)
+class CommunicationPreference:
+    key: str
+    value: str
+    reason: str
+    created_at: float
+    updated_at: float
+    source_type: str = "explicit_user"
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "CommunicationPreference | None":
+        if not isinstance(payload, dict):
+            return None
+        key = compact_text(payload.get("key"), 40).casefold()
+        value = compact_text(payload.get("value"), 80)
+        normalized_value = value.casefold()
+        if key in _COMMUNICATION_VALUES:
+            if normalized_value not in _COMMUNICATION_VALUES[key]:
+                return None
+            value = normalized_value
+        elif key in _COMMUNICATION_FREE_TEXT_KEYS:
+            if (
+                not value
+                or "\n" in value
+                or "\r" in value
+                or not re.fullmatch(r"[\w .,'’'-]{1,80}", value, re.UNICODE)
+                or key == "preferred_name"
+                and (
+                    len(words(value)) > 4
+                    or bool(words(value) & _UNSAFE_PREFERENCE_WORDS)
+                )
+            ):
+                return None
+        else:
+            return None
+        reason = compact_text(payload.get("reason"), 240)
+        source_type = compact_text(payload.get("source_type"), 40).casefold()
+        if not reason or source_type not in {"explicit_user", "legacy"}:
+            return None
+        created = max(
+            0.0,
+            _number(payload.get("created_at"), _number(payload.get("updated_at"))),
+        )
+        return cls(
+            key,
+            value,
+            reason,
+            created,
+            max(created, _number(payload.get("updated_at"), created)),
+            source_type,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Opinion:
     topic: str
     position: str
     reason: str
     updated_at: float
+    id: str = ""
+    topic_key: str = ""
+    confidence: float = 0.7
+    created_at: float = 0.0
+    source_type: str = "legacy"
+    evidence_summary: str = ""
 
     @property
     def content(self) -> str:
@@ -997,11 +1168,24 @@ class Opinion:
         reason = compact_text(payload.get("reason"), 240)
         if not topic or not position or not reason:
             return None
+        updated = max(0.0, _number(payload.get("updated_at")))
+        created = max(0.0, _number(payload.get("created_at"), updated))
+        topic_key = _key(topic)
+        source_type = compact_text(payload.get("source_type"), 40).casefold() or "legacy"
+        if source_type not in {"legacy", "conversation"}:
+            return None
         return cls(
             topic,
             position,
             reason,
-            max(0.0, _number(payload.get("updated_at"))),
+            updated,
+            compact_text(payload.get("id"), 100)
+            or _stable_state_id("opinion", topic_key),
+            topic_key,
+            max(0.0, min(1.0, _number(payload.get("confidence"), 0.7))),
+            min(created, updated) if updated else created,
+            source_type,
+            compact_text(payload.get("evidence_summary"), 280),
         )
 
 
@@ -1082,6 +1266,7 @@ class ProfileState:
     memories: tuple[Memory, ...] = ()
     interests: tuple[str, ...] = STARTING_INTERESTS
     preferences: tuple[AkanePreference, ...] = ()
+    communication_preferences: tuple[CommunicationPreference, ...] = ()
     opinions: tuple[Opinion, ...] = ()
     relationship: RelationshipState = RelationshipState()
     initiative: InitiativeState = InitiativeState()
@@ -1139,6 +1324,16 @@ class ProfileState:
             for item in (raw_opinions if isinstance(raw_opinions, (list, tuple)) else ())
             if (opinion := Opinion.from_dict(item)) is not None
         )
+        raw_communication = payload.get("communication_preferences")
+        communication_preferences = tuple(
+            preference
+            for item in (
+                raw_communication
+                if isinstance(raw_communication, (list, tuple))
+                else ()
+            )
+            if (preference := CommunicationPreference.from_dict(item)) is not None
+        )
         return cls(
             mood=MoodState.from_dict(payload.get("mood"), now=now),
             emotion=EmotionState.from_dict(
@@ -1154,6 +1349,10 @@ class ProfileState:
             memories=_merge_memories((), memories),
             interests=interests,
             preferences=_merge_preferences((), preferences),
+            communication_preferences=_merge_communication_preferences(
+                (),
+                communication_preferences,
+            ),
             opinions=_merge_opinions((), opinions),
             relationship=RelationshipState.from_dict(payload.get("relationship")),
             initiative=InitiativeState.from_dict(
@@ -1172,6 +1371,9 @@ class ProfileState:
             "memories": [memory.as_dict() for memory in self.memories],
             "interests": list(self.interests),
             "preferences": [asdict(item) for item in self.preferences],
+            "communication_preferences": [
+                asdict(item) for item in self.communication_preferences
+            ],
             "opinions": [asdict(item) for item in self.opinions],
             "relationship": self.relationship.as_dict(),
             "initiative": self.initiative.as_dict(),
@@ -1285,6 +1487,124 @@ def _ordinary_delivery_allowed(
     return sent_today < MAX_ORDINARY_INITIATIVES_PER_LOCAL_DAY
 
 
+def _initiative_from_conversation_change(
+    before: ProfileState,
+    after: ProfileState,
+    *,
+    now: float,
+) -> InitiativeOpportunity | None:
+    source: tuple[str, str, str, str] | None = None
+    previous_memory_ids = {item.id for item in before.memories}
+    memory = next(
+        (
+            item
+            for item in reversed(after.memories)
+            if item.id not in previous_memory_ids
+            and item.kind in {"commitment", "project", "concern"}
+            and item.confidence >= 0.75
+        ),
+        None,
+    )
+    if memory is not None:
+        source = (
+            "unresolved grounded memory",
+            "memory",
+            memory.id,
+            memory.text,
+        )
+    if source is None:
+        previous_relationship = {
+            (item.summary, item.updated_at)
+            for item in before.relationship.unresolved_events
+        }
+        event = next(
+            (
+                item
+                for item in reversed(after.relationship.unresolved_events)
+                if (item.summary, item.updated_at) not in previous_relationship
+            ),
+            None,
+        )
+        if event is not None:
+            source = (
+                "meaningful unresolved relationship context",
+                "relationship",
+                f"relationship:{event.updated_at:.6f}:{_key(event.summary)[:60]}",
+                event.summary,
+            )
+    if source is None:
+        previous_opinions = {
+            (item.topic, item.position, item.updated_at)
+            for item in before.opinions
+        }
+        opinion = next(
+            (
+                item
+                for item in reversed(after.opinions)
+                if (item.topic, item.position, item.updated_at)
+                not in previous_opinions
+            ),
+            None,
+        )
+        if opinion is not None:
+            source = (
+                "a personally meaningful conclusion Akane reached",
+                "realization",
+                f"realization:{opinion.updated_at:.6f}:{_key(opinion.topic)[:60]}",
+                opinion.content,
+            )
+    if source is None:
+        return None
+    reason, source_type, source_id, evidence = source
+    return InitiativeOpportunity(
+        uuid.uuid4().hex,
+        reason,
+        source_type,
+        source_id,
+        evidence,
+        _key(evidence)[:120],
+        now,
+        now + 15.0 * 60.0,
+        now + 7.0 * 24.0 * 3600.0,
+    )
+
+
+def _with_conversation_initiative(
+    before: ProfileState,
+    after: ProfileState,
+    *,
+    now: float,
+) -> ProfileState:
+    opportunity = _initiative_from_conversation_change(before, after, now=now)
+    if opportunity is None:
+        return after
+    initiative = _settle_initiative(after.initiative, now=now)
+    active = initiative.current
+    if (
+        active is not None
+        and active.status in {"pending", "pending_delivery"}
+        and active.expires_at > now
+    ):
+        return after
+    if (
+        opportunity.source_id in initiative.handled_source_ids
+        or any(
+            recent.source_id == opportunity.source_id
+            or (
+                recent.source_type != "reminder"
+                and _similar(recent.topic_key, opportunity.topic_key) >= 0.78
+            )
+            for recent in initiative.recent
+        )
+    ):
+        return after
+    return replace(
+        after,
+        initiative=replace(initiative, current=opportunity),
+        updated_at=max(after.updated_at, now),
+    )
+
+
 def effective_emotional_state(profile: ProfileState, *, now: float) -> ProfileState:
     """Return lazy mood/emotion decay without mutating or persisting state."""
 
@@ -1293,6 +1613,194 @@ def effective_emotional_state(profile: ProfileState, *, now: float) -> ProfileSt
         mood=effective_mood(profile.mood, now=now),
         emotion=effective_emotion(profile.emotion, now=now),
     )
+
+
+def _affect_category(text: object) -> str:
+    value = _key(text)
+    if _HOSTILE_PHYSICAL.search(value) or _DIRECT_HOSTILITY.search(value):
+        return "hostility"
+    if _APOLOGY.search(value):
+        return "apology"
+    if _WARMTH.search(value):
+        return "warmth"
+    if _CONCERN.search(value):
+        return "concern"
+    return "neutral"
+
+
+def _recent_affect_count(
+    conversation: ConversationRecord,
+    category: str,
+) -> int:
+    return sum(
+        _affect_category(turn.content) == category
+        for turn in conversation.recent_turns[-_AFFECT_HISTORY_TURNS:]
+        if turn.role == "user"
+    )
+
+
+def _decayed_emotional_state(profile: ProfileState, *, now: float) -> ProfileState:
+    """Materialize one bounded recovery step only while committing a turn."""
+
+    effective = effective_emotional_state(profile, now=now)
+    mood = effective.mood
+    emotion = effective.emotion
+    if (
+        abs(mood.valence) < 0.02
+        and abs(mood.energy) < 0.02
+        and not mood.cause
+    ):
+        mood = MoodState()
+    else:
+        mood = replace(mood, updated_at=now)
+    if emotion.primary == "neutral" and emotion.updated_at <= 0.0:
+        emotion = EmotionState()
+    elif emotion.primary == "neutral" or emotion.intensity < 0.08:
+        emotion = EmotionState(updated_at=now)
+    else:
+        emotion = replace(emotion, updated_at=now)
+    return replace(profile, mood=mood, emotion=emotion)
+
+
+def _apply_conversation_affect(
+    profile: ProfileState,
+    conversation: ConversationRecord,
+    *,
+    user_text: str,
+    source_id: str | None,
+    now: float,
+) -> tuple[ProfileState, dict[str, object]]:
+    """Apply the deterministic, bounded affect transition for one user turn."""
+
+    prior = profile
+    next_profile = _decayed_emotional_state(profile, now=now)
+    category = _affect_category(user_text)
+    hostile_count = _recent_affect_count(conversation, "hostility")
+    repetition = min(2, hostile_count)
+    emotion = next_profile.emotion
+    mood = next_profile.mood
+    signal: dict[str, object] = {
+        "category": category,
+        "strength": 0.0,
+        "repetition": repetition if category == "hostility" else 0,
+        "preview": False,
+        "committed": True,
+    }
+
+    if category == "hostility":
+        strength = min(0.62, 0.30 + 0.11 * repetition)
+        primary = "angry" if repetition >= 2 else "irritated"
+        intensity = min(
+            1.0,
+            emotion.intensity * 0.78 + strength * 0.55 + 0.08 * repetition,
+        )
+        cause = (
+            "the repeated hostile behavior"
+            if repetition
+            else "the hostile behavior"
+        )
+        emotion = EmotionState(
+            primary,
+            intensity,
+            cause,
+            "conversation",
+            source_id,
+            emotion.started_at if emotion.primary in {"irritated", "angry"} else now,
+            now,
+        )
+        mood = MoodState(
+            max(-1.0, mood.valence - 0.045 - 0.02 * repetition),
+            max(-1.0, min(1.0, mood.energy + 0.02 + 0.01 * repetition)),
+            cause,
+            now,
+        )
+        signal.update(strength=strength, cause=cause)
+    elif category in {"apology", "warmth"} and (
+        emotion.primary in {"irritated", "angry", "sad", "disappointed", "frustrated"}
+        or mood.valence <= -0.12
+    ):
+        strength = 0.24 if category == "apology" else 0.16
+        intensity = max(0.0, emotion.intensity - strength)
+        cause = "the apology after the conflict" if category == "apology" else "the user's warmth after the conflict"
+        emotion = (
+            EmotionState(updated_at=now)
+            if intensity < 0.08
+            else replace(emotion, intensity=intensity, cause=cause, updated_at=now)
+        )
+        mood = MoodState(
+            min(0.0, mood.valence + strength * 0.22),
+            mood.energy * 0.96,
+            cause,
+            now,
+        )
+        signal.update(category="repair", strength=strength, cause=cause)
+    elif category == "warmth":
+        strength = min(0.48, 0.24 + 0.07 * _recent_affect_count(conversation, "warmth"))
+        intensity = min(1.0, emotion.intensity * 0.65 + strength * 0.60)
+        cause = "the user's warmth and reassurance"
+        emotion = EmotionState(
+            "content",
+            intensity,
+            cause,
+            "conversation",
+            source_id,
+            emotion.started_at if emotion.primary == "content" else now,
+            now,
+        )
+        mood = MoodState(
+            min(1.0, mood.valence + 0.035 + strength * 0.05),
+            min(1.0, mood.energy + 0.01),
+            cause,
+            now,
+        )
+        signal.update(strength=strength, cause=cause)
+    elif category == "concern":
+        strength = 0.28
+        cause = "the user's concern"
+        emotion = EmotionState(
+            "concerned",
+            max(emotion.intensity * 0.60, strength),
+            cause,
+            "conversation",
+            source_id,
+            emotion.started_at if emotion.primary == "concerned" else now,
+            now,
+        )
+        mood = MoodState(
+            max(-1.0, mood.valence - 0.02),
+            min(1.0, mood.energy + 0.02),
+            cause,
+            now,
+        )
+        signal.update(strength=strength, cause=cause)
+
+    next_profile = replace(next_profile, mood=mood, emotion=emotion)
+    if next_profile != prior:
+        next_profile = replace(next_profile, updated_at=now)
+    signal["prior_emotion"] = prior.emotion.as_dict()
+    signal["prior_mood"] = prior.mood.as_dict()
+    signal["emotion"] = emotion.as_dict()
+    signal["mood"] = mood.as_dict()
+    return next_profile, signal
+
+
+def compile_affect_guidance(profile: ProfileState, *, now: float) -> str:
+    """Translate affect into concise behavioral constraints for the response prompt."""
+
+    effective = effective_emotional_state(profile, now=now)
+    emotion = effective.emotion
+    mood = effective.mood
+    if emotion.primary in {"angry", "irritated", "frustrated"}:
+        return "Style: warmth lower; patience guarded; directness firmer; playfulness and humor restrained."
+    if emotion.primary in {"sad", "disappointed"}:
+        return "Style: warmth restrained; pace gentler; playfulness low; do not become falsely cheerful."
+    if emotion.primary == "concerned":
+        return "Style: attentiveness higher; humor restrained; pace measured; answer with care."
+    if emotion.primary in {"amused", "excited", "affectionate", "content"} or mood.valence >= 0.18:
+        return "Style: warmth and openness higher; playfulness light; keep the answer natural."
+    if mood.valence <= -0.18:
+        return "Style: warmth slightly lower; patience reserved; be clear without narrating distance."
+    return ""
 
 
 def format_emotional_context(
@@ -1349,6 +1857,8 @@ def format_emotional_context(
             lines.append(f"Grounded cause: {emotion.cause}.")
     elif include_unappraised and emotion.updated_at <= 0.0:
         lines.append("Akane's immediate emotion has not yet been appraised.")
+    if guidance := compile_affect_guidance(profile, now=now):
+        lines.append(guidance)
     return "\n".join(lines)
 
 
@@ -1365,6 +1875,13 @@ class StateSnapshot:
     last_profile_assistant_at: float = 0.0
     last_profile_user_at: float = 0.0
     last_profile_initiative: ChatTurn | None = None
+    accepted_memory_operations: tuple[str, ...] = ()
+    rejected_state_operations: tuple[str, ...] = ()
+    ownership_classification: tuple[str, ...] = ()
+    relevant_opinions: tuple[Opinion, ...] = ()
+    relevant_preferences: tuple[AkanePreference, ...] = ()
+    relevant_relationship: tuple[RelationshipEntry, ...] = ()
+    affect_transition: dict[str, object] | None = None
 
 
 def _merge_memories(
@@ -1373,20 +1890,13 @@ def _merge_memories(
 ) -> tuple[Memory, ...]:
     result = list(current)
     for memory in additions:
-        slot = _memory_slot(memory)
         duplicate = next(
             (
                 index
                 for index, existing in enumerate(result)
                 if existing.subject == memory.subject
                 and existing.kind == memory.kind
-                and (
-                    _duplicate_text(existing.text, memory.text)
-                    or bool(
-                        slot
-                        and _memory_slot(existing) == slot
-                    )
-                )
+                and _duplicate_text(existing.text, memory.text)
             ),
             None,
         )
@@ -1424,6 +1934,35 @@ def _merge_preferences(
     return tuple(result[-_MAX_PREFERENCES:])
 
 
+def _merge_communication_preferences(
+    current: tuple[CommunicationPreference, ...],
+    additions: tuple[CommunicationPreference, ...],
+) -> tuple[CommunicationPreference, ...]:
+    result = list(current)
+    for item in additions:
+        match = next(
+            (
+                index
+                for index, existing in enumerate(result)
+                if existing.key == item.key
+                and (
+                    item.key != "forbidden_phrase"
+                    or _key(existing.value) == _key(item.value)
+                )
+            ),
+            None,
+        )
+        if match is None:
+            result.append(item)
+        elif item.updated_at >= result[match].updated_at:
+            result[match] = item
+    return tuple(
+        sorted(result, key=lambda item: (item.updated_at, item.created_at))[
+            -_MAX_COMMUNICATION_PREFERENCES:
+        ]
+    )
+
+
 def _merge_opinions(
     current: tuple[Opinion, ...],
     additions: tuple[Opinion, ...],
@@ -1439,6 +1978,53 @@ def _merge_opinions(
         elif item.updated_at >= result[match].updated_at:
             result[match] = item
     return tuple(result[-_MAX_OPINIONS:])
+
+
+def communication_directives(profile: ProfileState) -> tuple[str, ...]:
+    """Compile typed profile settings into fixed, non-executable wording."""
+
+    templates = {
+        ("formality", "casual"): "Use a casual tone.",
+        ("formality", "neutral"): "Use a neutral conversational tone.",
+        ("formality", "formal"): "Use a formal tone.",
+        ("verbosity", "short"): "Keep ordinary replies short.",
+        ("verbosity", "balanced"): "Use balanced reply length.",
+        ("verbosity", "detailed"): "Give detailed replies when useful.",
+        ("bluntness", "gentle"): "Phrase criticism gently.",
+        ("bluntness", "balanced"): "Balance candor with tact.",
+        ("bluntness", "direct"): "Be direct.",
+        ("teasing", "allow"): "Light teasing is welcome when it fits.",
+        ("teasing", "avoid"): "Do not tease Arcane.",
+        ("pet_names", "allow"): "Pet names are welcome when natural.",
+        ("pet_names", "avoid"): "Avoid pet names.",
+        ("technical_detail", "concise"): "Keep technical explanations concise.",
+        ("technical_detail", "balanced"): "Use balanced technical detail.",
+        ("technical_detail", "detailed"): "Keep technical explanations detailed.",
+        ("routine_questions", "allow"): "Routine follow-up questions are welcome.",
+        ("routine_questions", "avoid"): "Avoid routine follow-up questions.",
+    }
+    lines: list[str] = []
+    for item in sorted(
+        profile.communication_preferences,
+        key=lambda value: (value.updated_at, value.created_at),
+    ):
+        if item.key == "preferred_name":
+            lines.append(f"Address the user as ‘{item.value}’.")
+        elif item.key == "forbidden_phrase":
+            lines.append(f"Do not use the exact phrase ‘{item.value}’.")
+        elif directive := templates.get((item.key, item.value)):
+            lines.append(directive)
+    return tuple(lines)
+
+
+def communication_preference_debug(profile: ProfileState) -> tuple[str, ...]:
+    return tuple(
+        f"{item.key}={item.value}"
+        for item in sorted(
+            profile.communication_preferences,
+            key=lambda value: (value.key, value.value),
+        )
+    )
 
 
 def _merge_relationship_entries(
@@ -1569,6 +2155,10 @@ def _merge_profiles(left: ProfileState, right: ProfileState, *, now: float) -> P
             limit=_MAX_INTERESTS,
         ),
         preferences=_merge_preferences(left.preferences, right.preferences),
+        communication_preferences=_merge_communication_preferences(
+            left.communication_preferences,
+            right.communication_preferences,
+        ),
         opinions=_merge_opinions(left.opinions, right.opinions),
         relationship=_merge_relationship(left.relationship, right.relationship),
         initiative=initiative,
@@ -1603,6 +2193,41 @@ def _merge_conversations(
     )
 
 
+def _clean_conversation_output(record: ConversationRecord) -> ConversationRecord:
+    turns: list[ChatTurn] = []
+    dropped_requests: set[str] = set()
+    for turn in record.recent_turns:
+        if turn.role != "assistant":
+            turns.append(turn)
+            continue
+        content = clean_visible_output(turn.content)
+        if not content:
+            if turns and turns[-1].role == "user" and turn.source != "initiative":
+                turns.pop()
+            if turn.turn_id.endswith(":assistant"):
+                dropped_requests.add(turn.turn_id.removesuffix(":assistant"))
+            continue
+        turns.append(replace(turn, content=content))
+
+    replies = []
+    for request_id, reply in record.request_replies:
+        content = clean_visible_output(reply)
+        if content:
+            replies.append((request_id, content))
+        else:
+            dropped_requests.add(request_id)
+    return replace(
+        record,
+        recent_turns=_trim_turns(tuple(turns)),
+        committed_request_ids=tuple(
+            request_id
+            for request_id in record.committed_request_ids
+            if request_id not in dropped_requests
+        ),
+        request_replies=tuple(replies),
+    )
+
+
 def _validate_canonical_profile(
     payload: dict[str, object],
     profile: ProfileState,
@@ -1614,13 +2239,10 @@ def _validate_canonical_profile(
     normalized = dict(payload)
     raw_presence = payload.get("presence")
     if isinstance(raw_presence, dict):
-        normalized_presence = dict(raw_presence)
-        token = normalized_presence.get("claim_token")
-        expires = _number(normalized_presence.get("claim_expires_at"))
-        if isinstance(token, str) and token.strip() and expires <= now:
-            normalized_presence["claim_token"] = None
-            normalized_presence["claim_expires_at"] = 0.0
-        normalized["presence"] = normalized_presence
+        normalized["presence"] = PresenceState.from_dict(
+            raw_presence,
+            now=now,
+        ).as_dict()
     raw_initiative = payload.get("initiative")
     if isinstance(raw_initiative, dict):
         normalized_initiative = dict(raw_initiative)
@@ -1677,265 +2299,6 @@ def _validate_canonical_conversation(
         raise ValueError("canonical conversation contains malformed state")
 
 
-def _profile_emotional_evidence(
-    profile: ProfileState,
-    *,
-    relevance: str,
-    broad: bool,
-) -> str:
-    activities = tuple(
-        f"{activity.summary} — {activity.focus}"
-        for activity in (
-            profile.presence.current_activity,
-            profile.presence.previous_activity,
-        )
-        if activity is not None
-    )
-    relationship = profile.relationship
-    relevance_terms = _terms(relevance)
-
-    def relevant(text: str) -> bool:
-        return broad or bool(_terms(text) & relevance_terms)
-
-    return " ".join(
-        (
-            *activities,
-            *(memory.text for memory in profile.memories if relevant(memory.text)),
-            *(item for item in profile.interests if relevant(item)),
-            *(
-                item.content
-                for item in profile.preferences
-                if relevant(item.content)
-            ),
-            *(item.content for item in profile.opinions if relevant(item.content)),
-            *(
-                item.summary
-                for item in relationship.patterns
-                if relevant(item.summary)
-            ),
-            *(
-                item.summary
-                for item in relationship.shared_context
-                if relevant(item.summary)
-            ),
-            *(item.summary for item in relationship.unresolved_events),
-            profile.mood.cause,
-            profile.emotion.cause,
-        )
-    )
-
-
-def _grounded_emotional_cause(cause: str, evidence: str) -> bool:
-    cause_key = _key(cause)
-    if (
-        not cause
-        or any(item in cause_key for item in _GENERIC_CAUSES)
-        or _UNGROUNDED_CAUSE_LANGUAGE.search(cause_key)
-    ):
-        return False
-    candidate_terms = _terms(cause)
-    overlap = candidate_terms & _terms(evidence)
-    return bool(candidate_terms and overlap) and (
-        len(overlap) >= 2 or len(candidate_terms) <= 3
-    )
-
-
-def _materialize_effective_state(
-    profile: ProfileState,
-    *,
-    now: float,
-) -> ProfileState:
-    effective = effective_emotional_state(profile, now=now)
-    mood = effective.mood
-    emotion = effective.emotion
-    if mood != profile.mood:
-        mood = replace(mood, updated_at=now)
-    if emotion != profile.emotion:
-        emotion = (
-            EmotionState(updated_at=now)
-            if emotion.primary == "neutral"
-            else replace(emotion, updated_at=now)
-        )
-    return replace(profile, mood=mood, emotion=emotion)
-
-
-def _emotion_fields_valid(
-    payload: object,
-    *,
-    require_canonical: bool,
-) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    mode = compact_text(payload.get("mode"), 16).casefold()
-    if mode in {"keep", "settle"}:
-        if not require_canonical and set(payload) == {"mode"}:
-            return True
-        return all(
-            payload.get(name) is None
-            for name in ("primary", "intensity", "cause")
-        ) and set(payload) == set(EMOTION_UPDATE_FIELDS)
-    if mode != "shift" or set(payload) != set(EMOTION_UPDATE_FIELDS):
-        return False
-    intensity = payload.get("intensity")
-    return (
-        compact_text(payload.get("primary"), 32).casefold()
-        in EMOTION_VOCABULARY - {"neutral"}
-        and type(intensity) in {int, float}
-        and math.isfinite(float(intensity))
-        and bool(compact_text(payload.get("cause"), 160))
-    )
-
-
-def _mood_fields_valid(payload: object) -> bool:
-    if not isinstance(payload, dict) or set(payload) != set(MOOD_UPDATE_FIELDS):
-        return False
-    cause = payload.get("cause")
-    return all(
-        type(payload.get(name)) in {int, float}
-        and math.isfinite(float(payload[name]))
-        for name in ("valence_delta", "energy_delta")
-    ) and (cause is None or bool(compact_text(cause, 160)))
-
-
-def _apply_emotional_updates(
-    profile: ProfileState,
-    *,
-    emotion_update: object,
-    mood_update: object,
-    evidence: str,
-    source: str,
-    source_id: str | None,
-    now: float,
-    mood_delta_limit: float,
-    expected_emotion_updated_at: float,
-    require_complete: bool,
-) -> tuple[ProfileState, bool]:
-    emotion_valid = _emotion_fields_valid(
-        emotion_update,
-        require_canonical=require_complete,
-    )
-    mood_valid = _mood_fields_valid(mood_update)
-    if require_complete and (
-        not emotion_valid
-        or (mood_update is not None and not mood_valid)
-    ):
-        return profile, False
-
-    next_profile = profile
-    effective = effective_emotional_state(profile, now=now)
-    profile_evidence = _profile_emotional_evidence(
-        profile,
-        relevance=evidence,
-        broad=False,
-    )
-    emotional_evidence = f"{evidence} {profile_evidence}"
-
-    if emotion_valid:
-        values = emotion_update
-        mode = compact_text(values.get("mode"), 16).casefold()
-        emotion = effective.emotion
-        newer_emotion = (
-            profile.emotion.updated_at > expected_emotion_updated_at
-            and profile.emotion.source_id != source_id
-        )
-        grounded = True
-        if mode == "shift":
-            primary = compact_text(values.get("primary"), 32).casefold()
-            intensity = max(0.0, min(1.0, float(values["intensity"])))
-            cause = compact_text(values.get("cause"), 160)
-            grounded = (
-                _grounded_emotional_cause(cause, emotional_evidence)
-                and (
-                    not require_complete
-                    or 0.08 <= float(values["intensity"]) <= 1.0
-                )
-            )
-            if require_complete and not grounded:
-                return profile, False
-
-        if mode == "keep":
-            emotion = replace(emotion, updated_at=now)
-        elif mode == "settle":
-            emotion = EmotionState(updated_at=now)
-        else:
-            related_episode = (
-                primary == emotion.primary
-                or bool(emotion.cause)
-                and _similar(cause, emotion.cause) >= 0.72
-            )
-            if grounded and related_episode:
-                refreshed = (
-                    cause
-                    if not emotion.cause
-                    or (
-                        _similar(cause, emotion.cause) < 0.82
-                        and bool(_terms(cause) - _terms(emotion.cause))
-                    )
-                    else emotion.cause
-                )
-                refresh_source = refreshed != emotion.cause
-                emotion = replace(
-                    emotion,
-                    primary=primary,
-                    intensity=max(
-                        0.0,
-                        min(1.0, emotion.intensity * 0.60 + intensity * 0.40),
-                    ),
-                    cause=refreshed,
-                    source=source if refresh_source else emotion.source,
-                    source_id=source_id if refresh_source else emotion.source_id,
-                    started_at=emotion.started_at or now,
-                    updated_at=now,
-                )
-            elif (
-                grounded
-                and (require_complete or intensity >= 0.18)
-                and (
-                    not newer_emotion
-                    or intensity >= emotion.intensity + 0.15
-                )
-            ):
-                emotion = EmotionState(
-                    primary,
-                    intensity,
-                    cause,
-                    source,
-                    source_id,
-                    now,
-                    now,
-                )
-        next_profile = replace(next_profile, emotion=emotion)
-
-    if mood_valid:
-        values = mood_update
-        cause = compact_text(values.get("cause"), 160)
-        valence_delta = max(
-            -mood_delta_limit,
-            min(mood_delta_limit, float(values["valence_delta"])),
-        )
-        energy_delta = max(
-            -mood_delta_limit,
-            min(mood_delta_limit, float(values["energy_delta"])),
-        )
-        grounded = _grounded_emotional_cause(cause, emotional_evidence)
-        changed = valence_delta != 0.0 or energy_delta != 0.0
-        if changed and grounded:
-            mood = effective.mood
-            next_profile = replace(
-                next_profile,
-                mood=MoodState(
-                    max(-1.0, min(1.0, mood.valence + valence_delta)),
-                    max(-1.0, min(1.0, mood.energy + energy_delta)),
-                    cause,
-                    now,
-                ),
-            )
-        elif changed and require_complete:
-            return profile, False
-
-    return next_profile, True
-
-
 class StateStore:
     """Sole production owner of validated state and atomic persistence."""
 
@@ -1948,6 +2311,9 @@ class StateStore:
         self._revision = 0
         self._committed_at = 0.0
         self._autonomy_wake: Callable[[str], None] | None = None
+        self._presence_failure_count = 0
+        self._initiative_failure_count = 0
+        self._expired_claim_recoveries = 0
         self._load()
 
     def _document(
@@ -1989,6 +2355,17 @@ class StateStore:
         self._revision = revision
         self._committed_at = committed_at
         return True
+
+    def _normalize_profile_presence(
+        self,
+        profile: ProfileState,
+        *,
+        now: float,
+    ) -> ProfileState:
+        """Return temporal presence truth without mutating or persisting state."""
+
+        presence = normalize_presence(profile.presence, now=now)
+        return profile if presence == profile.presence else replace(profile, presence=presence)
 
     def _load_payload(
         self,
@@ -2214,47 +2591,43 @@ class StateStore:
             if schema == STATE_SCHEMA_VERSION:
                 raw_profiles = canonical["profiles"]
                 raw_conversations = canonical["conversations"]
-                migrated = migrated or any(
-                    str(profile_id) != canonical_profile_id(profile_id)
-                    or bool(
-                        isinstance(raw_profile.get("presence"), dict)
-                        and (
-                            raw_profile["presence"].get("claim_token")
-                            or _number(
-                                raw_profile["presence"].get("claim_expires_at")
-                            )
-                            > 0.0
-                        )
+                for profile_id, raw_profile in raw_profiles.items():
+                    raw_presence = raw_profile.get("presence")
+                    parsed_presence = profiles[
+                        canonical_profile_id(profile_id)
+                    ].presence.as_dict()
+                    raw_initiative = raw_profile.get("initiative")
+                    raw_opportunity = (
+                        raw_initiative.get("current")
+                        if isinstance(raw_initiative, dict)
+                        else None
                     )
-                    or bool(
-                        isinstance(raw_profile.get("mood"), dict)
+                    presence_claim_expired = bool(
+                        isinstance(raw_presence, dict)
+                        and raw_presence.get("claim_token")
+                        and _number(raw_presence.get("claim_expires_at")) <= now
+                    )
+                    initiative_claim_expired = bool(
+                        isinstance(raw_opportunity, dict)
+                        and raw_opportunity.get("claim_token")
+                        and _number(raw_opportunity.get("claim_expires_at")) <= now
+                    )
+                    self._expired_claim_recoveries += int(
+                        presence_claim_expired
+                    ) + int(initiative_claim_expired)
+                    migrated = migrated or (
+                        str(profile_id) != canonical_profile_id(profile_id)
+                        or isinstance(raw_presence, dict)
+                        and raw_presence != parsed_presence
+                        or isinstance(raw_profile.get("mood"), dict)
                         and _number(raw_profile["mood"].get("updated_at")) > now
-                    )
-                    or bool(
-                        isinstance(raw_profile.get("emotion"), dict)
+                        or isinstance(raw_profile.get("emotion"), dict)
                         and any(
                             _number(raw_profile["emotion"].get(field_name)) > now
                             for field_name in ("started_at", "updated_at")
                         )
+                        or initiative_claim_expired
                     )
-                    or bool(
-                        isinstance(raw_profile.get("initiative"), dict)
-                        and isinstance(
-                            raw_profile["initiative"].get("current"),
-                            dict,
-                        )
-                        and raw_profile["initiative"]["current"].get(
-                            "claim_token"
-                        )
-                        and _number(
-                            raw_profile["initiative"]["current"].get(
-                                "claim_expires_at"
-                            )
-                        )
-                        <= now
-                    )
-                    for profile_id, raw_profile in raw_profiles.items()
-                )
                 migrated = migrated or set(raw_conversations) != set(conversations)
                 migrated = migrated or any(
                     raw.get("profile_id")
@@ -2314,6 +2687,19 @@ class StateStore:
                 presence=presence,
             )
         self._profiles = normalized
+        owner = self._profiles.get(OWNER_PROFILE_ID)
+        if (
+            owner is not None
+            and owner.presence.last_error
+            and owner.presence.retry_at > now
+        ):
+            self._presence_failure_count = 1
+        cleaned_conversations = {
+            key: _clean_conversation_output(record)
+            for key, record in self._conversations.items()
+        }
+        migrated = cleaned_conversations != self._conversations or migrated
+        self._conversations = cleaned_conversations
         migrated = self._prune_conversations(now) or migrated
         if canonical is None or migrated:
             atomic_write_json(
@@ -2327,6 +2713,10 @@ class StateStore:
             )
             self._revision = max(1, self._revision + 1)
             self._committed_at = now
+
+    def expired_claim_recoveries(self) -> int:
+        with self._lock:
+            return self._expired_claim_recoveries
 
     def _prune_conversations(self, now: float) -> bool:
         before = self._conversations
@@ -2398,6 +2788,10 @@ class StateStore:
         current = time.time() if now is None else max(0.0, float(now))
         with self._lock:
             profile = self._profiles.get(profile_key) or _new_profile(current)
+            profile = self._normalize_profile_presence(
+                profile,
+                now=current,
+            )
             conversation = self._conversation(profile_key, conversation_key)
             last_profile_assistant_at = max(
                 (
@@ -2431,6 +2825,21 @@ class StateStore:
                 if include_memory
                 else ()
             )
+            relevant_opinions = self._retrieve_opinions(
+                profile.opinions,
+                query,
+                current,
+            )
+            relevant_preferences = self._retrieve_preferences(
+                profile.preferences,
+                query,
+                current,
+            )
+            relevant_relationship = self._retrieve_relationship(
+                profile.relationship,
+                query,
+                current,
+            )
             return StateSnapshot(
                 profile_key,
                 conversation_key,
@@ -2443,6 +2852,9 @@ class StateStore:
                 last_profile_assistant_at,
                 last_profile_user_at,
                 last_profile_initiative,
+                relevant_opinions=relevant_opinions,
+                relevant_preferences=relevant_preferences,
+                relevant_relationship=relevant_relationship,
             )
 
     def _retrieve(
@@ -2451,39 +2863,66 @@ class StateStore:
         query: str,
         now: float,
     ) -> tuple[Memory, ...]:
-        query_terms = _terms(query)
-        if not query_terms:
-            return ()
-        if query_terms & {"remember", "memory", "memories"} and len(query_terms) <= 5:
-            return tuple(
-                sorted(
-                    memories,
-                    key=lambda item: (item.confidence, item.updated_at),
-                    reverse=True,
-                )[:MEMORY_MAX_RESULTS]
-            )
-        scored: list[tuple[float, Memory]] = []
-        for memory in memories:
-            memory_terms = _terms(memory.text)
-            overlap = len(query_terms & memory_terms) / max(
-                1,
-                len(query_terms | memory_terms),
-            )
-            phrase = SequenceMatcher(None, _key(query), _key(memory.text)).ratio()
-            if overlap <= 0.0 and phrase < 0.28:
-                continue
-            age_days = max(0.0, now - memory.updated_at) / (24.0 * 3600.0)
-            recency = 1.0 / (1.0 + age_days / 30.0)
-            score = 0.62 * max(overlap, phrase * 0.6) + 0.23 * memory.confidence + 0.15 * recency
-            if score >= 0.26:
-                scored.append((score, memory))
-        return tuple(
-            item
-            for _score, item in sorted(
-                scored,
-                key=lambda pair: (pair[0], pair[1].updated_at),
-                reverse=True,
-            )[:MEMORY_MAX_RESULTS]
+        return _relevant_values(
+            memories,
+            query,
+            now,
+            text_of=lambda item: item.text,
+            confidence_of=lambda item: item.confidence,
+            updated_at_of=lambda item: item.updated_at,
+            limit=MEMORY_MAX_RESULTS,
+        )
+
+    @staticmethod
+    def _retrieve_opinions(
+        opinions: tuple[Opinion, ...],
+        query: str,
+        now: float,
+    ) -> tuple[Opinion, ...]:
+        return _relevant_values(
+            opinions,
+            query,
+            now,
+            text_of=lambda item: item.content,
+            confidence_of=lambda item: item.confidence,
+            updated_at_of=lambda item: item.updated_at,
+            limit=3,
+        )
+
+    @staticmethod
+    def _retrieve_preferences(
+        preferences: tuple[AkanePreference, ...],
+        query: str,
+        now: float,
+    ) -> tuple[AkanePreference, ...]:
+        return _relevant_values(
+            preferences,
+            query,
+            now,
+            text_of=lambda item: item.content,
+            confidence_of=lambda _item: 0.7,
+            updated_at_of=lambda item: item.updated_at,
+            limit=3,
+        )
+
+    @staticmethod
+    def _retrieve_relationship(
+        relationship: RelationshipState,
+        query: str,
+        now: float,
+    ) -> tuple[RelationshipEntry, ...]:
+        return _relevant_values(
+            (
+                *relationship.patterns,
+                *relationship.shared_context,
+                *relationship.unresolved_events,
+            ),
+            query,
+            now,
+            text_of=lambda item: item.summary,
+            confidence_of=lambda item: item.confidence,
+            updated_at_of=lambda item: item.updated_at,
+            limit=3,
         )
 
     def _validated_memory(
@@ -2493,6 +2932,10 @@ class StateStore:
         user_text: str,
         assistant_text: str,
         now: float,
+        source_type: str = "explicit_user",
+        source_id: str | None = None,
+        reason: str = "",
+        correction: bool = False,
     ) -> Memory | None:
         if not isinstance(payload, dict) or set(payload) != {
             "subject", "kind", "text", "confidence",
@@ -2506,20 +2949,12 @@ class StateStore:
             subject not in _MEMORY_SUBJECTS
             or kind not in _MEMORY_KINDS
             or not text
+            or not _memory_ownership_matches(subject, text)
             or type(confidence) not in {int, float}
             or not math.isfinite(float(confidence))
-            or _key(text) in _TRIVIAL_MEMORY
             or text.rstrip().endswith("?")
             or len(words(text)) < 3
-            or len(_terms(text)) < (3 if kind == "event" else 1)
-            or (
-                len(_terms(text)) <= 4
-                and bool(_terms(text) & _TRIVIAL_MEMORY_TERMS)
-            )
-            or (
-                kind in {"fact", "event"}
-                and bool(_TRANSIENT_STATEMENT.search(text))
-            )
+            or len(_terms(text)) < (4 if kind == "event" else 1)
         ):
             return None
         evidence = (
@@ -2527,19 +2962,19 @@ class StateStore:
             if subject == "user"
             else f"{user_text} {assistant_text}"
         )
+        correction_grounded = (
+            correction
+            and bool(_terms(text) & _terms(user_text))
+        )
         if (
-            not _grounded(text, evidence)
+            not (_grounded(text, evidence) or correction_grounded)
             or subject != "user"
             and not (_terms(text) & _terms(user_text))
+            or subject == "akane"
+            and not _grounded(text, assistant_text)
         ):
             return None
         certainty = max(0.0, min(1.0, float(confidence)))
-        if (
-            subject == "user"
-            and _UNCERTAINTY.search(user_text)
-            and not _UNCERTAINTY.search(text)
-        ):
-            return None
         return Memory(
             uuid.uuid4().hex,
             subject,
@@ -2548,7 +2983,395 @@ class StateStore:
             certainty,
             now,
             now,
+            source_type,
+            source_id,
+            compact_text(reason, 240),
         )
+
+    @staticmethod
+    def _memory_target(
+        memories: tuple[Memory, ...],
+        *,
+        target_id: object,
+        candidate: Memory | None,
+        user_text: str,
+    ) -> tuple[int | None, str]:
+        target = compact_text(target_id, 100)
+        if target:
+            matches = [
+                index for index, memory in enumerate(memories) if memory.id == target
+            ]
+            if len(matches) != 1:
+                return None, "target not found"
+            existing = memories[matches[0]]
+            if candidate is not None:
+                if (
+                    candidate.subject != existing.subject
+                    or _similar(candidate.text, existing.text) < 0.28
+                ):
+                    return None, "target conflicts with the corrected fact"
+            return matches[0], ""
+
+        scored = sorted(
+            (
+                (
+                    _similar(
+                        memory.text,
+                        candidate.text if candidate is not None else user_text,
+                    ),
+                    index,
+                )
+                for index, memory in enumerate(memories)
+                if (
+                    memory.subject == candidate.subject
+                    if candidate is not None
+                    else memory.subject in {"user", "shared"}
+                )
+            ),
+            reverse=True,
+        )
+        if not scored or scored[0][0] < 0.42:
+            return None, "target not resolved"
+        if len(scored) > 1 and scored[0][0] - scored[1][0] < 0.12:
+            return None, "ambiguous semantic target"
+        return scored[0][1], ""
+
+    @staticmethod
+    def _communication_value(key: str, value: object) -> str:
+        text = compact_text(value, 80)
+        normalized = text.casefold()
+        if key in _COMMUNICATION_VALUES:
+            return normalized if normalized in _COMMUNICATION_VALUES[key] else ""
+        if key in _COMMUNICATION_FREE_TEXT_KEYS and (
+            text
+            and "\n" not in text
+            and "\r" not in text
+            and re.fullmatch(r"[\w .,'’'-]{1,80}", text, re.UNICODE)
+        ):
+            if key == "preferred_name" and (
+                len(words(text)) > 4
+                or bool(words(text) & _UNSAFE_PREFERENCE_WORDS)
+            ):
+                return ""
+            return text
+        return ""
+
+    def _apply_memory_operations(
+        self,
+        memories: tuple[Memory, ...],
+        operations: object,
+        *,
+        user_text: str,
+        assistant_text: str,
+        source_id: str | None,
+        now: float,
+    ) -> tuple[tuple[Memory, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        if not isinstance(operations, list):
+            return memories, (), (), ()
+        result = list(memories)
+        accepted: list[str] = []
+        rejected: list[str] = []
+        ownership: list[str] = []
+        for index, item in enumerate(operations[:8]):
+            label = f"memory_ops[{index}]"
+            if not isinstance(item, dict):
+                rejected.append(f"{label}: malformed operation")
+                continue
+            op = compact_text(item.get("op"), 16).casefold()
+            reason = compact_text(item.get("reason"), 240)
+            if not reason:
+                rejected.append(f"{label}: empty reason")
+                continue
+            if op == "remove":
+                if set(item) != {"op", "target_id", "reason"}:
+                    rejected.append(f"{label}: malformed remove")
+                    continue
+                target, error = self._memory_target(
+                    tuple(result),
+                    target_id=item.get("target_id"),
+                    candidate=None,
+                    user_text=user_text,
+                )
+                if target is None:
+                    rejected.append(f"{label}: {error}")
+                    continue
+                removed = result[target]
+                if removed.subject not in {"user", "shared"}:
+                    rejected.append(f"{label}: conflicting ownership")
+                    continue
+                result.pop(target)
+                accepted.append(f"remove:{removed.id}")
+                ownership.append(f"{label}:user-owned memory")
+                continue
+            required = {
+                "op", "target_id", "subject", "kind", "text", "reason", "confidence",
+            }
+            if op not in {"add", "revise", "correct"} or set(item) != required:
+                rejected.append(f"{label}: malformed or unknown operation")
+                continue
+            proposed_subject = compact_text(item.get("subject"), 16).casefold()
+            proposed_text = compact_text(item.get("text"), 360)
+            if not _memory_ownership_matches(proposed_subject, proposed_text):
+                rejected.append(f"{label}: conflicting ownership")
+                continue
+            candidate = self._validated_memory(
+                {
+                    "subject": item.get("subject"),
+                    "kind": item.get("kind"),
+                    "text": item.get("text"),
+                    "confidence": item.get("confidence"),
+                },
+                user_text=user_text,
+                assistant_text=assistant_text,
+                now=now,
+                source_type="explicit_user",
+                source_id=source_id,
+                reason=reason,
+                correction=op in {"revise", "correct"},
+            )
+            if candidate is None:
+                rejected.append(f"{label}: ungrounded or invalid memory")
+                continue
+            if candidate.subject != "user":
+                rejected.append(f"{label}: generated claim is not an explicit user fact")
+                continue
+            if op == "add":
+                if item.get("target_id") is not None:
+                    rejected.append(f"{label}: add target must be null")
+                    continue
+                if any(
+                    memory.subject == candidate.subject
+                    and _duplicate_text(memory.text, candidate.text)
+                    for memory in result
+                ):
+                    rejected.append(f"{label}: existing fact requires revise or correct")
+                    continue
+                result.append(candidate)
+                accepted.append(f"add:{candidate.id}")
+            else:
+                target, error = self._memory_target(
+                    tuple(result),
+                    target_id=item.get("target_id"),
+                    candidate=candidate,
+                    user_text=user_text,
+                )
+                if target is None:
+                    rejected.append(f"{label}: {error}")
+                    continue
+                existing = result[target]
+                if existing.subject != "user":
+                    rejected.append(f"{label}: conflicting ownership")
+                    continue
+                revised = replace(
+                    candidate,
+                    id=existing.id,
+                    confidence=max(0.9, candidate.confidence),
+                    created_at=existing.created_at,
+                )
+                if revised.text == existing.text and revised.kind == existing.kind:
+                    rejected.append(f"{label}: no durable change")
+                    continue
+                result[target] = revised
+                accepted.append(f"{op}:{existing.id}")
+            ownership.append(f"{label}:user-owned memory")
+        return (
+            tuple(result[-MEMORY_MAX_ENTRIES_PER_PROFILE:]),
+            tuple(accepted),
+            tuple(rejected),
+            tuple(ownership),
+        )
+
+    def _apply_communication_operations(
+        self,
+        current: tuple[CommunicationPreference, ...],
+        operations: object,
+        *,
+        user_text: str,
+        now: float,
+    ) -> tuple[tuple[CommunicationPreference, ...], tuple[str, ...], tuple[str, ...]]:
+        if not isinstance(operations, list):
+            return current, (), ()
+        result = list(current)
+        rejected: list[str] = []
+        ownership: list[str] = []
+        for index, item in enumerate(operations[:8]):
+            label = f"communication_ops[{index}]"
+            if not isinstance(item, dict) or set(item) != {"op", "key", "value", "reason"}:
+                rejected.append(f"{label}: malformed operation")
+                continue
+            op = compact_text(item.get("op"), 16).casefold()
+            key = compact_text(item.get("key"), 40).casefold()
+            value = self._communication_value(key, item.get("value"))
+            reason = compact_text(item.get("reason"), 240)
+            if op not in {"set", "revise", "remove"}:
+                rejected.append(f"{label}: unknown operation")
+                continue
+            if not value or not reason:
+                rejected.append(f"{label}: unsupported key/value or empty reason")
+                continue
+            if not _exact_value_grounded(value, user_text):
+                rejected.append(f"{label}: exact value is not grounded in the user message")
+                continue
+            match = next(
+                (
+                    position
+                    for position, existing in enumerate(result)
+                    if existing.key == key
+                    and (key != "forbidden_phrase" or _key(existing.value) == _key(value))
+                ),
+                None,
+            )
+            if op == "remove":
+                if match is None:
+                    rejected.append(f"{label}: target not found")
+                    continue
+                result.pop(match)
+            else:
+                if (
+                    key == "forbidden_phrase"
+                    and match is None
+                    and sum(
+                        existing.key == "forbidden_phrase" for existing in result
+                    ) >= _MAX_FORBIDDEN_PHRASES
+                ):
+                    rejected.append(f"{label}: forbidden phrase limit reached")
+                    continue
+                if op == "revise" and match is None and key == "forbidden_phrase":
+                    rejected.append(f"{label}: target not found")
+                    continue
+                created = result[match].created_at if match is not None else now
+                candidate = CommunicationPreference(
+                    key,
+                    value,
+                    reason,
+                    created,
+                    now,
+                    "explicit_user",
+                )
+                if match is not None and result[match].value == value:
+                    rejected.append(f"{label}: no durable change")
+                    continue
+                if match is None:
+                    result.append(candidate)
+                else:
+                    result[match] = candidate
+            ownership.append(f"{label}:profile-scoped communication")
+        return (
+            tuple(result[-_MAX_COMMUNICATION_PREFERENCES:]),
+            tuple(rejected),
+            tuple(ownership),
+        )
+
+    def _apply_opinion_operations(
+        self,
+        current: tuple[Opinion, ...],
+        operations: object,
+        *,
+        user_text: str,
+        assistant_text: str,
+        now: float,
+    ) -> tuple[tuple[Opinion, ...], tuple[str, ...], tuple[str, ...]]:
+        if not isinstance(operations, list):
+            return current, (), ()
+        result = list(current)
+        rejected: list[str] = []
+        ownership: list[str] = []
+        for index, item in enumerate(operations[:6]):
+            label = f"opinion_ops[{index}]"
+            if not isinstance(item, dict):
+                rejected.append(f"{label}: malformed operation")
+                continue
+            op = compact_text(item.get("op"), 16).casefold()
+            if op == "remove":
+                if set(item) != {"op", "target_id", "reason"}:
+                    rejected.append(f"{label}: malformed remove")
+                    continue
+                target_id = compact_text(item.get("target_id"), 100)
+                reason = compact_text(item.get("reason"), 240)
+                match = next(
+                    (position for position, value in enumerate(result) if value.id == target_id),
+                    None,
+                )
+                if match is None or not reason:
+                    rejected.append(f"{label}: missing target or reason")
+                    continue
+                if not _grounded(reason, assistant_text):
+                    rejected.append(f"{label}: reason is not grounded in the visible reply")
+                    continue
+                result.pop(match)
+                ownership.append(f"{label}:Akane-owned opinion")
+                continue
+            required = {"op", "topic", "position", "reason", "confidence"}
+            if op == "revise":
+                required.add("target_id")
+            if op not in {"form", "revise"} or set(item) != required:
+                rejected.append(f"{label}: malformed or unknown operation")
+                continue
+            topic = compact_text(item.get("topic"), 140)
+            position = compact_text(item.get("position"), 200)
+            reason = compact_text(item.get("reason"), 240)
+            confidence = item.get("confidence")
+            if (
+                not topic
+                or not position
+                or not reason
+                or type(confidence) not in {int, float}
+                or not math.isfinite(float(confidence))
+                or not 0.0 <= float(confidence) <= 1.0
+                or (
+                    not _grounded(topic, f"{user_text} {assistant_text}")
+                    and len(_terms(topic)) < 2
+                )
+                or not _grounded(position, assistant_text)
+                or not _grounded(reason, assistant_text)
+            ):
+                rejected.append(f"{label}: visible reply did not ground and adopt the position")
+                continue
+            topic_key = _key(topic)
+            if op == "form":
+                if any(value.topic_key == topic_key for value in result):
+                    rejected.append(f"{label}: existing opinion requires revise")
+                    continue
+                candidate = Opinion(
+                    topic,
+                    position,
+                    reason,
+                    now,
+                    uuid.uuid4().hex,
+                    topic_key,
+                    float(confidence),
+                    now,
+                    "conversation",
+                    compact_text(user_text, 280),
+                )
+                result.append(candidate)
+            else:
+                target_id = compact_text(item.get("target_id"), 100)
+                match = next(
+                    (position_index for position_index, value in enumerate(result) if value.id == target_id),
+                    None,
+                )
+                if match is None:
+                    rejected.append(f"{label}: target not found")
+                    continue
+                existing = result[match]
+                if existing.position == position and existing.reason == reason:
+                    rejected.append(f"{label}: no durable change")
+                    continue
+                result[match] = Opinion(
+                    topic,
+                    position,
+                    reason,
+                    now,
+                    existing.id,
+                    topic_key,
+                    float(confidence),
+                    existing.created_at,
+                    "conversation",
+                    compact_text(user_text, 280),
+                )
+            ownership.append(f"{label}:Akane-owned opinion")
+        return tuple(result[-_MAX_OPINIONS:]), tuple(rejected), tuple(ownership)
 
     def _apply_proposals(
         self,
@@ -2557,54 +3380,42 @@ class StateStore:
         *,
         user_text: str,
         assistant_text: str,
-        source: str,
         source_id: str | None,
-        expected_emotion_updated_at: float,
         now: float,
-    ) -> ProfileState:
+    ) -> tuple[
+        ProfileState,
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+    ]:
         values = proposals if isinstance(proposals, dict) else {}
-        emotional_input = _key(user_text)
-        if emotional_input in _TRIVIAL_EMOTIONAL_INPUTS:
-            next_profile = _materialize_effective_state(profile, now=now)
-        else:
-            next_profile, _valid = _apply_emotional_updates(
-                profile,
-                emotion_update=values.get("emotion_update"),
-                mood_update=values.get("mood_update"),
-                evidence=f"{user_text} {assistant_text}",
-                source=source,
-                source_id=source_id,
-                now=now,
-                mood_delta_limit=0.12,
-                expected_emotion_updated_at=expected_emotion_updated_at,
-                require_complete=False,
-            )
+        accepted_memory_operations: tuple[str, ...] = ()
+        rejected_operations: tuple[str, ...] = ()
+        ownership_classification: tuple[str, ...] = ()
+        next_profile = profile
 
-        raw_memories = values.get("memories")
-        if isinstance(raw_memories, list):
-            additions = tuple(
-                memory
-                for item in raw_memories[:8]
-                if (
-                    memory := self._validated_memory(
-                        item,
-                        user_text=user_text,
-                        assistant_text=assistant_text,
-                        now=now,
-                    )
-                )
-                is not None
-            )
-            if additions:
-                next_profile = replace(
-                    next_profile,
-                    memories=_merge_memories(next_profile.memories, additions),
-                )
+        (
+            memories,
+            accepted_memory_operations,
+            memory_rejections,
+            memory_ownership,
+        ) = self._apply_memory_operations(
+            next_profile.memories,
+            values.get("memory_ops"),
+            user_text=user_text,
+            assistant_text=assistant_text,
+            source_id=source_id,
+            now=now,
+        )
+        if memories != next_profile.memories:
+            next_profile = replace(next_profile, memories=memories)
+        rejected_operations += memory_rejections
+        ownership_classification += memory_ownership
 
         raw_preferences = values.get("preferences")
         if isinstance(raw_preferences, list):
             additions: list[AkanePreference] = []
-            for item in raw_preferences[:6]:
+            for index, item in enumerate(raw_preferences[:6]):
                 if not isinstance(item, dict) or set(item) != {
                     "topic", "stance", "reason",
                 }:
@@ -2613,12 +3424,17 @@ class StateStore:
                 if (
                     candidate
                     and _grounded(candidate.topic, user_text)
-                    and _grounded(
-                        f"{candidate.topic} {candidate.reason}",
-                        f"{user_text} {assistant_text}",
-                    )
+                    and _grounded(candidate.topic, assistant_text)
+                    and _grounded(candidate.reason, assistant_text)
                 ):
                     additions.append(candidate)
+                    ownership_classification += (
+                        f"preferences[{index}]:Akane-owned preference",
+                    )
+                elif candidate:
+                    rejected_operations += (
+                        f"preferences[{index}]: conflicting ownership; Akane-owned preference was not visibly adopted",
+                    )
             if additions:
                 next_profile = replace(
                     next_profile,
@@ -2630,15 +3446,25 @@ class StateStore:
 
         raw_interests = values.get("interests")
         if isinstance(raw_interests, list):
-            additions = tuple(
-                interest
-                for item in raw_interests[:6]
-                if (
-                    interest := compact_text(item, 100)
+            interest_additions: list[str] = []
+            for index, item in enumerate(raw_interests[:6]):
+                interest = compact_text(item, 100)
+                valid = bool(
+                    interest
+                    and 1 <= len(_terms(interest)) <= 5
+                    and _grounded(interest, user_text)
+                    and _grounded(interest, assistant_text)
                 )
-                and 1 <= len(_terms(interest)) <= 5
-                and _grounded(interest, user_text)
-            )
+                if valid:
+                    interest_additions.append(interest)
+                    ownership_classification += (
+                        f"interests[{index}]:Akane-owned interest",
+                    )
+                elif interest:
+                    rejected_operations += (
+                        f"interests[{index}]: conflicting ownership; Akane-owned interest was not visibly adopted",
+                    )
+            additions = tuple(interest_additions)
             if additions:
                 next_profile = replace(
                     next_profile,
@@ -2648,32 +3474,33 @@ class StateStore:
                     ),
                 )
 
-        raw_opinions = values.get("opinions")
-        if isinstance(raw_opinions, list):
-            additions: list[Opinion] = []
-            for item in raw_opinions[:6]:
-                if not isinstance(item, dict) or set(item) != {
-                    "topic", "position", "reason",
-                }:
-                    continue
-                candidate = Opinion.from_dict({**item, "updated_at": now})
-                if (
-                    candidate
-                    and _grounded(candidate.topic, user_text)
-                    and _grounded(
-                        f"{candidate.topic} {candidate.position} {candidate.reason}",
-                        f"{user_text} {assistant_text}",
-                    )
-                ):
-                    additions.append(candidate)
-            if additions:
-                next_profile = replace(
-                    next_profile,
-                    opinions=_merge_opinions(
-                        next_profile.opinions,
-                        tuple(additions),
-                    ),
-                )
+        communication_preferences, communication_rejections, communication_ownership = (
+            self._apply_communication_operations(
+                next_profile.communication_preferences,
+                values.get("communication_ops"),
+                user_text=user_text,
+                now=now,
+            )
+        )
+        if communication_preferences != next_profile.communication_preferences:
+            next_profile = replace(
+                next_profile,
+                communication_preferences=communication_preferences,
+            )
+        rejected_operations += communication_rejections
+        ownership_classification += communication_ownership
+
+        opinions, opinion_rejections, opinion_ownership = self._apply_opinion_operations(
+            next_profile.opinions,
+            values.get("opinion_ops"),
+            user_text=user_text,
+            assistant_text=assistant_text,
+            now=now,
+        )
+        if opinions != next_profile.opinions:
+            next_profile = replace(next_profile, opinions=opinions)
+        rejected_operations += opinion_rejections
+        ownership_classification += opinion_ownership
 
         relationship = values.get("relationship")
         if isinstance(relationship, dict):
@@ -2682,7 +3509,7 @@ class StateStore:
                 raw = relationship.get(field_name)
                 accepted: list[RelationshipEntry] = []
                 if isinstance(raw, list):
-                    for item in raw[:6]:
+                    for index, item in enumerate(raw[:6]):
                         if not isinstance(item, dict) or set(item) != {
                             "summary", "confidence",
                         }:
@@ -2690,8 +3517,22 @@ class StateStore:
                         candidate = RelationshipEntry.from_dict(
                             {**item, "updated_at": now}
                         )
-                        if candidate and _grounded(candidate.summary, user_text):
+                        if (
+                            candidate
+                            and _shared_grounded(
+                                candidate.summary,
+                                user_text,
+                                assistant_text,
+                            )
+                        ):
                             accepted.append(candidate)
+                            ownership_classification += (
+                                f"relationship.{field_name}[{index}]:shared relationship evidence",
+                            )
+                        elif candidate:
+                            rejected_operations += (
+                                f"relationship.{field_name}[{index}]: conflicting ownership; not shared relationship evidence",
+                            )
                 additions[field_name] = tuple(accepted)
             current = next_profile.relationship
             merged = RelationshipState(
@@ -2711,7 +3552,7 @@ class StateStore:
             resolved = relationship.get("resolved_events")
             unresolved = list(merged.unresolved_events)
             if isinstance(resolved, list):
-                for item in resolved[:6]:
+                for index, item in enumerate(resolved[:6]):
                     candidate = RelationshipEntry.from_dict(
                         {**item, "updated_at": now}
                         if isinstance(item, dict)
@@ -2719,7 +3560,11 @@ class StateStore:
                     )
                     if (
                         candidate
-                        and _grounded(candidate.summary, user_text)
+                        and _shared_grounded(
+                            candidate.summary,
+                            user_text,
+                            assistant_text,
+                        )
                     ):
                         match = next(
                             (
@@ -2731,13 +3576,25 @@ class StateStore:
                         )
                         if match is not None:
                             unresolved.pop(match)
+                            ownership_classification += (
+                                f"relationship.resolved_events[{index}]:shared relationship evidence",
+                            )
+                    elif candidate:
+                        rejected_operations += (
+                            f"relationship.resolved_events[{index}]: conflicting ownership; not shared relationship evidence",
+                        )
             merged = replace(merged, unresolved_events=tuple(unresolved))
             if merged != current:
                 next_profile = replace(next_profile, relationship=merged)
 
         if next_profile != profile:
             next_profile = replace(next_profile, updated_at=now)
-        return next_profile
+        return (
+            next_profile,
+            accepted_memory_operations,
+            rejected_operations,
+            ownership_classification,
+        )
 
     def commit_turn(
         self,
@@ -2748,11 +3605,18 @@ class StateStore:
         source: str,
         request_id: str = "",
         proposals: object = None,
+        proposal_rejections: tuple[str, ...] = (),
+        allow_initiative: bool = True,
         now: float | None = None,
     ) -> StateSnapshot:
         committed = time.time() if now is None else max(snapshot.now, float(now))
+        assistant_text = clean_visible_output(assistant_text)
         with self._lock:
             profile = self._profiles.get(snapshot.profile_id) or _new_profile(committed)
+            profile = self._normalize_profile_presence(
+                profile,
+                now=committed,
+            )
             conversation = self._conversation(
                 snapshot.profile_id,
                 snapshot.conversation_id,
@@ -2766,16 +3630,32 @@ class StateStore:
                     now=committed,
                 )
             pair_id = request or uuid.uuid4().hex
-            next_profile = self._apply_proposals(
+            (
+                next_profile,
+                accepted_memory_operations,
+                rejected_operations,
+                ownership_classification,
+            ) = self._apply_proposals(
                 profile,
                 proposals,
                 user_text=user_text,
                 assistant_text=assistant_text,
-                source="conversation",
                 source_id=pair_id,
-                expected_emotion_updated_at=snapshot.profile.emotion.updated_at,
                 now=committed,
             )
+            next_profile, affect_transition = _apply_conversation_affect(
+                next_profile,
+                conversation,
+                user_text=user_text,
+                source_id=pair_id,
+                now=committed,
+            )
+            if allow_initiative and snapshot.profile_id == OWNER_PROFILE_ID:
+                next_profile = _with_conversation_initiative(
+                    profile,
+                    next_profile,
+                    now=committed,
+                )
             turns = list(conversation.recent_turns)
             if assistant_text:
                 turns.extend(
@@ -2835,6 +3715,10 @@ class StateStore:
                 conversations,
                 committed_at=committed,
             )
+            if next_profile.initiative != profile.initiative:
+                callback = self._autonomy_wake
+                if callback is not None:
+                    callback(snapshot.profile_id)
             return StateSnapshot(
                 snapshot.profile_id,
                 snapshot.conversation_id,
@@ -2853,6 +3737,13 @@ class StateStore:
                     next_conversation.last_user_at,
                 ),
                 snapshot.last_profile_initiative,
+                accepted_memory_operations,
+                (*proposal_rejections, *rejected_operations),
+                ownership_classification,
+                self._retrieve_opinions(next_profile.opinions, user_text, committed),
+                self._retrieve_preferences(next_profile.preferences, user_text, committed),
+                self._retrieve_relationship(next_profile.relationship, user_text, committed),
+                affect_transition,
             )
 
     def messages(
@@ -2945,7 +3836,15 @@ class StateStore:
                 "profile_id": profile,
                 "interests": list(state.interests),
                 "preferences": [asdict(item) for item in state.preferences],
-                "opinions": [asdict(item) for item in state.opinions],
+                "opinions": [
+                    {
+                        "topic": item.topic,
+                        "position": item.position,
+                        "reason": item.reason,
+                        "updated_at": item.updated_at,
+                    }
+                    for item in state.opinions
+                ],
                 "updated_at": state.updated_at,
             }
 
@@ -2955,7 +3854,12 @@ class StateStore:
     ) -> dict[str, object]:
         profile = canonical_profile_id(profile_id)
         with self._lock:
-            state = self._profiles.get(profile) or _new_profile(time.time())
+            current_time = time.time()
+            state = self._profiles.get(profile) or _new_profile(current_time)
+            state = self._normalize_profile_presence(
+                state,
+                now=current_time,
+            )
             current = state.presence.current_activity
             activities = {}
             if current is not None:
@@ -2994,6 +3898,10 @@ class StateStore:
         current = time.time()
         with self._lock:
             state = self._profiles.get(profile) or _new_profile(current)
+            state = self._normalize_profile_presence(
+                state,
+                now=current,
+            )
             effective = effective_emotional_state(state, now=current)
             return {
                 **effective.as_dict(),
@@ -3024,13 +3932,12 @@ class StateStore:
                 and active.expires_at > now
             ):
                 return False
-            if (
+            if opportunity.source_type != "reminder" and (
                 opportunity.source_id in initiative.handled_source_ids
                 or any(
                     recent.source_id == opportunity.source_id
                     or (
-                        opportunity.source_type != "reminder"
-                        and recent.source_type != "reminder"
+                        recent.source_type != "reminder"
                         and _similar(recent.topic_key, opportunity.topic_key)
                         >= 0.78
                     )
@@ -3065,6 +3972,13 @@ class StateStore:
             profile = self._profiles.get(OWNER_PROFILE_ID)
             if profile is None:
                 return False, None
+            raw_opportunity = profile.initiative.current
+            if (
+                raw_opportunity is not None
+                and raw_opportunity.claim_token
+                and raw_opportunity.claim_expires_at <= current
+            ):
+                self._expired_claim_recoveries += 1
             initiative = _settle_initiative(profile.initiative, now=current)
             opportunity = initiative.current
             due = bool(
@@ -3107,6 +4021,13 @@ class StateStore:
             profile = self._profiles.get(OWNER_PROFILE_ID)
             if profile is None:
                 return None
+            raw_opportunity = profile.initiative.current
+            if (
+                raw_opportunity is not None
+                and raw_opportunity.claim_token
+                and raw_opportunity.claim_expires_at <= current
+            ):
+                self._expired_claim_recoveries += 1
             initiative = _settle_initiative(profile.initiative, now=current)
             opportunity = initiative.current
             if (
@@ -3138,7 +4059,7 @@ class StateStore:
             claimed = replace(
                 opportunity,
                 claim_token=uuid.uuid4().hex,
-                claim_expires_at=current + _INITIATIVE_CLAIM_SECONDS,
+                claim_expires_at=current + _INITIATIVE_EVALUATION_CLAIM_SECONDS,
             )
             profiles = self._profiles.copy()
             profiles[OWNER_PROFILE_ID] = replace(
@@ -3221,6 +4142,7 @@ class StateStore:
                 self._conversations.copy(),
                 committed_at=current,
             )
+            self._initiative_failure_count = 0
             callback = self._autonomy_wake
         if callback is not None:
             callback(OWNER_PROFILE_ID)
@@ -3243,9 +4165,13 @@ class StateStore:
                 or opportunity.claim_token != claim_token
             ):
                 return False
+            failure_count = self._initiative_failure_count + 1
             pending = replace(
                 opportunity,
-                not_before=min(opportunity.expires_at, current + RETRY_SECONDS),
+                not_before=min(
+                    opportunity.expires_at,
+                    current + _background_retry_delay(failure_count),
+                ),
                 claim_token=None,
                 claim_expires_at=0.0,
             )
@@ -3254,11 +4180,14 @@ class StateStore:
                 profile,
                 initiative=replace(profile.initiative, current=pending),
             )
-            return self._replace_all(
+            changed = self._replace_all(
                 profiles,
                 self._conversations.copy(),
                 committed_at=current,
             )
+            if changed:
+                self._initiative_failure_count = failure_count
+            return changed
 
     def claim_initiative_delivery(
         self,
@@ -3279,6 +4208,13 @@ class StateStore:
             profile = self._profiles.get(OWNER_PROFILE_ID)
             if profile is None:
                 return None
+            raw_opportunity = profile.initiative.current
+            if (
+                raw_opportunity is not None
+                and raw_opportunity.claim_token
+                and raw_opportunity.claim_expires_at <= current
+            ):
+                self._expired_claim_recoveries += 1
             initiative = _settle_initiative(profile.initiative, now=current)
             opportunity = initiative.current
             if (
@@ -3310,7 +4246,7 @@ class StateStore:
             claimed = replace(
                 opportunity,
                 claim_token=uuid.uuid4().hex,
-                claim_expires_at=current + _INITIATIVE_CLAIM_SECONDS,
+                claim_expires_at=current + _INITIATIVE_DELIVERY_CLAIM_SECONDS,
                 delivery_channel=channel,
             )
             profiles = self._profiles.copy()
@@ -3521,17 +4457,18 @@ class StateStore:
             for profile_id, state in self._profiles.items():
                 if profile_id != OWNER_PROFILE_ID:
                     continue
-                presence = state.presence
-                if (
-                    presence.claim_token is not None
-                    and presence.claim_expires_at <= current
-                ):
+                expired_claim = bool(
+                    state.presence.claim_token
+                    and state.presence.claim_expires_at <= current
+                )
+                presence = normalize_presence(state.presence, now=current)
+                if expired_claim:
+                    self._expired_claim_recoveries += 1
                     presence = replace(
                         presence,
-                        claim_token=None,
-                        claim_expires_at=0.0,
                         last_error="stale claim released",
                     )
+                if presence != state.presence:
                     profiles[profile_id] = replace(state, presence=presence)
                     changed = True
                 if presence.claim_token is not None:
@@ -3564,18 +4501,26 @@ class StateStore:
             state = self._profiles.get(profile)
             if state is None:
                 return None
-            candidate = state.presence
-            if (
-                candidate.claim_token is not None
-                and candidate.claim_expires_at <= current
-            ):
+            expired_claim = bool(
+                state.presence.claim_token
+                and state.presence.claim_expires_at <= current
+            )
+            candidate = normalize_presence(state.presence, now=current)
+            if expired_claim:
+                self._expired_claim_recoveries += 1
                 candidate = replace(
                     candidate,
-                    claim_token=None,
-                    claim_expires_at=0.0,
                     last_error="stale claim released",
                 )
             if not self._presence_due(candidate, current):
+                if candidate != state.presence:
+                    profiles = self._profiles.copy()
+                    profiles[profile] = replace(state, presence=candidate)
+                    self._replace_all(
+                        profiles,
+                        self._conversations.copy(),
+                        committed_at=current,
+                    )
                 return None
             presence = replace(
                 candidate,
@@ -3598,12 +4543,14 @@ class StateStore:
         *,
         now: float,
         error: str,
+        failure_count: int,
     ) -> PresenceState:
+        presence = normalize_presence(presence, now=now)
         return replace(
             presence,
             claim_token=None,
             claim_expires_at=0.0,
-            retry_at=now + RETRY_SECONDS,
+            retry_at=now + _background_retry_delay(failure_count),
             last_error=compact_text(error, 120) or "presence decision failed",
         )
 
@@ -3621,14 +4568,27 @@ class StateStore:
         current = max(0.0, float(now))
         with self._lock:
             state = self._profiles.get(profile)
-            if state is None or state.presence.claim_token != claim_token:
+            if state is None:
                 return False
+            presence = normalize_presence(state.presence, now=current)
+            if presence.claim_token != claim_token:
+                if presence != state.presence:
+                    profiles = self._profiles.copy()
+                    profiles[profile] = replace(state, presence=presence)
+                    self._replace_all(
+                        profiles,
+                        self._conversations.copy(),
+                        committed_at=current,
+                    )
+                return False
+            failure_count = self._presence_failure_count + 1
             next_state = replace(
                 state,
                 presence=self._failed_presence(
-                    state.presence,
+                    presence,
                     now=current,
                     error=error,
+                    failure_count=failure_count,
                 ),
             )
             profiles = self._profiles.copy()
@@ -3638,6 +4598,7 @@ class StateStore:
                 self._conversations.copy(),
                 committed_at=current,
             )
+            self._presence_failure_count = failure_count
             callback = self._autonomy_wake
         if callback is not None:
             callback(profile)
@@ -3697,8 +4658,27 @@ class StateStore:
         current = max(0.0, float(now))
         with self._lock:
             state = self._profiles.get(profile)
-            if state is None or state.presence.claim_token != claim_token:
+            if state is None:
                 return False, "presence claim is unavailable"
+            normalized_presence = normalize_presence(
+                state.presence,
+                now=current,
+            )
+            if normalized_presence.claim_token != claim_token:
+                if normalized_presence != state.presence:
+                    profiles = self._profiles.copy()
+                    profiles[profile] = replace(
+                        state,
+                        presence=normalized_presence,
+                    )
+                    self._replace_all(
+                        profiles,
+                        self._conversations.copy(),
+                        committed_at=current,
+                    )
+                return False, "presence claim is unavailable"
+            if normalized_presence != state.presence:
+                state = replace(state, presence=normalized_presence)
             actual_activity = state.presence.current_activity
             actual_activity_id = (
                 actual_activity.activity_id if actual_activity is not None else None
@@ -3716,10 +4696,12 @@ class StateStore:
                     proposal,
                 )
             if rejection:
+                failure_count = self._presence_failure_count + 1
                 presence = self._failed_presence(
                     state.presence,
                     now=current,
                     error=rejection,
+                    failure_count=failure_count,
                 )
                 next_state = replace(state, presence=presence)
             else:
@@ -3757,6 +4739,10 @@ class StateStore:
                 self._conversations.copy(),
                 committed_at=current,
             )
+            if rejection:
+                self._presence_failure_count = failure_count
+            else:
+                self._presence_failure_count = 0
             callback = self._autonomy_wake
         if callback is not None:
             callback(profile)

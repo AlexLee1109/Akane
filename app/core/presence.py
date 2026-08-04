@@ -7,12 +7,15 @@ import math
 import re
 import time
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from app.core.utils import compact_text
 
 PRESENCE_INTERVAL_SECONDS = 4 * 60 * 60
-CLAIM_SECONDS = 10 * 60
+PRESENCE_DECISION_LEAD_SECONDS = 5 * 60
+CLAIM_SECONDS = 2 * 60 * 60
 RETRY_SECONDS = 5 * 60
+RECENT_PREVIOUS_ACTIVITY_SECONDS = 24 * 60 * 60
 
 PRESENCE_PROPOSAL_FIELDS = (
     "decision",
@@ -21,7 +24,7 @@ PRESENCE_PROPOSAL_FIELDS = (
     "emotion",
 )
 BOOTSTRAP_PRESENCE_FIELDS = ("decision", "activity", "emotion")
-PRESENCE_ACTIVITY_FIELDS = ("summary", "focus")
+PRESENCE_ACTIVITY_FIELDS = ("summary", "focus", "grounding")
 PRESENCE_EMOTION_FIELDS = ("primary", "intensity", "cause")
 _DECISIONS = {"new", "continue"}
 _EMOTIONS = {
@@ -45,44 +48,6 @@ _EMOTIONS = {
     "irritated",
     "angry",
 }
-UNSUPPORTED_PHYSICAL_ACTIVITY_REASON = (
-    "presence activity must be plausible for a digital AI companion and must not "
-    "invent a physical environment"
-)
-_DIRECT_UNSUPPORTED_ACTIVITY = re.compile(
-    r"\b(?:eat(?:s|ing)?|dr(?:ink|inks|inking|ank)|sip(?:s|ping)?|"
-    r"travel(?:s|ed|led|ing)|commut(?:e|es|ed|ing)|shop(?:s|ped|ping)?|"
-    r"purchas(?:e|es|ed|ing)|buy(?:s|ing)?|bought|cook(?:s|ed|ing)?|"
-    r"wash(?:es|ed|ing)?|vacuum(?:s|ed|ing)?|"
-    r"meet(?:s|ing)?\s+(?:someone|people|other\s+people|friends?|"
-    r"a\s+friends?|a\s+person)|"
-    r"do(?:es|ing)?\s+(?:laundry|dishes|chores)|breaking\s+news|"
-    r"new\s+release|chapter\s+\d+|episode\s+\d+)\b",
-    re.IGNORECASE,
-)
-_PHYSICAL_CONTEXT = re.compile(
-    r"\b(?:room|bed|sofa|couch|chair|desk|window|balcony|porch|garden|"
-    r"park|cafe|store|school|office|place|outside|indoors|weather|rain|"
-    r"snow|storm|clouds?|"
-    r"sun(?:light|rise|set)?|daylight|sky|scenery|landscape|tea|coffee|"
-    r"food|meal|snack|drink|cup|mug|glass|book|phone|pen|package|blinds|"
-    r"physical\s+object)\b",
-    re.IGNORECASE,
-)
-_PHYSICAL_CONTEXT_ACTION = re.compile(
-    r"\b(?:sit(?:s|ting)?|stand(?:s|ing)?|lie|lies|lying|sleep(?:s|ing)?|"
-    r"rest(?:s|ing)?|relax(?:es|ing)?|look(?:s|ing)?|watch(?:es|ing)?|"
-    r"observ(?:e|es|ing)|hold(?:s|ing)?|carr(?:y|ies|ying)|"
-    r"handl(?:e|es|ing)|hav(?:e|ing)|visit(?:s|ed|ing)?|"
-    r"clean(?:s|ed|ing)?|attend(?:s|ed|ing)?|taking\s+a\s+break)\b|"
-    r"\b(?:akane|she)\s+is\s+(?:in|at|by|outside)\b",
-    re.IGNORECASE,
-)
-_OBSOLETE_ERRORS = (
-    "life decision lacks a grounded emotional appraisal",
-    "invalid life block",
-    "invalid emotional appraisal",
-)
 
 
 def _nullable(kind: str) -> dict[str, object]:
@@ -99,6 +64,7 @@ PRESENCE_JSON_SCHEMA = json.dumps(
                 "properties": {
                     "summary": {"type": "string"},
                     "focus": {"type": "string"},
+                    "grounding": {"type": "string", "enum": ["digital"]},
                 },
                 "required": list(PRESENCE_ACTIVITY_FIELDS),
                 "additionalProperties": False,
@@ -131,6 +97,7 @@ BOOTSTRAP_PRESENCE_JSON_SCHEMA = json.dumps(
                 "properties": {
                     "summary": {"type": "string", "minLength": 1},
                     "focus": {"type": "string", "minLength": 1},
+                    "grounding": {"type": "string", "enum": ["digital"]},
                 },
                 "required": list(PRESENCE_ACTIVITY_FIELDS),
                 "additionalProperties": False,
@@ -146,7 +113,7 @@ BOOTSTRAP_PRESENCE_JSON_SCHEMA = json.dumps(
                 "additionalProperties": False,
             },
         },
-        "required": ["decision", "activity"],
+        "required": list(BOOTSTRAP_PRESENCE_FIELDS),
         "additionalProperties": False,
     },
     separators=(",", ":"),
@@ -220,7 +187,6 @@ class PresenceState:
         payload: object,
         *,
         now: float | None = None,
-        repair_schedule: bool = False,
     ) -> "PresenceState":
         current_time = time.time() if now is None else max(0.0, float(now))
         values = payload if isinstance(payload, dict) else {}
@@ -244,11 +210,7 @@ class PresenceState:
             claim_expires_at=claim_expires_at,
             continuation_count=continuation_count,
         )
-        return normalize_presence(
-            state,
-            now=current_time,
-            repair_schedule=repair_schedule,
-        )
+        return normalize_presence(state, now=current_time)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -269,41 +231,80 @@ class PresenceState:
 
 
 def needs_bootstrap(state: PresenceState) -> bool:
-    return state.current_activity is None or state.last_decision_at <= 0.0
+    return state.last_decision_at <= 0.0
+
+
+def activity_status(
+    activity: PresenceActivity | None,
+    *,
+    now: float,
+) -> str:
+    """Return the one canonical temporal status for a presence activity."""
+
+    if activity is None:
+        return "none"
+    if activity.expected_end_at <= now:
+        return "expired"
+    if activity.started_at <= now < activity.expected_end_at:
+        return "active"
+    return "none"
+
+
+def is_activity_active(
+    activity: PresenceActivity | None,
+    *,
+    now: float,
+) -> bool:
+    return activity_status(activity, now=now) == "active"
 
 
 def normalize_presence(
     state: PresenceState,
     *,
     now: float,
-    initialize_schedule: bool = False,
-    repair_schedule: bool = False,
 ) -> PresenceState:
-    """Normalize claims and perform the one schema-migration bootstrap repair."""
-
-    del initialize_schedule
+    """Return the sole temporal interpretation of persisted presence state."""
+    current = state.current_activity
+    previous = state.previous_activity
+    continuation_count = state.continuation_count
+    next_decision_at = state.next_decision_at
+    status = activity_status(current, now=now)
+    if status != "active":
+        if (
+            status == "expired"
+            and current is not None
+            and (
+                previous is None
+                or previous.activity_id != current.activity_id
+            )
+        ):
+            previous = current
+        current = None
+        continuation_count = 0
+        # Zero is the stable persisted sentinel for immediately due work. The
+        # scheduler translates it to `now`; read-only snapshots therefore do
+        # not manufacture a different deadline on every read.
+        next_decision_at = 0.0
+    elif current is not None:
+        decision_deadline = max(
+            current.started_at,
+            current.expected_end_at - PRESENCE_DECISION_LEAD_SECONDS,
+        )
+        if next_decision_at <= 0.0 or next_decision_at >= current.expected_end_at:
+            next_decision_at = decision_deadline
     token = state.claim_token
     claim_expires_at = state.claim_expires_at
     if token is not None and claim_expires_at <= now:
         token = None
         claim_expires_at = 0.0
-    next_decision_at = state.next_decision_at
-    retry_at = state.retry_at
-    last_error = state.last_error
-    if repair_schedule and needs_bootstrap(state):
-        next_decision_at = 0.0
-        retry_at = 0.0
-        token = None
-        claim_expires_at = 0.0
-    if last_error and any(error in last_error.casefold() for error in _OBSOLETE_ERRORS):
-        last_error = None
     return replace(
         state,
+        current_activity=current,
+        previous_activity=previous,
         next_decision_at=next_decision_at,
-        retry_at=retry_at,
-        last_error=last_error,
         claim_token=token,
         claim_expires_at=claim_expires_at,
+        continuation_count=continuation_count,
     )
 
 
@@ -311,6 +312,7 @@ def normalize_presence(
 class ProposedActivity:
     summary: str
     focus: str
+    grounding: Literal["digital"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,22 +340,17 @@ class PresenceParseError(ValueError):
 
 def _normalize_activity(
     payload: object,
-    *,
-    bootstrap: bool,
 ) -> ProposedActivity | None:
     if not isinstance(payload, dict):
         return None
-    summary = (
-        _text(payload.get("summary"), 120)
-        if bootstrap
-        else _activity_text(payload.get("summary"), 120, 18)
+    summary = _activity_text(payload.get("summary"), 120, 18)
+    focus = _activity_text(payload.get("focus"), 220, 36)
+    grounding = _text(payload.get("grounding"), 16).casefold()
+    return (
+        ProposedActivity(summary, focus, "digital")
+        if summary and focus and grounding == "digital"
+        else None
     )
-    focus = (
-        _text(payload.get("focus"), 220)
-        if bootstrap
-        else _activity_text(payload.get("focus"), 220, 36)
-    )
-    return ProposedActivity(summary, focus) if summary and focus else None
 
 
 def _normalize_emotion(payload: object) -> ProposedEmotion | None:
@@ -371,17 +368,6 @@ def _normalize_emotion(payload: object) -> ProposedEmotion | None:
     ):
         return None
     return ProposedEmotion(primary, float(intensity), cause)
-
-
-def presence_activity_rejection(activity: ProposedActivity | None) -> str:
-    if activity is None:
-        return ""
-    text = f"{activity.summary} {activity.focus}"
-    unsupported = _DIRECT_UNSUPPORTED_ACTIVITY.search(text) or (
-        _PHYSICAL_CONTEXT.search(text)
-        and _PHYSICAL_CONTEXT_ACTION.search(text)
-    )
-    return UNSUPPORTED_PHYSICAL_ACTIVITY_REASON if unsupported else ""
 
 
 def parse_presence_proposal(
@@ -418,8 +404,7 @@ def parse_presence_proposal(
     allowed = set(
         BOOTSTRAP_PRESENCE_FIELDS if bootstrap else PRESENCE_PROPOSAL_FIELDS
     )
-    unexpected = set(payload) - allowed
-    if unexpected:
+    if set(payload) != allowed:
         raise PresenceParseError("unexpected presence fields", decoded=payload)
     if bootstrap:
         if payload.get("decision") != "new":
@@ -434,13 +419,20 @@ def parse_presence_proposal(
                 decoded=payload,
             )
     else:
-        missing = set(PRESENCE_PROPOSAL_FIELDS[:-1]) - set(payload)
-        if missing:
+        raw_activity = payload.get("activity")
+        if payload.get("decision") == "new" and not isinstance(
+            raw_activity,
+            dict,
+        ):
             raise PresenceParseError(
-                f"missing presence fields: {', '.join(sorted(missing))}",
+                "new decision requires activity object",
                 decoded=payload,
             )
-        raw_activity = payload.get("activity")
+        if payload.get("decision") == "continue" and raw_activity is not None:
+            raise PresenceParseError(
+                "continued presence activity must be null",
+                decoded=payload,
+            )
     if isinstance(raw_activity, dict):
         summary = raw_activity.get("summary")
         focus = raw_activity.get("focus")
@@ -462,9 +454,15 @@ def parse_presence_proposal(
     reason = None
     if not bootstrap and payload.get("continuation_reason") is not None:
         reason = _text(payload.get("continuation_reason"), 180) or None
+    activity = _normalize_activity(raw_activity)
+    if isinstance(raw_activity, dict) and activity is None:
+        raise PresenceParseError(
+            "presence activity fields are invalid",
+            decoded=payload,
+        )
     return PresenceProposal(
         _text(payload.get("decision"), 16).casefold(),
-        _normalize_activity(raw_activity, bootstrap=bootstrap),
+        activity,
         reason,
         _normalize_emotion(payload.get("emotion")),
     )
@@ -488,7 +486,7 @@ def presence_proposal_rejection(
             return "new decision requires activity object"
         if not first_decision and proposal.continuation_reason is not None:
             return "new presence activity cannot have a continuation reason"
-        return presence_activity_rejection(proposal.activity)
+        return ""
     if proposal.activity is not None:
         return "continued presence activity must be null"
     if state.current_activity is None:
@@ -511,7 +509,12 @@ def apply_presence_proposal(
     now: float,
     activity_id: str,
 ) -> PresenceState:
-    next_decision_at = max(0.0, float(now)) + PRESENCE_INTERVAL_SECONDS
+    state = normalize_presence(state, now=max(0.0, float(now)))
+    expected_end_at = max(0.0, float(now)) + PRESENCE_INTERVAL_SECONDS
+    next_decision_at = max(
+        max(0.0, float(now)),
+        expected_end_at - PRESENCE_DECISION_LEAD_SECONDS,
+    )
     current = state.current_activity
     previous = state.previous_activity
     continuation_count = state.continuation_count
@@ -522,11 +525,11 @@ def apply_presence_proposal(
             proposal.activity.summary,
             proposal.activity.focus,
             now,
-            next_decision_at,
+            expected_end_at,
         )
         continuation_count = 0
     elif current is not None:
-        current = replace(current, expected_end_at=next_decision_at)
+        current = replace(current, expected_end_at=expected_end_at)
         continuation_count = 1
     return PresenceState(
         current_activity=current,
@@ -541,13 +544,49 @@ def apply_presence_proposal(
     )
 
 
-def format_presence_context(state: PresenceState) -> str:
-    activity = state.current_activity
-    if activity is None:
-        return "Current activity: none."
-    return "\n".join(
-        (
-            f"Current activity: {activity.summary}.",
-            f"Current focus: {activity.focus}.",
+@dataclass(frozen=True, slots=True)
+class PresenceView:
+    status: Literal["active", "previous", "none"]
+    current_activity: PresenceActivity | None = None
+    previous_activity: PresenceActivity | None = None
+
+
+def presence_view(state: PresenceState, *, now: float) -> PresenceView:
+    """Build the canonical bounded view used by every presence consumer."""
+
+    normalized = normalize_presence(state, now=now)
+    if normalized.current_activity is not None:
+        return PresenceView("active", current_activity=normalized.current_activity)
+    previous = normalized.previous_activity
+    if (
+        previous is not None
+        and 0.0 <= now - previous.expected_end_at <= RECENT_PREVIOUS_ACTIVITY_SECONDS
+    ):
+        return PresenceView("previous", previous_activity=previous)
+    return PresenceView("none")
+
+
+def format_presence_context(state: PresenceState, *, now: float) -> str:
+    """Format the same compact authoritative envelope for every conversation."""
+
+    view = presence_view(state, now=now)
+    if view.current_activity is not None:
+        activity = view.current_activity
+        return "\n".join(
+            (
+                "Status: active",
+                f"Activity: {activity.summary}",
+                f"Focus: {activity.focus}",
+            )
         )
-    )
+    if view.previous_activity is not None:
+        previous = view.previous_activity
+        return "\n".join(
+            (
+                "Status: no current activity",
+                f"Previous activity: {previous.summary}",
+                f"Previous focus: {previous.focus}",
+                "Previous activity completed earlier.",
+            )
+        )
+    return "Status: no current or recent recorded activity"

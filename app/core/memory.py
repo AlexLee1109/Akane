@@ -2682,6 +2682,19 @@ class StateStore:
                     claim_expires_at=0.0,
                 )
                 migrated = True
+            if (
+                needs_bootstrap(presence)
+                and presence.last_error == "presence inference failed"
+            ):
+                # Older builds rejected the presence lane's priority before inference
+                # and persisted only this generic error. Retry immediately once under
+                # the corrected scheduler instead of preserving a stale backoff.
+                presence = replace(
+                    presence,
+                    retry_at=0.0,
+                    last_error=None,
+                )
+                migrated = True
             normalized[canonical_profile_id(profile_id)] = replace(
                 profile,
                 presence=presence,
@@ -4536,6 +4549,55 @@ class StateStore:
                 committed_at=current,
             )
             return next_state
+
+    def defer_presence_decision(
+        self,
+        profile_id: str,
+        *,
+        claim_token: str,
+        now: float,
+        retry_seconds: float = 15.0,
+    ) -> bool:
+        """Release a preempted presence claim without treating it as a failure."""
+
+        profile = canonical_profile_id(profile_id)
+        if profile != OWNER_PROFILE_ID:
+            return False
+        current = max(0.0, float(now))
+        delay = max(1.0, min(60.0, float(retry_seconds)))
+        with self._lock:
+            state = self._profiles.get(profile)
+            if state is None:
+                return False
+            presence = normalize_presence(state.presence, now=current)
+            if presence.claim_token != claim_token:
+                if presence != state.presence:
+                    profiles = self._profiles.copy()
+                    profiles[profile] = replace(state, presence=presence)
+                    self._replace_all(
+                        profiles,
+                        self._conversations.copy(),
+                        committed_at=current,
+                    )
+                return False
+            presence = replace(
+                presence,
+                claim_token=None,
+                claim_expires_at=0.0,
+                retry_at=current + delay,
+                last_error=None,
+            )
+            profiles = self._profiles.copy()
+            profiles[profile] = replace(state, presence=presence)
+            self._replace_all(
+                profiles,
+                self._conversations.copy(),
+                committed_at=current,
+            )
+            callback = self._autonomy_wake
+        if callback is not None:
+            callback(profile)
+        return True
 
     def _failed_presence(
         self,

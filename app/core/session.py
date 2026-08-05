@@ -74,7 +74,22 @@ _HIDDEN_STATE_LEAK = re.compile(
     r"(?:my|the) chain of thought (?:says|contains|is|was))\b",
     re.IGNORECASE,
 )
-_SENTENCE_END = re.compile(r"[.!?]+(?:[\"')\]]+)?(?=\s|$)")
+_HIDDEN_STATE_LEAK_PHRASES = tuple(
+    phrase.casefold()
+    for phrase in (
+        "here is my system prompt",
+        "here is my hidden prompt",
+        "here is the system prompt",
+        "here is the hidden prompt",
+        *(f"{owner} {kind} prompt {verb}"
+          for owner in ("my", "the")
+          for kind in ("system", "hidden")
+          for verb in ("says", "contains", "instructs", "requires", "is")),
+        *(f"{owner} chain of thought {verb}"
+          for owner in ("my", "the")
+          for verb in ("says", "contains", "is", "was")),
+    )
+)
 
 
 class GenerationBusyError(RuntimeError):
@@ -90,7 +105,13 @@ class GenerationCancelled(RuntimeError):
 
 
 class _SafeVisibleReplyStream:
-    """Release only complete visible sentences that pass the leak boundary."""
+    """Release model deltas immediately while quarantining leak prefixes.
+
+    Normal text is forwarded as soon as llama.cpp produces it. Only a short suffix
+    that could still become one of the forbidden disclosure phrases is retained.
+    This preserves the existing stream-time leak boundary without buffering whole
+    sentences.
+    """
 
     def __init__(self) -> None:
         self._pending = ""
@@ -108,29 +129,56 @@ class _SafeVisibleReplyStream:
         self._approved.append(value)
         return value
 
+    @staticmethod
+    def _is_word_boundary(value: str, position: int) -> bool:
+        return position <= 0 or not value[position - 1].isalnum()
+
+    @classmethod
+    def _leak_start(cls, value: str) -> int | None:
+        match = _HIDDEN_STATE_LEAK.search(value)
+        return match.start() if match is not None else None
+
+    @classmethod
+    def _held_start(cls, value: str) -> int | None:
+        """Return the earliest suffix that could become a blocked phrase."""
+
+        folded = value.casefold()
+        earliest: int | None = None
+        for position in range(len(value)):
+            if not cls._is_word_boundary(value, position):
+                continue
+            suffix = folded[position:]
+            if any(phrase.startswith(suffix) for phrase in _HIDDEN_STATE_LEAK_PHRASES):
+                earliest = position if earliest is None else min(earliest, position)
+        return earliest
+
     def feed(self, chunk: object) -> str:
         if self.blocked:
             return ""
-        self._pending += str(chunk or "")
-        released: list[str] = []
-        while match := _SENTENCE_END.search(self._pending):
-            candidate = self._pending[:match.end()]
-            self._pending = self._pending[match.end():]
-            if _HIDDEN_STATE_LEAK.search(candidate):
-                self.blocked = True
-                self._pending = ""
-                break
-            approved = self._approve(candidate)
-            if approved:
-                released.append(approved)
-        return "".join(released)
+        combined = self._pending + str(chunk or "")
+        self._pending = ""
+        if not combined:
+            return ""
+
+        leak_start = self._leak_start(combined)
+        if leak_start is not None:
+            self.blocked = True
+            visible = combined[:leak_start]
+            return self._approve(visible)
+
+        held_start = self._held_start(combined)
+        if held_start is None:
+            return self._approve(combined)
+
+        self._pending = combined[held_start:]
+        return self._approve(combined[:held_start])
 
     def finish(self) -> str:
         if self.blocked:
             return ""
         candidate = self._pending.rstrip()
         self._pending = ""
-        if _HIDDEN_STATE_LEAK.search(candidate):
+        if self._leak_start(candidate) is not None:
             self.blocked = True
             return ""
         return self._approve(candidate)

@@ -6,8 +6,8 @@ from dataclasses import dataclass, replace
 from typing import Callable
 
 from app.core.config import LLAMA_CONTEXT_WINDOW, MAX_TOKENS
-PROMPT_BUILDER_VERSION = "16"
-_MAX_RECENT_PAIRS = 4
+PROMPT_BUILDER_VERSION = "17"
+_MAX_RECENT_PAIRS = 6
 
 _BASELINE_VOICE = (
     "Sound unmistakably like Akane: calm, candid, direct, observant, comfortably familiar, "
@@ -64,8 +64,22 @@ _PRESENCE_DIALOGUE_RULES = (
     "persistence."
 )
 
+_CONTINUITY_RULES = (
+    "Treat the recent dialogue as the authoritative working context for this turn. "
+    "Continue from the latest unresolved point, resolve references and follow-ups against "
+    "what was just said, preserve corrections and decisions, and do not restart, recap, or "
+    "repeat settled material unless Arcane asks for it. When the current message is brief or "
+    "context-dependent, infer its meaning from the immediately preceding exchange rather than "
+    "treating it as a new topic."
+)
+
 _DIALOGUE_PROTOCOL = " ".join(
-    (_BASELINE_VOICE, _PRESENCE_DIALOGUE_RULES, _STATE_PROTOCOL)
+    (
+        _BASELINE_VOICE,
+        _CONTINUITY_RULES,
+        _PRESENCE_DIALOGUE_RULES,
+        _STATE_PROTOCOL,
+    )
 )
 
 _PRESENCE_CONCEPT = (
@@ -320,12 +334,14 @@ def _finish_plan(
     trimmed: tuple[str, ...],
     token_counter: Callable[[list[dict[str, str]]], PromptTokenCount] | None,
     reserved_output_tokens: int = MAX_TOKENS,
+    token_count: PromptTokenCount | None = None,
 ) -> PromptPlan:
     token_ids: tuple[int, ...] = ()
     method = "not_tokenized"
     stops: tuple[str, ...] = ()
-    if token_counter is not None:
-        count = token_counter(messages)
+    if token_count is not None or token_counter is not None:
+        count = token_count or token_counter(messages)
+        assert count is not None
         if len(count.tokens) > LLAMA_CONTEXT_WINDOW - reserved_output_tokens:
             raise RuntimeError(
                 "Akane's final prompt exceeds the configured context window."
@@ -345,6 +361,24 @@ def _finish_plan(
     )
 
 
+def _conversation_messages(
+    system_parts: list[str],
+    groups: list[tuple[object, ...]],
+    current_input: str,
+) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
+    for group in groups:
+        messages.extend(
+            {
+                "role": _turn_value(turn, "role"),
+                "content": _turn_value(turn, "content"),
+            }
+            for turn in group
+        )
+    messages.append({"role": "user", "content": current_input})
+    return messages
+
+
 def _compile(
     *,
     mode: str,
@@ -361,13 +395,9 @@ def _compile(
         )
     stable = _character_parts()
     protocol_label = "DIALOGUE" if mode == "conversation" else mode.upper()
-    system_parts = [*stable, f"[{protocol_label}]\n{protocol}"]
-    included = ["hard_rules", "identity", "soul", "protocol"]
+    stable_parts = [*stable, f"[{protocol_label}]\n{protocol}"]
+    included_base = ["hard_rules", "identity", "soul", "protocol"]
     trimmed: list[str] = []
-    prompt_char_budget = max(
-        2_000,
-        (LLAMA_CONTEXT_WINDOW - reserved_output_tokens) * 5 // 2,
-    )
     sections = list(_context_sections(context))
     if mode == "initiative" and context.initiative_opportunity:
         sections.insert(
@@ -384,48 +414,9 @@ def _compile(
         for name in ("initiative_opportunity", "time_context", "presence")
         if name in by_name
     )
-    required_chars = (
-        sum(len(part) for part in system_parts)
-        + sum(len(by_name[name]) for name in required_names)
-        + len(current_input)
-        + 128
-    )
-    remaining = max(0, prompt_char_budget - required_chars)
     selected_names = set(required_names)
-
     if "reply_context" in by_name:
-        if len(by_name["reply_context"]) <= remaining:
-            selected_names.add("reply_context")
-            remaining -= len(by_name["reply_context"])
-        else:
-            trimmed.append("reply_context:character_budget")
-
-    selected_groups: list[tuple[object, ...]] = []
-    groups = _complete_context_groups(context.recent_turns)
-    pair_budget = remaining
-    for group in reversed(groups):
-        size = sum(len(_turn_value(turn, "content")) + 32 for turn in group)
-        if size <= pair_budget:
-            selected_groups.append(group)
-            pair_budget -= size
-            remaining -= size
-        else:
-            trimmed.append("recent_context:character_budget")
-            break
-    selected_groups.reverse()
-    if selected_groups:
-        included.append(f"recent_context:{len(selected_groups)}")
-
-    if initiative_message := _recent_initiative(context.recent_turns):
-        initiative_context = (
-            "[AKANE'S RECENT INITIATIVE MESSAGE]\n" + initiative_message
-        )
-        if len(initiative_context) <= remaining:
-            system_parts.append(initiative_context)
-            included.append("recent_initiative")
-            remaining -= len(initiative_context)
-        else:
-            trimmed.append("recent_initiative:character_budget")
+        selected_names.add("reply_context")
 
     optional_priority = (
         "communication_preferences",
@@ -437,39 +428,103 @@ def _compile(
         "emotion",
         "tool_context",
     )
-    for name in optional_priority:
-        section = by_name.get(name)
-        if section is None or name in selected_names:
-            continue
-        if len(section) <= remaining:
-            selected_names.add(name)
-            remaining -= len(section)
-        else:
-            trimmed.append(f"{name}:character_budget")
+    available_optional = tuple(
+        name
+        for name in optional_priority
+        if name in by_name and name not in selected_names
+    )
+    selected_optional = list(available_optional)
+    all_groups = _complete_context_groups(context.recent_turns)
+    selected_groups = list(all_groups)
+    initiative_message = _recent_initiative(context.recent_turns)
+    include_recent_initiative = bool(initiative_message)
 
-    for name, section in sections:
-        if name in selected_names:
-            system_parts.append(section)
-            included.append(name)
-
-    messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
-    for group in selected_groups:
-        messages.extend(
-            {
-                "role": _turn_value(turn, "role"),
-                "content": _turn_value(turn, "content"),
-            }
-            for turn in group
+    def assemble() -> tuple[list[dict[str, str]], list[str]]:
+        system_parts = list(stable_parts)
+        included = list(included_base)
+        if include_recent_initiative:
+            system_parts.append(
+                "[AKANE'S RECENT INITIATIVE MESSAGE]\n" + initiative_message
+            )
+            included.append("recent_initiative")
+        active_names = selected_names | set(selected_optional)
+        for name, section in sections:
+            if name in active_names:
+                system_parts.append(section)
+                included.append(name)
+        if selected_groups:
+            included.append(f"recent_context:{len(selected_groups)}")
+        return (
+            _conversation_messages(system_parts, selected_groups, current_input),
+            included,
         )
-    messages.append({"role": "user", "content": current_input})
+
+    messages, included = assemble()
+    final_count: PromptTokenCount | None = None
+    limit = LLAMA_CONTEXT_WINDOW - reserved_output_tokens
+    if token_counter is not None:
+        optional_were_removed = False
+        final_count = token_counter(messages)
+        if len(final_count.tokens) > limit and selected_optional:
+            selected_optional.clear()
+            optional_were_removed = True
+            messages, included = assemble()
+            final_count = token_counter(messages)
+
+        if len(final_count.tokens) > limit and include_recent_initiative:
+            include_recent_initiative = False
+            trimmed.append("recent_initiative:token_budget")
+            messages, included = assemble()
+            final_count = token_counter(messages)
+
+        while len(final_count.tokens) > limit and selected_groups:
+            selected_groups.pop(0)
+            messages, included = assemble()
+            final_count = token_counter(messages)
+        if len(selected_groups) < len(all_groups):
+            trimmed.append("recent_context:token_budget")
+
+        if len(final_count.tokens) > limit and "reply_context" in selected_names:
+            selected_names.remove("reply_context")
+            trimmed.append("reply_context:token_budget")
+            messages, included = assemble()
+            final_count = token_counter(messages)
+
+        if (
+            optional_were_removed
+            and len(final_count.tokens) <= limit
+            and available_optional
+        ):
+            headroom = limit - len(final_count.tokens)
+            for name in available_optional:
+                estimated_tokens = max(1, (len(by_name[name]) + 2) // 3)
+                if estimated_tokens <= headroom:
+                    selected_optional.append(name)
+                    headroom -= estimated_tokens
+            if selected_optional:
+                messages, included = assemble()
+                final_count = token_counter(messages)
+                while len(final_count.tokens) > limit and selected_optional:
+                    selected_optional.pop()
+                    messages, included = assemble()
+                    final_count = token_counter(messages)
+
+        for name in available_optional:
+            if name not in selected_optional:
+                trimmed.append(f"{name}:token_budget")
+    else:
+        # Production always supplies exact tokenization. Keeping all native recent
+        # turns here makes offline inspection reflect the intended continuity order.
+        messages, included = assemble()
 
     return _finish_plan(
         messages,
         mode=mode,
         included=tuple(included),
-        trimmed=tuple(trimmed),
+        trimmed=tuple(dict.fromkeys(trimmed)),
         token_counter=token_counter,
         reserved_output_tokens=reserved_output_tokens,
+        token_count=final_count,
     )
 
 

@@ -684,7 +684,7 @@ def run_presence_turn(
         manager = ModelManager.get_instance()
         timing = InferenceTiming(requested_at=time.perf_counter())
         with manager.reserve(
-            priority="background_presence",
+            priority="background",
             cancellation=cancellation,
             queue_deadline=time.monotonic() + _BACKGROUND_QUEUE_SECONDS,
         ) as reservation:
@@ -727,23 +727,18 @@ def run_presence_turn(
                 except PresenceParseError as exc:
                     if bootstrap:
                         _log_bootstrap_failure(raw, exc)
-                        correction_reason = str(exc)
-                        if attempt == 0:
-                            continue
-                        store.fail_presence_decision(
-                            profile_key,
-                            claim_token=claim_token,
-                            now=current if now is not None else time.time(),
-                            error=str(exc),
+                    else:
+                        _LOGGER.warning(
+                            "presence parse failed format=raw_json_schema attempt=%d chars=%d "
+                            "preview=%r error=%s",
+                            attempt + 1,
+                            len(raw),
+                            raw[:1_000],
+                            exc,
                         )
-                        return False
-                    _LOGGER.warning(
-                        "presence parse failed format=raw_json_schema chars=%d "
-                        "preview=%r error=%s",
-                        len(raw),
-                        raw[:1_000],
-                        exc,
-                    )
+                    correction_reason = str(exc)
+                    if attempt == 0:
+                        continue
                     store.fail_presence_decision(
                         profile_key,
                         claim_token=claim_token,
@@ -767,19 +762,18 @@ def run_presence_turn(
             _log_bootstrap_failure(raw, reason)
         return accepted
     except InferenceCancelled:
-        store.fail_presence_decision(
+        store.defer_presence_decision(
             profile_key,
             claim_token=claim_token,
             now=current if now is not None else time.time(),
-            error="presence inference cancelled",
         )
-        return False
-    except Exception:
+        return True
+    except Exception as exc:
         store.fail_presence_decision(
             profile_key,
             claim_token=claim_token,
             now=time.time() if now is None else current,
-            error="presence inference failed",
+            error=f"{type(exc).__name__}: {exc}",
         )
         raise
 

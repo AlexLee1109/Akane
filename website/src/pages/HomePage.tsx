@@ -66,8 +66,6 @@ function HomeHero() {
     <img
       className="home-hero-media"
       src={homepageImage}
-      width="1448"
-      height="1086"
       fetchPriority="high"
       decoding="async"
       alt="Akane, a blue-haired AI companion, standing in a bright room overlooking a city"

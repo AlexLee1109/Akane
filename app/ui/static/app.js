@@ -336,10 +336,18 @@ window.__akaneStreamEvent = (event) => {
     setSendingState(false);
   }
 
-  handleStreamEvent(
-    event,
-    window.__akanePendingMessage,
-  );
+  try {
+    handleStreamEvent(
+      event,
+      window.__akanePendingMessage,
+    );
+  } catch (error) {
+    showNotice(
+      error?.message ||
+        "Could not receive Akane's reply.",
+      "error",
+    );
+  }
 };
 
 function escapeHtml(text) {

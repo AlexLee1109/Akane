@@ -92,6 +92,14 @@ def _log(event: str, profile_id: str = "") -> None:
     print(f"[Akane:public] {event}{suffix}", flush=True)
 
 
+def _log_chat(role: str, profile_id: str, text: str) -> None:
+    print(
+        f"[Akane:public:{role}] guest={_profile_ref(profile_id)} "
+        f"text={str(text or '')!r}",
+        flush=True,
+    )
+
+
 def _normalized_origin(value: str) -> str:
     candidate = str(value or "").strip().rstrip("/")
     parsed = urlsplit(candidate)
@@ -432,6 +440,7 @@ def public_chat_events(
             source="public_guest",
             request_id=f"public:{request_id}",
         )
+        _log_chat("question", session.profile_id, chat.text)
 
         def generate() -> None:
             try:
@@ -475,6 +484,8 @@ def public_chat_events(
                 continue
             if kind == "done":
                 finished = True
+                reply = value.message if value.decision.should_respond else ""
+                _log_chat("reply", session.profile_id, reply)
                 _log("public generation completed", session.profile_id)
                 yield _json_line({"type": "done", "request_id": request_id})
                 return

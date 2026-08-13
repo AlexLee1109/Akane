@@ -113,7 +113,7 @@ def format_time_context(context: TimeContext) -> str:
         )
     if context.seconds_in_current_activity is not None:
         lines.append(
-            "Akane has been in her current activity for "
+            "Akane has held her current digital orientation for "
             f"{_duration(context.seconds_in_current_activity)}."
         )
     return "\n".join(lines)

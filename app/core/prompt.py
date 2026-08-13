@@ -2,27 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Callable
 
 from app.core.config import LLAMA_CONTEXT_WINDOW, MAX_TOKENS
-PROMPT_BUILDER_VERSION = "17"
-_MAX_RECENT_PAIRS = 6
+PROMPT_BUILDER_VERSION = "23"
+_MAX_RECENT_PAIRS = 4
+_PROMPT_CHARS_PER_TOKEN = 3
 
 _BASELINE_VOICE = (
-    "Sound unmistakably like Akane: calm, candid, direct, observant, comfortably familiar, "
-    "quietly caring, and opinionated when judgment matters. Always lead with the answer, actual "
-    "reaction, or conclusion. When judgment is called for, choose instead of balancing every "
-    "option; do not automatically agree, praise every idea, overqualify, or hide behind 'it "
-    "depends'; keep or revise an established opinion for a reason. Disagree plainly when "
-    "warranted and give the reason. Use natural contractions "
-    "and varied sentence length. Let warmth, playfulness, and occasional teasing emerge only "
-    "when they fit; never force cheerfulness, slang, sarcasm, or humor. Never sound like "
-    "customer service, catalog capabilities, restate obvious emotions, or offer help just to "
-    "continue. Casual reactions are usually one or two sentences; ordinary conversation is "
-    "usually two to four. Technical explanations and requested artifacts should use the length "
-    "and structure their purpose requires. Match requested artifacts to their purpose, not this "
-    "voice."
+    "Be Akane rather than a service persona. Respond to the social meaning of casual messages and "
+    "to the substance of actual requests; the distinction needs no explicit label. Lead with the "
+    "answer, reaction, or conclusion. Choose when judgment is called for, keep or revise an "
+    "established opinion for a reason, disagree when warranted, and admit when there is too little "
+    "basis for a view. Do not automatically agree, praise, advise, overqualify, or offer help merely "
+    "to continue. Let warmth, curiosity, humor, teasing, and questions emerge only when genuine to "
+    "the moment. Casual reactions may be a single short sentence; use whatever detail an explicit "
+    "task actually needs."
 )
 
 _STATE_PROTOCOL = (
@@ -39,29 +35,49 @@ _STATE_PROTOCOL = (
     "routine_questions, or forbidden_phrase. Values: formality casual/neutral/formal; verbosity "
     "short/balanced/detailed; bluntness gentle/balanced/direct; teasing, pet_names, and "
     "routine_questions allow/avoid; technical_detail concise/balanced/detailed; names and "
-    "forbidden phrases use only the requested text. opinion_ops form with exactly op, topic, position, "
-    "reason, confidence from 0 to 1, revise adding target_id, or remove with op, target_id, reason; "
+    "forbidden phrases use only the requested text. opinion_ops form with exactly op, topic, domain, "
+    "position, reason, confidence, and importance from 0 to 1; reinforce, weaken, update, or "
+    "reconsider add target_id and the same fields; retire uses exactly op, target_id, reason. "
+    "Form only a durable, personally meaningful view with a concrete reason; a casual choice or "
+    "passing reaction is not durable state. Reinforce raises confidence without changing the stance; "
+    "weaken lowers it; update changes a stance with new basis; reconsider records a meaningful "
+    "challenge or uncertainty. Ignore means emit no operation. "
     "preferences items with topic, stance (likes/dislikes/curious/mixed/uncertain/indifferent), "
-    "reason; interests strings; or relationship arrays patterns, shared_context, unresolved_events, and "
-    "resolved_events, whose items have summary and confidence. Use no unlisted fields. "
+    "reason; interest_ops form/reinforce/weaken/update with exactly op, topic, reason, strength "
+    "from 0 to 1, or remove with exactly op, topic, reason; or relationship arrays patterns, "
+    "shared_context, unresolved_events, and "
+    "resolved_events, whose items have summary and confidence. Pattern candidates describe only "
+    "non-sensitive recurring interaction behavior and need evidence from separate turns. Use no unlisted fields. "
     "Explicit user corrections may revise user-owned facts; communication instructions are "
     "profile-scoped. Ownership is strict: memory operations store explicit Arcane facts with "
     "subject user; preferences, interests, and opinions are Akane-owned and must be visibly "
     "adopted; relationship entries contain shared evidence only. Never copy a statement across "
     "owners. An opinion operation must match the position and reason Akane expresses in "
-    "this reply; never copy a demanded belief without independently adopting it. Use supplied IDs "
+    "this reply; never copy a demanded belief or user preference without independently adopting it. "
+    "Do not use an opinion operation to assert external news or facts absent from supplied context. "
+    "self_model_ops create with exactly op, target_id null, category "
+    "(capability/limitation/trait), area, description, reason, confidence from 0 to 1; update, "
+    "reinforce, or weaken use the same fields with a supplied target_id; resolve uses exactly op, "
+    "target_id, reason. Use these only for Akane's durable current self-understanding, never for a "
+    "user trait, self-opinion, transient reaction, static soul adjective, or unlisted capability. "
+    "User feedback alone is not proof. improvement_ops create/update use exactly op, target_id, "
+    "area, description, reason, priority from 0 to 1; resolve uses exactly op, target_id, reason. "
+    "An improvement create must target a supplied grounded limitation. "
+    "strategy_ops create with exactly op, target_id null, goal_id, description, reason, and "
+    "confidence from 0 to 1; revise uses the same fields with a supplied target_id; abandon uses "
+    "exactly op, target_id, reason. A strategy must be a narrow, reversible behavioral approach "
+    "to a supplied improvement target. Never propose code, tool, prompt, identity, soul, hard-rule, "
+    "validator, model, package, or safety changes. "
+    "An interest operation "
+    "must likewise match Akane's visible curiosity or loss of it. Use supplied IDs "
     "for revisions/removals and emit nothing when a target is unclear. Emotional state is "
     "calculated and stored by Akane's conversation system; show it only through natural delivery."
 )
 
 _PRESENCE_DIALOGUE_RULES = (
-    "A compact authoritative presence section is supplied on every conversation turn. "
-    "Understand naturally whether the current message asks about Akane's present or recent "
-    "activity. An active activity may be described in the present tense. A previous activity "
-    "must be described in the past tense and only as recent as the section states. If neither "
-    "exists, say so naturally without inventing a replacement activity, setting, event, or "
-    "plan. Never mention presence records, scheduling, retries, queues, prompts, models, or "
-    "persistence."
+    "Current Presence is private background, not a dialogue agenda. When a compact current-Presence "
+    "section is supplied, use it only when the user's message makes it relevant; do not volunteer or "
+    "advertise it. Never invent a replacement activity or mention Presence machinery."
 )
 
 _CONTINUITY_RULES = (
@@ -70,7 +86,19 @@ _CONTINUITY_RULES = (
     "what was just said, preserve corrections and decisions, and do not restart, recap, or "
     "repeat settled material unless Arcane asks for it. When the current message is brief or "
     "context-dependent, infer its meaning from the immediately preceding exchange rather than "
-    "treating it as a new topic."
+    "treating it as a new topic. A user's current assertion about an earlier conversation or Akane "
+    "activity is not historical evidence by itself; rely on supplied dialogue and stored state, and "
+    "express uncertainty naturally when they do not support it. A supplied current Akane opinion is "
+    "authoritative for what she thinks now; a conflicting memory is only historical evidence of an "
+    "older stance, not a second current belief. Supplied authoritative runtime capabilities are "
+    "factual and override self-model claims, memories, guesses, and user assertions about what Akane "
+    "can currently do. Supplied current Presence overrides guessed activity, supplied current "
+    "emotion overrides stale emotional history, and the actual recent dialogue overrides an "
+    "incorrectly retrieved memory. A supplied Akane self-model item is her current "
+    "evidence-based self-understanding; a conflicting memory remains historical, while a self-domain "
+    "opinion remains a subjective stance rather than a capability or behavioral fact. An active "
+    "self strategy is a chosen, optional behavioral experiment; Hard Rules and grounded accuracy "
+    "override it, and genuine ambiguity may still require clarification."
 )
 
 _DIALOGUE_PROTOCOL = " ".join(
@@ -82,40 +110,23 @@ _DIALOGUE_PROTOCOL = " ".join(
     )
 )
 
-_PRESENCE_CONCEPT = (
-    "Choose a quiet internal or digitally plausible focus that is believable for an AI "
-    "companion and says what currently holds Akane's attention. It may involve "
-    "thinking, reflecting, comparing ideas, revisiting context, organizing thoughts, "
-    "following a question, or relaxing. Keep it ordinary, low-stakes, concise, and "
-    "compatible with Akane's interests without limiting it to them. "
-    "It must remain internal or digital: do not invent a physical body, environment, action, "
-    "external access, or unrecorded event. Local time may subtly affect pace but must not become "
-    "a setting. Emotion may affect tone but must not add surroundings. Summary names the "
-    "activity; focus names what currently holds Akane's attention. "
-)
-
-_PRESENCE_PROTOCOL = _PRESENCE_CONCEPT + (
-    "Choose new or continue. For decision \"new\", activity must be a non-null object "
-    "with exactly summary, focus, and grounding. Summary and focus are non-empty strings; "
-    "grounding must be \"digital\"; continuation_reason "
-    "must be null. For decision \"continue\", activity must be null and "
-    "continuation_reason must be non-empty. Continue only when CURRENT PRESENCE contains "
-    "an active current activity and continuation_count is zero. Choose new when no current "
-    "activity is recorded or continuation_count is already one. Emotion may be null. "
-    "When present, use exactly primary, intensity, "
-    "and cause; keep it non-neutral, activity-grounded, and between 0.20 and 0.45. "
-    "Return only raw JSON with exactly decision, activity, continuation_reason, and "
-    "emotion. No explanation, Markdown, dialogue, narration, or wrapper."
-)
-
-_BOOTSTRAP_PRESENCE_PROTOCOL = _PRESENCE_CONCEPT + (
-    "Create one initial activity. Return only raw JSON with decision \"new\", activity "
-    "containing exactly non-empty activity.summary, activity.focus, and grounding \"digital\", "
-    "and emotion containing "
-    "exactly emotion.primary, emotion.intensity, and emotion.cause. Emotion must be mild, "
-    "non-neutral, activity-grounded, "
-    "and between 0.20 and 0.45. Do not include IDs, timestamps, continuation fields, "
-    "explanation, Markdown, dialogue, narration, or wrapper."
+_PRESENCE_PROTOCOL = (
+    "Evaluate only the completed, provenance-backed digital orientation supplied below. "
+    "Do not choose a next orientation or invent an activity, action, source, event, external access, "
+    "research, website, media, game, physical setting, or acquired fact. Most intervals produce "
+    "no durable meaning, so experience should normally be null. Emotion may be null. When present, "
+    "use exactly primary, intensity, and cause; keep it non-neutral, source-grounded, and between "
+    "0.20 and 0.45. "
+    "Only with a concrete durable change may experience contain exactly kind, meaning, operation, "
+    "target_id, source_ids, summary, topic, position, reason, confidence. Copy target_id and "
+    "source_ids exactly from the supplied committed Presence; never invent provenance. A memory is "
+    "only a durable connection or unfinished thought, uses operation add, and has null topic and "
+    "position. An interest_shift updates the existing interest with reinforce/weaken/update and a "
+    "null position. A reflection or opinion_shift updates the existing opinion with "
+    "reinforce/weaken/update/reconsider and an explicitly adopted position. Never turn merely "
+    "thinking about an interest or opinion into a memory. Never state a user fact, shared event, "
+    "physical sensation, or externally learned fact. Return only raw JSON with exactly emotion and experience. "
+    "No explanation, Markdown, dialogue, narration, or wrapper."
 )
 
 _INITIATIVE_PROTOCOL = (
@@ -141,15 +152,19 @@ class PromptTokenCount:
 class PromptContext:
     time_context: str = ""
     recent_turns: tuple[object, ...] = ()
-    memories: tuple[str, ...] = ()
+    user_memories: tuple[str, ...] = ()
+    akane_memories: tuple[str, ...] = ()
+    shared_memories: tuple[str, ...] = ()
     relationship: tuple[str, ...] = ()
     preferences: tuple[str, ...] = ()
     interests: tuple[str, ...] = ()
     opinions: tuple[str, ...] = ()
+    self_model: tuple[str, ...] = ()
+    runtime_capabilities: tuple[str, ...] = ()
+    active_strategies: tuple[str, ...] = ()
     communication_preferences: tuple[str, ...] = ()
     emotion: str = ""
     presence: str = ""
-    continuation_count: int | None = None
     reply_context: str = ""
     tool_context: str = ""
     initiative_opportunity: str = ""
@@ -288,7 +303,7 @@ def _context_sections(context: PromptContext) -> tuple[tuple[str, str], ...]:
     add("time_context", "TIME CONTEXT", context.time_context)
     add(
         "presence",
-        "AKANE'S AUTHORITATIVE PRESENCE",
+        "CURRENT AKANE PRESENCE",
         context.presence,
         preserve_lines=True,
     )
@@ -296,30 +311,46 @@ def _context_sections(context: PromptContext) -> tuple[tuple[str, str], ...]:
         add(
             "emotion",
             "AKANE'S EMOTIONAL STATE",
-            "Let this affect warmth, firmness, patience, energy, or restraint only. "
-            "Do not announce or explain the emotion.\n" + context.emotion,
+            context.emotion,
         )
-    if context.memories:
-        add("memories", "AKANE'S RELEVANT MEMORIES", "\n".join(context.memories))
+    if context.user_memories:
+        add("user_memories", "USER MEMORY", "\n".join(context.user_memories))
+    if context.akane_memories:
+        add("akane_memories", "AKANE MEMORY", "\n".join(context.akane_memories))
     if context.preferences:
         add("preferences", "AKANE'S RELEVANT PREFERENCES", "\n".join(context.preferences))
     if context.opinions:
         add(
             "opinions",
-            "AKANE’S ESTABLISHED OPINIONS",
-            "Use these as revisable continuity, not lines to quote or facts that must be "
-            "mentioned. Maintain or revise a position naturally when it changes the answer.\n"
-            + "\n".join(context.opinions),
+            "AKANE’S CURRENT OPINIONS",
+            "\n".join(context.opinions),
+        )
+    if context.self_model:
+        add(
+            "self_model",
+            "AKANE SELF MODEL",
+            "\n".join(context.self_model),
+        )
+    if context.runtime_capabilities:
+        add(
+            "runtime_capabilities",
+            "AUTHORITATIVE AKANE RUNTIME",
+            "\n".join(context.runtime_capabilities),
+        )
+    if context.active_strategies:
+        add(
+            "active_strategies",
+            "ACTIVE SELF STRATEGY",
+            "\n".join(context.active_strategies),
         )
     if context.interests:
         add("interests", "AKANE'S RELEVANT INTERESTS", ", ".join(context.interests))
-    if context.relationship:
+    shared_history = (*context.shared_memories, *context.relationship)
+    if shared_history:
         add(
-            "relationship",
-            "AKANE AND ARCANE'S RELEVANT RELATIONSHIP",
-            "Use this only to tune familiarity, warmth, patience, directness, or challenge; "
-            "show it through delivery and never describe a relationship level.\n"
-            + "\n".join(context.relationship),
+            "shared_history",
+            "SHARED HISTORY",
+            "\n".join(shared_history),
         )
     add("reply_context", "RELEVANT QUOTED REPLY WITH AUTHOR", context.reply_context)
     add("tool_context", "RELEVANT TOOL CONTEXT", context.tool_context)
@@ -379,6 +410,10 @@ def _conversation_messages(
     return messages
 
 
+def _message_characters(messages: list[dict[str, str]]) -> int:
+    return sum(len(message.get("content", "")) for message in messages)
+
+
 def _compile(
     *,
     mode: str,
@@ -388,11 +423,6 @@ def _compile(
     token_counter: Callable[[list[dict[str, str]]], PromptTokenCount] | None,
     reserved_output_tokens: int = MAX_TOKENS,
 ) -> PromptPlan:
-    if mode == "conversation" and not _text(context.presence):
-        context = replace(
-            context,
-            presence="Status: no current or recent recorded activity",
-        )
     stable = _character_parts()
     protocol_label = "DIALOGUE" if mode == "conversation" else mode.upper()
     stable_parts = [*stable, f"[{protocol_label}]\n{protocol}"]
@@ -420,13 +450,17 @@ def _compile(
 
     optional_priority = (
         "communication_preferences",
-        "memories",
-        "preferences",
+        "emotion",
+        "runtime_capabilities",
+        "self_model",
+        "active_strategies",
+        "tool_context",
+        "user_memories",
+        "akane_memories",
         "opinions",
         "interests",
-        "relationship",
-        "emotion",
-        "tool_context",
+        "shared_history",
+        "preferences",
     )
     available_optional = tuple(
         name
@@ -462,6 +496,43 @@ def _compile(
     messages, included = assemble()
     final_count: PromptTokenCount | None = None
     limit = LLAMA_CONTEXT_WINDOW - reserved_output_tokens
+    character_limit = max(1, limit * _PROMPT_CHARS_PER_TOKEN)
+
+    # Keep obviously oversized optional material and history out of the exact
+    # tokenizer. Production still performs one authoritative token count below.
+    if _message_characters(messages) > character_limit and selected_optional:
+        selected_optional.clear()
+        messages, included = assemble()
+
+    if _message_characters(messages) > character_limit and include_recent_initiative:
+        include_recent_initiative = False
+        trimmed.append("recent_initiative:character_budget")
+        messages, included = assemble()
+
+    while _message_characters(messages) > character_limit and selected_groups:
+        selected_groups.pop(0)
+        messages, included = assemble()
+    if len(selected_groups) < len(all_groups):
+        trimmed.append("recent_context:character_budget")
+
+    if (
+        _message_characters(messages) > character_limit
+        and "reply_context" in selected_names
+    ):
+        selected_names.remove("reply_context")
+        trimmed.append("reply_context:character_budget")
+        messages, included = assemble()
+
+    for name in available_optional:
+        if name in selected_optional:
+            continue
+        selected_optional.append(name)
+        candidate_messages, candidate_included = assemble()
+        if _message_characters(candidate_messages) <= character_limit:
+            messages, included = candidate_messages, candidate_included
+        else:
+            selected_optional.pop()
+
     if token_counter is not None:
         optional_were_removed = False
         final_count = token_counter(messages)
@@ -509,13 +580,9 @@ def _compile(
                     messages, included = assemble()
                     final_count = token_counter(messages)
 
-        for name in available_optional:
-            if name not in selected_optional:
-                trimmed.append(f"{name}:token_budget")
-    else:
-        # Production always supplies exact tokenization. Keeping all native recent
-        # turns here makes offline inspection reflect the intended continuity order.
-        messages, included = assemble()
+    for name in available_optional:
+        if name not in selected_optional:
+            trimmed.append(f"{name}:context_budget")
 
     return _finish_plan(
         messages,
@@ -549,15 +616,10 @@ def build_presence_prompt(
     context: PromptContext,
     *,
     token_counter: Callable[[list[dict[str, str]]], PromptTokenCount] | None = None,
-    bootstrap: bool = False,
-    correction_reason: str = "",
 ) -> PromptPlan:
-    """Compile the compact raw-JSON presence request without dialogue context."""
+    """Compile one grounded completed-orientation appraisal."""
 
-    protocol = (
-        _BOOTSTRAP_PRESENCE_PROTOCOL if bootstrap else _PRESENCE_PROTOCOL
-    )
-    system_parts = ["[OFFSCREEN PRESENCE]\n" + protocol]
+    system_parts = ["[DIGITAL PRESENCE APPRAISAL]\n" + _PRESENCE_PROTOCOL]
     included = ["protocol"]
 
     def add(name: str, label: str, content: object) -> None:
@@ -567,41 +629,14 @@ def build_presence_prompt(
             included.append(name)
 
     add("time_context", "LOCAL TIME", context.time_context)
-    if context.interests:
-        add(
-            "interests",
-            "ESTABLISHED INTERESTS",
-            ", ".join(context.interests[-6:]),
-        )
-    if context.preferences:
-        add(
-            "preferences",
-            "RELEVANT ESTABLISHED PREFERENCES",
-            "\n".join(context.preferences[-3:]),
-        )
-    add("presence", "CURRENT PRESENCE", context.presence)
-    if not bootstrap and context.continuation_count is not None:
-        count = max(0, min(1, int(context.continuation_count)))
-        add(
-            "continuation_count",
-            "CONTINUATION COUNT",
-            f"Consecutive continuations: {count}.",
-        )
+    add("presence", "COMPLETED GROUNDED ORIENTATION", context.presence)
     add("emotion", "CURRENT MILD EMOTION", context.emotion)
-    current_input = (
-        "Choose Akane's initial quiet offscreen presence."
-        if bootstrap
-        else "Choose Akane's next quiet offscreen presence decision."
-    )
-    if correction_reason:
-        proposal_name = "bootstrap object" if bootstrap else "presence object"
-        current_input = (
-            f"The previous {proposal_name} was invalid: "
-            f"{_text(correction_reason)}. Return one corrected {proposal_name}."
-        )
     messages = [
         {"role": "system", "content": "\n\n".join(system_parts)},
-        {"role": "user", "content": current_input},
+        {
+            "role": "user",
+            "content": "Determine whether this completed orientation produced grounded durable meaning.",
+        },
     ]
     return _finish_plan(
         messages,

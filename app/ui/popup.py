@@ -242,6 +242,12 @@ class PopupApp:
                 detail = payload.get("error") or payload.get("detail") or body
             except Exception:
                 pass
+            if exc.code == 401:
+                raise RuntimeError(
+                    "The Pi rejected the popup credentials (HTTP 401). Set "
+                    "AKANE_SERVER_API_TOKEN on this computer to the same private "
+                    "token used by the Pi's akane.service."
+                ) from exc
             raise RuntimeError(f"Remote backend returned HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
             raise RuntimeError(f"Could not reach remote backend at {self.backend_url}: {exc.reason}") from exc

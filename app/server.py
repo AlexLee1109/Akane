@@ -136,6 +136,15 @@ def _log(label: str, text: str = "") -> None:
     print(f"[Akane:{label}]{' ' + value if value else ''}", flush=True)
 
 
+def _log_chat(role: str, item: ChatInput, text: str) -> None:
+    value = str(text or "")
+    print(
+        f"[Akane:chat:{role}] source={item.source} "
+        f"conversation={item.conversation_id} text={value!r}",
+        flush=True,
+    )
+
+
 def _static_response_path(route: str) -> tuple[Path, str] | None:
     if route in _STATIC_ROUTES:
         name, media_type = _STATIC_ROUTES[route]
@@ -233,6 +242,7 @@ def _stream_chat_events(chat: ChatRequestData):
     worker: threading.Thread | None = None
     finished = False
     try:
+        _log_chat("question", item, item.text)
         yield _json_line(
             {
                 "type": "start",
@@ -281,13 +291,13 @@ def _stream_chat_events(chat: ChatRequestData):
             finished = True
         worker.join()
         generation_id = result.generation_id
+        reply = result.message if result.decision.should_respond else ""
+        _log_chat("reply", item, reply)
         yield _json_line(
             {
                 "type": "done",
                 "generation_id": generation_id,
-                "reply": (
-                    result.message if result.decision.should_respond else ""
-                ),
+                "reply": reply,
                 "messages": _messages(item.conversation_id, item.profile_id),
             }
         )
@@ -535,12 +545,14 @@ def create_app() -> FastAPI:
         command = handle_builtin_command(chat.chat_input)
         if command is not None:
             return JSONResponse(command)
+        _log_chat("question", chat.chat_input, chat.chat_input.text)
         prior_reply = get_state_store().reply_for_request(
             chat.chat_input.conversation_id,
             chat.chat_input.profile_id,
             chat.chat_input.request_id,
         )
         if prior_reply is not None:
+            _log_chat("reply", chat.chat_input, prior_reply)
             return JSONResponse(
                 {
                     "reply": prior_reply,
@@ -556,6 +568,7 @@ def create_app() -> FastAPI:
         except Exception as exc:
             _log("error", f"type={type(exc).__name__} detail={exc}")
             return JSONResponse({"error": _safe_error(exc)}, status_code=_error_status(exc))
+        _log_chat("reply", chat.chat_input, reply)
         return JSONResponse(
             {
                 "reply": reply,

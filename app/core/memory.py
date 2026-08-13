@@ -7,11 +7,12 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, TypeVar
 
+from app.core.capabilities import CAPABILITY_REGISTRY, CapabilityFact
 from app.core.config import (
     CONVERSATION_STALE_DAYS,
     LONG_TERM_MEMORY_PATH,
@@ -19,20 +20,23 @@ from app.core.config import (
     MEMORY_MAX_ENTRIES_PER_PROFILE,
     MEMORY_MAX_RESULTS,
     MEMORY_PATH,
+    OPINIONS_PATH,
     POPUP_USER_PATH,
+    SELF_MODEL_PATH,
+    STRATEGIES_PATH,
 )
 from app.core.persistence import atomic_write_json, read_json
 from app.core.presence import (
     CLAIM_SECONDS,
     RETRY_SECONDS,
     PresenceActivity,
-    PresenceProposal,
+    PresenceAppraisal,
+    PresenceCandidate,
     PresenceState,
     ProposedEmotion,
-    apply_presence_proposal,
-    needs_bootstrap,
+    choose_presence_transition,
+    make_presence_activity,
     normalize_presence,
-    presence_proposal_rejection,
 )
 from app.core.time_context import build_time_context
 from app.core.utils import (
@@ -43,9 +47,12 @@ from app.core.utils import (
     words,
 )
 
-STATE_SCHEMA_VERSION = 15
+STATE_SCHEMA_VERSION = 20
+OPINION_SCHEMA_VERSION = 1
+SELF_MODEL_SCHEMA_VERSION = 1
+STRATEGY_SCHEMA_VERSION = 1
 _T = TypeVar("_T")
-STARTING_INTERESTS = ("anime", "manga", "VTubers")
+STARTING_INTEREST_TOPICS = ("anime", "manga", "VTubers")
 
 _MAX_RECENT_TURNS = 28
 _MAX_RELATIONSHIP_ENTRIES = 16
@@ -53,6 +60,11 @@ _MAX_PREFERENCES = 32
 _MAX_COMMUNICATION_PREFERENCES = 12
 _MAX_FORBIDDEN_PHRASES = 4
 _MAX_OPINIONS = 32
+_MAX_SELF_MODEL_ITEMS_PER_CATEGORY = 12
+_MAX_IMPROVEMENT_TARGETS = 3
+_MAX_STRATEGIES = 8
+_MAX_ACTIVE_STRATEGIES = 2
+_STRATEGY_EVALUATION_WINDOW = 4
 _MAX_INTERESTS = 32
 _MAX_RECENT_INITIATIVES = 16
 _INITIATIVE_EVALUATION_CLAIM_SECONDS = 2.0 * 60.0 * 60.0
@@ -61,9 +73,7 @@ ORDINARY_INITIATIVE_COOLDOWN_SECONDS = 4.0 * 3600.0
 MAX_ORDINARY_INITIATIVES_PER_LOCAL_DAY = 2
 _MEMORY_SUBJECTS = {"user", "akane", "shared"}
 _MEMORY_KINDS = {"fact", "event", "commitment", "project", "concern"}
-_PREFERENCE_STANCES = {
-    "likes", "dislikes", "curious", "mixed", "uncertain", "indifferent",
-}
+_PREFERENCE_STANCES = {"likes", "dislikes", "curious", "mixed", "uncertain", "indifferent"}
 _COMMUNICATION_VALUES = {
     "formality": {"casual", "neutral", "formal"},
     "verbosity": {"short", "balanced", "detailed"},
@@ -130,6 +140,148 @@ _WARMTH = re.compile(
     r"you(?: re| are) (?:kind|wonderful)|good job)\b"
 )
 _CONCERN = re.compile(r"\b(?:i(?: m| am) worried|are you okay|that sounds scary)\b")
+_UNVERIFIED_HISTORY = re.compile(
+    r"\b(?:remember when|don['’]?t you remember|didn['’]?t you (?:say|tell)|"
+    r"you (?:said|told me) (?:yesterday|before|last)|we (?:went|did|made|watched|played) .+ (?:before|together))\b",
+    re.IGNORECASE,
+)
+_AKANE_TASTE_ADOPTION = re.compile(
+    r"\b(?:i (?:like|love|dislike|hate|prefer|enjoy|favor|favour|care about|"
+    r"don['’]?t care|am curious|am interested|find .{1,80} (?:interesting|appealing|dull))|"
+    r"i['’]?m (?:curious|interested|drawn|intrigued|fascinated|bored)|"
+    r"my (?:interest|curiosity|preference)|caught my attention|appeals to me|lost interest)\b",
+    re.IGNORECASE,
+)
+_AKANE_OPINION_ADOPTION = re.compile(
+    r"\b(?:i (?:now |still |do |really )?(?:think|believe|feel|find|like|love|dislike|hate|prefer|favor|favour|"
+    r"support|oppose|value|want|don['’]?t (?:think|believe|like|want))|"
+    r"i(?:['’]?m| am) (?:(?:more|less) )?(?:for|against|uncertain|convinced|confident)|"
+    r"my (?:view|opinion|position)|"
+    r"it seems to me)\b",
+    re.IGNORECASE,
+)
+_SELF_OPINION_QUERY = re.compile(
+    r"\b(?:who you are|of yourself|about yourself|like yourself|think of yourself|"
+    r"being (?:an? )?(?:ai|digital)|your digital existence|your future)\b",
+    re.IGNORECASE,
+)
+_TRANSIENT_SELF_REACTION = re.compile(
+    r"\bi(?:['’]?m| am| feel) (?:sad|happy|tired|angry|upset|anxious|excited|"
+    r"frustrated|irritated|lonely|calm|content)\b",
+    re.IGNORECASE,
+)
+_EXTERNAL_FACT_CLAIM = re.compile(
+    r"\b(?:announced|according to|breaking news|reported (?:that|today)|"
+    r"released (?:today|yesterday|this (?:week|month|year))|"
+    r"(?:a |the )?(?:study|report|research) (?:found|shows?|proved)|"
+    r"researchers? (?:found|discovered)|is now available|happened today)\b",
+    re.IGNORECASE,
+)
+_AKANE_SELF_CLAIM = re.compile(
+    r"\bi (?:can|cannot|can['’]?t|am able|am not able|tend|often|sometimes|usually|"
+    r"have become|struggle|overuse|underuse|need to|want to improve|am working on)\b",
+    re.IGNORECASE,
+)
+_SELF_QUERY_CAPABILITY = re.compile(
+    r"\b(?:can you|what can you|capabilit|able to|good at|what do you do)\b",
+    re.IGNORECASE,
+)
+_SELF_QUERY_LIMITATION = re.compile(
+    r"\b(?:weakness|limitation|struggle|bad at|can['’]?t you|cannot you|"
+    r"what can['’]?t|what cannot|improve about yourself)\b",
+    re.IGNORECASE,
+)
+_SELF_QUERY_TRAIT = re.compile(
+    r"\b(?:your traits?|your tendencies|how (?:have|did) you change|"
+    r"what are you like|about yourself|understand about yourself)\b",
+    re.IGNORECASE,
+)
+_QUESTION_BEHAVIOR = re.compile(
+    r"\b(?:ask|asking|question|questions|clarif|follow[- ]?up)\w*\b",
+    re.IGNORECASE,
+)
+_USER_SELF_FEEDBACK = re.compile(
+    r"\b(?:you|akane) (?:always |often |sometimes |usually |keep )?"
+    r"(?:ask|answer|clarif|repeat|overuse|underuse|tend|seem)\w*\b",
+    re.IGNORECASE,
+)
+_USER_STATE_CONTAMINATION = re.compile(
+    r"\b(?:the user|arcane|you) (?:am|are|can|cannot|can['’]?t|tend|often|"
+    r"sometimes|usually|struggle|need to)\b",
+    re.IGNORECASE,
+)
+_AKANE_STRATEGY_CLAIM = re.compile(
+    r"\bi (?:will|want to try|am trying|can try|plan to)|\bmy (?:strategy|approach)\b",
+    re.IGNORECASE,
+)
+_ACTIONABLE_STRATEGY = re.compile(
+    r"\b(?:answer|ask|state|explain|acknowledge|check|pause|lead|give|avoid|"
+    r"clarify|summarize|summarise|compare|name|express)\b",
+    re.IGNORECASE,
+)
+_BROAD_STRATEGY = re.compile(
+    r"\b(?:be better|be smarter|improve everything|fix everything|always be perfect|"
+    r"become perfect|improve myself generally)\b",
+    re.IGNORECASE,
+)
+_FOUNDATIONAL_STRATEGY = re.compile(
+    r"\b(?:identity\.md|soul\.md|hard rules?|system prompt|prompt rewriting|"
+    r"rewrite (?:my |the )?(?:identity|soul|prompt|rules?|source|code)|"
+    r"edit (?:my |the )?(?:identity|soul|prompt|rules?|python|source|code)|"
+    r"install (?:a |the )?(?:package|plugin)|fine[- ]?tun|train (?:the |my )?model|"
+    r"shell command|bypass (?:the )?(?:validator|safety|grounding))\b",
+    re.IGNORECASE,
+)
+_PERSONAL_QUESTION = re.compile(
+    r"\b(?:what do you|what are you|how do you|how are you|who are you|"
+    r"your (?:opinion|view|favorite|favourite|preference|feeling|weakness|strength)|"
+    r"do you|are you|can you|would you|will you)\b",
+    re.IGNORECASE,
+)
+_AMBIGUOUS_QUESTION = re.compile(
+    r"^\s*(?:what|which|how|why|who|when|where)?\s*(?:about )?(?:it|that|this|"
+    r"thing|one|they|them)?\s*\??\s*$|\b(?:not sure what i mean|ambiguous|"
+    r"whichever one|you know what i mean)\b",
+    re.IGNORECASE,
+)
+_TECHNICAL_QUESTION = re.compile(
+    r"\b(?:code|python|javascript|typescript|api|database|sql|function|class|"
+    r"algorithm|server|network|compiler|repository|git|css|html|bug|exception)\b",
+    re.IGNORECASE,
+)
+_STRATEGY_POSITIVE_FEEDBACK = re.compile(
+    r"\b(?:you(?:'re| are) (?:more direct|better at)|that was more direct|"
+    r"fewer questions|less clarification)\b",
+    re.IGNORECASE,
+)
+_STRATEGY_NEGATIVE_FEEDBACK = re.compile(
+    r"\b(?:still asking too many|too many questions|you assumed|wrong assumption|"
+    r"should have clarified|didn't answer directly)\b",
+    re.IGNORECASE,
+)
+_SENSITIVE_PATTERN = re.compile(
+    r"\b(?:diagnos(?:is|ed)|medical|mental health|disability|race|ethnicity|religion|"
+    r"sexual orientation|gender identity|political affiliation|criminal history|income|debt)\b",
+    re.IGNORECASE,
+)
+_PRESENCE_PHYSICAL_CLAIM = re.compile(
+    r"\b(?:ate|drank|slept|walked|traveled|travelled|touched|smelled|tasted|"
+    r"felt (?:warm|cold|hot|pain|tired)|physically)\b",
+    re.IGNORECASE,
+)
+_PRESENCE_EXTERNAL_CLAIM = re.compile(
+    r"\b(?:browsed|searched|looked up|read (?:an?|the) (?:article|website|news)|"
+    r"watched|played|a (?:new )?(?:study|report) (?:found|shows?|proved)|"
+    r"researchers? (?:found|discovered)|learned (?:that|from))\b",
+    re.IGNORECASE,
+)
+_PRESENCE_USER_FACT = re.compile(
+    r"\b(?:the user|arcane|you) (?:is|are|has|have|likes?|dislikes?|prefers?|said|told)\b",
+    re.IGNORECASE,
+)
+_PRESENCE_CONSEQUENCE_MIN_CONFIDENCE = 0.75
+_PRESENCE_CONSEQUENCE_MAX_SOURCE_AGE_SECONDS = 45 * 24 * 60 * 60
+_PRESENCE_CONSEQUENCE_MIN_INTERVAL_SECONDS = 60 * 60
 
 
 def _number(value: object, default: float = 0.0) -> float:
@@ -192,8 +344,23 @@ def _grounded(candidate: str, evidence: str) -> bool:
         return False
     overlap = candidate_terms & evidence_terms
     coverage = len(overlap) / len(candidate_terms)
-    return bool(overlap) and coverage >= 0.5 and (
-        len(overlap) >= 2 or len(candidate_terms) <= 2
+    return bool(overlap) and coverage >= 0.5 and (len(overlap) >= 2 or len(candidate_terms) <= 2)
+
+
+def _durable_opinion_form(
+    topic: str,
+    reason: str,
+    *,
+    confidence: float,
+    importance: float,
+) -> bool:
+    """Require a meaningful grounded basis before creating permanent state."""
+
+    explanatory_terms = _terms(reason) - _terms(topic)
+    return (
+        confidence >= 0.45
+        and importance >= 0.50
+        and len(explanatory_terms) >= 2
     )
 
 
@@ -245,33 +412,26 @@ def _relevant_values(
     query: str,
     now: float,
     *,
-    text_of: Callable[[_T], str],
-    confidence_of: Callable[[_T], float],
-    updated_at_of: Callable[[_T], float],
+    text_of: Callable[[_T], str] | None = None,
+    confidence_of: Callable[[_T], float] | None = None,
     limit: int,
 ) -> tuple[_T, ...]:
     """Rank any typed durable state with one bounded generic scorer."""
 
-    query_terms = _terms(query)
-    if not query_terms:
-        return ()
-    query_key = _key(query)
+    text_of = text_of or (lambda item: item.content)
+    confidence_of = confidence_of or (lambda item: item.confidence)
     scored: list[tuple[float, float, _T]] = []
     for value in values:
         text = text_of(value)
-        value_terms = _terms(text)
-        overlap = len(query_terms & value_terms) / max(
-            1,
-            len(query_terms | value_terms),
-        )
-        phrase = SequenceMatcher(None, query_key, _key(text)).ratio()
-        if overlap <= 0.0 and phrase < 0.28:
-            continue
-        updated_at = max(0.0, updated_at_of(value))
-        age_days = max(0.0, now - updated_at) / (24.0 * 3600.0)
-        recency = 1.0 / (1.0 + age_days / 30.0)
+        updated_at = max(0.0, value.updated_at)
         confidence = max(0.0, min(1.0, confidence_of(value)))
-        score = 0.62 * max(overlap, phrase * 0.6) + 0.23 * confidence + 0.15 * recency
+        score = lightweight_relevance_score(
+            query,
+            text,
+            now=now,
+            updated_at=updated_at,
+            confidence=confidence,
+        )
         if score >= 0.26:
             scored.append((score, updated_at, value))
     return tuple(
@@ -281,6 +441,34 @@ def _relevant_values(
             key=lambda item: (item[0], item[1]),
             reverse=True,
         )[:limit]
+    )
+
+
+def lightweight_relevance_score(
+    query: str,
+    text: str,
+    *,
+    now: float,
+    updated_at: float,
+    confidence: float,
+) -> float:
+    """Expose the bounded lexical scorer used by typed state retrieval."""
+
+    query_terms = _terms(query)
+    if not query_terms:
+        return 0.0
+    value_terms = _terms(text)
+    overlap = len(query_terms & value_terms) / max(1, len(query_terms | value_terms))
+    phrase = SequenceMatcher(None, _key(query), _key(text)).ratio()
+    if overlap <= 0.0 and phrase < 0.28:
+        return 0.0
+    age_days = max(0.0, now - max(0.0, updated_at)) / (24.0 * 3600.0)
+    recency = 1.0 / (1.0 + age_days / 30.0)
+    bounded_confidence = max(0.0, min(1.0, confidence))
+    return (
+        0.62 * max(overlap, phrase * 0.6)
+        + 0.23 * bounded_confidence
+        + 0.15 * recency
     )
 
 
@@ -303,6 +491,9 @@ def _legacy_activity_payload(
 ) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
+    structured = PresenceActivity.from_dict(payload)
+    if structured is not None:
+        return structured.as_dict()
     started = max(0.0, _number(payload.get("started_at")))
     expected = max(
         0.0,
@@ -311,10 +502,7 @@ def _legacy_activity_payload(
             _number(payload.get("ends_at"), fallback_end),
         ),
     )
-    summary = compact_text(
-        payload.get("summary") or payload.get("activity"),
-        120,
-    )
+    summary = compact_text(payload.get("summary") or payload.get("activity"), 120)
     focus = compact_text(
         payload.get("focus")
         or payload.get("detail")
@@ -329,18 +517,19 @@ def _legacy_activity_payload(
         uuid.NAMESPACE_URL,
         f"akane-presence:{started:.6f}:{expected:.6f}:{summary}:{focus}",
     ).hex
+    subject = compact_text(f"{summary}: {focus}" if focus != summary else summary, 360)
     migrated = {
         "activity_id": activity_id,
-        "summary": summary,
-        "focus": focus,
+        "kind": "legacy",
+        "subject": subject,
+        "subject_kind": "legacy_activity",
+        "source_ids": [activity_id],
         "started_at": started,
         "expected_end_at": expected,
+        "origin": "legacy_presence",
+        "grounding_confidence": 0.20,
     }
-    return (
-        migrated
-        if PresenceActivity.from_dict(migrated) is not None
-        else None
-    )
+    return (migrated if PresenceActivity.from_dict(migrated) is not None else None)
 
 
 def _legacy_presence_payload(payload: object) -> dict[str, object]:
@@ -352,10 +541,7 @@ def _legacy_presence_payload(payload: object) -> dict[str, object]:
             _number(values.get("life_next_run_at")),
         ),
     )
-    current = _legacy_activity_payload(
-        values.get("current_activity"),
-        fallback_end=next_at,
-    )
+    current = _legacy_activity_payload(values.get("current_activity"), fallback_end=next_at)
     recent = values.get("recent_activities")
     historical = [
         activity
@@ -372,10 +558,7 @@ def _legacy_presence_payload(payload: object) -> dict[str, object]:
         ),
         reverse=True,
     )
-    previous = next(
-        (activity for activity in historical if activity != current),
-        None,
-    )
+    previous = next((activity for activity in historical if activity != current), None)
     last_decision_at = max(
         0.0,
         _number(
@@ -389,11 +572,11 @@ def _legacy_presence_payload(payload: object) -> dict[str, object]:
         if isinstance(raw_pattern, dict)
         else 0
     )
-    raw_continuations = values.get("continuation_count")
-    continuation_count = (
-        max(0, min(1, raw_continuations))
-        if type(raw_continuations) is int
-        else max(0, min(1, repeat_count - 1))
+    raw_repetitions = values.get("repetition_count", values.get("continuation_count"))
+    repetition_count = (
+        max(0, min(3, raw_repetitions))
+        if type(raw_repetitions) is int
+        else max(0, min(3, repeat_count - 1))
     )
     retry_at = max(0.0, _number(values.get("retry_at")))
     claim_token = values.get("claim_token")
@@ -404,7 +587,25 @@ def _legacy_presence_payload(payload: object) -> dict[str, object]:
         retry_at = 0.0
         claim_token = None
         claim_expires_at = 0.0
-        continuation_count = 0
+        repetition_count = 0
+    raw_recent = values.get("recent_source_ids")
+    recent_source_ids = [
+        source
+        for item in (raw_recent if isinstance(raw_recent, (list, tuple)) else ())
+        if (source := compact_text(item, 180))
+    ][-6:]
+    raw_quiet_streak = values.get("quiet_streak")
+    quiet_streak = (
+        max(0, min(3, raw_quiet_streak))
+        if type(raw_quiet_streak) is int
+        else (1 if current is not None and current.get("kind") == "quiet" else 0)
+    )
+    raw_score = values.get("last_candidate_score")
+    last_candidate_score = (
+        float(raw_score)
+        if type(raw_score) in {int, float} and math.isfinite(float(raw_score))
+        else None
+    )
     return {
         "current_activity": current,
         "previous_activity": previous,
@@ -414,7 +615,25 @@ def _legacy_presence_payload(payload: object) -> dict[str, object]:
         "last_error": last_error,
         "claim_token": claim_token,
         "claim_expires_at": claim_expires_at,
-        "continuation_count": continuation_count,
+        "repetition_count": repetition_count,
+        "recent_source_ids": recent_source_ids,
+        "quiet_streak": quiet_streak,
+        "last_transition_reason": (
+            compact_text(values.get("last_transition_reason"), 80)
+            or "migrated_existing_state"
+        ),
+        "last_candidate_score": last_candidate_score,
+        "last_candidate_source_id": (
+            compact_text(values.get("last_candidate_source_id"), 180) or None
+        ),
+        "last_appraised_activity_id": (
+            compact_text(values.get("last_appraised_activity_id"), 80) or None
+        ),
+        "last_appraised_at": max(0.0, _number(values.get("last_appraised_at"))),
+        "last_appraisal_result": compact_text(
+            values.get("last_appraisal_result"),
+            32,
+        ),
     }
 
 
@@ -427,10 +646,7 @@ def _legacy_memory_payload(payload: object) -> dict[str, object] | None:
         return None
     if thread_status in {"resolved", "abandoned", "expired"}:
         return None
-    old_kind = compact_text(
-        payload.get("kind") or payload.get("category"),
-        32,
-    ).casefold()
+    old_kind = compact_text(payload.get("kind") or payload.get("category"), 32).casefold()
     kind = {
         "episode": "event",
         "task_outcome": "event",
@@ -488,19 +704,19 @@ def _legacy_memory_payload(payload: object) -> dict[str, object] | None:
     }
 
 
-def _legacy_profile_payload(payload: object) -> object:
+def _legacy_profile_payload(
+    payload: object,
+    *,
+    preserve_structured_memory: bool = False,
+) -> object:
     if isinstance(payload, list):
-        return [
-            memory
-            for item in payload
-            if (memory := _legacy_memory_payload(item)) is not None
-        ]
+        return [memory for item in payload if (memory := _legacy_memory_payload(item)) is not None]
     if not isinstance(payload, dict):
         return payload
     migrated = dict(payload)
     migrated["presence"] = _legacy_presence_payload(payload.get("presence"))
     raw_memories = payload.get("memories")
-    if isinstance(raw_memories, list):
+    if not preserve_structured_memory and isinstance(raw_memories, list):
         migrated["memories"] = [
             memory
             for item in raw_memories
@@ -584,12 +800,7 @@ class InitiativeOpportunity:
     failed_channels: tuple[str, ...] = ()
 
     @classmethod
-    def from_dict(
-        cls,
-        payload: object,
-        *,
-        now: float,
-    ) -> "InitiativeOpportunity | None":
+    def from_dict(cls, payload: object, *, now: float) -> "InitiativeOpportunity | None":
         if not isinstance(payload, dict):
             return None
         opportunity_id = compact_text(payload.get("opportunity_id"), 100)
@@ -616,10 +827,7 @@ class InitiativeOpportunity:
             return None
         claim_token = compact_text(payload.get("claim_token"), 100) or None
         claim_expires = max(0.0, _number(payload.get("claim_expires_at")))
-        delivery_channel = compact_text(
-            payload.get("delivery_channel"),
-            16,
-        ).casefold() or None
+        delivery_channel = compact_text(payload.get("delivery_channel"), 16).casefold() or None
         failed_channels = tuple(
             channel
             for item in (payload.get("failed_channels") or ())
@@ -628,9 +836,7 @@ class InitiativeOpportunity:
         )
         if claim_token is None or claim_expires <= now:
             if status == "pending_delivery" and delivery_channel:
-                failed_channels = tuple(
-                    dict.fromkeys((*failed_channels, delivery_channel))
-                )
+                failed_channels = tuple(dict.fromkeys((*failed_channels, delivery_channel)))
             claim_token = None
             claim_expires = 0.0
             if status != "sent":
@@ -658,10 +864,7 @@ class InitiativeOpportunity:
         )
 
     def as_dict(self) -> dict[str, object]:
-        return {
-            **asdict(self),
-            "failed_channels": list(self.failed_channels),
-        }
+        return {**asdict(self), "failed_channels": list(self.failed_channels)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,17 +936,10 @@ class ConversationRecord:
     request_replies: tuple[tuple[str, str], ...] = ()
 
     @classmethod
-    def from_dict(
-        cls,
-        key: str,
-        payload: object,
-    ) -> "ConversationRecord | None":
+    def from_dict(cls, key: str, payload: object) -> "ConversationRecord | None":
         if not isinstance(payload, dict):
             return None
-        conversation_id = compact_text(
-            payload.get("conversation_id") or key,
-            160,
-        )
+        conversation_id = compact_text(payload.get("conversation_id") or key, 160)
         if not conversation_id:
             return None
         profile_id = canonical_profile_id(payload.get("profile_id"))
@@ -844,12 +1040,7 @@ class MoodState:
     updated_at: float = 0.0
 
     @classmethod
-    def from_dict(
-        cls,
-        payload: object,
-        *,
-        now: float,
-    ) -> "MoodState":
+    def from_dict(cls, payload: object, *, now: float) -> "MoodState":
         values = payload if isinstance(payload, dict) else {}
         updated = min(now, max(0.0, _number(values.get("updated_at"))))
         return cls(
@@ -916,10 +1107,7 @@ class EmotionState:
             ),
         )
         cause = compact_text(values.get("cause"), 160)
-        updated = min(
-            now,
-            max(0.0, _number(values.get("updated_at"), fallback_time)),
-        )
+        updated = min(now, max(0.0, _number(values.get("updated_at"), fallback_time)))
         source = compact_text(values.get("source"), 32).casefold() or None
         if source not in _EMOTION_SOURCES:
             source = "self_reflection" if migrating and primary != "neutral" else None
@@ -938,15 +1126,7 @@ class EmotionState:
             source = None
             source_id = None
             started = 0.0
-        return cls(
-            primary,
-            intensity,
-            cause,
-            source,
-            source_id,
-            started,
-            updated,
-        )
+        return cls(primary, intensity, cause, source, source_id, started, updated)
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -989,11 +1169,7 @@ class Memory:
 
     @property
     def content(self) -> str:
-        return (
-            self.text
-            if self.confidence >= 0.75
-            else f"Uncertain memory: {self.text}"
-        )
+        return (self.text if self.confidence >= 0.75 else f"Uncertain memory: {self.text}")
 
     @classmethod
     def from_dict(cls, payload: object) -> "Memory | None":
@@ -1014,10 +1190,7 @@ class Memory:
             subject = "user" if actor in {"arcane", "user"} else (
                 "akane" if actor == "akane" else "shared"
             )
-        kind = compact_text(
-            payload.get("kind") or payload.get("category"),
-            32,
-        ).casefold()
+        kind = compact_text(payload.get("kind") or payload.get("category"), 32).casefold()
         aliases = {
             "stable_fact": "fact",
             "user_fact": "fact",
@@ -1029,10 +1202,7 @@ class Memory:
         kind = aliases.get(kind, kind)
         if kind not in _MEMORY_KINDS:
             kind = "fact"
-        created = max(
-            0.0,
-            _number(payload.get("created_at"), _number(payload.get("updated_at"))),
-        )
+        created = max(0.0, _number(payload.get("created_at"), _number(payload.get("updated_at"))))
         updated = max(created, _number(payload.get("updated_at"), created))
         memory_id = compact_text(payload.get("id"), 100) or _stable_state_id(
             "memory",
@@ -1042,7 +1212,9 @@ class Memory:
             f"{created:.6f}",
         )
         source_type = source_type or "legacy"
-        if source_type not in {"legacy", "explicit_user", "conversation", "migration"}:
+        if source_type not in {
+            "legacy", "explicit_user", "conversation", "migration", "offscreen_presence",
+        }:
             return None
         return cls(
             memory_id,
@@ -1059,6 +1231,96 @@ class Memory:
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+class Interest(str):
+    """An Akane-owned topic with lightweight, revisable evidence."""
+
+    def __new__(
+        cls,
+        topic: str,
+        strength: float = 0.7,
+        reason: str = "",
+        created_at: float = 0.0,
+        updated_at: float = 0.0,
+        source_type: str = "legacy",
+        source_ids: tuple[str, ...] = (),
+        evidence_count: int = 1,
+    ) -> "Interest":
+        value = str.__new__(cls, compact_text(topic, 100))
+        value.strength = max(0.0, min(1.0, float(strength)))
+        value.reason = compact_text(reason, 240)
+        value.created_at = max(0.0, float(created_at))
+        value.updated_at = max(value.created_at, float(updated_at))
+        value.source_type = compact_text(source_type, 40).casefold() or "legacy"
+        value.source_ids = tuple(
+            compact_text(item, 180) for item in source_ids if compact_text(item, 180)
+        )[-6:]
+        value.evidence_count = max(1, int(evidence_count))
+        return value
+
+    @property
+    def topic(self) -> str:
+        return str(self)
+
+    @property
+    def content(self) -> str:
+        return str(self)
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "Interest | None":
+        if isinstance(payload, str):
+            topic = compact_text(payload, 100)
+            if not topic:
+                return None
+            identity = _key(topic) in {_key(item) for item in STARTING_INTEREST_TOPICS}
+            return cls(
+                topic,
+                0.8 if identity else 0.6,
+                "Established by Akane's identity." if identity else "Migrated established interest.",
+                source_type="identity" if identity else "legacy",
+            )
+        if not isinstance(payload, dict):
+            return None
+        topic = compact_text(payload.get("topic"), 100)
+        strength = payload.get("strength")
+        source_type = compact_text(payload.get("source_type"), 40).casefold()
+        source_ids = payload.get("source_ids")
+        evidence_count = payload.get("evidence_count", 1)
+        if (
+            not topic
+            or type(strength) not in {int, float}
+            or not math.isfinite(float(strength))
+            or source_type not in {"identity", "legacy", "conversation", "offscreen_presence"}
+            or not isinstance(source_ids, (list, tuple))
+            or type(evidence_count) is not int
+        ):
+            return None
+        return cls(
+            topic,
+            float(strength),
+            compact_text(payload.get("reason"), 240),
+            _number(payload.get("created_at")),
+            _number(payload.get("updated_at")),
+            source_type,
+            tuple(str(item) for item in source_ids),
+            evidence_count,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "topic": str(self),
+            "strength": self.strength,
+            "reason": self.reason,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "source_type": self.source_type,
+            "source_ids": list(self.source_ids),
+            "evidence_count": self.evidence_count,
+        }
+
+
+STARTING_INTERESTS = tuple(Interest.from_dict(topic) for topic in STARTING_INTEREST_TOPICS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1081,12 +1343,7 @@ class AkanePreference:
         reason = compact_text(payload.get("reason"), 240)
         if not topic or stance not in _PREFERENCE_STANCES or not reason:
             return None
-        return cls(
-            topic,
-            stance,
-            reason,
-            max(0.0, _number(payload.get("updated_at"))),
-        )
+        return cls(topic, stance, reason, max(0.0, _number(payload.get("updated_at"))))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1128,10 +1385,7 @@ class CommunicationPreference:
         source_type = compact_text(payload.get("source_type"), 40).casefold()
         if not reason or source_type not in {"explicit_user", "legacy"}:
             return None
-        created = max(
-            0.0,
-            _number(payload.get("created_at"), _number(payload.get("updated_at"))),
-        )
+        created = max(0.0, _number(payload.get("created_at"), _number(payload.get("updated_at"))))
         return cls(
             key,
             value,
@@ -1153,11 +1407,31 @@ class Opinion:
     confidence: float = 0.7
     created_at: float = 0.0
     source_type: str = "legacy"
-    evidence_summary: str = ""
+    evidence_summary: str = field(default="", compare=False, repr=False)
+    source_ids: tuple[str, ...] = ()
+    domain: str = "general"
+    importance: float = 0.5
+    revision_count: int = 0
 
     @property
     def content(self) -> str:
         return f"{self.topic}: {self.position} — {self.reason}"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "topic": self.topic,
+            "domain": self.domain,
+            "position": self.position,
+            "reason": self.reason,
+            "confidence": self.confidence,
+            "importance": self.importance,
+            "source_ids": list(self.source_ids),
+            "source_type": self.source_type,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "revision_count": self.revision_count,
+        }
 
     @classmethod
     def from_dict(cls, payload: object) -> "Opinion | None":
@@ -1172,8 +1446,15 @@ class Opinion:
         created = max(0.0, _number(payload.get("created_at"), updated))
         topic_key = _key(topic)
         source_type = compact_text(payload.get("source_type"), 40).casefold() or "legacy"
-        if source_type not in {"legacy", "conversation"}:
+        if source_type not in {"legacy", "conversation", "offscreen_presence"}:
             return None
+        domain = compact_text(payload.get("domain"), 48).casefold() or "general"
+        raw_revision_count = payload.get("revision_count", 0)
+        revision_count = (
+            max(0, raw_revision_count)
+            if type(raw_revision_count) is int
+            else 0
+        )
         return cls(
             topic,
             position,
@@ -1186,7 +1467,349 @@ class Opinion:
             min(created, updated) if updated else created,
             source_type,
             compact_text(payload.get("evidence_summary"), 280),
+            tuple(
+                dict.fromkeys(
+                    source
+                    for item in (
+                        payload.get("source_ids")
+                        if isinstance(payload.get("source_ids"), (list, tuple))
+                        else ()
+                    )
+                    if (source := compact_text(item, 180))
+                )
+            )[-8:],
+            domain,
+            max(0.0, min(1.0, _number(payload.get("importance"), 0.5))),
+            revision_count,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SelfModelItem:
+    id: str
+    category: str
+    area: str
+    description: str
+    confidence: float
+    source_ids: tuple[str, ...]
+    created_at: float
+    updated_at: float
+    revision_count: int = 0
+
+    @property
+    def content(self) -> str:
+        return f"{self.area}: {self.description}"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "area": self.area,
+            "description": self.description,
+            "confidence": self.confidence,
+            "source_ids": list(self.source_ids),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "revision_count": self.revision_count,
+        }
+
+    @classmethod
+    def from_dict(cls, category: str, payload: object) -> "SelfModelItem | None":
+        if category not in {"capability", "limitation", "trait"} or not isinstance(
+            payload, dict
+        ):
+            return None
+        item_id = compact_text(payload.get("id"), 100)
+        area = compact_text(payload.get("area"), 80).casefold()
+        description = compact_text(payload.get("description"), 280)
+        confidence = payload.get("confidence")
+        raw_sources = payload.get("source_ids")
+        sources = tuple(
+            dict.fromkeys(
+                source
+                for value in (
+                    raw_sources if isinstance(raw_sources, (list, tuple)) else ()
+                )
+                if (source := compact_text(value, 180))
+            )
+        )[-8:]
+        created = max(0.0, _number(payload.get("created_at")))
+        updated = max(created, _number(payload.get("updated_at"), created))
+        raw_revisions = payload.get("revision_count", 0)
+        revisions = max(0, raw_revisions) if type(raw_revisions) is int else 0
+        if (
+            not item_id
+            or not area
+            or not description
+            or type(confidence) not in {int, float}
+            or not math.isfinite(float(confidence))
+            or not 0.0 <= float(confidence) <= 1.0
+            or not sources
+        ):
+            return None
+        return cls(
+            item_id,
+            category,
+            area,
+            description,
+            float(confidence),
+            sources,
+            created,
+            updated,
+            revisions,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ImprovementTarget:
+    id: str
+    area: str
+    description: str
+    reason: str
+    priority: float
+    source_ids: tuple[str, ...]
+    created_at: float
+    updated_at: float
+    revision_count: int = 0
+
+    @property
+    def content(self) -> str:
+        return f"{self.area}: {self.description} — {self.reason}"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "area": self.area,
+            "description": self.description,
+            "reason": self.reason,
+            "priority": self.priority,
+            "source_ids": list(self.source_ids),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "revision_count": self.revision_count,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "ImprovementTarget | None":
+        if not isinstance(payload, dict):
+            return None
+        target_id = compact_text(payload.get("id"), 100)
+        area = compact_text(payload.get("area"), 80).casefold()
+        description = compact_text(payload.get("description"), 240)
+        reason = compact_text(payload.get("reason"), 240)
+        priority = payload.get("priority")
+        raw_sources = payload.get("source_ids")
+        sources = tuple(
+            dict.fromkeys(
+                source
+                for value in (
+                    raw_sources if isinstance(raw_sources, (list, tuple)) else ()
+                )
+                if (source := compact_text(value, 180))
+            )
+        )[-8:]
+        created = max(0.0, _number(payload.get("created_at")))
+        updated = max(created, _number(payload.get("updated_at"), created))
+        raw_revisions = payload.get("revision_count", 0)
+        revisions = max(0, raw_revisions) if type(raw_revisions) is int else 0
+        if (
+            not target_id
+            or not area
+            or not description
+            or not reason
+            or type(priority) not in {int, float}
+            or not math.isfinite(float(priority))
+            or not 0.0 <= float(priority) <= 1.0
+            or not sources
+        ):
+            return None
+        return cls(
+            target_id,
+            area,
+            description,
+            reason,
+            float(priority),
+            sources,
+            created,
+            updated,
+            revisions,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SelfModelState:
+    capabilities: tuple[SelfModelItem, ...] = ()
+    limitations: tuple[SelfModelItem, ...] = ()
+    traits: tuple[SelfModelItem, ...] = ()
+    improvement_targets: tuple[ImprovementTarget, ...] = ()
+
+    @property
+    def items(self) -> tuple[SelfModelItem, ...]:
+        return (*self.capabilities, *self.limitations, *self.traits)
+
+    def category_items(self, category: str) -> tuple[SelfModelItem, ...]:
+        return {
+            "capability": self.capabilities,
+            "limitation": self.limitations,
+            "trait": self.traits,
+        }.get(category, ())
+
+    def replace_category(
+        self,
+        category: str,
+        values: tuple[SelfModelItem, ...],
+    ) -> "SelfModelState":
+        field_name = {
+            "capability": "capabilities",
+            "limitation": "limitations",
+            "trait": "traits",
+        }.get(category)
+        return replace(self, **{field_name: values}) if field_name else self
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "capabilities": [item.as_dict() for item in self.capabilities],
+            "limitations": [item.as_dict() for item in self.limitations],
+            "traits": [item.as_dict() for item in self.traits],
+            "improvement_targets": [
+                target.as_dict() for target in self.improvement_targets
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Strategy:
+    id: str
+    goal_id: str
+    description: str
+    status: str
+    confidence: float
+    source_ids: tuple[str, ...]
+    created_at: float
+    updated_at: float
+    evaluation_count: int = 0
+    opportunity_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    evidence_summary: str = "Not evaluated yet."
+    last_evaluation_result: str = "insufficient_evidence"
+    revision_count: int = 0
+
+    @property
+    def content(self) -> str:
+        return self.description
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "goal_id": self.goal_id,
+            "description": self.description,
+            "status": self.status,
+            "confidence": self.confidence,
+            "source_ids": list(self.source_ids),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "evaluation_count": self.evaluation_count,
+            "opportunity_count": self.opportunity_count,
+            "success_count": self.success_count,
+            "failure_count": self.failure_count,
+            "evidence_summary": self.evidence_summary,
+            "last_evaluation_result": self.last_evaluation_result,
+            "revision_count": self.revision_count,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "Strategy | None":
+        if not isinstance(payload, dict):
+            return None
+        strategy_id = compact_text(payload.get("id"), 100)
+        goal_id = compact_text(payload.get("goal_id"), 100)
+        description = compact_text(payload.get("description"), 240)
+        status = compact_text(payload.get("status"), 16).casefold()
+        confidence = payload.get("confidence")
+        raw_sources = payload.get("source_ids")
+        source_ids = tuple(
+            dict.fromkeys(
+                source
+                for value in (
+                    raw_sources if isinstance(raw_sources, (list, tuple)) else ()
+                )
+                if (source := compact_text(value, 180))
+            )
+        )[-12:]
+        created_at = max(0.0, _number(payload.get("created_at")))
+        updated_at = max(created_at, _number(payload.get("updated_at"), created_at))
+        counters = tuple(
+            payload.get(name)
+            for name in (
+                "evaluation_count",
+                "opportunity_count",
+                "success_count",
+                "failure_count",
+                "revision_count",
+            )
+        )
+        evidence_summary = compact_text(payload.get("evidence_summary"), 280)
+        result = compact_text(payload.get("last_evaluation_result"), 32).casefold()
+        if (
+            not strategy_id
+            or not goal_id
+            or not description
+            or status not in {"active", "completed", "abandoned"}
+            or type(confidence) not in {int, float}
+            or not math.isfinite(float(confidence))
+            or not 0.0 <= float(confidence) <= 1.0
+            or not source_ids
+            or any(type(value) is not int or value < 0 for value in counters)
+            or counters[2] + counters[3] > counters[1]
+            or not evidence_summary
+            or result
+            not in {
+                "insufficient_evidence",
+                "improving",
+                "unchanged",
+                "worsening",
+                "completed",
+                "abandoned",
+                "stale_goal",
+            }
+        ):
+            return None
+        return cls(
+            strategy_id,
+            goal_id,
+            description,
+            status,
+            float(confidence),
+            source_ids,
+            created_at,
+            updated_at,
+            *counters[:4],
+            evidence_summary,
+            result,
+            counters[4],
+        )
+
+
+def _runtime_capability_for(
+    description: str,
+    area: str,
+) -> CapabilityFact | None:
+    return CAPABILITY_REGISTRY.match_persistent_claim(
+        "capability",
+        area,
+        description,
+    )
+
+
+def _runtime_limitation_for(
+    description: str,
+    area: str,
+) -> CapabilityFact | None:
+    return CAPABILITY_REGISTRY.match_persistent_claim(
+        "limitation",
+        area,
+        description,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1194,6 +1817,8 @@ class RelationshipEntry:
     summary: str
     confidence: float
     updated_at: float
+    evidence_count: int = 1
+    source_ids: tuple[str, ...] = ()
 
     @property
     def content(self) -> str:
@@ -1206,16 +1831,25 @@ class RelationshipEntry:
             return cls(summary, 0.7, 0.0) if summary else None
         if not isinstance(payload, dict):
             return None
-        summary = compact_text(
-            payload.get("summary") or payload.get("content"),
-            300,
-        )
+        summary = compact_text(payload.get("summary") or payload.get("content"), 300)
         if not summary:
             return None
         return cls(
             summary,
             max(0.0, min(1.0, _number(payload.get("confidence"), 0.7))),
             max(0.0, _number(payload.get("updated_at"))),
+            max(1, int(payload.get("evidence_count", 1)))
+            if type(payload.get("evidence_count", 1)) is int
+            else 1,
+            tuple(
+                compact_text(item, 180)
+                for item in (
+                    payload.get("source_ids")
+                    if isinstance(payload.get("source_ids"), (list, tuple))
+                    else ()
+                )
+                if compact_text(item, 180)
+            )[-6:],
         )
 
 
@@ -1249,7 +1883,10 @@ class RelationshipState:
 
     def as_dict(self) -> dict[str, object]:
         def payload(values: tuple[RelationshipEntry, ...]) -> list[dict[str, object]]:
-            return [asdict(item) for item in values]
+            return [
+                {**asdict(item), "source_ids": list(item.source_ids)}
+                for item in values
+            ]
 
         return {
             "patterns": payload(self.patterns),
@@ -1264,7 +1901,7 @@ class ProfileState:
     emotion: EmotionState = EmotionState()
     presence: PresenceState = PresenceState()
     memories: tuple[Memory, ...] = ()
-    interests: tuple[str, ...] = STARTING_INTERESTS
+    interests: tuple[Interest, ...] = STARTING_INTERESTS
     preferences: tuple[AkanePreference, ...] = ()
     communication_preferences: tuple[CommunicationPreference, ...] = ()
     opinions: tuple[Opinion, ...] = ()
@@ -1299,16 +1936,17 @@ class ProfileState:
             for item in (raw_memories if isinstance(raw_memories, list) else [])
             if (memory := Memory.from_dict(item)) is not None
         )
-        interests = _dedupe_text(
-            (
-                *STARTING_INTERESTS,
-                *(
-                    tuple(payload.get("interests"))
+        interests = _merge_interests(
+            STARTING_INTERESTS,
+            tuple(
+                interest
+                for item in (
+                    payload.get("interests")
                     if isinstance(payload.get("interests"), (list, tuple))
                     else ()
-                ),
+                )
+                if (interest := Interest.from_dict(item)) is not None
             ),
-            limit=_MAX_INTERESTS,
         )
         raw_preferences = payload.get("preferences")
         preferences = tuple(
@@ -1362,29 +2000,28 @@ class ProfileState:
             updated_at=updated,
         )
 
-    def as_dict(self) -> dict[str, object]:
-        return {
+    def as_dict(self, *, include_opinions: bool = True) -> dict[str, object]:
+        payload: dict[str, object] = {
             "updated_at": self.updated_at,
             "mood": self.mood.as_dict(),
             "emotion": self.emotion.as_dict(),
             "presence": self.presence.as_dict(),
             "memories": [memory.as_dict() for memory in self.memories],
-            "interests": list(self.interests),
+            "interests": [interest.as_dict() for interest in self.interests],
             "preferences": [asdict(item) for item in self.preferences],
             "communication_preferences": [
                 asdict(item) for item in self.communication_preferences
             ],
-            "opinions": [asdict(item) for item in self.opinions],
             "relationship": self.relationship.as_dict(),
             "initiative": self.initiative.as_dict(),
         }
+        if include_opinions:
+            payload["opinions"] = [item.as_dict() for item in self.opinions]
+        return payload
 
 
 def _new_profile(now: float) -> ProfileState:
-    return ProfileState(
-        presence=PresenceState(),
-        updated_at=0.0,
-    )
+    return ProfileState(presence=PresenceState(), updated_at=0.0)
 
 
 def _handled_initiative(
@@ -1403,10 +2040,7 @@ def _settle_initiative(state: InitiativeState, *, now: float) -> InitiativeState
     opportunity = state.current
     if opportunity is None:
         return state
-    if (
-        opportunity.status in {"pending", "pending_delivery"}
-        and opportunity.expires_at <= now
-    ):
+    if (opportunity.status in {"pending", "pending_delivery"} and opportunity.expires_at <= now):
         expired = replace(
             opportunity,
             status="expired",
@@ -1419,9 +2053,7 @@ def _settle_initiative(state: InitiativeState, *, now: float) -> InitiativeState
     if opportunity.claim_token and opportunity.claim_expires_at <= now:
         failed = opportunity.failed_channels
         if opportunity.status == "pending_delivery" and opportunity.delivery_channel:
-            failed = tuple(
-                dict.fromkeys((*failed, opportunity.delivery_channel))
-            )
+            failed = tuple(dict.fromkeys((*failed, opportunity.delivery_channel)))
         return replace(
             state,
             current=replace(
@@ -1435,10 +2067,7 @@ def _settle_initiative(state: InitiativeState, *, now: float) -> InitiativeState
     return state
 
 
-def _initiative_source_exists(
-    profile: ProfileState,
-    opportunity: InitiativeOpportunity,
-) -> bool:
+def _initiative_source_exists(profile: ProfileState, opportunity: InitiativeOpportunity) -> bool:
     if opportunity.source_type == "offscreen_life":
         return any(
             opportunity.source_id == f"offscreen_life:{activity.started_at:.6f}"
@@ -1506,12 +2135,7 @@ def _initiative_from_conversation_change(
         None,
     )
     if memory is not None:
-        source = (
-            "unresolved grounded memory",
-            "memory",
-            memory.id,
-            memory.text,
-        )
+        source = ("unresolved grounded memory", "memory", memory.id, memory.text)
     if source is None:
         previous_relationship = {
             (item.summary, item.updated_at)
@@ -1628,10 +2252,7 @@ def _affect_category(text: object) -> str:
     return "neutral"
 
 
-def _recent_affect_count(
-    conversation: ConversationRecord,
-    category: str,
-) -> int:
+def _recent_affect_count(conversation: ConversationRecord, category: str) -> int:
     return sum(
         _affect_category(turn.content) == category
         for turn in conversation.recent_turns[-_AFFECT_HISTORY_TURNS:]
@@ -1645,11 +2266,7 @@ def _decayed_emotional_state(profile: ProfileState, *, now: float) -> ProfileSta
     effective = effective_emotional_state(profile, now=now)
     mood = effective.mood
     emotion = effective.emotion
-    if (
-        abs(mood.valence) < 0.02
-        and abs(mood.energy) < 0.02
-        and not mood.cause
-    ):
+    if (abs(mood.valence) < 0.02 and abs(mood.energy) < 0.02 and not mood.cause):
         mood = MoodState()
     else:
         mood = replace(mood, updated_at=now)
@@ -1690,15 +2307,8 @@ def _apply_conversation_affect(
     if category == "hostility":
         strength = min(0.62, 0.30 + 0.11 * repetition)
         primary = "angry" if repetition >= 2 else "irritated"
-        intensity = min(
-            1.0,
-            emotion.intensity * 0.78 + strength * 0.55 + 0.08 * repetition,
-        )
-        cause = (
-            "the repeated hostile behavior"
-            if repetition
-            else "the hostile behavior"
-        )
+        intensity = min(1.0, emotion.intensity * 0.78 + strength * 0.55 + 0.08 * repetition)
+        cause = ("the repeated hostile behavior" if repetition else "the hostile behavior")
         emotion = EmotionState(
             primary,
             intensity,
@@ -1727,12 +2337,7 @@ def _apply_conversation_affect(
             if intensity < 0.08
             else replace(emotion, intensity=intensity, cause=cause, updated_at=now)
         )
-        mood = MoodState(
-            min(0.0, mood.valence + strength * 0.22),
-            mood.energy * 0.96,
-            cause,
-            now,
-        )
+        mood = MoodState(min(0.0, mood.valence + strength * 0.22), mood.energy * 0.96, cause, now)
         signal.update(category="repair", strength=strength, cause=cause)
     elif category == "warmth":
         strength = min(0.48, 0.24 + 0.07 * _recent_affect_count(conversation, "warmth"))
@@ -1766,12 +2371,7 @@ def _apply_conversation_affect(
             emotion.started_at if emotion.primary == "concerned" else now,
             now,
         )
-        mood = MoodState(
-            max(-1.0, mood.valence - 0.02),
-            min(1.0, mood.energy + 0.02),
-            cause,
-            now,
-        )
+        mood = MoodState(max(-1.0, mood.valence - 0.02), min(1.0, mood.energy + 0.02), cause, now)
         signal.update(strength=strength, cause=cause)
 
     next_profile = replace(next_profile, mood=mood, emotion=emotion)
@@ -1782,25 +2382,6 @@ def _apply_conversation_affect(
     signal["emotion"] = emotion.as_dict()
     signal["mood"] = mood.as_dict()
     return next_profile, signal
-
-
-def compile_affect_guidance(profile: ProfileState, *, now: float) -> str:
-    """Translate affect into concise behavioral constraints for the response prompt."""
-
-    effective = effective_emotional_state(profile, now=now)
-    emotion = effective.emotion
-    mood = effective.mood
-    if emotion.primary in {"angry", "irritated", "frustrated"}:
-        return "Style: warmth lower; patience guarded; directness firmer; playfulness and humor restrained."
-    if emotion.primary in {"sad", "disappointed"}:
-        return "Style: warmth restrained; pace gentler; playfulness low; do not become falsely cheerful."
-    if emotion.primary == "concerned":
-        return "Style: attentiveness higher; humor restrained; pace measured; answer with care."
-    if emotion.primary in {"amused", "excited", "affectionate", "content"} or mood.valence >= 0.18:
-        return "Style: warmth and openness higher; playfulness light; keep the answer natural."
-    if mood.valence <= -0.18:
-        return "Style: warmth slightly lower; patience reserved; be clear without narrating distance."
-    return ""
 
 
 def format_emotional_context(
@@ -1814,51 +2395,20 @@ def format_emotional_context(
     emotion = effective.emotion
     lines: list[str] = []
     if mood.updated_at > 0.0 or mood.cause:
-        valence = (
-            "strongly negative"
-            if mood.valence <= -0.6
-            else "mildly negative"
-            if mood.valence <= -0.15
-            else "strongly positive"
-            if mood.valence >= 0.6
-            else "mildly positive"
-            if mood.valence >= 0.15
-            else "balanced"
-        )
-        energy = (
-            "very depleted"
-            if mood.energy <= -0.6
-            else "somewhat depleted"
-            if mood.energy <= -0.15
-            else "highly energized"
-            if mood.energy >= 0.6
-            else "moderately energized"
-            if mood.energy >= 0.15
-            else "steady energy"
-        )
-        lines.append(f"Akane's mood: {valence} and {energy}.")
+        lines.append(f"mood.valence={mood.valence:+.2f}; mood.energy={mood.energy:+.2f}")
         if mood.cause:
-            lines.append(f"Ongoing influence: {mood.cause}.")
+            lines.append(f"mood.cause={mood.cause}")
     elif include_unappraised:
-        lines.append("Akane's underlying mood has not yet been appraised.")
+        lines.append("mood=unappraised")
 
     if emotion.primary != "neutral" and emotion.intensity >= 0.08:
-        degree = (
-            "strong"
-            if emotion.intensity >= 0.7
-            else "moderate"
-            if emotion.intensity >= 0.35
-            else "mild"
-        )
         lines.append(
-            f"Akane's current emotion: {emotion.primary} at {degree} intensity."
+            f"emotion.primary={emotion.primary}; emotion.intensity={emotion.intensity:.2f}"
         )
         if emotion.cause:
-            lines.append(f"Grounded cause: {emotion.cause}.")
+            lines.append(f"emotion.cause={emotion.cause}")
     elif include_unappraised and emotion.updated_at <= 0.0:
-        lines.append("Akane's immediate emotion has not yet been appraised.")
-    if guidance := compile_affect_guidance(profile, now=now):
-        lines.append(guidance)
+        lines.append("emotion=unappraised")
     return "\n".join(lines)
 
 
@@ -1880,8 +2430,476 @@ class StateSnapshot:
     ownership_classification: tuple[str, ...] = ()
     relevant_opinions: tuple[Opinion, ...] = ()
     relevant_preferences: tuple[AkanePreference, ...] = ()
+    relevant_interests: tuple[Interest, ...] = ()
     relevant_relationship: tuple[RelationshipEntry, ...] = ()
+    familiarity: str = ""
     affect_transition: dict[str, object] | None = None
+    self_model: SelfModelState = SelfModelState()
+    relevant_self_model: tuple[object, ...] = ()
+    strategies: tuple[Strategy, ...] = ()
+    relevant_strategies: tuple[Strategy, ...] = ()
+
+
+def _familiarity_context(
+    profile: ProfileState,
+    conversations: dict[str, ConversationRecord],
+    profile_id: str,
+) -> str:
+    """Describe shared history qualitatively; never expose relationship scores."""
+
+    exchanges = sum(
+        sum(turn.role == "user" for turn in _complete_turns(record.recent_turns))
+        for record in conversations.values()
+        if record.profile_id == profile_id
+    )
+    shared_evidence = (
+        len(profile.relationship.shared_context)
+        + len(profile.relationship.unresolved_events)
+        + sum(item.evidence_count >= 2 for item in profile.relationship.patterns)
+    )
+    if exchanges >= 12 or shared_evidence >= 4:
+        return "Familiarity is established through repeated shared conversations."
+    if exchanges >= 4 or shared_evidence >= 2:
+        return "Familiarity is growing through several shared conversations."
+    return ""
+
+
+def _relevant_profile_state(
+    profile: ProfileState,
+    query: str,
+    now: float,
+) -> tuple[
+    tuple[Memory, ...],
+    tuple[Opinion, ...],
+    tuple[AkanePreference, ...],
+    tuple[Interest, ...],
+    tuple[RelationshipEntry, ...],
+]:
+    relationship = profile.relationship
+    opinions = _relevant_values(
+        profile.opinions,
+        query,
+        now,
+        confidence_of=lambda item: 0.7 * item.confidence + 0.3 * item.importance,
+        limit=3,
+    )
+    preferences = _relevant_values(
+        profile.preferences,
+        query,
+        now,
+        confidence_of=lambda _item: 0.7,
+        limit=3,
+    )
+    preferences = tuple(
+        item
+        for item in preferences
+        if not any(_similar(item.topic, opinion.topic) >= 0.70 for opinion in opinions)
+    )
+    return (
+        _relevant_values(
+            profile.memories,
+            query,
+            now,
+            text_of=lambda item: item.text,
+            limit=MEMORY_MAX_RESULTS,
+        ),
+        opinions,
+        preferences,
+        _relevant_values(
+            tuple(item for item in profile.interests if item.strength >= 0.25),
+            query,
+            now,
+            confidence_of=lambda item: item.strength,
+            limit=3,
+        ),
+        _relevant_values(
+            (
+                *(item for item in relationship.patterns if item.evidence_count >= 2),
+                *relationship.shared_context,
+                *relationship.unresolved_events,
+            ),
+            query,
+            now,
+            limit=3,
+        ),
+    )
+
+
+def _relevant_self_model(
+    state: SelfModelState,
+    query: str,
+    now: float,
+) -> tuple[object, ...]:
+    categories: set[str] = set()
+    if _SELF_QUERY_CAPABILITY.search(query):
+        categories.add("capability")
+    if _SELF_QUERY_LIMITATION.search(query):
+        categories.update(("limitation", "improvement"))
+    if _SELF_QUERY_TRAIT.search(query):
+        categories.add("trait")
+    query_key = _key(query)
+    if "about yourself" in query_key or "understand about yourself" in query_key:
+        categories.update(("capability", "limitation", "trait", "improvement"))
+
+    scored: list[tuple[float, float, object]] = []
+    for item in state.items:
+        score = lightweight_relevance_score(
+            query,
+            item.content,
+            now=now,
+            updated_at=item.updated_at,
+            confidence=item.confidence,
+        )
+        if item.category in categories:
+            score = max(score, 0.31)
+        elif not (_terms(query) & _terms(item.content)):
+            score = 0.0
+        if score >= 0.26:
+            scored.append((score, item.updated_at, item))
+    for target in state.improvement_targets:
+        score = lightweight_relevance_score(
+            query,
+            target.content,
+            now=now,
+            updated_at=target.updated_at,
+            confidence=target.priority,
+        )
+        if "improvement" in categories:
+            score = max(score, 0.31)
+        elif not (_terms(query) & _terms(target.content)):
+            score = 0.0
+        if score >= 0.26:
+            scored.append((score, target.updated_at, target))
+    return tuple(item for _score, _updated, item in sorted(scored, reverse=True)[:3])
+
+
+def _strategy_metric_kind(
+    strategy: Strategy,
+    goal: ImprovementTarget,
+) -> str | None:
+    text = f"{strategy.description} {goal.description} {goal.reason}"
+    if _QUESTION_BEHAVIOR.search(text) or (
+        re.search(r"\bdirect(?:ly|ness)?\b", text, re.IGNORECASE)
+        and re.search(r"\banswer", text, re.IGNORECASE)
+    ):
+        return "clarification_directness"
+    return None
+
+
+def _strategy_applies(
+    strategy: Strategy,
+    goal: ImprovementTarget,
+    query: str,
+) -> bool:
+    if strategy.status != "active" or not query.strip():
+        return False
+    if _strategy_metric_kind(strategy, goal) == "clarification_directness":
+        if _AMBIGUOUS_QUESTION.search(query) or _TECHNICAL_QUESTION.search(query):
+            return False
+        return bool(_PERSONAL_QUESTION.search(query) and query.rstrip().endswith("?"))
+    return bool(
+        _terms(query) & _terms(f"{strategy.description} {goal.content}")
+        and lightweight_relevance_score(
+            query,
+            f"{strategy.description} {goal.content}",
+            now=0.0,
+            updated_at=0.0,
+            confidence=strategy.confidence,
+        )
+        >= 0.28
+    )
+
+
+def _relevant_strategies(
+    strategies: tuple[Strategy, ...],
+    state: SelfModelState,
+    query: str,
+) -> tuple[Strategy, ...]:
+    goals = {goal.id: goal for goal in state.improvement_targets}
+    relevant = tuple(
+        strategy
+        for strategy in strategies
+        if (goal := goals.get(strategy.goal_id)) is not None
+        and _strategy_applies(strategy, goal, query)
+    )
+    return tuple(
+        sorted(
+            relevant,
+            key=lambda item: (item.confidence, item.updated_at, item.id),
+            reverse=True,
+        )[:2]
+    )
+
+
+def _interest_presence_source_id(interest: Interest) -> str:
+    return _stable_state_id("presence-interest", str(interest))
+
+
+def _relationship_presence_source_id(entry: RelationshipEntry) -> str:
+    return _stable_state_id(
+        "presence-relationship",
+        entry.summary,
+        f"{entry.updated_at:.6f}",
+    )
+
+
+def _presence_candidates(profile: ProfileState) -> tuple[PresenceCandidate, ...]:
+    """Build autonomous candidates only from Akane-owned or shared safe state."""
+
+    candidates: list[PresenceCandidate] = []
+    for interest in profile.interests:
+        if (
+            interest.strength < 0.50
+            or interest.source_type == "offscreen_presence"
+            or _SENSITIVE_PATTERN.search(str(interest))
+        ):
+            continue
+        candidates.append(
+            PresenceCandidate(
+                "revisiting_interest",
+                str(interest),
+                "interest",
+                tuple(
+                    dict.fromkeys(
+                        (_interest_presence_source_id(interest), *interest.source_ids)
+                    )
+                )[-8:],
+                interest.source_type,
+                interest.strength,
+                interest.updated_at,
+                interest.strength,
+                interest.strength,
+            )
+        )
+    for opinion in profile.opinions:
+        if (
+            opinion.confidence < 0.50
+            or opinion.source_type == "offscreen_presence"
+            or _SENSITIVE_PATTERN.search(opinion.content)
+        ):
+            continue
+        candidates.append(
+            PresenceCandidate(
+                "reconsidering_opinion",
+                opinion.topic,
+                "opinion",
+                (opinion.id,),
+                opinion.source_type,
+                opinion.confidence,
+                opinion.updated_at,
+                max(0.45, 1.0 - opinion.confidence),
+            )
+        )
+    for memory in profile.memories:
+        if (
+            memory.subject != "akane"
+            or memory.source_type != "conversation"
+            or memory.kind not in {"event", "project", "concern"}
+            or memory.confidence < 0.65
+            or _SENSITIVE_PATTERN.search(memory.text)
+        ):
+            continue
+        candidates.append(
+            PresenceCandidate(
+                "following_unfinished_thought",
+                memory.text,
+                "akane_experience",
+                (memory.id,),
+                memory.source_type,
+                memory.confidence,
+                memory.updated_at,
+                0.95 if memory.kind in {"project", "concern"} else 0.65,
+                unresolved=memory.kind in {"project", "concern"},
+            )
+        )
+    unresolved_ids = {
+        _relationship_presence_source_id(entry)
+        for entry in profile.relationship.unresolved_events
+    }
+    for entry in (
+        *profile.relationship.unresolved_events,
+        *profile.relationship.shared_context,
+    ):
+        source_id = _relationship_presence_source_id(entry)
+        if entry.confidence < 0.65 or _SENSITIVE_PATTERN.search(entry.summary):
+            continue
+        candidates.append(
+            PresenceCandidate(
+                "reflecting_on_shared_thread",
+                entry.summary,
+                "shared_thread",
+                tuple(dict.fromkeys((source_id, *entry.source_ids)))[-8:],
+                "relationship",
+                entry.confidence,
+                entry.updated_at,
+                1.0 if source_id in unresolved_ids else 0.70,
+                unresolved=source_id in unresolved_ids,
+            )
+        )
+    return tuple(candidates)
+
+
+def _presence_emotion_weights(profile: ProfileState, *, now: float) -> dict[str, float]:
+    primary = effective_emotion(profile.emotion, now=now).primary
+    weights: dict[str, float] = {}
+    if primary in {"curious", "interested", "inspired", "excited"}:
+        weights["revisiting_interest"] = 1.0
+    if primary in {"uncertain", "concerned", "anxious"}:
+        weights["reconsidering_opinion"] = 0.9
+        weights["reflecting_on_shared_thread"] = 0.5
+    if primary in {"affectionate", "content", "hopeful"}:
+        weights["reflecting_on_shared_thread"] = 0.7
+    if primary in {"frustrated", "disappointed", "sad"}:
+        weights["following_unfinished_thought"] = 0.6
+    return weights
+
+
+@dataclass(frozen=True, slots=True)
+class PresenceConsequenceEligibility:
+    eligible: bool
+    reason: str
+    basis: str = ""
+
+
+def _presence_activity_source(
+    profile: ProfileState,
+    activity: PresenceActivity | None,
+) -> tuple[object | None, str, str]:
+    if activity is None or activity.kind in {"quiet", "legacy"} or not activity.source_ids:
+        return None, "", ""
+    source_id = activity.source_ids[0]
+    if activity.subject_kind == "interest":
+        source = next(
+            (
+                item
+                for item in profile.interests
+                if _interest_presence_source_id(item) == source_id
+                and item.source_type != "offscreen_presence"
+            ),
+            None,
+        )
+        return (
+            source,
+            f"{source.content} — {source.reason}" if source is not None else "",
+            "interest",
+        )
+    if activity.subject_kind == "opinion":
+        source = next(
+            (
+                item
+                for item in profile.opinions
+                if item.id == source_id and item.source_type != "offscreen_presence"
+            ),
+            None,
+        )
+        return source, source.content if source is not None else "", "opinion"
+    if activity.subject_kind == "akane_experience":
+        source = next(
+            (
+                item
+                for item in profile.memories
+                if item.id == source_id
+                and item.subject == "akane"
+                and item.source_type == "conversation"
+            ),
+            None,
+        )
+        return source, source.text if source is not None else "", "akane_experience"
+    if activity.subject_kind == "shared_thread":
+        source = next(
+            (
+                item
+                for item in profile.relationship.unresolved_events
+                if _relationship_presence_source_id(item) == source_id
+                and not _SENSITIVE_PATTERN.search(item.summary)
+            ),
+            None,
+        )
+        if source is not None:
+            return source, source.summary, "unresolved_shared_thread"
+        source = next(
+            (
+                item
+                for item in profile.relationship.shared_context
+                if _relationship_presence_source_id(item) == source_id
+                and not _SENSITIVE_PATTERN.search(item.summary)
+            ),
+            None,
+        )
+        return source, source.summary if source is not None else "", "shared_context"
+    return None, "", ""
+
+
+def presence_consequence_eligibility(
+    profile: ProfileState,
+    activity: PresenceActivity | None,
+    *,
+    now: float,
+) -> PresenceConsequenceEligibility:
+    """Gate optional episodic inference using only committed trusted state."""
+
+    if activity is None:
+        return PresenceConsequenceEligibility(False, "no_completed_presence")
+    if activity.kind in {"quiet", "legacy"}:
+        return PresenceConsequenceEligibility(False, "quiet_or_legacy")
+    if not activity.source_ids:
+        return PresenceConsequenceEligibility(False, "missing_source_ids")
+    if activity.grounding_confidence < _PRESENCE_CONSEQUENCE_MIN_CONFIDENCE:
+        return PresenceConsequenceEligibility(False, "insufficient_grounding")
+    if (
+        activity.expected_end_at - activity.started_at
+        < _PRESENCE_CONSEQUENCE_MIN_INTERVAL_SECONDS
+    ):
+        return PresenceConsequenceEligibility(False, "trivial_interval")
+    if activity.origin in {"identity", "legacy", "legacy_presence", "offscreen_presence"}:
+        return PresenceConsequenceEligibility(False, "routine_source")
+    source, basis, source_kind = _presence_activity_source(profile, activity)
+    if source is None or not basis:
+        return PresenceConsequenceEligibility(False, "invalid_source_id")
+    expected = {
+        "revisiting_interest": "interest",
+        "reconsidering_opinion": "opinion",
+        "following_unfinished_thought": "akane_experience",
+        "reflecting_on_shared_thread": "shared_thread",
+    }.get(activity.kind)
+    if expected != activity.subject_kind or not _grounded(activity.subject, basis):
+        return PresenceConsequenceEligibility(False, "fabricated_presence")
+    updated_at = max(0.0, float(getattr(source, "updated_at", 0.0)))
+    if (
+        updated_at <= 0.0
+        or now - updated_at > _PRESENCE_CONSEQUENCE_MAX_SOURCE_AGE_SECONDS
+    ):
+        return PresenceConsequenceEligibility(False, "stale_subject")
+    if profile.presence.last_appraised_activity_id == activity.activity_id:
+        return PresenceConsequenceEligibility(False, "already_appraised")
+    if any(
+        memory.source_type == "offscreen_presence"
+        and memory.source_id == activity.activity_id
+        for memory in profile.memories
+    ) or any(activity.activity_id in interest.source_ids for interest in profile.interests) or any(
+        activity.activity_id in opinion.source_ids for opinion in profile.opinions
+    ):
+        return PresenceConsequenceEligibility(False, "recent_experience_repeat")
+    if source_kind == "interest" and getattr(source, "strength", 1.0) >= 0.95:
+        return PresenceConsequenceEligibility(False, "no_meaningful_change")
+    if source_kind == "akane_experience" and getattr(source, "kind", "") not in {
+        "project",
+        "concern",
+    }:
+        return PresenceConsequenceEligibility(False, "routine_experience")
+    if source_kind == "shared_context":
+        return PresenceConsequenceEligibility(False, "routine_shared_context")
+    return PresenceConsequenceEligibility(True, "eligible", basis)
+
+
+def presence_activity_basis(
+    profile: ProfileState,
+    activity: PresenceActivity | None,
+) -> str:
+    """Resolve an orientation back to its still-committed authoritative source."""
+
+    _source, basis, _source_kind = _presence_activity_source(profile, activity)
+    return basis
 
 
 def _merge_memories(
@@ -1917,49 +2935,67 @@ def _merge_memories(
     )
 
 
-def _merge_preferences(
-    current: tuple[AkanePreference, ...],
-    additions: tuple[AkanePreference, ...],
-) -> tuple[AkanePreference, ...]:
+def _merge_latest(
+    current: tuple[_T, ...],
+    additions: tuple[_T, ...],
+    *,
+    matches: Callable[[_T, _T], bool],
+    limit: int,
+    sort_key: Callable[[_T], object] | None = None,
+) -> tuple[_T, ...]:
     result = list(current)
     for item in additions:
         match = next(
-            (index for index, existing in enumerate(result) if _key(existing.topic) == _key(item.topic)),
+            (index for index, existing in enumerate(result) if matches(existing, item)),
             None,
         )
         if match is None:
             result.append(item)
         elif item.updated_at >= result[match].updated_at:
             result[match] = item
-    return tuple(result[-_MAX_PREFERENCES:])
+    ordered = sorted(result, key=sort_key) if sort_key else result
+    return tuple(ordered[-limit:])
+
+
+def _merge_preferences(
+    current: tuple[AkanePreference, ...],
+    additions: tuple[AkanePreference, ...],
+) -> tuple[AkanePreference, ...]:
+    return _merge_latest(
+        current,
+        additions,
+        matches=lambda existing, item: _key(existing.topic) == _key(item.topic),
+        limit=_MAX_PREFERENCES,
+    )
+
+
+def _merge_interests(
+    current: tuple[Interest, ...],
+    additions: tuple[Interest, ...],
+) -> tuple[Interest, ...]:
+    return _merge_latest(
+        current,
+        additions,
+        matches=lambda existing, item: _key(existing) == _key(item),
+        sort_key=lambda item: (item.updated_at, item.created_at),
+        limit=_MAX_INTERESTS,
+    )
 
 
 def _merge_communication_preferences(
     current: tuple[CommunicationPreference, ...],
     additions: tuple[CommunicationPreference, ...],
 ) -> tuple[CommunicationPreference, ...]:
-    result = list(current)
-    for item in additions:
-        match = next(
-            (
-                index
-                for index, existing in enumerate(result)
-                if existing.key == item.key
-                and (
-                    item.key != "forbidden_phrase"
-                    or _key(existing.value) == _key(item.value)
-                )
-            ),
-            None,
-        )
-        if match is None:
-            result.append(item)
-        elif item.updated_at >= result[match].updated_at:
-            result[match] = item
-    return tuple(
-        sorted(result, key=lambda item: (item.updated_at, item.created_at))[
-            -_MAX_COMMUNICATION_PREFERENCES:
-        ]
+    return _merge_latest(
+        current,
+        additions,
+        matches=lambda existing, item: existing.key == item.key
+        and (
+            item.key != "forbidden_phrase"
+            or _key(existing.value) == _key(item.value)
+        ),
+        sort_key=lambda item: (item.updated_at, item.created_at),
+        limit=_MAX_COMMUNICATION_PREFERENCES,
     )
 
 
@@ -1967,17 +3003,132 @@ def _merge_opinions(
     current: tuple[Opinion, ...],
     additions: tuple[Opinion, ...],
 ) -> tuple[Opinion, ...]:
-    result = list(current)
-    for item in additions:
-        match = next(
-            (index for index, existing in enumerate(result) if _key(existing.topic) == _key(item.topic)),
-            None,
+    return _merge_latest(
+        current,
+        additions,
+        matches=lambda existing, item: _key(existing.topic) == _key(item.topic),
+        limit=_MAX_OPINIONS,
+    )
+
+
+def conversation_opinion_candidate(
+    user_text: str,
+    assistant_text: str,
+    current: tuple[Opinion, ...],
+) -> dict[str, object] | None:
+    """Derive one validator-bound candidate from Akane's explicit visible stance."""
+
+    reply = compact_text(assistant_text, 800)
+    if not reply or not _AKANE_OPINION_ADOPTION.search(reply):
+        return None
+    sentences = tuple(
+        compact_text(value, 280)
+        for value in re.split(r"(?<=[.!?])\s+", reply)
+        if compact_text(value, 280)
+    )
+    adopted_index = next(
+        (
+            index
+            for index, sentence in enumerate(sentences)
+            if _AKANE_OPINION_ADOPTION.search(sentence)
+            and not _AKANE_SELF_CLAIM.search(sentence)
+            and not _TRANSIENT_SELF_REACTION.search(sentence)
+        ),
+        None,
+    )
+    if adopted_index is None:
+        return None
+    adopted = sentences[adopted_index]
+    reason = ""
+    because = re.search(r"\b(?:because|since)\b\s+(.+)", adopted, re.IGNORECASE)
+    if because:
+        position = compact_text(adopted[:because.start()].rstrip(" ,;:-") + ".", 200)
+        reason = compact_text(because.group(1), 240)
+    else:
+        position = compact_text(adopted, 200)
+        reason = compact_text(" ".join(sentences[adopted_index + 1:]), 240)
+
+    self_domain = bool(_SELF_OPINION_QUERY.search(user_text))
+    existing: Opinion | None = None
+    if self_domain:
+        existing = max(
+            (item for item in current if item.domain == "self"),
+            key=lambda item: item.updated_at,
+            default=None,
         )
-        if match is None:
-            result.append(item)
-        elif item.updated_at >= result[match].updated_at:
-            result[match] = item
-    return tuple(result[-_MAX_OPINIONS:])
+        topic = existing.topic if existing is not None else "who I am"
+        domain = "self"
+    else:
+        patterns = (
+            r"\bwhat do you think (?:of|about)\s+(.+?)(?:[?.!]|$)",
+            r"\bhow do you feel about\s+(.+?)(?:[?.!]|$)",
+            r"\bdo you (?:like|love|dislike|hate|prefer|value)\s+(.+?)(?:[?.!]|$)",
+        )
+        topic = next(
+            (
+                compact_text(match.group(1), 140)
+                for pattern in patterns
+                if (match := re.search(pattern, user_text, re.IGNORECASE)) is not None
+            ),
+            "",
+        )
+        if _key(topic) in {"it", "them", "that", "this", "those", "these"}:
+            adoption = re.search(
+                r"\bi (?:like|love|dislike|hate|prefer|value)\s+([^.!?]+)",
+                user_text,
+                re.IGNORECASE,
+            )
+            topic = compact_text(adoption.group(1), 140) if adoption else ""
+        if not topic:
+            return None
+        existing = max(
+            (
+                item
+                for item in current
+                if _similar(item.topic, topic) >= 0.62
+            ),
+            key=lambda item: (_similar(item.topic, topic), item.updated_at),
+            default=None,
+        )
+        if existing is not None:
+            topic = existing.topic
+            domain = existing.domain
+        else:
+            domain = "general"
+
+    has_explanation = bool(reason and _key(reason) != _key(position))
+    confidence = existing.confidence if existing is not None else 0.68
+    importance = existing.importance if existing is not None else (
+        0.72 if self_domain and has_explanation else 0.62 if has_explanation else 0.40
+    )
+    operation = "form"
+    candidate: dict[str, object] = {
+        "op": operation,
+        "topic": topic,
+        "domain": domain,
+        "position": position,
+        "reason": reason or position,
+        "confidence": confidence,
+        "importance": importance,
+    }
+    if existing is not None:
+        if not has_explanation:
+            return None
+        operation = (
+            "reinforce"
+            if _similar(existing.position, position) >= 0.70
+            else "update"
+        )
+        candidate.update(
+            op=operation,
+            target_id=existing.id,
+            confidence=(
+                min(0.95, existing.confidence + 0.05)
+                if operation == "reinforce"
+                else existing.confidence
+            ),
+        )
+    return candidate
 
 
 def communication_directives(profile: ProfileState) -> tuple[str, ...]:
@@ -2043,9 +3194,20 @@ def _merge_relationship_entries(
         )
         if match is None:
             result.append(item)
-        elif item.updated_at >= result[match].updated_at:
-            result[match] = item
-    return tuple(result[-_MAX_RELATIONSHIP_ENTRIES:])
+            continue
+        existing = result[match]
+        source_ids = tuple(dict.fromkeys((*existing.source_ids, *item.source_ids)))[-6:]
+        new_evidence = max(0, len(source_ids) - len(existing.source_ids))
+        result[match] = RelationshipEntry(
+            item.summary if item.updated_at >= existing.updated_at else existing.summary,
+            min(0.98, max(existing.confidence, item.confidence) + 0.04 * new_evidence),
+            max(existing.updated_at, item.updated_at),
+            max(existing.evidence_count, len(source_ids), item.evidence_count),
+            source_ids,
+        )
+    return tuple(
+        sorted(result, key=lambda item: item.updated_at)[-_MAX_RELATIONSHIP_ENTRIES:]
+    )
 
 
 def _merge_relationship(
@@ -2150,10 +3312,7 @@ def _merge_profiles(left: ProfileState, right: ProfileState, *, now: float) -> P
         emotion=emotion,
         presence=presence,
         memories=_merge_memories(left.memories, right.memories),
-        interests=_dedupe_text(
-            (*left.interests, *right.interests),
-            limit=_MAX_INTERESTS,
-        ),
+        interests=_merge_interests(left.interests, right.interests),
         preferences=_merge_preferences(left.preferences, right.preferences),
         communication_preferences=_merge_communication_preferences(
             left.communication_preferences,
@@ -2239,10 +3398,7 @@ def _validate_canonical_profile(
     normalized = dict(payload)
     raw_presence = payload.get("presence")
     if isinstance(raw_presence, dict):
-        normalized["presence"] = PresenceState.from_dict(
-            raw_presence,
-            now=now,
-        ).as_dict()
+        normalized["presence"] = PresenceState.from_dict(raw_presence, now=now).as_dict()
     raw_initiative = payload.get("initiative")
     if isinstance(raw_initiative, dict):
         normalized_initiative = dict(raw_initiative)
@@ -2252,10 +3408,7 @@ def _validate_canonical_profile(
             token = normalized_current.get("claim_token")
             expires = _number(normalized_current.get("claim_expires_at"))
             if isinstance(token, str) and token.strip() and expires <= now:
-                channel = compact_text(
-                    normalized_current.get("delivery_channel"),
-                    16,
-                ).casefold()
+                channel = compact_text(normalized_current.get("delivery_channel"), 16).casefold()
                 failed = list(normalized_current.get("failed_channels") or ())
                 if (
                     normalized_current.get("status") == "pending_delivery"
@@ -2283,7 +3436,7 @@ def _validate_canonical_profile(
             if _number(normalized_emotion.get(field_name)) > now:
                 normalized_emotion[field_name] = now
         normalized["emotion"] = normalized_emotion
-    if normalized != profile.as_dict():
+    if normalized != profile.as_dict(include_opinions=False):
         raise ValueError("canonical profile contains malformed state")
 
 
@@ -2302,12 +3455,42 @@ def _validate_canonical_conversation(
 class StateStore:
     """Sole production owner of validated state and atomic persistence."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        opinions_path: Path | None = None,
+        self_model_path: Path | None = None,
+        strategies_path: Path | None = None,
+    ) -> None:
         self._path = Path(path) if path is not None else LONG_TERM_MEMORY_PATH
         self._default_path = path is None
+        self._opinions_path = (
+            Path(opinions_path)
+            if opinions_path is not None
+            else OPINIONS_PATH
+            if self._default_path
+            else self._path.with_name("opinions.json")
+        )
+        self._self_model_path = (
+            Path(self_model_path)
+            if self_model_path is not None
+            else SELF_MODEL_PATH
+            if self._default_path
+            else self._path.with_name("self_model.json")
+        )
+        self._strategies_path = (
+            Path(strategies_path)
+            if strategies_path is not None
+            else STRATEGIES_PATH
+            if self._default_path
+            else self._path.with_name("strategies.json")
+        )
         self._lock = threading.RLock()
         self._profiles: dict[str, ProfileState] = {}
         self._conversations: dict[str, ConversationRecord] = {}
+        self._self_model = SelfModelState()
+        self._strategies: tuple[Strategy, ...] = ()
         self._revision = 0
         self._committed_at = 0.0
         self._autonomy_wake: Callable[[str], None] | None = None
@@ -2329,12 +3512,257 @@ class StateStore:
             "revision": revision,
             "committed_at": committed_at,
             "profiles": {
-                key: value.as_dict() for key, value in profiles.items()
+                key: value.as_dict(include_opinions=False)
+                for key, value in profiles.items()
             },
             "conversations": {
                 key: value.as_dict() for key, value in conversations.items()
             },
         }
+
+    @staticmethod
+    def _opinion_document(opinions: tuple[Opinion, ...]) -> dict[str, object]:
+        return {
+            "version": OPINION_SCHEMA_VERSION,
+            "opinions": [opinion.as_dict() for opinion in opinions],
+        }
+
+    @staticmethod
+    def _self_model_document(state: SelfModelState) -> dict[str, object]:
+        return {"version": SELF_MODEL_SCHEMA_VERSION, **state.as_dict()}
+
+    @staticmethod
+    def _strategy_document(strategies: tuple[Strategy, ...]) -> dict[str, object]:
+        return {
+            "version": STRATEGY_SCHEMA_VERSION,
+            "strategies": [strategy.as_dict() for strategy in strategies],
+        }
+
+    def _decode_self_model_source(self, payload: object) -> SelfModelState:
+        fields = {
+            "version",
+            "capabilities",
+            "limitations",
+            "traits",
+            "improvement_targets",
+        }
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != fields
+            or payload.get("version") != SELF_MODEL_SCHEMA_VERSION
+            or type(payload.get("version")) is not int
+        ):
+            raise RuntimeError(
+                f"Akane self-model recovery is required for {self._self_model_path}: "
+                "malformed or unsupported schema"
+            )
+
+        def items(field_name: str, category: str) -> tuple[SelfModelItem, ...]:
+            raw = payload.get(field_name)
+            if not isinstance(raw, list):
+                return ()
+            return tuple(
+                item
+                for value in raw
+                if (item := SelfModelItem.from_dict(category, value)) is not None
+            )
+
+        raw_targets = payload.get("improvement_targets")
+        targets = tuple(
+            target
+            for value in (raw_targets if isinstance(raw_targets, list) else ())
+            if (target := ImprovementTarget.from_dict(value)) is not None
+        )
+        state = SelfModelState(
+            items("capabilities", "capability"),
+            items("limitations", "limitation"),
+            items("traits", "trait"),
+            targets,
+        )
+        ids = [item.id for item in state.items]
+        target_ids = [target.id for target in state.improvement_targets]
+        limitation_ids = {item.id for item in state.limitations}
+        malformed = (
+            any(not isinstance(payload.get(name), list) for name in fields - {"version"})
+            or len(ids) != len(set(ids))
+            or len(target_ids) != len(set(target_ids))
+            or len(state.capabilities) > _MAX_SELF_MODEL_ITEMS_PER_CATEGORY
+            or len(state.limitations) > _MAX_SELF_MODEL_ITEMS_PER_CATEGORY
+            or len(state.traits) > _MAX_SELF_MODEL_ITEMS_PER_CATEGORY
+            or len(state.improvement_targets) > _MAX_IMPROVEMENT_TARGETS
+            or any(
+                (evidence := _runtime_capability_for(item.description, item.area))
+                is None
+                or item.source_ids != (evidence.source_id,)
+                for item in state.capabilities
+            )
+            or any(
+                any(source.startswith("runtime:") for source in item.source_ids)
+                and (
+                    (evidence := _runtime_limitation_for(item.description, item.area))
+                    is None
+                    or item.source_ids != (evidence.source_id,)
+                )
+                for item in state.limitations
+            )
+            or any(
+                not any(source in limitation_ids for source in target.source_ids)
+                for target in state.improvement_targets
+            )
+            or self._self_model_document(state) != payload
+        )
+        if malformed:
+            raise RuntimeError(
+                f"Akane self-model recovery is required for {self._self_model_path}: "
+                "canonical state is malformed"
+            )
+        return state
+
+    def _decode_strategy_source(self, payload: object) -> tuple[Strategy, ...]:
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"version", "strategies"}
+            or type(payload.get("version")) is not int
+            or payload.get("version") != STRATEGY_SCHEMA_VERSION
+            or not isinstance(payload.get("strategies"), list)
+        ):
+            raise RuntimeError(
+                f"Akane strategy recovery is required for {self._strategies_path}: "
+                "malformed or unsupported schema"
+            )
+        raw = payload["strategies"]
+        strategies = tuple(
+            strategy
+            for value in raw
+            if (strategy := Strategy.from_dict(value)) is not None
+        )
+        ids = [strategy.id for strategy in strategies]
+        malformed = (
+            len(strategies) != len(raw)
+            or len(ids) != len(set(ids))
+            or len(strategies) > _MAX_STRATEGIES
+            or sum(strategy.status == "active" for strategy in strategies)
+            > _MAX_ACTIVE_STRATEGIES
+            or any(
+                _FOUNDATIONAL_STRATEGY.search(strategy.description)
+                or _BROAD_STRATEGY.search(strategy.description)
+                for strategy in strategies
+            )
+            or self._strategy_document(strategies) != payload
+        )
+        if malformed:
+            raise RuntimeError(
+                f"Akane strategy recovery is required for {self._strategies_path}: "
+                "canonical state is malformed"
+            )
+        return strategies
+
+    @staticmethod
+    def _repair_stale_strategies(
+        strategies: tuple[Strategy, ...],
+        self_model: SelfModelState,
+        *,
+        now: float,
+    ) -> tuple[Strategy, ...]:
+        goal_ids = {goal.id for goal in self_model.improvement_targets}
+        return tuple(
+            replace(
+                strategy,
+                status="abandoned",
+                updated_at=now,
+                evidence_summary="The linked improvement target no longer exists.",
+                last_evaluation_result="stale_goal",
+                revision_count=strategy.revision_count + 1,
+            )
+            if strategy.status == "active" and strategy.goal_id not in goal_ids
+            else strategy
+            for strategy in strategies
+        )
+
+    @staticmethod
+    def _migrate_opinion_provenance(
+        opinions: tuple[Opinion, ...],
+    ) -> tuple[Opinion, ...]:
+        return tuple(
+            opinion
+            if opinion.source_ids
+            else replace(
+                opinion,
+                source_type="legacy",
+                evidence_summary=(
+                    opinion.evidence_summary or "Migrated persisted Akane opinion."
+                ),
+                source_ids=(
+                    "migration:"
+                    + _stable_state_id(
+                        "opinion-migration",
+                        opinion.id,
+                        opinion.topic,
+                        opinion.created_at,
+                    ),
+                ),
+            )
+            for opinion in opinions
+        )
+
+    def _decode_opinion_source(
+        self,
+        payload: object,
+    ) -> tuple[tuple[Opinion, ...], bool]:
+        if isinstance(payload, list):
+            raw_opinions = payload
+            version = 0
+        elif isinstance(payload, dict):
+            raw_version = payload.get("version", 0)
+            if type(raw_version) is not int or raw_version not in range(
+                OPINION_SCHEMA_VERSION + 1
+            ):
+                raise RuntimeError(
+                    f"Akane opinion recovery is required for {self._opinions_path}: "
+                    "unsupported schema"
+                )
+            version = raw_version
+            if version == OPINION_SCHEMA_VERSION and set(payload) != {
+                "version",
+                "opinions",
+            }:
+                raise RuntimeError(
+                    f"Akane opinion recovery is required for {self._opinions_path}: "
+                    "malformed header"
+                )
+            raw_opinions = payload.get("opinions")
+        else:
+            raw_opinions = None
+            version = 0
+        if not isinstance(raw_opinions, list):
+            raise RuntimeError(
+                f"Akane opinion recovery is required for {self._opinions_path}: "
+                "opinions are unavailable"
+            )
+        parsed = tuple(
+            opinion
+            for item in raw_opinions
+            if (opinion := Opinion.from_dict(item)) is not None
+        )
+        if version != OPINION_SCHEMA_VERSION:
+            parsed = self._migrate_opinion_provenance(parsed)
+        opinions = _merge_opinions((), parsed)
+        if version == OPINION_SCHEMA_VERSION and (
+            len(parsed) != len(raw_opinions)
+            or len(opinions) != len(parsed)
+            or any(not opinion.source_ids for opinion in opinions)
+            or [opinion.as_dict() for opinion in opinions] != raw_opinions
+        ):
+            raise RuntimeError(
+                f"Akane opinion recovery is required for {self._opinions_path}: "
+                "canonical opinions are malformed"
+            )
+        if raw_opinions and not opinions:
+            raise RuntimeError(
+                f"Akane opinion recovery is required for {self._opinions_path}: "
+                "no recoverable opinions"
+            )
+        return opinions, version != OPINION_SCHEMA_VERSION
 
     def _replace_all(
         self,
@@ -2342,26 +3770,96 @@ class StateStore:
         conversations: dict[str, ConversationRecord],
         *,
         committed_at: float,
+        self_model: SelfModelState | None = None,
+        strategies: tuple[Strategy, ...] | None = None,
     ) -> bool:
-        if profiles == self._profiles and conversations == self._conversations:
+        next_self_model = self._self_model if self_model is None else self_model
+        next_strategies = self._strategies if strategies is None else strategies
+        if (
+            profiles == self._profiles
+            and conversations == self._conversations
+            and next_self_model == self._self_model
+            and next_strategies == self._strategies
+        ):
             return False
         revision = self._revision + 1
-        atomic_write_json(
-            self._path,
-            self._document(profiles, conversations, revision, committed_at),
-        )
+        current_opinions = (
+            self._profiles.get(OWNER_PROFILE_ID) or ProfileState()
+        ).opinions
+        next_opinions = (
+            profiles.get(OWNER_PROFILE_ID) or ProfileState()
+        ).opinions
+        opinions_changed = next_opinions != current_opinions
+        self_model_changed = next_self_model != self._self_model
+        strategies_changed = next_strategies != self._strategies
+        opinions_written = False
+        self_model_written = False
+        strategies_written = False
+        try:
+            if opinions_changed:
+                atomic_write_json(
+                    self._opinions_path,
+                    self._opinion_document(next_opinions),
+                )
+                opinions_written = True
+            if self_model_changed:
+                atomic_write_json(
+                    self._self_model_path,
+                    self._self_model_document(next_self_model),
+                )
+                self_model_written = True
+            if strategies_changed:
+                atomic_write_json(
+                    self._strategies_path,
+                    self._strategy_document(next_strategies),
+                )
+                strategies_written = True
+            atomic_write_json(
+                self._path,
+                self._document(profiles, conversations, revision, committed_at),
+            )
+        except Exception:
+            if opinions_written:
+                atomic_write_json(
+                    self._opinions_path,
+                    self._opinion_document(current_opinions),
+                )
+            if self_model_written:
+                atomic_write_json(
+                    self._self_model_path,
+                    self._self_model_document(self._self_model),
+                )
+            if strategies_written:
+                atomic_write_json(
+                    self._strategies_path,
+                    self._strategy_document(self._strategies),
+                )
+            raise
         self._profiles = profiles
         self._conversations = conversations
+        self._self_model = next_self_model
+        self._strategies = next_strategies
         self._revision = revision
         self._committed_at = committed_at
         return True
 
-    def _normalize_profile_presence(
+    def _replace_profile(
         self,
-        profile: ProfileState,
+        profile_id: str,
+        state: ProfileState,
         *,
-        now: float,
-    ) -> ProfileState:
+        committed_at: float,
+        conversations: dict[str, ConversationRecord] | None = None,
+    ) -> bool:
+        profiles = self._profiles.copy()
+        profiles[profile_id] = state
+        return self._replace_all(
+            profiles,
+            self._conversations.copy() if conversations is None else conversations,
+            committed_at=committed_at,
+        )
+
+    def _normalize_profile_presence(self, profile: ProfileState, *, now: float) -> ProfileState:
         """Return temporal presence truth without mutating or persisting state."""
 
         presence = normalize_presence(profile.presence, now=now)
@@ -2416,16 +3914,16 @@ class StateStore:
             raise ValueError("canonical state profiles are unavailable")
         if isinstance(raw_profiles, dict):
             for raw_id, raw_profile in raw_profiles.items():
-                if schema == STATE_SCHEMA_VERSION and not isinstance(
-                    raw_profile,
-                    dict,
-                ):
+                if schema == STATE_SCHEMA_VERSION and not isinstance(raw_profile, dict):
                     raise ValueError("canonical profile is malformed")
                 profile = ProfileState.from_dict(
                     (
                         raw_profile
                         if schema == STATE_SCHEMA_VERSION
-                        else _legacy_profile_payload(raw_profile)
+                        else _legacy_profile_payload(
+                            raw_profile,
+                            preserve_structured_memory=schema >= 17,
+                        )
                     ),
                     now=now,
                     migrating=schema != STATE_SCHEMA_VERSION,
@@ -2433,11 +3931,7 @@ class StateStore:
                 if profile is None:
                     continue
                 if schema == STATE_SCHEMA_VERSION:
-                    _validate_canonical_profile(
-                        raw_profile,
-                        profile,
-                        now=now,
-                    )
+                    _validate_canonical_profile(raw_profile, profile, now=now)
                 profile_id = canonical_profile_id(raw_id)
                 profiles[profile_id] = (
                     _merge_profiles(profiles[profile_id], profile, now=now)
@@ -2445,17 +3939,11 @@ class StateStore:
                     else profile
                 )
         elif isinstance(payload.get("user"), dict):
-            profiles[OWNER_PROFILE_ID] = self._popup_profile(
-                payload["user"],
-                now=now,
-            )
+            profiles[OWNER_PROFILE_ID] = self._popup_profile(payload["user"], now=now)
         elif schema == 0:
             profiles[OWNER_PROFILE_ID] = self._popup_profile(payload, now=now)
         raw_conversations = payload.get("conversations")
-        if schema == STATE_SCHEMA_VERSION and not isinstance(
-            raw_conversations,
-            dict,
-        ):
+        if schema == STATE_SCHEMA_VERSION and not isinstance(raw_conversations, dict):
             raise ValueError("canonical state conversations are unavailable")
         if isinstance(raw_conversations, dict):
             for key, raw in raw_conversations.items():
@@ -2510,17 +3998,7 @@ class StateStore:
         def add(text: str, kind: str = "fact") -> None:
             value = compact_text(text, 300)
             if value:
-                memories.append(
-                    Memory(
-                        uuid.uuid4().hex,
-                        "user",
-                        kind,
-                        value,
-                        0.8,
-                        now,
-                        now,
-                    )
-                )
+                memories.append(Memory(uuid.uuid4().hex, "user", kind, value, 0.8, now, now))
 
         name = compact_text(payload.get("name"), 80)
         if name:
@@ -2549,6 +4027,39 @@ class StateStore:
         except (OSError, TypeError, ValueError) as exc:
             raise RuntimeError(
                 f"Akane state recovery is required for {path}: "
+                f"{type(exc).__name__}"
+            ) from exc
+
+    def _read_opinion_source(self) -> object | None:
+        try:
+            return read_json(self._opinions_path)
+        except FileNotFoundError:
+            return None
+        except (OSError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Akane opinion recovery is required for {self._opinions_path}: "
+                f"{type(exc).__name__}"
+            ) from exc
+
+    def _read_self_model_source(self) -> object | None:
+        try:
+            return read_json(self._self_model_path)
+        except FileNotFoundError:
+            return None
+        except (OSError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Akane self-model recovery is required for {self._self_model_path}: "
+                f"{type(exc).__name__}"
+            ) from exc
+
+    def _read_strategy_source(self) -> object | None:
+        try:
+            return read_json(self._strategies_path)
+        except FileNotFoundError:
+            return None
+        except (OSError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Akane strategy recovery is required for {self._strategies_path}: "
                 f"{type(exc).__name__}"
             ) from exc
 
@@ -2593,9 +4104,7 @@ class StateStore:
                 raw_conversations = canonical["conversations"]
                 for profile_id, raw_profile in raw_profiles.items():
                     raw_presence = raw_profile.get("presence")
-                    parsed_presence = profiles[
-                        canonical_profile_id(profile_id)
-                    ].presence.as_dict()
+                    parsed_presence = profiles[canonical_profile_id(profile_id)].presence.as_dict()
                     raw_initiative = raw_profile.get("initiative")
                     raw_opportunity = (
                         raw_initiative.get("current")
@@ -2676,36 +4185,54 @@ class StateStore:
         for profile_id, profile in self._profiles.items():
             presence = profile.presence
             if presence.claim_token is not None or presence.claim_expires_at:
-                presence = replace(
-                    presence,
-                    claim_token=None,
-                    claim_expires_at=0.0,
-                )
+                presence = replace(presence, claim_token=None, claim_expires_at=0.0)
                 migrated = True
-            if (
-                needs_bootstrap(presence)
-                and presence.last_error == "presence inference failed"
-            ):
-                # Older builds rejected the presence lane's priority before inference
-                # and persisted only this generic error. Retry immediately once under
-                # the corrected scheduler instead of preserving a stale backoff.
-                presence = replace(
-                    presence,
-                    retry_at=0.0,
-                    last_error=None,
-                )
-                migrated = True
-            normalized[canonical_profile_id(profile_id)] = replace(
-                profile,
-                presence=presence,
-            )
+            normalized[canonical_profile_id(profile_id)] = replace(profile, presence=presence)
         self._profiles = normalized
+        opinion_payload = self._read_opinion_source()
+        opinions_migrated = opinion_payload is None
+        if opinion_payload is not None:
+            opinions, opinions_migrated = self._decode_opinion_source(opinion_payload)
+            self._profiles[OWNER_PROFILE_ID] = replace(
+                self._profiles[OWNER_PROFILE_ID],
+                opinions=opinions,
+            )
+        else:
+            owner = self._profiles[OWNER_PROFILE_ID]
+            self._profiles[OWNER_PROFILE_ID] = replace(
+                owner,
+                opinions=self._migrate_opinion_provenance(owner.opinions),
+            )
+        self_model_payload = self._read_self_model_source()
+        if self_model_payload is None:
+            self._self_model = SelfModelState()
+            atomic_write_json(
+                self._self_model_path,
+                self._self_model_document(self._self_model),
+            )
+        else:
+            self._self_model = self._decode_self_model_source(self_model_payload)
+        strategy_payload = self._read_strategy_source()
+        if strategy_payload is None:
+            self._strategies = ()
+            atomic_write_json(
+                self._strategies_path,
+                self._strategy_document(self._strategies),
+            )
+        else:
+            loaded_strategies = self._decode_strategy_source(strategy_payload)
+            self._strategies = self._repair_stale_strategies(
+                loaded_strategies,
+                self._self_model,
+                now=now,
+            )
+            if self._strategies != loaded_strategies:
+                atomic_write_json(
+                    self._strategies_path,
+                    self._strategy_document(self._strategies),
+                )
         owner = self._profiles.get(OWNER_PROFILE_ID)
-        if (
-            owner is not None
-            and owner.presence.last_error
-            and owner.presence.retry_at > now
-        ):
+        if (owner is not None and owner.presence.last_error and owner.presence.retry_at > now):
             self._presence_failure_count = 1
         cleaned_conversations = {
             key: _clean_conversation_output(record)
@@ -2714,6 +4241,11 @@ class StateStore:
         migrated = cleaned_conversations != self._conversations or migrated
         self._conversations = cleaned_conversations
         migrated = self._prune_conversations(now) or migrated
+        if opinions_migrated:
+            atomic_write_json(
+                self._opinions_path,
+                self._opinion_document(self._profiles[OWNER_PROFILE_ID].opinions),
+            )
         if canonical is None or migrated:
             atomic_write_json(
                 self._path,
@@ -2749,11 +4281,7 @@ class StateStore:
         self._conversations = kept
         return kept != before
 
-    def _conversation(
-        self,
-        profile_id: str,
-        conversation_id: str,
-    ) -> ConversationRecord:
+    def _conversation(self, profile_id: str, conversation_id: str) -> ConversationRecord:
         current = self._conversations.get(conversation_id)
         if current is not None and current.profile_id == profile_id:
             return current
@@ -2769,11 +4297,7 @@ class StateStore:
                 return
             profiles = self._profiles.copy()
             profiles[profile] = _new_profile(current)
-            self._replace_all(
-                profiles,
-                self._conversations.copy(),
-                committed_at=current,
-            )
+            self._replace_all(profiles, self._conversations.copy(), committed_at=current)
 
     def profile_exists(self, profile_id: str) -> bool:
         profile = canonical_profile_id(profile_id)
@@ -2801,10 +4325,7 @@ class StateStore:
         current = time.time() if now is None else max(0.0, float(now))
         with self._lock:
             profile = self._profiles.get(profile_key) or _new_profile(current)
-            profile = self._normalize_profile_presence(
-                profile,
-                now=current,
-            )
+            profile = self._normalize_profile_presence(profile, now=current)
             conversation = self._conversation(profile_key, conversation_key)
             last_profile_assistant_at = max(
                 (
@@ -2833,25 +4354,22 @@ class StateStore:
                 key=lambda item: item.timestamp,
                 default=None,
             )
-            recalled = (
-                self._retrieve(profile.memories, query, current)
-                if include_memory
-                else ()
+            (
+                recalled,
+                relevant_opinions,
+                relevant_preferences,
+                relevant_interests,
+                relevant_relationship,
+            ) = _relevant_profile_state(profile, query, current)
+            if not include_memory:
+                recalled = ()
+            self_model = (
+                self._self_model
+                if profile_key == OWNER_PROFILE_ID
+                else SelfModelState()
             )
-            relevant_opinions = self._retrieve_opinions(
-                profile.opinions,
-                query,
-                current,
-            )
-            relevant_preferences = self._retrieve_preferences(
-                profile.preferences,
-                query,
-                current,
-            )
-            relevant_relationship = self._retrieve_relationship(
-                profile.relationship,
-                query,
-                current,
+            strategies = (
+                self._strategies if profile_key == OWNER_PROFILE_ID else ()
             )
             return StateSnapshot(
                 profile_key,
@@ -2867,76 +4385,26 @@ class StateStore:
                 last_profile_initiative,
                 relevant_opinions=relevant_opinions,
                 relevant_preferences=relevant_preferences,
+                relevant_interests=relevant_interests,
                 relevant_relationship=relevant_relationship,
+                familiarity=_familiarity_context(
+                    profile,
+                    self._conversations,
+                    profile_key,
+                ),
+                self_model=self_model,
+                relevant_self_model=_relevant_self_model(
+                    self_model,
+                    query,
+                    current,
+                ),
+                strategies=strategies,
+                relevant_strategies=_relevant_strategies(
+                    strategies,
+                    self_model,
+                    query,
+                ),
             )
-
-    def _retrieve(
-        self,
-        memories: tuple[Memory, ...],
-        query: str,
-        now: float,
-    ) -> tuple[Memory, ...]:
-        return _relevant_values(
-            memories,
-            query,
-            now,
-            text_of=lambda item: item.text,
-            confidence_of=lambda item: item.confidence,
-            updated_at_of=lambda item: item.updated_at,
-            limit=MEMORY_MAX_RESULTS,
-        )
-
-    @staticmethod
-    def _retrieve_opinions(
-        opinions: tuple[Opinion, ...],
-        query: str,
-        now: float,
-    ) -> tuple[Opinion, ...]:
-        return _relevant_values(
-            opinions,
-            query,
-            now,
-            text_of=lambda item: item.content,
-            confidence_of=lambda item: item.confidence,
-            updated_at_of=lambda item: item.updated_at,
-            limit=3,
-        )
-
-    @staticmethod
-    def _retrieve_preferences(
-        preferences: tuple[AkanePreference, ...],
-        query: str,
-        now: float,
-    ) -> tuple[AkanePreference, ...]:
-        return _relevant_values(
-            preferences,
-            query,
-            now,
-            text_of=lambda item: item.content,
-            confidence_of=lambda _item: 0.7,
-            updated_at_of=lambda item: item.updated_at,
-            limit=3,
-        )
-
-    @staticmethod
-    def _retrieve_relationship(
-        relationship: RelationshipState,
-        query: str,
-        now: float,
-    ) -> tuple[RelationshipEntry, ...]:
-        return _relevant_values(
-            (
-                *relationship.patterns,
-                *relationship.shared_context,
-                *relationship.unresolved_events,
-            ),
-            query,
-            now,
-            text_of=lambda item: item.summary,
-            confidence_of=lambda item: item.confidence,
-            updated_at_of=lambda item: item.updated_at,
-            limit=3,
-        )
 
     def _validated_memory(
         self,
@@ -2970,15 +4438,8 @@ class StateStore:
             or len(_terms(text)) < (4 if kind == "event" else 1)
         ):
             return None
-        evidence = (
-            user_text
-            if subject == "user"
-            else f"{user_text} {assistant_text}"
-        )
-        correction_grounded = (
-            correction
-            and bool(_terms(text) & _terms(user_text))
-        )
+        evidence = (user_text if subject == "user" else f"{user_text} {assistant_text}")
+        correction_grounded = (correction and bool(_terms(text) & _terms(user_text)))
         if (
             not (_grounded(text, evidence) or correction_grounded)
             or subject != "user"
@@ -3011,9 +4472,7 @@ class StateStore:
     ) -> tuple[int | None, str]:
         target = compact_text(target_id, 100)
         if target:
-            matches = [
-                index for index, memory in enumerate(memories) if memory.id == target
-            ]
+            matches = [index for index, memory in enumerate(memories) if memory.id == target]
             if len(matches) != 1:
                 return None, "target not found"
             existing = memories[matches[0]]
@@ -3116,9 +4575,7 @@ class StateStore:
                 accepted.append(f"remove:{removed.id}")
                 ownership.append(f"{label}:user-owned memory")
                 continue
-            required = {
-                "op", "target_id", "subject", "kind", "text", "reason", "confidence",
-            }
+            required = {"op", "target_id", "subject", "kind", "text", "reason", "confidence"}
             if op not in {"add", "revise", "correct"} or set(item) != required:
                 rejected.append(f"{label}: malformed or unknown operation")
                 continue
@@ -3152,12 +4609,27 @@ class StateStore:
                 if item.get("target_id") is not None:
                     rejected.append(f"{label}: add target must be null")
                     continue
-                if any(
-                    memory.subject == candidate.subject
-                    and _duplicate_text(memory.text, candidate.text)
-                    for memory in result
-                ):
-                    rejected.append(f"{label}: existing fact requires revise or correct")
+                duplicate = next(
+                    (
+                        position
+                        for position, memory in enumerate(result)
+                        if memory.subject == candidate.subject
+                        and _duplicate_text(memory.text, candidate.text)
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    existing = result[duplicate]
+                    result[duplicate] = replace(
+                        existing,
+                        confidence=max(existing.confidence, candidate.confidence),
+                        updated_at=now,
+                        source_type=candidate.source_type,
+                        source_id=candidate.source_id,
+                        reason=candidate.reason,
+                    )
+                    accepted.append(f"update:{existing.id}")
+                    ownership.append(f"{label}:user-owned memory")
                     continue
                 result.append(candidate)
                 accepted.append(f"add:{candidate.id}")
@@ -3269,11 +4741,823 @@ class StateStore:
                 else:
                     result[match] = candidate
             ownership.append(f"{label}:profile-scoped communication")
-        return (
-            tuple(result[-_MAX_COMMUNICATION_PREFERENCES:]),
-            tuple(rejected),
-            tuple(ownership),
+        return (tuple(result[-_MAX_COMMUNICATION_PREFERENCES:]), tuple(rejected), tuple(ownership))
+
+    @staticmethod
+    def _assistant_behavior_evidence(
+        conversation: ConversationRecord,
+        *,
+        assistant_text: str,
+        source_id: str,
+    ) -> tuple[tuple[str, str], ...]:
+        evidence = [
+            (turn.turn_id, turn.content)
+            for turn in conversation.recent_turns
+            if turn.role == "assistant" and turn.source != "initiative"
+        ]
+        if assistant_text and source_id:
+            evidence.append((f"{source_id}:assistant", assistant_text))
+        return tuple(evidence[-6:])
+
+    def _self_behavior_sources(
+        self,
+        *,
+        category: str,
+        description: str,
+        reason: str,
+        conversation: ConversationRecord,
+        profile: ProfileState,
+        user_text: str,
+        assistant_text: str,
+        source_id: str,
+        conflicting: bool = False,
+    ) -> tuple[str, ...]:
+        evidence = self._assistant_behavior_evidence(
+            conversation,
+            assistant_text=assistant_text,
+            source_id=source_id,
         )
+        sources: list[str] = []
+        if _QUESTION_BEHAVIOR.search(f"{description} {reason}"):
+            if len(evidence) < 3:
+                return ()
+            question_evidence = tuple(
+                item for item in evidence if item[1].rstrip().endswith("?")
+            )
+            rate = len(question_evidence) / len(evidence)
+            selected = (
+                tuple(item for item in evidence if not item[1].rstrip().endswith("?"))
+                if conflicting and rate <= 0.35
+                else question_evidence
+                if not conflicting and rate >= 0.60
+                else ()
+            )
+            sources.extend(item[0] for item in selected)
+        elif not conflicting:
+            sources.extend(
+                evidence_id
+                for evidence_id, text in evidence
+                if _grounded(reason, text) or _grounded(description, text)
+            )
+
+        if not conflicting:
+            sources.extend(
+                memory.id
+                for memory in profile.memories
+                if memory.subject == "akane"
+                and (
+                    _grounded(reason, memory.text)
+                    or _grounded(description, memory.text)
+                )
+            )
+            sources.extend(
+                opinion.id
+                for opinion in profile.opinions
+                if opinion.domain == "self"
+                and (
+                    _grounded(reason, opinion.content)
+                    or _grounded(description, opinion.content)
+                )
+            )
+        actual_sources = tuple(dict.fromkeys(sources))[-8:]
+        if (
+            len(actual_sources) >= 2
+            and source_id
+            and _USER_SELF_FEEDBACK.search(user_text)
+            and _grounded(reason, user_text)
+        ):
+            return tuple(
+                dict.fromkeys((*actual_sources, f"{source_id}:user"))
+            )[-8:]
+        return actual_sources
+
+    @staticmethod
+    def _strategy_addresses_goal(
+        description: str,
+        reason: str,
+        goal: ImprovementTarget,
+    ) -> bool:
+        goal_terms = _terms(goal.content)
+        return bool(
+            _terms(description) & goal_terms
+            and _grounded(reason, goal.content)
+        )
+
+    def _apply_strategy_operations(
+        self,
+        current: tuple[Strategy, ...],
+        operations: object,
+        *,
+        self_model: SelfModelState,
+        assistant_text: str,
+        source_id: str,
+        now: float,
+    ) -> tuple[tuple[Strategy, ...], tuple[str, ...], tuple[str, ...]]:
+        strategies = list(current)
+        rejected: list[str] = []
+        ownership: list[str] = []
+        goals = {goal.id: goal for goal in self_model.improvement_targets}
+        if not isinstance(operations, list):
+            return current, (), ()
+        for index, raw in enumerate(operations[:4]):
+            label = f"strategy_ops[{index}]"
+            if not isinstance(raw, dict):
+                rejected.append(f"{label}: malformed operation")
+                continue
+            op = compact_text(raw.get("op"), 16).casefold()
+            if op == "abandon":
+                if set(raw) != {"op", "target_id", "reason"}:
+                    rejected.append(f"{label}: malformed abandon")
+                    continue
+                target_id = compact_text(raw.get("target_id"), 100)
+                reason = compact_text(raw.get("reason"), 240)
+                match = next(
+                    (
+                        position
+                        for position, strategy in enumerate(strategies)
+                        if strategy.id == target_id and strategy.status == "active"
+                    ),
+                    None,
+                )
+                if (
+                    match is None
+                    or not reason
+                    or not _grounded(reason, assistant_text)
+                    or not _AKANE_STRATEGY_CLAIM.search(assistant_text)
+                ):
+                    rejected.append(f"{label}: missing target or ungrounded reason")
+                    continue
+                strategies[match] = replace(
+                    strategies[match],
+                    status="abandoned",
+                    updated_at=now,
+                    evidence_summary=reason,
+                    last_evaluation_result="abandoned",
+                    revision_count=strategies[match].revision_count + 1,
+                )
+                ownership.append(f"{label}:Akane-owned behavioral strategy")
+                continue
+
+            required = {
+                "op",
+                "target_id",
+                "goal_id",
+                "description",
+                "reason",
+                "confidence",
+            }
+            if op not in {"create", "revise"} or set(raw) != required:
+                rejected.append(f"{label}: malformed or unknown operation")
+                continue
+            target_id = compact_text(raw.get("target_id"), 100)
+            goal_id = compact_text(raw.get("goal_id"), 100)
+            description = compact_text(raw.get("description"), 240)
+            reason = compact_text(raw.get("reason"), 240)
+            confidence = raw.get("confidence")
+            goal = goals.get(goal_id)
+            if (
+                goal is None
+                or not description
+                or not reason
+                or type(confidence) not in {int, float}
+                or not math.isfinite(float(confidence))
+                or not 0.35 <= float(confidence) <= 0.90
+                or not _AKANE_STRATEGY_CLAIM.search(assistant_text)
+                or not _grounded(description, assistant_text)
+                or not _grounded(reason, assistant_text)
+                or not _ACTIONABLE_STRATEGY.search(description)
+                or _BROAD_STRATEGY.search(description)
+                or _FOUNDATIONAL_STRATEGY.search(f"{description} {reason}")
+                or not self._strategy_addresses_goal(description, reason, goal)
+            ):
+                rejected.append(f"{label}: invalid, broad, or ungrounded strategy")
+                continue
+
+            match = next(
+                (
+                    position
+                    for position, strategy in enumerate(strategies)
+                    if strategy.id == target_id
+                ),
+                None,
+            )
+            if op == "create":
+                if (
+                    target_id
+                    or sum(item.status == "active" for item in strategies)
+                    >= _MAX_ACTIVE_STRATEGIES
+                    or any(
+                        item.status == "active" and item.goal_id == goal_id
+                        for item in strategies
+                    )
+                    or any(
+                        _similar(item.description, description) >= 0.68
+                        for item in strategies
+                    )
+                ):
+                    rejected.append(f"{label}: duplicate or strategy bound reached")
+                    continue
+                if len(strategies) >= _MAX_STRATEGIES:
+                    oldest_inactive = min(
+                        (
+                            position
+                            for position, item in enumerate(strategies)
+                            if item.status != "active"
+                        ),
+                        key=lambda position: (
+                            strategies[position].updated_at,
+                            strategies[position].id,
+                        ),
+                        default=None,
+                    )
+                    if oldest_inactive is None:
+                        rejected.append(f"{label}: strategy bound reached")
+                        continue
+                    strategies.pop(oldest_inactive)
+                strategies.append(
+                    Strategy(
+                        "strategy_" + uuid.uuid4().hex,
+                        goal_id,
+                        description,
+                        "active",
+                        float(confidence),
+                        (goal_id, f"{source_id}:assistant"),
+                        now,
+                        now,
+                    )
+                )
+            else:
+                if match is None or strategies[match].status != "active":
+                    rejected.append(f"{label}: active target not found")
+                    continue
+                existing = strategies[match]
+                if (
+                    existing.goal_id != goal_id
+                    or existing.description == description
+                ):
+                    rejected.append(f"{label}: no meaningful goal-preserving revision")
+                    continue
+                strategies[match] = replace(
+                    existing,
+                    description=description,
+                    confidence=float(confidence),
+                    source_ids=tuple(
+                        dict.fromkeys((*existing.source_ids, f"{source_id}:assistant"))
+                    )[-12:],
+                    updated_at=now,
+                    opportunity_count=0,
+                    success_count=0,
+                    failure_count=0,
+                    evidence_summary=reason,
+                    last_evaluation_result="insufficient_evidence",
+                    revision_count=existing.revision_count + 1,
+                )
+            ownership.append(f"{label}:Akane-owned behavioral strategy")
+        return tuple(strategies), tuple(rejected), tuple(ownership)
+
+    @staticmethod
+    def _evaluate_strategies(
+        strategies: tuple[Strategy, ...],
+        prior_strategies: tuple[Strategy, ...],
+        self_model: SelfModelState,
+        *,
+        user_text: str,
+        assistant_text: str,
+        source_id: str,
+        now: float,
+    ) -> tuple[tuple[Strategy, ...], SelfModelState]:
+        prior = {strategy.id: strategy for strategy in prior_strategies}
+        goals = {goal.id: goal for goal in self_model.improvement_targets}
+        limitations = {item.id: item for item in self_model.limitations}
+        result = list(strategies)
+        next_self_model = self_model
+        for index, strategy in enumerate(tuple(result)):
+            previous = prior.get(strategy.id)
+            goal = goals.get(strategy.goal_id)
+            if (
+                previous is None
+                or previous.status != "active"
+                or strategy.status != "active"
+                or strategy.revision_count != previous.revision_count
+                or goal is None
+                or _strategy_metric_kind(strategy, goal)
+                != "clarification_directness"
+                or not _strategy_applies(strategy, goal, user_text)
+            ):
+                continue
+
+            negative_feedback = bool(_STRATEGY_NEGATIVE_FEEDBACK.search(user_text))
+            positive_feedback = bool(_STRATEGY_POSITIVE_FEEDBACK.search(user_text))
+            failed = assistant_text.rstrip().endswith("?") or negative_feedback
+            opportunities = strategy.opportunity_count + 1
+            successes = strategy.success_count + int(not failed)
+            failures = strategy.failure_count + int(failed)
+            evidence_sources = [*strategy.source_ids, f"{source_id}:assistant"]
+            if negative_feedback or positive_feedback:
+                evidence_sources.append(f"{source_id}:user")
+            if opportunities < _STRATEGY_EVALUATION_WINDOW:
+                result[index] = replace(
+                    strategy,
+                    source_ids=tuple(dict.fromkeys(evidence_sources))[-12:],
+                    updated_at=now,
+                    opportunity_count=opportunities,
+                    success_count=successes,
+                    failure_count=failures,
+                    evidence_summary=(
+                        f"{opportunities} of {_STRATEGY_EVALUATION_WINDOW} "
+                        "relevant opportunities observed."
+                    ),
+                    last_evaluation_result=strategy.last_evaluation_result,
+                )
+                continue
+
+            ratio = successes / opportunities
+            evaluation_result = (
+                "improving" if ratio >= 0.75 else "worsening" if ratio <= 0.25 else "unchanged"
+            )
+            evaluation_id = f"strategy:{strategy.id}:evaluation:{strategy.evaluation_count + 1}"
+            confidence = strategy.confidence
+            status = "active"
+            if evaluation_result == "improving":
+                confidence = min(0.95, confidence + 0.08)
+            elif evaluation_result == "worsening":
+                confidence = max(0.20, confidence - 0.12)
+                if strategy.last_evaluation_result == "worsening" or confidence < 0.45:
+                    status = "abandoned"
+            else:
+                confidence = max(0.30, confidence - 0.02)
+
+            evaluation_count = strategy.evaluation_count + 1
+            completed = (
+                evaluation_result == "improving"
+                and strategy.last_evaluation_result == "improving"
+                and evaluation_count >= 2
+            )
+            if evaluation_result == "improving":
+                limitation = next(
+                    (
+                        limitations[source]
+                        for source in goal.source_ids
+                        if source in limitations
+                    ),
+                    None,
+                )
+                if limitation is not None:
+                    revised_limitation = replace(
+                        limitation,
+                        confidence=max(0.0, limitation.confidence - 0.10),
+                        source_ids=tuple(
+                            dict.fromkeys((*limitation.source_ids, evaluation_id))
+                        )[-8:],
+                        updated_at=now,
+                        revision_count=limitation.revision_count + 1,
+                    )
+                    next_self_model = replace(
+                        next_self_model,
+                        limitations=tuple(
+                            revised_limitation if item.id == limitation.id else item
+                            for item in next_self_model.limitations
+                        ),
+                    )
+                    limitations[limitation.id] = revised_limitation
+                    if completed:
+                        next_self_model = replace(
+                            next_self_model,
+                            limitations=tuple(
+                                item
+                                for item in next_self_model.limitations
+                                if item.id != limitation.id
+                            ),
+                            improvement_targets=tuple(
+                                item
+                                for item in next_self_model.improvement_targets
+                                if item.id != goal.id
+                            ),
+                        )
+                        status = "completed"
+                        evaluation_result = "completed"
+
+            result[index] = replace(
+                strategy,
+                status=status,
+                confidence=confidence,
+                source_ids=tuple(
+                    dict.fromkeys((*evidence_sources, evaluation_id))
+                )[-12:],
+                updated_at=now,
+                evaluation_count=evaluation_count,
+                opportunity_count=0,
+                success_count=0,
+                failure_count=0,
+                evidence_summary=(
+                    f"{successes} of {opportunities} relevant replies met the strategy signal."
+                ),
+                last_evaluation_result=(
+                    "abandoned" if status == "abandoned" else evaluation_result
+                ),
+                revision_count=strategy.revision_count + 1,
+            )
+
+        repaired = StateStore._repair_stale_strategies(
+            tuple(result),
+            next_self_model,
+            now=now,
+        )
+        return repaired, next_self_model
+
+    def _apply_self_model_operations(
+        self,
+        current: SelfModelState,
+        self_operations: object,
+        improvement_operations: object,
+        *,
+        profile: ProfileState,
+        conversation: ConversationRecord,
+        user_text: str,
+        assistant_text: str,
+        source_id: str,
+        now: float,
+    ) -> tuple[SelfModelState, tuple[str, ...], tuple[str, ...]]:
+        state = current
+        rejected: list[str] = []
+        ownership: list[str] = []
+        if isinstance(self_operations, list):
+            for index, raw in enumerate(self_operations[:6]):
+                label = f"self_model_ops[{index}]"
+                if not isinstance(raw, dict):
+                    rejected.append(f"{label}: malformed operation")
+                    continue
+                op = compact_text(raw.get("op"), 16).casefold()
+                if op == "resolve":
+                    if set(raw) != {"op", "target_id", "reason"}:
+                        rejected.append(f"{label}: malformed resolve")
+                        continue
+                    target_id = compact_text(raw.get("target_id"), 100)
+                    reason = compact_text(raw.get("reason"), 240)
+                    target = next(
+                        (item for item in state.items if item.id == target_id),
+                        None,
+                    )
+                    if target is None or not _grounded(reason, assistant_text):
+                        rejected.append(f"{label}: missing target or ungrounded reason")
+                        continue
+                    if target.category == "capability":
+                        rejected.append(f"{label}: implemented capability is still authoritative")
+                        continue
+                    if any(
+                        source.startswith("runtime:")
+                        for source in target.source_ids
+                    ):
+                        rejected.append(
+                            f"{label}: runtime limitation is still authoritative"
+                        )
+                        continue
+                    conflict_sources = self._self_behavior_sources(
+                        category=target.category,
+                        description=target.description,
+                        reason=reason,
+                        conversation=conversation,
+                        profile=profile,
+                        user_text=user_text,
+                        assistant_text=assistant_text,
+                        source_id=source_id,
+                        conflicting=True,
+                    )
+                    if len(conflict_sources) < 2:
+                        rejected.append(f"{label}: insufficient conflicting evidence")
+                        continue
+                    remaining = tuple(
+                        item
+                        for item in state.category_items(target.category)
+                        if item.id != target.id
+                    )
+                    state = state.replace_category(target.category, remaining)
+                    state = replace(
+                        state,
+                        improvement_targets=tuple(
+                            improvement
+                            for improvement in state.improvement_targets
+                            if target.id not in improvement.source_ids
+                        ),
+                    )
+                    ownership.append(f"{label}:Akane-owned self-model")
+                    continue
+
+                required = {
+                    "op",
+                    "target_id",
+                    "category",
+                    "area",
+                    "description",
+                    "reason",
+                    "confidence",
+                }
+                if (
+                    op not in {"create", "update", "reinforce", "weaken"}
+                    or set(raw) != required
+                ):
+                    rejected.append(f"{label}: malformed or unknown operation")
+                    continue
+                category = compact_text(raw.get("category"), 20).casefold()
+                area = compact_text(raw.get("area"), 80).casefold()
+                description = compact_text(raw.get("description"), 280)
+                reason = compact_text(raw.get("reason"), 240)
+                confidence = raw.get("confidence")
+                if (
+                    category not in {"capability", "limitation", "trait"}
+                    or not area
+                    or not description
+                    or not reason
+                    or type(confidence) not in {int, float}
+                    or not math.isfinite(float(confidence))
+                    or not 0.0 <= float(confidence) <= 1.0
+                    or not _AKANE_SELF_CLAIM.search(description)
+                    or not _AKANE_SELF_CLAIM.search(assistant_text)
+                    or _USER_STATE_CONTAMINATION.search(description)
+                    or not _grounded(description, assistant_text)
+                    or not _grounded(reason, assistant_text)
+                    or _EXTERNAL_FACT_CLAIM.search(f"{description} {reason}")
+                ):
+                    rejected.append(f"{label}: invalid or ungrounded Akane self-claim")
+                    continue
+
+                capability = (
+                    _runtime_capability_for(description, area)
+                    if category == "capability"
+                    else None
+                )
+                runtime_limitation = (
+                    _runtime_limitation_for(description, area)
+                    if category == "limitation"
+                    else None
+                )
+                if category == "capability" and capability is None:
+                    rejected.append(f"{label}: capability is not implemented")
+                    continue
+                if runtime_limitation is not None and op == "weaken":
+                    rejected.append(f"{label}: runtime limitation is still authoritative")
+                    continue
+                conflicting = op == "weaken"
+                sources = (
+                    (capability.source_id,)
+                    if capability is not None
+                    else (runtime_limitation.source_id,)
+                    if runtime_limitation is not None
+                    else self._self_behavior_sources(
+                        category=category,
+                        description=description,
+                        reason=reason,
+                        conversation=conversation,
+                        profile=profile,
+                        user_text=user_text,
+                        assistant_text=assistant_text,
+                        source_id=source_id,
+                        conflicting=conflicting,
+                    )
+                )
+                if (
+                    category != "capability"
+                    and runtime_limitation is None
+                    and len(sources) < 2
+                ):
+                    rejected.append(f"{label}: insufficient behavioral evidence")
+                    continue
+                if op == "create" and (
+                    raw.get("target_id") is not None
+                    or float(confidence) < (0.70 if category == "capability" else 0.55)
+                ):
+                    rejected.append(f"{label}: invalid target or insufficient confidence")
+                    continue
+
+                values = list(state.category_items(category))
+                match = next(
+                    (
+                        position
+                        for position, item in enumerate(values)
+                        if item.id == compact_text(raw.get("target_id"), 100)
+                    ),
+                    None,
+                )
+                if category == "limitation" and match is not None:
+                    existing_is_runtime = any(
+                        source.startswith("runtime:")
+                        for source in values[match].source_ids
+                    )
+                    if existing_is_runtime != (runtime_limitation is not None):
+                        rejected.append(f"{label}: target evidence class changed")
+                        continue
+                if op == "create":
+                    if any(
+                        _similar(item.description, description) >= 0.68
+                        for item in values
+                    ):
+                        rejected.append(f"{label}: existing self-model item requires update")
+                        continue
+                    values.append(
+                        SelfModelItem(
+                            "self_" + uuid.uuid4().hex,
+                            category,
+                            area,
+                            description,
+                            float(confidence),
+                            sources,
+                            now,
+                            now,
+                        )
+                    )
+                else:
+                    if match is None:
+                        rejected.append(f"{label}: target not found")
+                        continue
+                    existing = values[match]
+                    if _similar(existing.area, area) < 0.65:
+                        rejected.append(f"{label}: target area changed")
+                        continue
+                    if op == "reinforce" and (
+                        _similar(existing.description, description) < 0.65
+                        or float(confidence) <= existing.confidence
+                    ):
+                        rejected.append(f"{label}: invalid reinforcement")
+                        continue
+                    if op == "weaken" and (
+                        _similar(existing.description, description) < 0.55
+                        or float(confidence) >= existing.confidence
+                    ):
+                        rejected.append(f"{label}: invalid weakening")
+                        continue
+                    if (
+                        existing.description == description
+                        and existing.confidence == float(confidence)
+                    ):
+                        rejected.append(f"{label}: no meaningful change")
+                        continue
+                    values[match] = replace(
+                        existing,
+                        area=area,
+                        description=description,
+                        confidence=float(confidence),
+                        source_ids=tuple(
+                            dict.fromkeys((*existing.source_ids, *sources))
+                        )[-8:],
+                        updated_at=now,
+                        revision_count=existing.revision_count + 1,
+                    )
+                state = state.replace_category(
+                    category,
+                    tuple(values[-_MAX_SELF_MODEL_ITEMS_PER_CATEGORY:]),
+                )
+                ownership.append(f"{label}:Akane-owned self-model")
+
+        if isinstance(improvement_operations, list):
+            for index, raw in enumerate(improvement_operations[:4]):
+                label = f"improvement_ops[{index}]"
+                if not isinstance(raw, dict):
+                    rejected.append(f"{label}: malformed operation")
+                    continue
+                op = compact_text(raw.get("op"), 16).casefold()
+                if op == "resolve":
+                    if set(raw) != {"op", "target_id", "reason"}:
+                        rejected.append(f"{label}: malformed resolve")
+                        continue
+                    target_id = compact_text(raw.get("target_id"), 100)
+                    reason = compact_text(raw.get("reason"), 240)
+                    match = next(
+                        (
+                            position
+                            for position, target in enumerate(state.improvement_targets)
+                            if target.id == target_id
+                        ),
+                        None,
+                    )
+                    if match is None or not _grounded(reason, assistant_text):
+                        rejected.append(f"{label}: missing target or ungrounded reason")
+                        continue
+                    targets = list(state.improvement_targets)
+                    targets.pop(match)
+                    state = replace(state, improvement_targets=tuple(targets))
+                    ownership.append(f"{label}:Akane-owned improvement target")
+                    continue
+
+                required = {
+                    "op",
+                    "target_id",
+                    "area",
+                    "description",
+                    "reason",
+                    "priority",
+                }
+                if op not in {"create", "update"} or set(raw) != required:
+                    rejected.append(f"{label}: malformed or unknown operation")
+                    continue
+                target_id = compact_text(raw.get("target_id"), 100)
+                area = compact_text(raw.get("area"), 80).casefold()
+                description = compact_text(raw.get("description"), 240)
+                reason = compact_text(raw.get("reason"), 240)
+                priority = raw.get("priority")
+                if (
+                    not target_id
+                    or not area
+                    or not description
+                    or not reason
+                    or type(priority) not in {int, float}
+                    or not math.isfinite(float(priority))
+                    or not 0.0 <= float(priority) <= 1.0
+                    or not _AKANE_SELF_CLAIM.search(assistant_text)
+                    or not _grounded(description, assistant_text)
+                    or not _grounded(reason, assistant_text)
+                ):
+                    rejected.append(f"{label}: invalid or ungrounded target")
+                    continue
+                targets = list(state.improvement_targets)
+                if op == "create":
+                    limitation = next(
+                        (item for item in state.limitations if item.id == target_id),
+                        None,
+                    )
+                    if (
+                        limitation is None
+                        or limitation.confidence < 0.60
+                        or _similar(limitation.area, area) < 0.65
+                        or not _grounded(reason, limitation.content)
+                        or not (
+                            _terms(description)
+                            & _terms(f"{limitation.content} {reason}")
+                        )
+                        or len(targets) >= _MAX_IMPROVEMENT_TARGETS
+                        or any(
+                            _similar(target.description, description) >= 0.68
+                            for target in targets
+                        )
+                    ):
+                        rejected.append(f"{label}: target lacks grounded limitation evidence")
+                        continue
+                    targets.append(
+                        ImprovementTarget(
+                            "goal_" + uuid.uuid4().hex,
+                            area,
+                            description,
+                            reason,
+                            float(priority),
+                            tuple(
+                                dict.fromkeys(
+                                    (*limitation.source_ids[-7:], limitation.id)
+                                )
+                            )[-8:],
+                            now,
+                            now,
+                        )
+                    )
+                else:
+                    match = next(
+                        (
+                            position
+                            for position, target in enumerate(targets)
+                            if target.id == target_id
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        rejected.append(f"{label}: target not found")
+                        continue
+                    existing = targets[match]
+                    limitation = next(
+                        (
+                            item
+                            for item in state.limitations
+                            if item.id in existing.source_ids
+                        ),
+                        None,
+                    )
+                    if (
+                        limitation is None
+                        or _similar(limitation.area, area) < 0.65
+                        or not _grounded(reason, limitation.content)
+                        or not (
+                            _terms(description)
+                            & _terms(f"{limitation.content} {reason}")
+                        )
+                    ):
+                        rejected.append(f"{label}: update lost its limitation evidence")
+                        continue
+                    if (
+                        existing.description == description
+                        and existing.reason == reason
+                        and existing.priority == float(priority)
+                    ):
+                        rejected.append(f"{label}: no meaningful change")
+                        continue
+                    targets[match] = replace(
+                        existing,
+                        area=area,
+                        description=description,
+                        reason=reason,
+                        priority=float(priority),
+                        updated_at=now,
+                        revision_count=existing.revision_count + 1,
+                    )
+                state = replace(state, improvement_targets=tuple(targets))
+                ownership.append(f"{label}:Akane-owned improvement target")
+        return state, tuple(rejected), tuple(ownership)
 
     def _apply_opinion_operations(
         self,
@@ -3283,6 +5567,10 @@ class StateStore:
         user_text: str,
         assistant_text: str,
         now: float,
+        source_type: str = "conversation",
+        source_ids: tuple[str, ...] = (),
+        evidence_summary: str | None = None,
+        trusted_history: str = "",
     ) -> tuple[tuple[Opinion, ...], tuple[str, ...], tuple[str, ...]]:
         if not isinstance(operations, list):
             return current, (), ()
@@ -3295,9 +5583,9 @@ class StateStore:
                 rejected.append(f"{label}: malformed operation")
                 continue
             op = compact_text(item.get("op"), 16).casefold()
-            if op == "remove":
+            if op in {"retire", "remove"}:
                 if set(item) != {"op", "target_id", "reason"}:
-                    rejected.append(f"{label}: malformed remove")
+                    rejected.append(f"{label}: malformed retire")
                     continue
                 target_id = compact_text(item.get("target_id"), 100)
                 reason = compact_text(item.get("reason"), 240)
@@ -3308,54 +5596,101 @@ class StateStore:
                 if match is None or not reason:
                     rejected.append(f"{label}: missing target or reason")
                     continue
-                if not _grounded(reason, assistant_text):
+                if (
+                    not _grounded(reason, assistant_text)
+                    or not _AKANE_OPINION_ADOPTION.search(assistant_text)
+                ):
                     rejected.append(f"{label}: reason is not grounded in the visible reply")
                     continue
                 result.pop(match)
                 ownership.append(f"{label}:Akane-owned opinion")
                 continue
-            required = {"op", "topic", "position", "reason", "confidence"}
-            if op == "revise":
+            required = {
+                "op",
+                "topic",
+                "domain",
+                "position",
+                "reason",
+                "confidence",
+                "importance",
+            }
+            if op in {"reinforce", "weaken", "update", "reconsider"}:
                 required.add("target_id")
-            if op not in {"form", "revise"} or set(item) != required:
+            if op not in {"form", "reinforce", "weaken", "update", "reconsider"} or set(item) != required:
                 rejected.append(f"{label}: malformed or unknown operation")
                 continue
             topic = compact_text(item.get("topic"), 140)
+            domain = compact_text(item.get("domain"), 48).casefold()
             position = compact_text(item.get("position"), 200)
             reason = compact_text(item.get("reason"), 240)
             confidence = item.get("confidence")
+            importance = item.get("importance")
+            trusted_sources = tuple(
+                dict.fromkeys(
+                    source
+                    for item_source in source_ids
+                    if (source := compact_text(item_source, 180))
+                )
+            )[-8:]
             if (
                 not topic
+                or not domain
+                or len(words(domain)) > 4
                 or not position
                 or not reason
                 or type(confidence) not in {int, float}
                 or not math.isfinite(float(confidence))
                 or not 0.0 <= float(confidence) <= 1.0
-                or (
+                or type(importance) not in {int, float}
+                or not math.isfinite(float(importance))
+                or not 0.0 <= float(importance) <= 1.0
+                or not trusted_sources
+                or op == "form" and (
                     not _grounded(topic, f"{user_text} {assistant_text}")
                     and len(_terms(topic)) < 2
                 )
                 or not _grounded(position, assistant_text)
                 or not _grounded(reason, assistant_text)
+                or not _AKANE_OPINION_ADOPTION.search(assistant_text)
             ):
                 rejected.append(f"{label}: visible reply did not ground and adopt the position")
                 continue
+            if (
+                _EXTERNAL_FACT_CLAIM.search(f"{position} {reason}")
+                and not _grounded(
+                    f"{position} {reason}",
+                    f"{user_text} {trusted_history}",
+                )
+            ):
+                rejected.append(f"{label}: external fact is not grounded in trusted state")
+                continue
             topic_key = _key(topic)
             if op == "form":
-                if any(value.topic_key == topic_key for value in result):
+                if not _durable_opinion_form(
+                    topic,
+                    reason,
+                    confidence=float(confidence),
+                    importance=float(importance),
+                ):
+                    rejected.append(f"{label}: below the durable opinion threshold")
+                    continue
+                if any(_similar(value.topic, topic) >= 0.72 for value in result):
                     rejected.append(f"{label}: existing opinion requires revise")
                     continue
                 candidate = Opinion(
-                    topic,
-                    position,
-                    reason,
-                    now,
-                    uuid.uuid4().hex,
-                    topic_key,
-                    float(confidence),
-                    now,
-                    "conversation",
-                    compact_text(user_text, 280),
+                    topic=topic,
+                    position=position,
+                    reason=reason,
+                    updated_at=now,
+                    id=uuid.uuid4().hex,
+                    topic_key=topic_key,
+                    confidence=float(confidence),
+                    created_at=now,
+                    source_type=source_type,
+                    evidence_summary=compact_text(evidence_summary or user_text, 280),
+                    source_ids=trusted_sources,
+                    domain=domain,
+                    importance=float(importance),
                 )
                 result.append(candidate)
             else:
@@ -3368,23 +5703,150 @@ class StateStore:
                     rejected.append(f"{label}: target not found")
                     continue
                 existing = result[match]
-                if existing.position == position and existing.reason == reason:
+                if _similar(existing.topic, topic) < 0.70:
+                    rejected.append(f"{label}: target topic changed")
+                    continue
+                if op == "reinforce" and (
+                    _similar(existing.position, position) < 0.70
+                    or float(confidence) <= existing.confidence
+                ):
+                    rejected.append(f"{label}: reinforcement must preserve and strengthen the stance")
+                    continue
+                if op == "weaken" and (
+                    _similar(existing.position, position) < 0.55
+                    or float(confidence) >= existing.confidence
+                ):
+                    rejected.append(f"{label}: weakening must reduce confidence without inventing a new stance")
+                    continue
+                if (
+                    existing.position == position
+                    and existing.reason == reason
+                    and existing.confidence == float(confidence)
+                    and existing.importance == float(importance)
+                    and existing.domain == domain
+                ):
                     rejected.append(f"{label}: no durable change")
                     continue
                 result[match] = Opinion(
-                    topic,
-                    position,
-                    reason,
-                    now,
-                    existing.id,
-                    topic_key,
-                    float(confidence),
-                    existing.created_at,
-                    "conversation",
-                    compact_text(user_text, 280),
+                    topic=topic,
+                    position=position,
+                    reason=reason,
+                    updated_at=now,
+                    id=existing.id,
+                    topic_key=topic_key,
+                    confidence=float(confidence),
+                    created_at=existing.created_at,
+                    source_type=source_type,
+                    evidence_summary=compact_text(evidence_summary or user_text, 280),
+                    source_ids=tuple(
+                        dict.fromkeys((*existing.source_ids, *trusted_sources))
+                    )[-8:],
+                    domain=domain,
+                    importance=float(importance),
+                    revision_count=existing.revision_count + 1,
                 )
             ownership.append(f"{label}:Akane-owned opinion")
         return tuple(result[-_MAX_OPINIONS:]), tuple(rejected), tuple(ownership)
+
+    def _apply_interest_operations(
+        self,
+        current: tuple[Interest, ...],
+        operations: object,
+        *,
+        user_text: str,
+        assistant_text: str,
+        source_id: str | None,
+        now: float,
+        source_type: str = "conversation",
+    ) -> tuple[tuple[Interest, ...], tuple[str, ...], tuple[str, ...]]:
+        if not isinstance(operations, list):
+            return current, (), ()
+        result = list(current)
+        rejected: list[str] = []
+        ownership: list[str] = []
+        for index, item in enumerate(operations[:6]):
+            label = f"interest_ops[{index}]"
+            if not isinstance(item, dict):
+                rejected.append(f"{label}: malformed operation")
+                continue
+            op = compact_text(item.get("op"), 16).casefold()
+            remove = op == "remove"
+            required = {"op", "topic", "reason"} if remove else {
+                "op", "topic", "reason", "strength",
+            }
+            if op not in {"form", "reinforce", "weaken", "update", "remove"} or set(item) != required:
+                rejected.append(f"{label}: malformed or unknown operation")
+                continue
+            topic = compact_text(item.get("topic"), 100)
+            reason = compact_text(item.get("reason"), 240)
+            strength = item.get("strength")
+            if (
+                not topic
+                or not reason
+                or not _grounded(topic, f"{user_text} {assistant_text}")
+                or not _grounded(topic, assistant_text)
+                or not _grounded(reason, assistant_text)
+                or not _AKANE_TASTE_ADOPTION.search(assistant_text)
+                or not remove
+                and (
+                    type(strength) not in {int, float}
+                    or not math.isfinite(float(strength))
+                    or not 0.0 <= float(strength) <= 1.0
+                )
+            ):
+                rejected.append(f"{label}: visible reply did not ground and adopt the interest")
+                continue
+            match = next(
+                (
+                    position
+                    for position, existing in enumerate(result)
+                    if _similar(str(existing), topic) >= 0.70
+                ),
+                None,
+            )
+            if remove:
+                if match is None:
+                    rejected.append(f"{label}: target not found")
+                    continue
+                result.pop(match)
+                ownership.append(f"{label}:Akane-owned interest")
+                continue
+            if op == "form" and match is not None:
+                rejected.append(f"{label}: existing interest requires an evolution operation")
+                continue
+            if op != "form" and match is None:
+                rejected.append(f"{label}: target not found")
+                continue
+            prior = result[match] if match is not None else None
+            value = float(strength)
+            if op == "reinforce" and prior is not None and value <= prior.strength:
+                rejected.append(f"{label}: reinforcement must increase strength")
+                continue
+            if op == "weaken" and prior is not None and value >= prior.strength:
+                rejected.append(f"{label}: weakening must reduce strength")
+                continue
+            source_ids = tuple(
+                dict.fromkeys((*((prior.source_ids) if prior else ()), *((source_id,) if source_id else ())))
+            )[-6:]
+            candidate = Interest(
+                topic,
+                value,
+                reason,
+                prior.created_at if prior else now,
+                now,
+                source_type,
+                source_ids,
+                (prior.evidence_count + 1) if prior else 1,
+            )
+            if prior is not None and candidate.as_dict() == prior.as_dict():
+                rejected.append(f"{label}: no durable change")
+                continue
+            if match is None:
+                result.append(candidate)
+            else:
+                result[match] = candidate
+            ownership.append(f"{label}:Akane-owned interest")
+        return tuple(result[-_MAX_INTERESTS:]), tuple(rejected), tuple(ownership)
 
     def _apply_proposals(
         self,
@@ -3394,6 +5856,7 @@ class StateStore:
         user_text: str,
         assistant_text: str,
         source_id: str | None,
+        trusted_history: str,
         now: float,
     ) -> tuple[
         ProfileState,
@@ -3429,9 +5892,7 @@ class StateStore:
         if isinstance(raw_preferences, list):
             additions: list[AkanePreference] = []
             for index, item in enumerate(raw_preferences[:6]):
-                if not isinstance(item, dict) or set(item) != {
-                    "topic", "stance", "reason",
-                }:
+                if not isinstance(item, dict) or set(item) != {"topic", "stance", "reason"}:
                     continue
                 candidate = AkanePreference.from_dict({**item, "updated_at": now})
                 if (
@@ -3439,11 +5900,10 @@ class StateStore:
                     and _grounded(candidate.topic, user_text)
                     and _grounded(candidate.topic, assistant_text)
                     and _grounded(candidate.reason, assistant_text)
+                    and _AKANE_TASTE_ADOPTION.search(assistant_text)
                 ):
                     additions.append(candidate)
-                    ownership_classification += (
-                        f"preferences[{index}]:Akane-owned preference",
-                    )
+                    ownership_classification += (f"preferences[{index}]:Akane-owned preference",)
                 elif candidate:
                     rejected_operations += (
                         f"preferences[{index}]: conflicting ownership; Akane-owned preference was not visibly adopted",
@@ -3457,35 +5917,20 @@ class StateStore:
                     ),
                 )
 
-        raw_interests = values.get("interests")
-        if isinstance(raw_interests, list):
-            interest_additions: list[str] = []
-            for index, item in enumerate(raw_interests[:6]):
-                interest = compact_text(item, 100)
-                valid = bool(
-                    interest
-                    and 1 <= len(_terms(interest)) <= 5
-                    and _grounded(interest, user_text)
-                    and _grounded(interest, assistant_text)
-                )
-                if valid:
-                    interest_additions.append(interest)
-                    ownership_classification += (
-                        f"interests[{index}]:Akane-owned interest",
-                    )
-                elif interest:
-                    rejected_operations += (
-                        f"interests[{index}]: conflicting ownership; Akane-owned interest was not visibly adopted",
-                    )
-            additions = tuple(interest_additions)
-            if additions:
-                next_profile = replace(
-                    next_profile,
-                    interests=_dedupe_text(
-                        (*next_profile.interests, *additions),
-                        limit=_MAX_INTERESTS,
-                    ),
-                )
+        interests, interest_rejections, interest_ownership = self._apply_interest_operations(
+            next_profile.interests,
+            values.get("interest_ops"),
+            user_text=user_text,
+            assistant_text=assistant_text,
+            source_id=source_id,
+            now=now,
+        )
+        if [item.as_dict() for item in interests] != [
+            item.as_dict() for item in next_profile.interests
+        ]:
+            next_profile = replace(next_profile, interests=interests)
+        rejected_operations += interest_rejections
+        ownership_classification += interest_ownership
 
         communication_preferences, communication_rejections, communication_ownership = (
             self._apply_communication_operations(
@@ -3509,6 +5954,8 @@ class StateStore:
             user_text=user_text,
             assistant_text=assistant_text,
             now=now,
+            source_ids=tuple((source_id,)) if source_id else (),
+            trusted_history=trusted_history,
         )
         if opinions != next_profile.opinions:
             next_profile = replace(next_profile, opinions=opinions)
@@ -3523,12 +5970,15 @@ class StateStore:
                 accepted: list[RelationshipEntry] = []
                 if isinstance(raw, list):
                     for index, item in enumerate(raw[:6]):
-                        if not isinstance(item, dict) or set(item) != {
-                            "summary", "confidence",
-                        }:
+                        if not isinstance(item, dict) or set(item) != {"summary", "confidence"}:
                             continue
                         candidate = RelationshipEntry.from_dict(
-                            {**item, "updated_at": now}
+                            {
+                                **item,
+                                "updated_at": now,
+                                "evidence_count": 1,
+                                "source_ids": [source_id] if source_id else [],
+                            }
                         )
                         if (
                             candidate
@@ -3536,6 +5986,15 @@ class StateStore:
                                 candidate.summary,
                                 user_text,
                                 assistant_text,
+                            )
+                            and not (
+                                field_name == "shared_context"
+                                and _UNVERIFIED_HISTORY.search(user_text)
+                                and not _grounded(candidate.summary, trusted_history)
+                            )
+                            and not (
+                                field_name == "patterns"
+                                and _SENSITIVE_PATTERN.search(candidate.summary)
                             )
                         ):
                             accepted.append(candidate)
@@ -3626,14 +6085,8 @@ class StateStore:
         assistant_text = clean_visible_output(assistant_text)
         with self._lock:
             profile = self._profiles.get(snapshot.profile_id) or _new_profile(committed)
-            profile = self._normalize_profile_presence(
-                profile,
-                now=committed,
-            )
-            conversation = self._conversation(
-                snapshot.profile_id,
-                snapshot.conversation_id,
-            )
+            profile = self._normalize_profile_presence(profile, now=committed)
+            conversation = self._conversation(snapshot.profile_id, snapshot.conversation_id)
             request = compact_text(request_id, 180)
             if request and request in conversation.committed_request_ids:
                 return self.snapshot(
@@ -3654,8 +6107,71 @@ class StateStore:
                 user_text=user_text,
                 assistant_text=assistant_text,
                 source_id=pair_id,
+                trusted_history="\n".join(
+                    (
+                        *(turn.content for turn in _complete_turns(conversation.recent_turns)),
+                        *(memory.text for memory in profile.memories),
+                        *(item.summary for item in profile.relationship.shared_context),
+                    )
+                ),
                 now=committed,
             )
+            next_self_model = self._self_model
+            next_strategies = self._strategies
+            proposal_values = proposals if isinstance(proposals, dict) else {}
+            if snapshot.profile_id == OWNER_PROFILE_ID:
+                (
+                    next_self_model,
+                    self_model_rejections,
+                    self_model_ownership,
+                ) = self._apply_self_model_operations(
+                    self._self_model,
+                    proposal_values.get("self_model_ops"),
+                    proposal_values.get("improvement_ops"),
+                    profile=next_profile,
+                    conversation=conversation,
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    source_id=pair_id,
+                    now=committed,
+                )
+                rejected_operations += self_model_rejections
+                ownership_classification += self_model_ownership
+                next_strategies = self._repair_stale_strategies(
+                    self._strategies,
+                    next_self_model,
+                    now=committed,
+                )
+                (
+                    next_strategies,
+                    strategy_rejections,
+                    strategy_ownership,
+                ) = self._apply_strategy_operations(
+                    next_strategies,
+                    proposal_values.get("strategy_ops"),
+                    self_model=next_self_model,
+                    assistant_text=assistant_text,
+                    source_id=pair_id,
+                    now=committed,
+                )
+                rejected_operations += strategy_rejections
+                ownership_classification += strategy_ownership
+                next_strategies, next_self_model = self._evaluate_strategies(
+                    next_strategies,
+                    self._strategies,
+                    next_self_model,
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    source_id=pair_id,
+                    now=committed,
+                )
+            elif any(
+                key in proposal_values
+                for key in ("self_model_ops", "improvement_ops", "strategy_ops")
+            ):
+                rejected_operations += (
+                    "self_model_ops/strategy_ops: unavailable outside Akane's owner profile",
+                )
             next_profile, affect_transition = _apply_conversation_affect(
                 next_profile,
                 conversation,
@@ -3664,11 +6180,7 @@ class StateStore:
                 now=committed,
             )
             if allow_initiative and snapshot.profile_id == OWNER_PROFILE_ID:
-                next_profile = _with_conversation_initiative(
-                    profile,
-                    next_profile,
-                    now=committed,
-                )
+                next_profile = _with_conversation_initiative(profile, next_profile, now=committed)
             turns = list(conversation.recent_turns)
             if assistant_text:
                 turns.extend(
@@ -3727,11 +6239,14 @@ class StateStore:
                 profiles,
                 conversations,
                 committed_at=committed,
+                self_model=next_self_model,
+                strategies=next_strategies,
             )
             if next_profile.initiative != profile.initiative:
                 callback = self._autonomy_wake
                 if callback is not None:
                     callback(snapshot.profile_id)
+            recalled = _relevant_profile_state(next_profile, user_text, committed)
             return StateSnapshot(
                 snapshot.profile_id,
                 snapshot.conversation_id,
@@ -3739,7 +6254,7 @@ class StateStore:
                 next_profile,
                 next_conversation,
                 _complete_turns(next_conversation.recent_turns),
-                self._retrieve(next_profile.memories, user_text, committed),
+                recalled[0],
                 committed,
                 max(
                     snapshot.last_profile_assistant_at,
@@ -3753,10 +6268,48 @@ class StateStore:
                 accepted_memory_operations,
                 (*proposal_rejections, *rejected_operations),
                 ownership_classification,
-                self._retrieve_opinions(next_profile.opinions, user_text, committed),
-                self._retrieve_preferences(next_profile.preferences, user_text, committed),
-                self._retrieve_relationship(next_profile.relationship, user_text, committed),
-                affect_transition,
+                relevant_opinions=recalled[1],
+                relevant_preferences=recalled[2],
+                relevant_interests=recalled[3],
+                relevant_relationship=recalled[4],
+                familiarity=_familiarity_context(
+                    next_profile,
+                    conversations,
+                    snapshot.profile_id,
+                ),
+                affect_transition=affect_transition,
+                self_model=(
+                    next_self_model
+                    if snapshot.profile_id == OWNER_PROFILE_ID
+                    else SelfModelState()
+                ),
+                relevant_self_model=_relevant_self_model(
+                    (
+                        next_self_model
+                        if snapshot.profile_id == OWNER_PROFILE_ID
+                        else SelfModelState()
+                    ),
+                    user_text,
+                    committed,
+                ),
+                strategies=(
+                    next_strategies
+                    if snapshot.profile_id == OWNER_PROFILE_ID
+                    else ()
+                ),
+                relevant_strategies=_relevant_strategies(
+                    (
+                        next_strategies
+                        if snapshot.profile_id == OWNER_PROFILE_ID
+                        else ()
+                    ),
+                    (
+                        next_self_model
+                        if snapshot.profile_id == OWNER_PROFILE_ID
+                        else SelfModelState()
+                    ),
+                    user_text,
+                ),
             )
 
     def messages(
@@ -3816,11 +6369,7 @@ class StateStore:
                 return
             conversations = self._conversations.copy()
             conversations.pop(key, None)
-            self._replace_all(
-                self._profiles.copy(),
-                conversations,
-                committed_at=time.time(),
-            )
+            self._replace_all(self._profiles.copy(), conversations, committed_at=time.time())
 
     def clear_profile(self, profile_id: str = OWNER_PROFILE_ID) -> None:
         profile = canonical_profile_id(profile_id)
@@ -3836,7 +6385,17 @@ class StateStore:
                 for key, value in self._conversations.items()
                 if value.profile_id != profile
             }
-            self._replace_all(profiles, conversations, committed_at=current)
+            self._replace_all(
+                profiles,
+                conversations,
+                committed_at=current,
+                self_model=(
+                    SelfModelState()
+                    if profile == OWNER_PROFILE_ID
+                    else self._self_model
+                ),
+                strategies=(() if profile == OWNER_PROFILE_ID else self._strategies),
+            )
             callback = self._autonomy_wake if profile == OWNER_PROFILE_ID else None
         if callback is not None:
             callback(profile)
@@ -3861,24 +6420,19 @@ class StateStore:
                 "updated_at": state.updated_at,
             }
 
-    def public_memory(
-        self,
-        profile_id: str = OWNER_PROFILE_ID,
-    ) -> dict[str, object]:
+    def public_memory(self, profile_id: str = OWNER_PROFILE_ID) -> dict[str, object]:
         profile = canonical_profile_id(profile_id)
         with self._lock:
             current_time = time.time()
             state = self._profiles.get(profile) or _new_profile(current_time)
-            state = self._normalize_profile_presence(
-                state,
-                now=current_time,
-            )
+            state = self._normalize_profile_presence(state, now=current_time)
             current = state.presence.current_activity
             activities = {}
             if current is not None:
-                activities[current.summary] = {
+                label = current.subject or current.kind
+                activities[label] = {
                     "status": "active",
-                    "details": [current.focus],
+                    "details": [current.kind, current.subject_kind],
                 }
             return {
                 "user": {},
@@ -3897,27 +6451,27 @@ class StateStore:
                     for item in state.memories
                 ],
                 "interests": list(state.interests),
-                "opinions": [
-                    {"content": item.content}
-                    for item in state.opinions
-                ],
             }
 
-    def public_internal_state(
-        self,
-        profile_id: str = OWNER_PROFILE_ID,
-    ) -> dict[str, object]:
+    def public_internal_state(self, profile_id: str = OWNER_PROFILE_ID) -> dict[str, object]:
         profile = canonical_profile_id(profile_id)
         current = time.time()
         with self._lock:
             state = self._profiles.get(profile) or _new_profile(current)
-            state = self._normalize_profile_presence(
-                state,
-                now=current,
-            )
+            state = self._normalize_profile_presence(state, now=current)
             effective = effective_emotional_state(state, now=current)
             return {
                 **effective.as_dict(),
+                "self_model": (
+                    self._self_model.as_dict()
+                    if profile == OWNER_PROFILE_ID
+                    else SelfModelState().as_dict()
+                ),
+                "strategies": (
+                    [strategy.as_dict() for strategy in self._strategies]
+                    if profile == OWNER_PROFILE_ID
+                    else []
+                ),
                 "profile_id": profile,
                 "revision": self._revision,
                 "committed_at": self._committed_at,
@@ -3963,37 +6517,18 @@ class StateStore:
                 initiative=replace(initiative, current=opportunity),
                 updated_at=max(current_profile.updated_at, now),
             )
-            profiles = self._profiles.copy()
-            profiles[profile] = next_profile
-            changed = self._replace_all(
-                profiles,
-                self._conversations.copy(),
-                committed_at=now,
-            )
+            changed = self._replace_profile(profile, next_profile, committed_at=now)
             callback = self._autonomy_wake
         if changed and callback is not None:
             callback(profile)
         return changed
 
-    def initiative_schedule(
-        self,
-        *,
-        now: float,
-    ) -> tuple[bool, float | None]:
+    def initiative_schedule(self, *, now: float) -> tuple[bool, float | None]:
         current = max(0.0, float(now))
         with self._lock:
-            profile = self._profiles.get(OWNER_PROFILE_ID)
+            profile, initiative, opportunity = self._settled_owner_initiative(current)
             if profile is None:
                 return False, None
-            raw_opportunity = profile.initiative.current
-            if (
-                raw_opportunity is not None
-                and raw_opportunity.claim_token
-                and raw_opportunity.claim_expires_at <= current
-            ):
-                self._expired_claim_recoveries += 1
-            initiative = _settle_initiative(profile.initiative, now=current)
-            opportunity = initiative.current
             due = bool(
                 opportunity is not None
                 and opportunity.status == "pending"
@@ -4002,10 +6537,7 @@ class StateStore:
                 and opportunity.expires_at > current
             )
             wakes: list[float] = []
-            if opportunity is not None and opportunity.status in {
-                "pending",
-                "pending_delivery",
-            }:
+            if opportunity is not None and opportunity.status in {"pending", "pending_delivery"}:
                 wakes.append(opportunity.expires_at)
                 if opportunity.claim_token:
                     wakes.append(opportunity.claim_expires_at)
@@ -4014,35 +6546,41 @@ class StateStore:
                 elif initiative.cooldown_until > current:
                     wakes.append(initiative.cooldown_until)
             if initiative != profile.initiative:
-                profiles = self._profiles.copy()
-                profiles[OWNER_PROFILE_ID] = replace(profile, initiative=initiative)
-                self._replace_all(
-                    profiles,
-                    self._conversations.copy(),
+                self._replace_profile(
+                    OWNER_PROFILE_ID,
+                    replace(profile, initiative=initiative),
                     committed_at=current,
                 )
             future = tuple(value for value in wakes if value > current)
             return due, min(future, default=None)
 
-    def claim_initiative_evaluation(
+    def _settled_owner_initiative(
         self,
-        *,
         now: float,
-    ) -> InitiativeOpportunity | None:
+    ) -> tuple[
+        ProfileState | None,
+        InitiativeState | None,
+        InitiativeOpportunity | None,
+    ]:
+        profile = self._profiles.get(OWNER_PROFILE_ID)
+        if profile is None:
+            return None, None, None
+        opportunity = profile.initiative.current
+        if (
+            opportunity is not None
+            and opportunity.claim_token
+            and opportunity.claim_expires_at <= now
+        ):
+            self._expired_claim_recoveries += 1
+        initiative = _settle_initiative(profile.initiative, now=now)
+        return profile, initiative, initiative.current
+
+    def claim_initiative_evaluation(self, *, now: float) -> InitiativeOpportunity | None:
         current = max(0.0, float(now))
         with self._lock:
-            profile = self._profiles.get(OWNER_PROFILE_ID)
+            profile, initiative, opportunity = self._settled_owner_initiative(current)
             if profile is None:
                 return None
-            raw_opportunity = profile.initiative.current
-            if (
-                raw_opportunity is not None
-                and raw_opportunity.claim_token
-                and raw_opportunity.claim_expires_at <= current
-            ):
-                self._expired_claim_recoveries += 1
-            initiative = _settle_initiative(profile.initiative, now=current)
-            opportunity = initiative.current
             if (
                 opportunity is None
                 or opportunity.status != "pending"
@@ -4052,20 +6590,11 @@ class StateStore:
             ):
                 return None
             if not _initiative_source_exists(profile, opportunity):
-                dismissed = replace(
-                    opportunity,
-                    status="dismissed",
-                    evaluated_at=current,
-                )
-                initiative = _handled_initiative(
-                    replace(initiative, current=dismissed),
-                    dismissed,
-                )
-                profiles = self._profiles.copy()
-                profiles[OWNER_PROFILE_ID] = replace(profile, initiative=initiative)
-                self._replace_all(
-                    profiles,
-                    self._conversations.copy(),
+                dismissed = replace(opportunity, status="dismissed", evaluated_at=current)
+                initiative = _handled_initiative(replace(initiative, current=dismissed), dismissed)
+                self._replace_profile(
+                    OWNER_PROFILE_ID,
+                    replace(profile, initiative=initiative),
                     committed_at=current,
                 )
                 return None
@@ -4074,14 +6603,12 @@ class StateStore:
                 claim_token=uuid.uuid4().hex,
                 claim_expires_at=current + _INITIATIVE_EVALUATION_CLAIM_SECONDS,
             )
-            profiles = self._profiles.copy()
-            profiles[OWNER_PROFILE_ID] = replace(
-                profile,
-                initiative=replace(initiative, current=claimed),
-            )
-            self._replace_all(
-                profiles,
-                self._conversations.copy(),
+            self._replace_profile(
+                OWNER_PROFILE_ID,
+                replace(
+                    profile,
+                    initiative=replace(initiative, current=claimed),
+                ),
                 committed_at=current,
             )
             return claimed
@@ -4108,11 +6635,7 @@ class StateStore:
                 return None
             initiative = profile.initiative
             normalized_topic = _key(topic)[:120]
-            speak = (
-                decision == "speak"
-                and normalized_topic
-                and compact_text(message, 500)
-            )
+            speak = (decision == "speak" and normalized_topic and compact_text(message, 500))
             duplicate = bool(
                 speak
                 and any(
@@ -4128,10 +6651,7 @@ class StateStore:
                     claim_token=None,
                     claim_expires_at=0.0,
                 )
-                initiative = _handled_initiative(
-                    replace(initiative, current=completed),
-                    completed,
-                )
+                initiative = _handled_initiative(replace(initiative, current=completed), completed)
             else:
                 completed = replace(
                     opportunity,
@@ -4144,15 +6664,13 @@ class StateStore:
                     claim_expires_at=0.0,
                 )
                 initiative = replace(initiative, current=completed)
-            profiles = self._profiles.copy()
-            profiles[OWNER_PROFILE_ID] = replace(
-                profile,
-                initiative=initiative,
-                updated_at=max(profile.updated_at, current),
-            )
-            self._replace_all(
-                profiles,
-                self._conversations.copy(),
+            self._replace_profile(
+                OWNER_PROFILE_ID,
+                replace(
+                    profile,
+                    initiative=initiative,
+                    updated_at=max(profile.updated_at, current),
+                ),
                 committed_at=current,
             )
             self._initiative_failure_count = 0
@@ -4161,12 +6679,7 @@ class StateStore:
             callback(OWNER_PROFILE_ID)
         return completed
 
-    def fail_initiative_evaluation(
-        self,
-        *,
-        claim_token: str,
-        now: float,
-    ) -> bool:
+    def fail_initiative_evaluation(self, *, claim_token: str, now: float) -> bool:
         current = max(0.0, float(now))
         with self._lock:
             profile = self._profiles.get(OWNER_PROFILE_ID)
@@ -4188,14 +6701,12 @@ class StateStore:
                 claim_token=None,
                 claim_expires_at=0.0,
             )
-            profiles = self._profiles.copy()
-            profiles[OWNER_PROFILE_ID] = replace(
-                profile,
-                initiative=replace(profile.initiative, current=pending),
-            )
-            changed = self._replace_all(
-                profiles,
-                self._conversations.copy(),
+            changed = self._replace_profile(
+                OWNER_PROFILE_ID,
+                replace(
+                    profile,
+                    initiative=replace(profile.initiative, current=pending),
+                ),
                 committed_at=current,
             )
             if changed:
@@ -4218,18 +6729,9 @@ class StateStore:
             in {"popup", "discord"}
         )
         with self._lock:
-            profile = self._profiles.get(OWNER_PROFILE_ID)
+            profile, initiative, opportunity = self._settled_owner_initiative(current)
             if profile is None:
                 return None
-            raw_opportunity = profile.initiative.current
-            if (
-                raw_opportunity is not None
-                and raw_opportunity.claim_token
-                and raw_opportunity.claim_expires_at <= current
-            ):
-                self._expired_claim_recoveries += 1
-            initiative = _settle_initiative(profile.initiative, now=current)
-            opportunity = initiative.current
             if (
                 opportunity is None
                 or opportunity.status != "pending_delivery"
@@ -4262,14 +6764,12 @@ class StateStore:
                 claim_expires_at=current + _INITIATIVE_DELIVERY_CLAIM_SECONDS,
                 delivery_channel=channel,
             )
-            profiles = self._profiles.copy()
-            profiles[OWNER_PROFILE_ID] = replace(
-                profile,
-                initiative=replace(initiative, current=claimed),
-            )
-            self._replace_all(
-                profiles,
-                self._conversations.copy(),
+            self._replace_profile(
+                OWNER_PROFILE_ID,
+                replace(
+                    profile,
+                    initiative=replace(initiative, current=claimed),
+                ),
                 committed_at=current,
             )
             return claimed
@@ -4314,9 +6814,7 @@ class StateStore:
             profiles = self._profiles.copy()
             conversations = self._conversations.copy()
             if not success:
-                failed = tuple(
-                    dict.fromkeys((*opportunity.failed_channels, channel))
-                )
+                failed = tuple(dict.fromkeys((*opportunity.failed_channels, channel)))
                 pending = replace(
                     opportunity,
                     claim_token=None,
@@ -4329,9 +6827,7 @@ class StateStore:
                     initiative=replace(initiative, current=pending),
                 )
             else:
-                delivery_id = (
-                    compact_text(message_id, 160) or opportunity.opportunity_id
-                )
+                delivery_id = (compact_text(message_id, 160) or opportunity.opportunity_id)
                 sent = replace(
                     opportunity,
                     status="sent",
@@ -4385,9 +6881,10 @@ class StateStore:
                         updated_at=max(record.updated_at, current),
                     )
                     conversations[conversation_key] = record
-            self._replace_all(
-                profiles,
-                conversations,
+            self._replace_profile(
+                OWNER_PROFILE_ID,
+                profiles[OWNER_PROFILE_ID],
+                conversations=conversations,
                 committed_at=current,
             )
             callback = self._autonomy_wake
@@ -4395,12 +6892,7 @@ class StateStore:
             callback(OWNER_PROFILE_ID)
         return True
 
-    def release_initiative_delivery(
-        self,
-        *,
-        adapter: str,
-        now: float,
-    ) -> bool:
+    def release_initiative_delivery(self, *, adapter: str, now: float) -> bool:
         channel = compact_text(adapter, 16).casefold()
         with self._lock:
             profile = self._profiles.get(OWNER_PROFILE_ID)
@@ -4413,9 +6905,7 @@ class StateStore:
                 or opportunity.claim_token is None
             ):
                 return False
-            failed = tuple(
-                dict.fromkeys((*opportunity.failed_channels, channel))
-            )
+            failed = tuple(dict.fromkeys((*opportunity.failed_channels, channel)))
             pending = replace(
                 opportunity,
                 claim_token=None,
@@ -4423,21 +6913,16 @@ class StateStore:
                 delivery_channel=None,
                 failed_channels=failed,
             )
-            profiles = self._profiles.copy()
-            profiles[OWNER_PROFILE_ID] = replace(
-                profile,
-                initiative=replace(profile.initiative, current=pending),
-            )
-            return self._replace_all(
-                profiles,
-                self._conversations.copy(),
+            return self._replace_profile(
+                OWNER_PROFILE_ID,
+                replace(
+                    profile,
+                    initiative=replace(profile.initiative, current=pending),
+                ),
                 committed_at=max(0.0, float(now)),
             )
 
-    def set_autonomy_wake(
-        self,
-        callback: Callable[[str], None] | None,
-    ) -> None:
+    def set_autonomy_wake(self, callback: Callable[[str], None] | None) -> None:
         with self._lock:
             self._autonomy_wake = callback
 
@@ -4445,22 +6930,15 @@ class StateStore:
     def _presence_due_at(presence: PresenceState, now: float) -> float:
         if presence.retry_at > 0.0:
             return presence.retry_at
-        if needs_bootstrap(presence) or presence.next_decision_at <= 0.0:
+        if presence.next_decision_at <= 0.0:
             return now
         return presence.next_decision_at
 
     @staticmethod
     def _presence_due(presence: PresenceState, now: float) -> bool:
-        return (
-            presence.claim_token is None
-            and StateStore._presence_due_at(presence, now) <= now
-        )
+        return (presence.claim_token is None and StateStore._presence_due_at(presence, now) <= now)
 
-    def presence_schedule(
-        self,
-        *,
-        now: float,
-    ) -> tuple[tuple[str, ...], float | None]:
+    def presence_schedule(self, *, now: float) -> tuple[tuple[str, ...], float | None]:
         current = max(0.0, float(now))
         with self._lock:
             profiles = self._profiles.copy()
@@ -4477,10 +6955,7 @@ class StateStore:
                 presence = normalize_presence(state.presence, now=current)
                 if expired_claim:
                     self._expired_claim_recoveries += 1
-                    presence = replace(
-                        presence,
-                        last_error="stale claim released",
-                    )
+                    presence = replace(presence, last_error="stale claim released")
                 if presence != state.presence:
                     profiles[profile_id] = replace(state, presence=presence)
                     changed = True
@@ -4493,19 +6968,10 @@ class StateStore:
                     else:
                         wakes.append(due_at)
             if changed:
-                self._replace_all(
-                    profiles,
-                    self._conversations.copy(),
-                    committed_at=current,
-                )
+                self._replace_all(profiles, self._conversations.copy(), committed_at=current)
             return tuple(due), min(wakes, default=None)
 
-    def claim_presence_decision(
-        self,
-        profile_id: str,
-        *,
-        now: float,
-    ) -> ProfileState | None:
+    def claim_presence_decision(self, profile_id: str, *, now: float) -> ProfileState | None:
         profile = canonical_profile_id(profile_id)
         if profile != OWNER_PROFILE_ID:
             return None
@@ -4521,17 +6987,12 @@ class StateStore:
             candidate = normalize_presence(state.presence, now=current)
             if expired_claim:
                 self._expired_claim_recoveries += 1
-                candidate = replace(
-                    candidate,
-                    last_error="stale claim released",
-                )
+                candidate = replace(candidate, last_error="stale claim released")
             if not self._presence_due(candidate, current):
                 if candidate != state.presence:
-                    profiles = self._profiles.copy()
-                    profiles[profile] = replace(state, presence=candidate)
-                    self._replace_all(
-                        profiles,
-                        self._conversations.copy(),
+                    self._replace_profile(
+                        profile,
+                        replace(state, presence=candidate),
                         committed_at=current,
                     )
                 return None
@@ -4541,63 +7002,28 @@ class StateStore:
                 claim_expires_at=current + CLAIM_SECONDS,
             )
             next_state = replace(state, presence=presence)
-            profiles = self._profiles.copy()
-            profiles[profile] = next_state
-            self._replace_all(
-                profiles,
-                self._conversations.copy(),
-                committed_at=current,
-            )
+            self._replace_profile(profile, next_state, committed_at=current)
             return next_state
 
-    def defer_presence_decision(
+    def _claimed_presence(
         self,
         profile_id: str,
-        *,
         claim_token: str,
         now: float,
-        retry_seconds: float = 15.0,
-    ) -> bool:
-        """Release a preempted presence claim without treating it as a failure."""
-
-        profile = canonical_profile_id(profile_id)
-        if profile != OWNER_PROFILE_ID:
-            return False
-        current = max(0.0, float(now))
-        delay = max(1.0, min(60.0, float(retry_seconds)))
-        with self._lock:
-            state = self._profiles.get(profile)
-            if state is None:
-                return False
-            presence = normalize_presence(state.presence, now=current)
-            if presence.claim_token != claim_token:
-                if presence != state.presence:
-                    profiles = self._profiles.copy()
-                    profiles[profile] = replace(state, presence=presence)
-                    self._replace_all(
-                        profiles,
-                        self._conversations.copy(),
-                        committed_at=current,
-                    )
-                return False
-            presence = replace(
-                presence,
-                claim_token=None,
-                claim_expires_at=0.0,
-                retry_at=current + delay,
-                last_error=None,
-            )
-            profiles = self._profiles.copy()
-            profiles[profile] = replace(state, presence=presence)
-            self._replace_all(
-                profiles,
-                self._conversations.copy(),
-                committed_at=current,
-            )
-            callback = self._autonomy_wake
-        if callback is not None:
-            callback(profile)
-        return True
+    ) -> tuple[ProfileState | None, PresenceState | None]:
+        state = self._profiles.get(profile_id)
+        if state is None:
+            return None, None
+        presence = normalize_presence(state.presence, now=now)
+        if presence.claim_token != claim_token:
+            if presence != state.presence:
+                self._replace_profile(
+                    profile_id,
+                    replace(state, presence=presence),
+                    committed_at=now,
+                )
+            return state, None
+        return replace(state, presence=presence), presence
 
     def _failed_presence(
         self,
@@ -4629,19 +7055,8 @@ class StateStore:
             return False
         current = max(0.0, float(now))
         with self._lock:
-            state = self._profiles.get(profile)
-            if state is None:
-                return False
-            presence = normalize_presence(state.presence, now=current)
-            if presence.claim_token != claim_token:
-                if presence != state.presence:
-                    profiles = self._profiles.copy()
-                    profiles[profile] = replace(state, presence=presence)
-                    self._replace_all(
-                        profiles,
-                        self._conversations.copy(),
-                        committed_at=current,
-                    )
+            state, presence = self._claimed_presence(profile, claim_token, current)
+            if presence is None:
                 return False
             failure_count = self._presence_failure_count + 1
             next_state = replace(
@@ -4653,13 +7068,7 @@ class StateStore:
                     failure_count=failure_count,
                 ),
             )
-            profiles = self._profiles.copy()
-            profiles[profile] = next_state
-            self._replace_all(
-                profiles,
-                self._conversations.copy(),
-                committed_at=current,
-            )
+            self._replace_profile(profile, next_state, committed_at=current)
             self._presence_failure_count = failure_count
             callback = self._autonomy_wake
         if callback is not None:
@@ -4671,92 +7080,210 @@ class StateStore:
         state: ProfileState,
         proposal: ProposedEmotion | None,
         *,
-        activity_id: str,
-        bootstrap: bool,
+        source_activity: PresenceActivity | None,
+        basis: str,
         expected_emotion_updated_at: float,
         now: float,
     ) -> EmotionState:
-        if state.emotion.updated_at > max(
-            0.0,
-            float(expected_emotion_updated_at),
-        ):
+        if state.emotion.updated_at > max(0.0, float(expected_emotion_updated_at)):
             return state.emotion
-        if proposal is not None:
+        if proposal is not None and basis and _grounded(proposal.cause, basis):
             return EmotionState(
                 proposal.primary,
                 proposal.intensity,
                 proposal.cause,
                 "offscreen_presence",
-                activity_id,
-                now,
-                now,
-            )
-        if bootstrap:
-            return EmotionState(
-                "interested",
-                0.3,
-                "the activity gave Akane something small to focus on",
-                "offscreen_presence",
-                activity_id,
+                source_activity.activity_id if source_activity else None,
                 now,
                 now,
             )
         return state.emotion
 
+    def _with_presence_experience(
+        self,
+        state: ProfileState,
+        appraisal: PresenceAppraisal,
+        *,
+        source_activity: PresenceActivity | None,
+        basis: str,
+        now: float,
+    ) -> tuple[ProfileState, bool]:
+        experience = appraisal.experience
+        if experience is None or source_activity is None or not basis:
+            return state, False
+        eligibility = presence_consequence_eligibility(
+            state,
+            source_activity,
+            now=now,
+        )
+        if (
+            not eligibility.eligible
+            or experience.target_id != source_activity.source_ids[0]
+            or experience.source_ids != source_activity.source_ids
+            or not _grounded(experience.summary, basis)
+            or not _grounded(experience.reason, f"{basis} {experience.summary}")
+            or not _memory_ownership_matches("akane", experience.summary)
+            or _SENSITIVE_PATTERN.search(f"{experience.summary} {experience.reason}")
+            or _PRESENCE_PHYSICAL_CLAIM.search(
+                f"{experience.summary} {experience.reason}"
+            )
+            or _PRESENCE_EXTERNAL_CLAIM.search(
+                f"{experience.summary} {experience.reason}"
+            )
+            or _PRESENCE_USER_FACT.search(experience.summary)
+            or _UNVERIFIED_HISTORY.search(
+                f"{experience.summary} {experience.reason}"
+            )
+        ):
+            return state, False
+
+        assistant_evidence = " ".join(
+            part
+            for part in (
+                experience.summary,
+                experience.position or "",
+                experience.reason,
+                basis,
+            )
+            if part
+        )
+        if experience.kind == "interest" and experience.topic:
+            if (
+                source_activity.kind != "revisiting_interest"
+                or not _grounded(experience.topic, basis)
+            ):
+                return state, False
+            interests, rejected, _ownership = self._apply_interest_operations(
+                state.interests,
+                [
+                    {
+                        "op": experience.operation,
+                        "topic": experience.topic,
+                        "reason": experience.reason,
+                        "strength": experience.confidence,
+                    }
+                ],
+                user_text=basis,
+                assistant_text=assistant_evidence,
+                source_id=source_activity.activity_id,
+                now=now,
+                source_type="offscreen_presence",
+            )
+            if rejected or [item.as_dict() for item in interests] == [
+                item.as_dict() for item in state.interests
+            ]:
+                return state, False
+            return replace(state, interests=interests, updated_at=now), True
+
+        if experience.kind == "opinion" and experience.topic and experience.position:
+            if (
+                source_activity.kind != "reconsidering_opinion"
+                or not _grounded(experience.topic, basis)
+                or not _grounded(experience.position, f"{basis} {experience.summary}")
+            ):
+                return state, False
+            existing_opinion = next(
+                (
+                    opinion
+                    for opinion in state.opinions
+                    if opinion.id == experience.target_id
+                ),
+                None,
+            )
+            if existing_opinion is None:
+                return state, False
+            opinions, rejected, _ownership = self._apply_opinion_operations(
+                state.opinions,
+                [
+                    {
+                        "op": experience.operation,
+                        "target_id": experience.target_id,
+                        "topic": experience.topic,
+                        "domain": existing_opinion.domain,
+                        "position": experience.position,
+                        "reason": experience.reason,
+                        "confidence": experience.confidence,
+                        "importance": existing_opinion.importance,
+                    }
+                ],
+                user_text=basis,
+                assistant_text=assistant_evidence,
+                now=now,
+                source_type="offscreen_presence",
+                source_ids=(source_activity.activity_id, *experience.source_ids),
+                evidence_summary=experience.summary,
+            )
+            if rejected or opinions == state.opinions:
+                return state, False
+            return replace(state, opinions=opinions, updated_at=now), True
+
+        if experience.kind == "memory":
+            memory_kind = (
+                "event" if experience.meaning == "connection" else "concern"
+            )
+            if (
+                experience.confidence < 0.80
+                or experience.meaning == "connection"
+                and source_activity.kind != "reflecting_on_shared_thread"
+                or experience.meaning == "unfinished_thought"
+                and source_activity.kind != "following_unfinished_thought"
+                or any(
+                    memory.subject == "akane"
+                    and _duplicate_text(memory.text, experience.summary)
+                    for memory in state.memories
+                )
+            ):
+                return state, False
+            memory = self._validated_memory(
+                {
+                    "subject": "akane",
+                    "kind": memory_kind,
+                    "text": experience.summary,
+                    "confidence": experience.confidence,
+                },
+                user_text=basis,
+                assistant_text=assistant_evidence,
+                now=now,
+                source_type="offscreen_presence",
+                source_id=source_activity.activity_id,
+                reason=experience.reason,
+            )
+            if memory is None:
+                return state, False
+            return replace(
+                state,
+                memories=_merge_memories(state.memories, (memory,)),
+                updated_at=now,
+            ), True
+        return state, False
+
     def commit_presence_decision(
         self,
         profile_id: str,
-        proposal: PresenceProposal,
+        appraisal: PresenceAppraisal | None,
         *,
         claim_token: str,
         now: float,
         expected_activity_id: str | None,
-        expected_bootstrap: bool,
         expected_emotion_updated_at: float = 0.0,
+        appraisal_attempted: bool = False,
     ) -> tuple[bool, str]:
         profile = canonical_profile_id(profile_id)
         if profile != OWNER_PROFILE_ID:
             return False, "presence claim is unavailable"
         current = max(0.0, float(now))
         with self._lock:
-            state = self._profiles.get(profile)
-            if state is None:
+            state, normalized_presence = self._claimed_presence(profile, claim_token, current)
+            if normalized_presence is None:
                 return False, "presence claim is unavailable"
-            normalized_presence = normalize_presence(
-                state.presence,
-                now=current,
-            )
-            if normalized_presence.claim_token != claim_token:
-                if normalized_presence != state.presence:
-                    profiles = self._profiles.copy()
-                    profiles[profile] = replace(
-                        state,
-                        presence=normalized_presence,
-                    )
-                    self._replace_all(
-                        profiles,
-                        self._conversations.copy(),
-                        committed_at=current,
-                    )
-                return False, "presence claim is unavailable"
-            if normalized_presence != state.presence:
-                state = replace(state, presence=normalized_presence)
-            actual_activity = state.presence.current_activity
-            actual_activity_id = (
-                actual_activity.activity_id if actual_activity is not None else None
-            )
+            completed_activity = state.presence.previous_activity
+            actual_activity_id = completed_activity.activity_id if completed_activity else None
             expected_id = compact_text(expected_activity_id, 80) or None
-            rejection = ""
-            if (
-                actual_activity_id != expected_id
-                or needs_bootstrap(state.presence) != bool(expected_bootstrap)
-            ):
-                rejection = "claimed presence activity changed"
-            if not rejection:
-                rejection = presence_proposal_rejection(
-                    state.presence,
-                    proposal,
-                )
+            rejection = (
+                "claimed presence activity changed"
+                if actual_activity_id != expected_id
+                else ""
+            )
             if rejection:
                 failure_count = self._presence_failure_count + 1
                 presence = self._failed_presence(
@@ -4767,24 +7294,80 @@ class StateStore:
                 )
                 next_state = replace(state, presence=presence)
             else:
-                was_bootstrap = needs_bootstrap(state.presence)
-                activity_id = (
-                    uuid.uuid4().hex
-                    if proposal.decision == "new"
-                    else actual_activity.activity_id
-                )
-                presence = apply_presence_proposal(
+                candidates = _presence_candidates(state)
+                selection = choose_presence_transition(
+                    candidates,
                     state.presence,
-                    proposal,
                     now=current,
-                    activity_id=activity_id,
+                    emotion_weights=_presence_emotion_weights(state, now=current),
                 )
-                committed_activity = presence.current_activity
+                selected = selection.candidate
+                activity = make_presence_activity(
+                    selected,
+                    now=current,
+                    activity_id=uuid.uuid4().hex,
+                    existing=(completed_activity if selection.continue_current else None),
+                )
+                selected_source = selected.primary_source_id if selected else ""
+                completed_source = (
+                    completed_activity.source_ids[0]
+                    if completed_activity and completed_activity.source_ids
+                    else ""
+                )
+                previous_selected_source = (
+                    completed_source
+                    or (
+                        state.presence.recent_source_ids[-1]
+                        if state.presence.recent_source_ids
+                        else ""
+                    )
+                )
+                if not selected_source:
+                    repetition_count = state.presence.repetition_count
+                elif selection.reset_repetition or selected_source != previous_selected_source:
+                    repetition_count = 1
+                else:
+                    repetition_count = min(3, state.presence.repetition_count + 1)
+                recent_sources = state.presence.recent_source_ids
+                if selected_source:
+                    recent_sources = (*recent_sources, selected_source)[-6:]
+                quiet_streak = (
+                    min(3, state.presence.quiet_streak + 1)
+                    if activity.kind == "quiet" and completed_activity is not None
+                    and completed_activity.kind == "quiet"
+                    else 1
+                    if activity.kind == "quiet"
+                    else 0
+                )
+                presence = replace(
+                    state.presence,
+                    current_activity=activity,
+                    last_decision_at=current,
+                    next_decision_at=activity.expected_end_at,
+                    retry_at=0.0,
+                    last_error=None,
+                    claim_token=None,
+                    claim_expires_at=0.0,
+                    repetition_count=repetition_count,
+                    recent_source_ids=recent_sources,
+                    quiet_streak=quiet_streak,
+                    last_transition_reason=selection.reason,
+                    last_candidate_score=(
+                        round(selection.score.total, 3) if selection.score else None
+                    ),
+                    last_candidate_source_id=(
+                        selection.candidate.primary_source_id
+                        if selection.candidate is not None
+                        else None
+                    ),
+                )
+                basis = presence_activity_basis(state, completed_activity)
+                proposal = appraisal.emotion if appraisal is not None else None
                 emotion = self._presence_emotion(
                     state,
-                    proposal.emotion,
-                    activity_id=committed_activity.activity_id,
-                    bootstrap=was_bootstrap,
+                    proposal,
+                    source_activity=completed_activity,
+                    basis=basis,
                     expected_emotion_updated_at=expected_emotion_updated_at,
                     now=current,
                 )
@@ -4794,13 +7377,35 @@ class StateStore:
                     emotion=emotion,
                     updated_at=current,
                 )
-            profiles = self._profiles.copy()
-            profiles[profile] = next_state
-            self._replace_all(
-                profiles,
-                self._conversations.copy(),
-                committed_at=current,
-            )
+                consequence_committed = False
+                if appraisal is not None:
+                    next_state, consequence_committed = self._with_presence_experience(
+                        next_state,
+                        appraisal,
+                        source_activity=completed_activity,
+                        basis=basis,
+                        now=current,
+                    )
+                if appraisal_attempted and completed_activity is not None:
+                    proposed_experience = bool(
+                        appraisal is not None and appraisal.experience is not None
+                    )
+                    next_state = replace(
+                        next_state,
+                        presence=replace(
+                            next_state.presence,
+                            last_appraised_activity_id=completed_activity.activity_id,
+                            last_appraised_at=current,
+                            last_appraisal_result=(
+                                "committed"
+                                if consequence_committed
+                                else "rejected"
+                                if proposed_experience
+                                else "null"
+                            ),
+                        ),
+                    )
+            self._replace_profile(profile, next_state, committed_at=current)
             if rejection:
                 self._presence_failure_count = failure_count
             else:

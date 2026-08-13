@@ -64,9 +64,15 @@ class InferenceQueueTimeout(RuntimeError):
 @dataclass(slots=True)
 class InferenceTiming:
     requested_at: float
+    reservation_acquired_at: float = 0.0
+    snapshot_ready_at: float = 0.0
+    context_ready_at: float = 0.0
+    prompt_ready_at: float = 0.0
     model_started_at: float = 0.0
     first_token_at: float = 0.0
     model_finished_at: float = 0.0
+    commit_started_at: float = 0.0
+    commit_finished_at: float = 0.0
     prompt_tokens: int = 0
 
 
@@ -193,10 +199,10 @@ class ModelManager:
         self._inference_condition = threading.Condition()
         self._inference_active = False
         self._inference_active_priority = ""
-        self._inference_active_cancellation: threading.Event | None = None
+        self._inference_started_at = 0.0
+        self._last_queue_wait_seconds = 0.0
         self._inference_waiters: list[tuple[int, int]] = []
         self._inference_waiter_sequence = 0
-        self._visible_waiters = 0
 
     @classmethod
     def get_instance(cls) -> "ModelManager":
@@ -207,12 +213,20 @@ class ModelManager:
         return cls._instance
 
     def status(self) -> dict[str, object]:
+        with self._inference_condition:
+            inference = {
+                "inference_active": self._inference_active,
+                "inference_priority": self._inference_active_priority,
+                "inference_started_at": self._inference_started_at,
+                "last_queue_wait_seconds": self._last_queue_wait_seconds,
+            }
         return {
             "loading": self._loading,
             "loaded": self._llm is not None,
             "error": str(self._load_error) if self._load_error else None,
             "backend": "llama_cpp",
             "local_model_path": str(self._local_model_path),
+            **inference,
         }
 
     def inference_busy(self) -> bool:
@@ -354,12 +368,18 @@ class ModelManager:
     ):
         """Reserve tokenization and generation as one priority-aware operation."""
 
-        ranks = {"owner": 0, "visible": 0, "guest": 1, "background": 2}
+        ranks = {
+            "owner": 0,
+            "visible": 0,
+            "guest": 1,
+            "background_presence": 2,
+            "background": 3,
+        }
         normalized_priority = str(priority or "visible").strip().lower()
         if normalized_priority not in ranks:
             raise ValueError("Unknown inference priority.")
-        visible = normalized_priority != "background"
         rank = ranks[normalized_priority]
+        queued_at = time.monotonic()
         waiter: tuple[int, int] | None = None
         acquired = False
         with self._inference_condition:
@@ -370,15 +390,6 @@ class ModelManager:
             self._inference_waiter_sequence += 1
             waiter = (rank, self._inference_waiter_sequence)
             self._inference_waiters.append(waiter)
-            if visible:
-                self._visible_waiters += 1
-            active_rank = ranks.get(self._inference_active_priority, 99)
-            if (
-                self._inference_active
-                and rank < active_rank
-                and self._inference_active_cancellation is not None
-            ):
-                self._inference_active_cancellation.set()
             try:
                 while self._inference_active or waiter != min(self._inference_waiters):
                     if cancellation is not None and cancellation.is_set():
@@ -397,13 +408,12 @@ class ModelManager:
                 waiter = None
                 self._inference_active = True
                 self._inference_active_priority = normalized_priority
-                self._inference_active_cancellation = cancellation
+                self._inference_started_at = time.time()
+                self._last_queue_wait_seconds = max(0.0, time.monotonic() - queued_at)
                 acquired = True
             finally:
                 if waiter is not None and waiter in self._inference_waiters:
                     self._inference_waiters.remove(waiter)
-                if visible:
-                    self._visible_waiters -= 1
                 if not acquired:
                     self._inference_condition.notify_all()
         try:
@@ -418,7 +428,7 @@ class ModelManager:
             with self._inference_condition:
                 self._inference_active = False
                 self._inference_active_priority = ""
-                self._inference_active_cancellation = None
+                self._inference_started_at = 0.0
                 self._inference_condition.notify_all()
 
     def tokenize_prompt(

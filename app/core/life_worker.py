@@ -17,6 +17,7 @@ from app.core.memory import (
     effective_emotion,
     format_emotional_context,
     get_state_store,
+    presence_consequence_eligibility,
 )
 from app.core.model_loader import (
     InferenceCancelled,
@@ -25,12 +26,10 @@ from app.core.model_loader import (
     compile_json_grammar,
 )
 from app.core.presence import (
-    BOOTSTRAP_PRESENCE_JSON_SCHEMA,
     PRESENCE_JSON_SCHEMA,
     PresenceParseError,
     format_presence_context,
-    needs_bootstrap,
-    parse_presence_proposal,
+    parse_presence_appraisal,
 )
 from app.core.prompt import (
     PromptContext,
@@ -586,16 +585,8 @@ class BackgroundService:
             lane.wake.wait(self._maintenance_interval_seconds)
 
 
-def _profile_text(item: object) -> str:
-    for name in ("content", "text", "summary"):
-        value = compact_text(getattr(item, name, ""), 240)
-        if value:
-            return value
-    return compact_text(item, 240)
-
-
-def _presence_context(profile, *, now: float) -> PromptContext:
-    activity = profile.presence.current_activity
+def _presence_context(profile, *, now: float, basis: str) -> PromptContext:
+    activity = profile.presence.previous_activity
     emotion = effective_emotion(profile.emotion, now=now)
     emotion_context = (
         "Current immediate emotion: neutral."
@@ -617,43 +608,17 @@ def _presence_context(profile, *, now: float) -> PromptContext:
                 ),
             )
         ),
-        preferences=tuple(
-            text
-            for item in profile.preferences[-3:]
-            if (text := _profile_text(item))
-        ),
-        interests=tuple(profile.interests[-8:]),
         emotion=emotion_context,
-        presence=format_presence_context(profile.presence, now=now),
-        continuation_count=profile.presence.continuation_count,
-    )
-
-
-def _log_bootstrap_failure(raw: str, error: PresenceParseError | str) -> None:
-    decoded = error.decoded if isinstance(error, PresenceParseError) else None
-    if decoded is None:
-        try:
-            decoded = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            decoded = None
-    decoded_keys = tuple(sorted(decoded)[:32]) if isinstance(decoded, dict) else ()
-    decision = decoded.get("decision") if isinstance(decoded, dict) else None
-    activity = decoded.get("activity") if isinstance(decoded, dict) else None
-    activity_keys = tuple(sorted(activity)[:32]) if isinstance(activity, dict) else ()
-    activity_value: object = activity
-    if len(repr(activity_value)) > 1_000:
-        activity_value = repr(activity_value)[:1_000]
-    _LOGGER.warning(
-        "presence bootstrap failed entered=%s raw_length=%d raw=%r "
-        "decoded_keys=%r decision=%r activity=%r activity_keys=%r reason=%s",
-        True,
-        len(raw),
-        raw[:1_000],
-        decoded_keys,
-        decision,
-        activity_value,
-        activity_keys,
-        error,
+        presence="\n".join(
+            (
+                format_presence_context(profile.presence, now=now),
+                f"Completed Presence ID: {activity.activity_id}",
+                f"Source IDs: {', '.join(activity.source_ids)}",
+                f"Authoritative source evidence: {basis}",
+                f"Grounding confidence: {activity.grounding_confidence:.2f}",
+                f"Origin: {activity.origin}",
+            )
+        ),
     )
 
 
@@ -663,7 +628,7 @@ def run_presence_turn(
     now: float | None = None,
     cancellation: threading.Event | None = None,
 ) -> bool:
-    """Run one claimed raw-JSON presence decision without visible dialogue."""
+    """Advance Ambient Presence and optionally appraise a grounded interval."""
 
     current = time.time() if now is None else max(0.0, float(now))
     profile_key = canonical_profile_id(profile_id)
@@ -674,17 +639,29 @@ def run_presence_turn(
     claim_token = claimed.presence.claim_token or ""
     if not claim_token:
         return False
-    expected_activity_id = (
-        claimed.presence.current_activity.activity_id
-        if claimed.presence.current_activity is not None
-        else None
+    completed = claimed.presence.previous_activity
+    expected_activity_id = completed.activity_id if completed is not None else None
+    eligibility = presence_consequence_eligibility(
+        claimed,
+        completed,
+        now=current,
     )
-    bootstrap = needs_bootstrap(claimed.presence)
     try:
+        if not eligibility.eligible:
+            accepted, _reason = store.commit_presence_decision(
+                profile_key,
+                None,
+                claim_token=claim_token,
+                now=time.time() if now is None else current,
+                expected_activity_id=expected_activity_id,
+                expected_emotion_updated_at=claimed.emotion.updated_at,
+            )
+            return accepted
+        basis = eligibility.basis
         manager = ModelManager.get_instance()
         timing = InferenceTiming(requested_at=time.perf_counter())
         with manager.reserve(
-            priority="background",
+            priority="background_presence",
             cancellation=cancellation,
             queue_deadline=time.monotonic() + _BACKGROUND_QUEUE_SECONDS,
         ) as reservation:
@@ -692,82 +669,62 @@ def run_presence_turn(
             context = _presence_context(
                 claimed,
                 now=prompt_now,
+                basis=basis,
             )
-            correction_reason = ""
-            proposal = None
-            raw = ""
-            for attempt in range(2):
-                plan = build_presence_prompt(
-                    context,
-                    token_counter=lambda messages: manager.tokenize_prompt(
-                        messages,
-                        reservation=reservation,
-                    ),
-                    bootstrap=bootstrap,
-                    correction_reason=correction_reason,
+            plan = build_presence_prompt(
+                context,
+                token_counter=lambda messages: manager.tokenize_prompt(
+                    messages,
+                    reservation=reservation,
+                ),
+            )
+            raw = "".join(
+                manager.stream(
+                    prompt_tokens=plan.token_ids,
+                    template_stop_sequences=plan.stop_sequences,
+                    max_tokens=MAX_TOKENS,
+                    cancellation=cancellation,
+                    timing=timing,
+                    grammar=compile_json_grammar(PRESENCE_JSON_SCHEMA),
+                    reservation=reservation,
                 )
-                schema = (
-                    BOOTSTRAP_PRESENCE_JSON_SCHEMA
-                    if bootstrap
-                    else PRESENCE_JSON_SCHEMA
+            )
+            try:
+                appraisal = parse_presence_appraisal(raw)
+            except PresenceParseError as exc:
+                _LOGGER.warning(
+                    "presence appraisal parse failed chars=%d preview=%r error=%s",
+                    len(raw),
+                    raw[:1_000],
+                    exc,
                 )
-                raw = "".join(
-                    manager.stream(
-                        prompt_tokens=plan.token_ids,
-                        template_stop_sequences=plan.stop_sequences,
-                        max_tokens=MAX_TOKENS,
-                        cancellation=cancellation,
-                        timing=timing,
-                        grammar=compile_json_grammar(schema),
-                        reservation=reservation,
-                    )
+                store.fail_presence_decision(
+                    profile_key,
+                    claim_token=claim_token,
+                    now=current if now is not None else time.time(),
+                    error=str(exc),
                 )
-                try:
-                    proposal = parse_presence_proposal(raw, bootstrap=bootstrap)
-                except PresenceParseError as exc:
-                    if bootstrap:
-                        _log_bootstrap_failure(raw, exc)
-                    else:
-                        _LOGGER.warning(
-                            "presence parse failed format=raw_json_schema attempt=%d chars=%d "
-                            "preview=%r error=%s",
-                            attempt + 1,
-                            len(raw),
-                            raw[:1_000],
-                            exc,
-                        )
-                    correction_reason = str(exc)
-                    if attempt == 0:
-                        continue
-                    store.fail_presence_decision(
-                        profile_key,
-                        claim_token=claim_token,
-                        now=current if now is not None else time.time(),
-                        error=str(exc),
-                    )
-                    return False
-                break
-        if proposal is None:
-            return False
+                return False
         accepted, reason = store.commit_presence_decision(
             profile_key,
-            proposal,
+            appraisal,
             claim_token=claim_token,
             now=time.time() if now is None else current,
             expected_activity_id=expected_activity_id,
-            expected_bootstrap=bootstrap,
             expected_emotion_updated_at=claimed.emotion.updated_at,
+            appraisal_attempted=True,
         )
-        if bootstrap and not accepted:
-            _log_bootstrap_failure(raw, reason)
+        if not accepted:
+            _LOGGER.warning("presence appraisal commit rejected reason=%s", reason)
         return accepted
     except InferenceCancelled:
-        store.defer_presence_decision(
+        store.fail_presence_decision(
             profile_key,
             claim_token=claim_token,
             now=current if now is not None else time.time(),
+            error="presence inference cancelled",
         )
-        return True
+        return False
     except Exception as exc:
         store.fail_presence_decision(
             profile_key,

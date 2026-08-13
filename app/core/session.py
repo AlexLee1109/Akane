@@ -19,12 +19,11 @@ from app.core.config import (
     PROMPT_DEBUG,
 )
 from app.core.memory import (
+    Strategy,
     STATE_SCHEMA_VERSION,
     StateSnapshot,
-    compile_affect_guidance,
-    communication_directives,
     communication_preference_debug,
-    format_emotional_context,
+    conversation_opinion_candidate,
     get_state_store,
 )
 from app.core.model_loader import (
@@ -40,14 +39,11 @@ from app.core.prompt import (
 )
 from app.core.presence import (
     PresenceState,
-    format_presence_context,
     presence_view,
 )
-from app.core.time_context import (
-    build_time_context,
-    format_time_context,
-)
+from app.core.state_selection import StateSelection, select_relevant_state
 from app.core.utils import (
+    OWNER_PROFILE_ID,
     VisibleReplyStream as _VisibleReplyStream,
     canonical_profile_id,
     clean_visible_output as _visible_text,
@@ -138,6 +134,12 @@ class _SafeVisibleReplyStream:
         match = _HIDDEN_STATE_LEAK.search(value)
         return match.start() if match is not None else None
 
+    @staticmethod
+    def _quarantine_start(value: str, position: int) -> int:
+        while position > 0 and value[position - 1].isspace():
+            position -= 1
+        return position
+
     @classmethod
     def _held_start(cls, value: str) -> int | None:
         """Return the earliest suffix that could become a blocked phrase."""
@@ -149,7 +151,15 @@ class _SafeVisibleReplyStream:
                 continue
             suffix = folded[position:]
             if any(phrase.startswith(suffix) for phrase in _HIDDEN_STATE_LEAK_PHRASES):
-                earliest = position if earliest is None else min(earliest, position)
+                start = cls._quarantine_start(value, position)
+                earliest = start if earliest is None else min(earliest, start)
+        trailing = re.search(r"\s+$", value)
+        if trailing is not None:
+            earliest = (
+                trailing.start()
+                if earliest is None
+                else min(earliest, trailing.start())
+            )
         return earliest
 
     def feed(self, chunk: object) -> str:
@@ -163,7 +173,7 @@ class _SafeVisibleReplyStream:
         leak_start = self._leak_start(combined)
         if leak_start is not None:
             self.blocked = True
-            visible = combined[:leak_start]
+            visible = combined[:self._quarantine_start(combined, leak_start)]
             return self._approve(visible)
 
         held_start = self._held_start(combined)
@@ -213,6 +223,7 @@ class ParsedStateOutput:
     proposals: dict[str, object] = field(default_factory=dict)
     parsed: bool = False
     rejected_operations: tuple[str, ...] = ()
+    opinion_candidate_origin: str = "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,8 +372,8 @@ def parse_akane_state(output: object) -> ParsedStateOutput:
         return ParsedStateOutput(visible)
 
     permitted = {
-        "memory_ops", "communication_ops", "preferences", "interests",
-        "opinion_ops", "relationship",
+        "memory_ops", "communication_ops", "preferences", "interest_ops",
+        "opinion_ops", "self_model_ops", "improvement_ops", "strategy_ops", "relationship",
     }
     if not set(payload) <= permitted:
         return ParsedStateOutput(visible)
@@ -421,79 +432,23 @@ def _canonical_prompt_context(
     *,
     editor: CodeContext,
 ) -> PromptContext:
-    """Map one typed snapshot into the same context envelope for every turn."""
+    """Compatibility adapter; selection policy lives in state_selection.py."""
 
-    profile = snapshot.profile
-    current = profile.presence.current_activity
-    recent_turns = tuple(snapshot.recent_turns)
-    initiative = snapshot.last_profile_initiative
-    if (
-        initiative is not None
-        and all(turn.turn_id != initiative.turn_id for turn in recent_turns)
-        and (
-            not recent_turns
-            or initiative.timestamp >= recent_turns[-1].timestamp
-        )
-    ):
-        recent_turns = (*recent_turns, initiative)
-
-    relevant_preferences = tuple(
-        getattr(snapshot, "relevant_preferences", ())
-    )
-    relevant_opinions = tuple(getattr(snapshot, "relevant_opinions", ()))
-    relevant_relationship = tuple(
-        getattr(snapshot, "relevant_relationship", ())
-    )
-    return PromptContext(
-        time_context=format_time_context(
-            build_time_context(
-                now=snapshot.now,
-                last_user_message_at=snapshot.last_profile_user_at,
-                last_akane_message_at=snapshot.last_profile_assistant_at,
-                current_activity_started_at=(
-                    current.started_at if current is not None else None
-                ),
-            )
-        ),
-        recent_turns=recent_turns,
-        memories=tuple(
-            f"[id={memory.id}; owner={memory.subject}; kind={memory.kind}] "
-            f"{memory.content}"
-            for memory in snapshot.relevant_memories
-        ),
-        preferences=tuple(
-            f"{item.content}"
-            for item in relevant_preferences
-        ),
-        opinions=tuple(
-            f"[id={item.id}; topic={item.topic}] {item.content}"
-            for item in relevant_opinions
-        ),
-        communication_preferences=communication_directives(profile),
-        relationship=tuple(
-            f"{item.content}"
-            for item in relevant_relationship
-        ),
-        emotion=format_emotional_context(profile, now=snapshot.now),
-        presence=format_presence_context(profile.presence, now=snapshot.now),
-        reply_context=chat.reply_context,
-        tool_context=editor.prompt_text if editor.connected else "",
-    )
+    return _canonical_state_selection(snapshot, chat, editor=editor).context
 
 
-def _compile_conversation_prompt(
+def _canonical_state_selection(
     snapshot: StateSnapshot,
     chat: ChatInput,
     *,
     editor: CodeContext,
-    token_counter,
-    reserved_output_tokens: int = MAX_TOKENS,
-) -> PromptPlan:
-    return build_conversation_prompt(
-        chat.text,
-        _canonical_prompt_context(snapshot, chat, editor=editor),
-        token_counter=token_counter,
-        reserved_output_tokens=reserved_output_tokens,
+) -> StateSelection:
+    return select_relevant_state(
+        snapshot,
+        user_message=chat.text,
+        conversation_context=chat.reply_context,
+        source=chat.source,
+        editor=editor,
     )
 
 
@@ -563,6 +518,7 @@ def run_companion_turn(
         safe_stream = _SafeVisibleReplyStream()
 
         def emit(value: str) -> None:
+            handle.raise_if_cancelled()
             approved = safe_stream.feed(value)
             if approved and on_delta is not None:
                 on_delta(approved)
@@ -571,6 +527,7 @@ def run_companion_turn(
             emit(visible_stream.finish())
             approved = safe_stream.finish()
             if approved and on_delta is not None:
+                handle.raise_if_cancelled()
                 on_delta(approved)
 
         try:
@@ -579,6 +536,7 @@ def run_companion_turn(
                 cancellation=handle.cancellation,
                 queue_deadline=handle.queue_deadline,
             ) as reservation:
+                timing.reservation_acquired_at = time.perf_counter()
                 snapshot_now = time.time()
                 snapshot = store.snapshot(
                     chat.profile_id,
@@ -587,21 +545,28 @@ def run_companion_turn(
                     now=snapshot_now,
                     include_memory=not skip_memory,
                 )
+                timing.snapshot_ready_at = time.perf_counter()
                 editor = (
                     current_code_context()
                     if allow_tool_context
                     else CodeContext(False, False)
                 )
-                plan = _compile_conversation_prompt(
+                state_selection = _canonical_state_selection(
                     snapshot,
                     chat,
                     editor=editor,
+                )
+                timing.context_ready_at = time.perf_counter()
+                plan = build_conversation_prompt(
+                    chat.text,
+                    state_selection.context,
                     token_counter=lambda messages: manager.tokenize_prompt(
                         messages,
                         reservation=reservation,
                     ),
                     reserved_output_tokens=max(1, int(max_tokens)),
                 )
+                timing.prompt_ready_at = time.perf_counter()
                 for chunk in manager.stream(
                     prompt_tokens=plan.token_ids,
                     template_stop_sequences=plan.stop_sequences,
@@ -615,7 +580,6 @@ def run_companion_turn(
                     if delta:
                         emit(delta)
         except InferenceCancelled as exc:
-            finish_visible()
             raise GenerationCancelled(str(exc)) from exc
         except InferenceQueueTimeout as exc:
             raise GenerationQueueFullError(str(exc)) from exc
@@ -625,12 +589,35 @@ def run_companion_turn(
             raise RuntimeError("Model returned no completion.")
         handle.raise_if_cancelled()
         parsed_output = parse_akane_state(raw)
+        proposals = dict(parsed_output.proposals)
+        opinion_candidate_origin = (
+            "model_metadata"
+            if isinstance(proposals.get("opinion_ops"), list)
+            and bool(proposals["opinion_ops"])
+            else "none"
+        )
+        if (
+            not safe_stream.blocked
+            and chat.profile_id == OWNER_PROFILE_ID
+            and "opinion_ops" not in proposals
+        ):
+            opinion_candidate = conversation_opinion_candidate(
+                chat.text,
+                safe_stream.message,
+                snapshot.profile.opinions,
+            )
+            if opinion_candidate is not None:
+                proposals["opinion_ops"] = [opinion_candidate]
+                opinion_candidate_origin = "visible_reply_fallback"
         parsed = ParsedStateOutput(
             safe_stream.message,
-            {} if safe_stream.blocked else parsed_output.proposals,
+            {} if safe_stream.blocked else proposals,
             parsed=parsed_output.parsed and not safe_stream.blocked,
             rejected_operations=(
                 () if safe_stream.blocked else parsed_output.rejected_operations
+            ),
+            opinion_candidate_origin=(
+                "none" if safe_stream.blocked else opinion_candidate_origin
             ),
         )
         checks = _visible_reply_checks(parsed.message, user_text=chat.text)
@@ -638,17 +625,35 @@ def run_companion_turn(
             raise RuntimeError("Model returned no safe visible reply.")
         decision = _decision_from_output(parsed, checks)
         handle.raise_if_cancelled()
-        committed = store.commit_turn(
-            snapshot,
-            user_text=chat.text,
-            assistant_text=decision.message if decision.should_respond else "",
-            source=chat.source,
-            request_id=chat.request_id,
-            proposals=parsed.proposals,
-            proposal_rejections=parsed.rejected_operations,
-            allow_initiative=allow_initiative,
-            now=time.time(),
-        )
+        timing.commit_started_at = time.perf_counter()
+        try:
+            committed = store.commit_turn(
+                snapshot,
+                user_text=chat.text,
+                assistant_text=decision.message if decision.should_respond else "",
+                source=chat.source,
+                request_id=chat.request_id,
+                proposals=parsed.proposals,
+                proposal_rejections=parsed.rejected_operations,
+                allow_initiative=allow_initiative,
+                now=time.time(),
+            )
+        except Exception as exc:
+            timing.commit_finished_at = time.perf_counter()
+            _record_debug(
+                chat,
+                snapshot,
+                plan,
+                parsed,
+                decision,
+                timing,
+                started_at,
+                visible_checks=checks,
+                state_selection=state_selection,
+                commit_error=f"{type(exc).__name__}: {compact_text(exc, 180)}",
+            )
+            raise
+        timing.commit_finished_at = time.perf_counter()
         _record_debug(
             chat,
             committed,
@@ -658,10 +663,16 @@ def run_companion_turn(
             timing,
             started_at,
             visible_checks=checks,
+            state_selection=state_selection,
         )
         return CompanionTurnResult(decision, handle.generation_id)
     finally:
         _SCHEDULER.finish(handle)
+
+
+def _elapsed(start: float, end: float) -> float:
+    return max(0.0, end - start) if start > 0.0 and end > 0.0 else 0.0
+
 
 def _record_debug(
     chat: ChatInput,
@@ -673,29 +684,97 @@ def _record_debug(
     started_at: float,
     *,
     visible_checks: VisibleReplyChecks,
+    state_selection: StateSelection,
+    commit_error: str = "",
 ) -> None:
     presence = snapshot.profile.presence
     view = presence_view(presence, now=snapshot.now)
     current_activity = view.current_activity
     previous_activity = view.previous_activity
     relevant_opinions = tuple(getattr(snapshot, "relevant_opinions", ()))
-    proposal_result = (
+    relevant_self_model = tuple(getattr(snapshot, "relevant_self_model", ()))
+    relevant_strategies = tuple(getattr(snapshot, "relevant_strategies", ()))
+    transition_result = (
         "rejected"
         if presence.last_error and presence.retry_at > 0.0
         else "accepted"
         if presence.last_decision_at > 0.0
         else "not_attempted"
     )
+    opinion_operations = parsed.proposals.get("opinion_ops")
+    opinion_candidate = (
+        opinion_operations[0]
+        if isinstance(opinion_operations, list)
+        and opinion_operations
+        and isinstance(opinion_operations[0], dict)
+        else None
+    )
+    opinion_rejections = tuple(
+        item
+        for item in snapshot.rejected_state_operations
+        if str(item).startswith("opinion_ops[")
+    )
+    opinion_accepted = any(
+        str(item).startswith("opinion_ops[")
+        for item in snapshot.ownership_classification
+    )
+    persisted_opinion = None
+    if opinion_candidate is not None and opinion_accepted:
+        target_id = compact_text(opinion_candidate.get("target_id"), 100)
+        topic = compact_text(opinion_candidate.get("topic"), 140).casefold()
+        persisted_opinion = next(
+            (
+                item
+                for item in reversed(snapshot.profile.opinions)
+                if target_id and item.id == target_id
+                or not target_id and item.topic.casefold() == topic
+            ),
+            None,
+        )
+    opinion_debug = {
+        "generated": opinion_candidate is not None,
+        "origin": parsed.opinion_candidate_origin,
+        "operation": (
+            compact_text(opinion_candidate.get("op"), 16)
+            if opinion_candidate is not None
+            else "none"
+        ),
+        "topic": (
+            compact_text(opinion_candidate.get("topic"), 140)
+            if opinion_candidate is not None
+            else None
+        ),
+        "validation": (
+            "not_completed"
+            if commit_error
+            else
+            "accepted"
+            if opinion_accepted
+            else "rejected"
+            if opinion_candidate is not None and opinion_rejections
+            else "not_applicable"
+        ),
+        "rejection_reason": "; ".join(opinion_rejections) or None,
+        "commit": (
+            "failed"
+            if commit_error
+            else "committed"
+            if opinion_accepted
+            else "not_committed"
+        ),
+        "commit_error": commit_error or None,
+        "target_store": "opinions.json",
+        "source_ids": (
+            persisted_opinion.source_ids if persisted_opinion is not None else ()
+        ),
+    }
     debug = {
         "revision": snapshot.revision,
         "prompt": plan.debug_metadata(),
         "state_fields": tuple(parsed.proposals),
         "state_block_parsed": parsed.parsed,
-        "response_intention": "conversation",
-        "style_modifier": compile_affect_guidance(
-            snapshot.profile,
-            now=snapshot.now,
-        ) or None,
+        "opinion_candidate": opinion_debug,
+        "decision_owner": "main_conversation_model",
         "affect_transition": snapshot.affect_transition or {
             "preview": True,
             "committed": False,
@@ -705,6 +784,7 @@ def _record_debug(
             for name in plan.included
             if name not in {"identity", "soul", "hard_rules", "protocol"}
         ),
+        "relevant_state": state_selection.debug,
         "active_communication_preferences": communication_preference_debug(
             snapshot.profile
         ),
@@ -721,6 +801,13 @@ def _record_debug(
             f"{item.id}:{item.topic}"
             for item in relevant_opinions
         ),
+        "relevant_self_model": tuple(
+            f"{getattr(item, 'id', '')}:{getattr(item, 'area', '')}"
+            for item in relevant_self_model
+        ),
+        "relevant_strategies": tuple(
+            item.id for item in relevant_strategies if isinstance(item, Strategy)
+        ),
         "relationship_influence_used": bool(
             getattr(snapshot, "relevant_relationship", ())
         ),
@@ -732,12 +819,43 @@ def _record_debug(
         "current_activity_expected_end_at": (
             current_activity.expected_end_at if current_activity else None
         ),
+        "current_presence_id": (
+            current_activity.activity_id if current_activity else None
+        ),
+        "current_presence_kind": current_activity.kind if current_activity else None,
+        "current_presence_subject": (
+            current_activity.subject if current_activity else None
+        ),
+        "current_presence_source_ids": (
+            current_activity.source_ids if current_activity else ()
+        ),
+        "current_presence_origin": (
+            current_activity.origin if current_activity else None
+        ),
+        "current_presence_started_at": (
+            current_activity.started_at if current_activity else None
+        ),
+        "current_presence_transition_at": (
+            current_activity.expected_end_at if current_activity else None
+        ),
+        "current_presence_expires_at": (
+            current_activity.expected_end_at if current_activity else None
+        ),
+        "presence_transition_reason": presence.last_transition_reason or None,
+        "presence_candidate_score_summary": (
+            {
+                "score": presence.last_candidate_score,
+                "source_id": presence.last_candidate_source_id,
+            }
+            if presence.last_candidate_score is not None
+            else None
+        ),
         "previous_activity_id": (
             previous_activity.activity_id if previous_activity else None
         ),
-        "presence_proposal_result": proposal_result,
+        "presence_transition_result": transition_result,
         "presence_rejection_reason": (
-            presence.last_error if proposal_result == "rejected" else None
+            presence.last_error if transition_result == "rejected" else None
         ),
         "retry_at": presence.retry_at,
         "visible_reply_warnings": visible_checks.warnings,
@@ -755,10 +873,38 @@ def _record_debug(
         "ownership_classification": snapshot.ownership_classification,
         "migration_schema_version": STATE_SCHEMA_VERSION,
         "should_respond": decision.should_respond,
-        "queue_wait_seconds": max(
-            0.0,
-            timing.model_started_at - timing.requested_at,
-        ) if timing.model_started_at else 0.0,
+        "queue_wait_seconds": _elapsed(
+            timing.requested_at,
+            timing.reservation_acquired_at,
+        ),
+        "state_retrieval_seconds": _elapsed(
+            timing.reservation_acquired_at,
+            timing.snapshot_ready_at,
+        ),
+        "context_build_seconds": _elapsed(
+            timing.snapshot_ready_at,
+            timing.context_ready_at,
+        ),
+        "prompt_build_seconds": _elapsed(
+            timing.context_ready_at,
+            timing.prompt_ready_at,
+        ),
+        "model_start_delay_seconds": _elapsed(
+            timing.prompt_ready_at,
+            timing.model_started_at,
+        ),
+        "model_time_to_first_token_seconds": _elapsed(
+            timing.model_started_at,
+            timing.first_token_at,
+        ),
+        "token_generation_seconds": _elapsed(
+            timing.first_token_at or timing.model_started_at,
+            timing.model_finished_at,
+        ),
+        "commit_seconds": _elapsed(
+            timing.commit_started_at,
+            timing.commit_finished_at,
+        ),
         "generation_seconds": time.perf_counter() - started_at,
         "prompt_tokens": timing.prompt_tokens,
         "updated_at": time.time(),
@@ -771,6 +917,14 @@ def _record_debug(
         print(
             "[Akane:timing] "
             f"total={debug['generation_seconds']:.3f}s "
+            f"queue={debug['queue_wait_seconds']:.3f}s "
+            f"state={debug['state_retrieval_seconds']:.3f}s "
+            f"context={debug['context_build_seconds']:.3f}s "
+            f"prompt={debug['prompt_build_seconds']:.3f}s "
+            f"model_start={debug['model_start_delay_seconds']:.3f}s "
+            f"ttft={debug['model_time_to_first_token_seconds']:.3f}s "
+            f"tokens={debug['token_generation_seconds']:.3f}s "
+            f"commit={debug['commit_seconds']:.3f}s "
             f"prompt_tokens={timing.prompt_tokens}",
             flush=True,
         )
@@ -854,6 +1008,47 @@ def session_state_snapshot(
                 if live_view.current_activity
                 else None
             ),
+            "current_presence_id": (
+                live_view.current_activity.activity_id
+                if live_view.current_activity
+                else None
+            ),
+            "current_presence_kind": (
+                live_view.current_activity.kind if live_view.current_activity else None
+            ),
+            "current_presence_subject": (
+                live_view.current_activity.subject if live_view.current_activity else None
+            ),
+            "current_presence_source_ids": (
+                live_view.current_activity.source_ids if live_view.current_activity else ()
+            ),
+            "current_presence_origin": (
+                live_view.current_activity.origin if live_view.current_activity else None
+            ),
+            "current_presence_started_at": (
+                live_view.current_activity.started_at if live_view.current_activity else None
+            ),
+            "current_presence_transition_at": (
+                live_view.current_activity.expected_end_at
+                if live_view.current_activity
+                else None
+            ),
+            "current_presence_expires_at": (
+                live_view.current_activity.expected_end_at
+                if live_view.current_activity
+                else None
+            ),
+            "presence_transition_reason": (
+                live_presence.last_transition_reason or None
+            ),
+            "presence_candidate_score_summary": (
+                {
+                    "score": live_presence.last_candidate_score,
+                    "source_id": live_presence.last_candidate_source_id,
+                }
+                if live_presence.last_candidate_score is not None
+                else None
+            ),
             "previous_activity_id": (
                 live_view.previous_activity.activity_id
                 if live_view.previous_activity
@@ -886,8 +1081,10 @@ def debug_state_report(
     prompt = (snapshot.get("turn") or {}).get("prompt") or {}
     turn = snapshot.get("turn") or {}
     affect = turn.get("affect_transition") or {}
+    opinion_candidate = turn.get("opinion_candidate") or {}
+    retrieval = turn.get("relevant_state") or {}
     model = ModelManager.get_instance().runtime_report(include_model_hash=verbose)
-    proposal_result = turn.get("presence_proposal_result") or (
+    transition_result = turn.get("presence_transition_result") or (
         "rejected"
         if presence.get("last_error") and presence.get("retry_at")
         else "accepted"
@@ -898,6 +1095,20 @@ def debug_state_report(
     def joined(label: str, field: str, separator: str = ", ") -> str:
         value = separator.join(turn.get(field) or ())
         return f"{label}: {value or 'None'}"
+
+    def retrieval_line(label: str, field: str) -> str:
+        value = retrieval.get(field) or {}
+        if "exposed" in value:
+            return (
+                f"{label}: exposed={bool(value.get('exposed'))}, "
+                f"reason={value.get('reason') or 'none'}"
+            )
+        selected = value.get("ids") or value.get("selected") or ()
+        return (
+            f"{label}: selected={selected or 'None'}, "
+            f"omitted={value.get('omitted', 0)}, "
+            f"reason={value.get('reason') or 'none'}"
+        )
 
     return "\n".join(
         (
@@ -911,16 +1122,25 @@ def debug_state_report(
             f"Mood: valence={(profile.get('mood') or {}).get('valence', 0.0)}, energy={(profile.get('mood') or {}).get('energy', 0.0)}",
             f"Affect Signal: {affect.get('category') or 'None'} (strength={affect.get('strength', 0.0)}, repetition={affect.get('repetition', 0)})",
             f"Affect Commit: {'committed' if affect.get('committed') else 'preview'}",
-            f"Current Focus: {current.get('summary') or 'None'}",
+            f"Current Presence Kind: {current.get('kind') or 'None'}",
+            f"Current Presence Subject: {current.get('subject') or 'None'}",
+            f"Current Presence Source IDs: {', '.join(current.get('source_ids') or ()) or 'None'}",
+            f"Current Presence Origin: {current.get('origin') or 'None'}",
+            f"Current Presence Started At: {current.get('started_at') or 'None'}",
+            f"Current Presence Transition At: {current.get('expected_end_at') or 'None'}",
+            f"Current Presence Expires At: {current.get('expected_end_at') or 'None'}",
             f"Current Activity Status: {turn.get('current_activity_status') or ('active' if current else 'none')}",
             f"Current Activity ID: {current.get('activity_id') or 'None'}",
             f"Current Activity Expected End At: {current.get('expected_end_at') or 'None'}",
             f"Previous Activity ID: {previous.get('activity_id') or 'None'}",
             f"Presence Context Status: {turn.get('presence_context_status') or 'none'}",
-            f"Presence Proposal Result: {proposal_result}",
+            f"Presence Transition Result: {transition_result}",
+            f"Presence Transition Reason: {presence.get('last_transition_reason') or 'None'}",
+            f"Presence Candidate Score: {presence.get('last_candidate_score') if presence.get('last_candidate_score') is not None else 'None'}",
+            f"Presence Candidate Source: {presence.get('last_candidate_source_id') or 'None'}",
             f"Presence Rejection Reason: {turn.get('presence_rejection_reason') or presence.get('last_error') or 'None'}",
             f"Presence Retry At: {presence.get('retry_at') or 'None'}",
-            f"Next Presence Decision At: {presence.get('next_decision_at') or 'None'}",
+            f"Next Presence Transition At: {presence.get('next_decision_at') or 'None'}",
             f"Background Service: {(snapshot.get('background_service') or {}).get('Background Service Started', False)}",
             f"Prompt Tokens: {prompt.get('exact_tokens', 'None')}",
             f"Prompt System Characters: {prompt.get('system_characters', 'None')}",
@@ -928,10 +1148,26 @@ def debug_state_report(
                 "Communication Preferences",
                 "active_communication_preferences",
             ),
-            f"Response Intention: {turn.get('response_intention') or 'None'}",
-            f"Style Modifier: {turn.get('style_modifier') or 'None'}",
+            f"Decision Owner: {turn.get('decision_owner') or 'Unknown'}",
             joined("Selected Context", "selected_context_categories"),
+            retrieval_line("Memory Retrieval", "memory"),
+            retrieval_line("Opinion Retrieval", "opinions"),
+            retrieval_line("Presence Retrieval", "presence"),
+            retrieval_line("Emotion Retrieval", "emotion"),
+            retrieval_line("Self-model Retrieval", "self_model"),
+            retrieval_line("Strategy Retrieval", "strategies"),
+            retrieval_line("Capability Retrieval", "capabilities"),
             joined("Relevant Opinions", "relevant_opinions"),
+            f"Opinion Candidate Generated: {opinion_candidate.get('generated', False)}",
+            f"Opinion Candidate Origin: {opinion_candidate.get('origin') or 'none'}",
+            f"Opinion Candidate Operation: {opinion_candidate.get('operation') or 'none'}",
+            f"Opinion Candidate Topic: {opinion_candidate.get('topic') or 'None'}",
+            f"Opinion Candidate Validation: {opinion_candidate.get('validation') or 'not_applicable'}",
+            f"Opinion Candidate Rejection: {opinion_candidate.get('rejection_reason') or 'None'}",
+            f"Opinion Candidate Commit: {opinion_candidate.get('commit') or 'not_committed'}",
+            f"Opinion Candidate Commit Error: {opinion_candidate.get('commit_error') or 'None'}",
+            f"Opinion Candidate Store: {opinion_candidate.get('target_store') or 'opinions.json'}",
+            f"Opinion Candidate Source IDs: {', '.join(opinion_candidate.get('source_ids') or ()) or 'None'}",
             f"Relationship Influence Used: {turn.get('relationship_influence_used', False)}",
             joined("Visible Reply Warnings", "visible_reply_warnings"),
             f"Final Visible Length: {turn.get('final_visible_length', 0)}",

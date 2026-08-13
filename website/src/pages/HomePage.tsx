@@ -63,21 +63,15 @@ function HomeHero() {
   ];
 
   return <section className="home-hero" aria-labelledby="home-title">
-    <picture className="home-hero-media">
-      <source
-        type="image/jpeg"
-        srcSet={`${projectConfig.basePath}assets/homepage-image-720.jpg 720w, ${projectConfig.basePath}assets/homepage-image-1100.jpg 1100w, ${projectConfig.basePath}assets/homepage-image-1448.jpg 1448w`}
-        sizes="100vw"
-      />
-      <img
-        src={homepageImage}
-        width="1448"
-        height="1086"
-        fetchPriority="high"
-        decoding="async"
-        alt="Akane, a blue-haired AI companion, standing in a bright room overlooking a city"
-      />
-    </picture>
+    <img
+      className="home-hero-media"
+      src={homepageImage}
+      width="1448"
+      height="1086"
+      fetchPriority="high"
+      decoding="async"
+      alt="Akane, a blue-haired AI companion, standing in a bright room overlooking a city"
+    />
     <div className="home-hero-copy shell">
       <p className="home-hero-eyebrow">Local-first <span>•</span> Private <span>•</span> Always yours</p>
       <h1 id="home-title">A local AI companion<br />that remembers you.</h1>

@@ -8,14 +8,7 @@ import re
 import time
 from collections import deque
 
-from app.core.config import (
-    DISCORD_ALLOWED_CHANNEL_IDS,
-    DISCORD_BOT_TOKEN,
-    DISCORD_PREFIX,
-    DISCORD_REPLY_TO_DMS,
-    DISCORD_SERVER_URL,
-    SERVER_API_TOKEN,
-)
+from app.core.config import SETTINGS
 from app.core.utils import OWNER_PROFILE_ID, compact_text
 
 _CHAT_TIMEOUT_SECONDS = 300
@@ -25,6 +18,8 @@ _RECENT_EVENT_IDS: deque[int] = deque()
 _RECENT_EVENT_SET: set[int] = set()
 _RAW_MENTION = re.compile(r"<@!?\d+>|<@&\d+>|<#\d+>")
 _CUSTOM_EMOJI = re.compile(r"<a?:([A-Za-z0-9_]+):\d+>")
+
+
 def _log(label: str, text: str = "") -> None:
     suffix = f" {text}" if text else ""
     print(f"[Akane:discord:{label}]{suffix}", flush=True)
@@ -63,8 +58,8 @@ def _message_text(message, bot_user_id: int) -> str:
     content = str(message.content or "").strip()
     if not content:
         return ""
-    if DISCORD_PREFIX and content.lower().startswith(DISCORD_PREFIX.lower()):
-        content = content[len(DISCORD_PREFIX) :].strip()
+    if SETTINGS.discord_prefix and content.lower().startswith(SETTINGS.discord_prefix.lower()):
+        content = content[len(SETTINGS.discord_prefix) :].strip()
         return _normalize_discord_text(message, content)
     if _mention_user_id(content) == bot_user_id:
         content = content[content.find(">") + 1 :].strip()
@@ -118,15 +113,15 @@ def _should_handle(message, bot_user_id: int) -> bool:
     if not content:
         return False
     if _is_dm(message):
-        return DISCORD_REPLY_TO_DMS or _is_explicit(content, bot_user_id)
-    if DISCORD_ALLOWED_CHANNEL_IDS and int(message.channel.id) not in DISCORD_ALLOWED_CHANNEL_IDS:
+        return SETTINGS.discord_reply_to_dms or _is_explicit(content, bot_user_id)
+    if SETTINGS.discord_allowed_channel_ids and int(message.channel.id) not in SETTINGS.discord_allowed_channel_ids:
         return False
     return _is_explicit(content, bot_user_id)
 
 
 def _is_explicit(content: str, bot_user_id: int) -> bool:
     return bool(
-        DISCORD_PREFIX and content.lower().startswith(DISCORD_PREFIX.lower())
+        SETTINGS.discord_prefix and content.lower().startswith(SETTINGS.discord_prefix.lower())
     ) or _mention_user_id(content) == bot_user_id
 
 
@@ -145,8 +140,8 @@ def _mark_event(message) -> bool:
 
 def _headers() -> dict[str, str]:
     headers = {"Accept": "application/json"}
-    if SERVER_API_TOKEN:
-        headers["Authorization"] = f"Bearer {SERVER_API_TOKEN}"
+    if SETTINGS.server_api_token:
+        headers["Authorization"] = f"Bearer {SETTINGS.server_api_token}"
     return headers
 
 
@@ -160,16 +155,17 @@ def _payload(message, text: str) -> dict[str, object]:
         "timestamp": time.time(),
         "display_name": _display_name(message),
         "reply_context": _reply_context(message),
+        "include_messages": False,
     }
 
 
-async def _post_chat(http, payload: dict[str, object]) -> dict:
+async def _post_chat(http, payload: dict[str, object]) -> dict[str, object]:
     import aiohttp
 
     timeout = aiohttp.ClientTimeout(total=_CHAT_TIMEOUT_SECONDS)
     try:
         async with http.post(
-            f"{DISCORD_SERVER_URL}/api/chat",
+            f"{SETTINGS.discord_server_url}/api/chat",
             json=payload,
             headers=_headers(),
             timeout=timeout,
@@ -178,17 +174,19 @@ async def _post_chat(http, payload: dict[str, object]) -> dict:
             try:
                 data = json.loads(text) if text else {}
             except json.JSONDecodeError:
-                data = {"error": "Akane server returned invalid JSON."}
+                data = {}
             if response.status >= 400:
                 return {
                     "error": data.get("error")
                     or f"Akane server returned HTTP {response.status}."
                 }
-            if isinstance(data, dict):
-                return data
-            return {"error": "Akane server returned invalid JSON."}
+            if not isinstance(data, dict):
+                return {"error": "Akane server returned invalid JSON."}
+            return data
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        return {"error": f"Could not reach the Akane server: {type(exc).__name__}."}
+        return {
+            "error": f"Could not reach the Akane server: {type(exc).__name__}.",
+        }
 
 
 async def _claim_delivery(
@@ -202,7 +200,7 @@ async def _claim_delivery(
     timeout = aiohttp.ClientTimeout(total=35)
     try:
         async with http.post(
-            f"{DISCORD_SERVER_URL}/api/initiative/delivery/claim",
+            f"{SETTINGS.discord_server_url}/api/initiative/delivery/claim",
             json={
                 "adapter": "discord",
                 "conversation_id": conversation_id,
@@ -237,7 +235,7 @@ async def _ack_delivery(
 ) -> bool:
     try:
         async with http.post(
-            f"{DISCORD_SERVER_URL}/api/initiative/delivery/ack",
+            f"{SETTINGS.discord_server_url}/api/initiative/delivery/ack",
             json={
                 "adapter": "discord",
                 "conversation_id": conversation_id,
@@ -257,7 +255,7 @@ async def _ack_delivery(
 async def _cancel_remote(http, conversation_id: str, profile_id: str) -> None:
     try:
         async with http.post(
-            f"{DISCORD_SERVER_URL}/api/chat/cancel",
+            f"{SETTINGS.discord_server_url}/api/chat/cancel",
             json={"conversation_id": conversation_id, "profile_id": profile_id},
             headers=_headers(),
         ) as response:
@@ -299,8 +297,43 @@ async def _send_reply(message, text: str, allowed_mentions) -> None:
         await message.channel.send(part, allowed_mentions=allowed_mentions)
 
 
+async def _send_completed_discord_reply(
+    message,
+    http,
+    payload: dict[str, object],
+    allowed_mentions,
+    *,
+    received_at: float,
+) -> str:
+    request_started_at = time.perf_counter()
+    result = await _post_chat(http, payload)
+    response_received_at = time.perf_counter()
+    error = compact_text(result.get("error"), 240)
+    if error:
+        await _send_reply(message, error, allowed_mentions)
+        return ""
+    text = str(result.get("reply") or result.get("notice") or "").strip()
+    if not text:
+        await _send_reply(message, "Akane server returned an empty reply.", allowed_mentions)
+        return ""
+    if SETTINGS.timing_enabled:
+        _log("foreground", f"stage=discord_send_start at={time.time():.6f}")
+    await _send_reply(message, text, allowed_mentions)
+    finished_at = time.perf_counter()
+    if SETTINGS.timing_enabled:
+        _log("foreground", f"stage=discord_send_end at={time.time():.6f}")
+        _log("foreground", f"stage=foreground_complete at={time.time():.6f}")
+        _log(
+            "timing",
+            f"server_roundtrip_ms={max(0.0, response_received_at - request_started_at) * 1000:.3f} "
+            f"integration_delivery_ms={max(0.0, finished_at - response_received_at) * 1000:.3f} "
+            f"foreground_total_ms={max(0.0, finished_at - received_at) * 1000:.3f}",
+        )
+    return text
+
+
 def run_discord_bot() -> None:
-    if not DISCORD_BOT_TOKEN:
+    if not SETTINGS.discord_bot_token:
         raise SystemExit(
             "Missing Discord bot token. Set AKANE_DISCORD_BOT_TOKEN or "
             "DISCORD_BOT_TOKEN."
@@ -344,7 +377,7 @@ def run_discord_bot() -> None:
     allowed_mentions = discord.AllowedMentions.none()
 
     def configured_delivery_target() -> dict[str, object] | None:
-        for channel_id in DISCORD_ALLOWED_CHANNEL_IDS:
+        for channel_id in SETTINGS.discord_allowed_channel_ids:
             channel = client.get_channel(channel_id)
             if channel is not None:
                 return {
@@ -406,7 +439,7 @@ def run_discord_bot() -> None:
     @client.event
     async def on_ready() -> None:
         _log("ready", f"logged in as {client.user}")
-        _log("status", f"forwarding to {DISCORD_SERVER_URL}")
+        _log("status", f"forwarding to {SETTINGS.discord_server_url}")
         if client.delivery_target is None:
             client.delivery_target = configured_delivery_target()
         if client.delivery_task is None or client.delivery_task.done():
@@ -415,6 +448,7 @@ def run_discord_bot() -> None:
 
     @client.event
     async def on_message(message) -> None:
+        received_at = time.perf_counter()
         if client.user is None or not _mark_event(message):
             return
         bot_user_id = int(client.user.id)
@@ -433,19 +467,15 @@ def run_discord_bot() -> None:
         client.delivery_wake.set()
         try:
             async with message.channel.typing():
-                result = await _post_chat(client.http_session, payload)
+                await _send_completed_discord_reply(
+                    message,
+                    client.http_session,
+                    payload,
+                    allowed_mentions,
+                    received_at=received_at,
+                )
         except asyncio.CancelledError:
             await _cancel_remote(client.http_session, conversation_id, profile_id)
             raise
 
-        error = compact_text(result.get("error"), 240)
-        if error:
-            _log("error", error)
-            await _send_reply(message, error, allowed_mentions)
-            return
-        output = str(result.get("reply") or result.get("notice") or "").strip()
-        if not output:
-            return
-        await _send_reply(message, output, allowed_mentions)
-
-    client.run(DISCORD_BOT_TOKEN)
+    client.run(SETTINGS.discord_bot_token)

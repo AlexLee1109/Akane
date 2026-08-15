@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import sys
 
-from app.core.config import APP_MODE, APPLICATION_HOST, APPLICATION_PORT
+from app.core.config import SETTINGS
 
 
 def main() -> None:
-    mode = str(sys.argv[1]).strip().lower() if len(sys.argv) > 1 else APP_MODE
+    mode = str(sys.argv[1]).strip().lower() if len(sys.argv) > 1 else SETTINGS.app_mode
     if mode == "server":
         from app.server import serve
-        serve(host=APPLICATION_HOST, port=APPLICATION_PORT)
+        serve(host=SETTINGS.application_host, port=SETTINGS.application_port)
         return
     if mode == "popup":
         from app.ui.popup import launch_popup

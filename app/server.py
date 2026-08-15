@@ -6,6 +6,7 @@ import asyncio
 import mimetypes
 import queue
 import secrets
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -20,21 +21,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.character import load_character_profile
-from app.core.config import (
-    APPLICATION_HOST,
-    APPLICATION_PORT,
-    CORS_ALLOWED_ORIGINS,
-    SERVER_API_TOKEN,
-    _coerce_bool,
+from app.core.config import SETTINGS, coerce_bool
+from app.core.autonomy import (
+    acknowledge_proactive_delivery,
+    claim_proactive_delivery,
+    start_autonomy,
+    stop_autonomy,
 )
-from app.core.memory import get_state_store
-from app.core.life_worker import (
-    acknowledge_initiative_delivery,
-    claim_initiative_delivery,
-    start_background_service,
-    stop_background_service,
-)
-from app.core.model_loader import ModelManager
+from app.core.inference import InferenceRuntime
 from app.core.session import (
     ChatInput,
     GenerationBusyError,
@@ -49,7 +43,8 @@ from app.core.session import (
     run_companion_turn,
     session_state_snapshot,
 )
-from app.core.utils import OWNER_PROFILE_ID
+from app.core.store import get_store
+from app.core.utils import OWNER_PROFILE_ID, log_timing
 from app.integrations.vscode_workspace import (
     MAX_REQUEST_BYTES,
     ReviewDecision,
@@ -85,10 +80,11 @@ class ChatRequestData:
     chat_input: ChatInput
     skip_memory: bool = False
     skip_if_busy: bool = False
+    include_messages: bool = True
 
 
 def _messages(conversation_id: str, profile_id: str) -> list[dict[str, str]]:
-    return get_state_store().messages(conversation_id, profile_id)
+    return get_store().messages(conversation_id, profile_id)
 
 
 def _messages_with_user(chat_input: ChatInput) -> list[dict[str, str]]:
@@ -120,8 +116,9 @@ def _parse_chat_request(payload: dict) -> ChatRequestData:
             reply_context=payload.get("reply_context", ""),
             request_id=payload.get("request_id", ""),
         ),
-        skip_memory=_coerce_bool(payload.get("skip_memory", False)),
-        skip_if_busy=_coerce_bool(payload.get("skip_if_busy", False)),
+        skip_memory=coerce_bool(payload.get("skip_memory", False)),
+        skip_if_busy=coerce_bool(payload.get("skip_if_busy", False)),
+        include_messages=coerce_bool(payload.get("include_messages", True), True),
     )
 
 
@@ -206,8 +203,9 @@ def _generate_reply(chat: ChatRequestData) -> str:
         item,
         skip_memory=chat.skip_memory,
         skip_if_busy=chat.skip_if_busy,
+        streaming=False,
     )
-    return result.message if result.decision.should_respond else ""
+    return result.message
 
 
 def _review_vscode_context(decision: ReviewDecision | None = None) -> str:
@@ -237,19 +235,19 @@ def _review_vscode_context(decision: ReviewDecision | None = None) -> str:
 
 def _stream_chat_events(chat: ChatRequestData):
     item = chat.chat_input
+    stream_started_at = time.perf_counter()
+    first_delta_at = 0.0
+    final_delta_at = 0.0
     generation_id = ""
     cancellation = threading.Event()
     worker: threading.Thread | None = None
     finished = False
     try:
         _log_chat("question", item, item.text)
-        yield _json_line(
-            {
-                "type": "start",
-                "generation_id": generation_id,
-                "messages": _messages_with_user(item),
-            }
-        )
+        start_event = {"type": "start", "generation_id": generation_id}
+        if chat.include_messages:
+            start_event["messages"] = _messages_with_user(item)
+        yield _json_line(start_event)
         stream_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
         def generate() -> None:
@@ -258,7 +256,9 @@ def _stream_chat_events(chat: ChatRequestData):
                     item,
                     skip_memory=chat.skip_memory,
                     skip_if_busy=chat.skip_if_busy,
+                    streaming=True,
                     on_delta=lambda text: stream_queue.put(("delta", text)),
+                    on_stream_end=lambda: stream_queue.put(("flush", None)),
                     cancellation=cancellation,
                 )
                 stream_queue.put(("done", result))
@@ -275,6 +275,10 @@ def _stream_chat_events(chat: ChatRequestData):
         while result is None:
             kind, value = stream_queue.get()
             if kind == "delta":
+                delta_at = time.perf_counter()
+                if not first_delta_at:
+                    first_delta_at = delta_at
+                final_delta_at = delta_at
                 yield _json_line(
                     {
                         "type": "delta",
@@ -282,6 +286,9 @@ def _stream_chat_events(chat: ChatRequestData):
                         "content": value,
                     }
                 )
+                continue
+            if kind == "flush":
+                yield _json_line({"type": "flush", "generation_id": generation_id})
                 continue
             if kind == "error":
                 if not isinstance(value, Exception):
@@ -291,16 +298,23 @@ def _stream_chat_events(chat: ChatRequestData):
             finished = True
         worker.join()
         generation_id = result.generation_id
-        reply = result.message if result.decision.should_respond else ""
+        reply = result.message
         _log_chat("reply", item, reply)
-        yield _json_line(
-            {
-                "type": "done",
-                "generation_id": generation_id,
-                "reply": reply,
-                "messages": _messages(item.conversation_id, item.profile_id),
-            }
+        done_at = time.perf_counter()
+        log_timing(
+            "stream",
+            first_update=(first_delta_at or done_at) - stream_started_at,
+            final_update_to_done=done_at - (final_delta_at or done_at),
+            total=done_at - stream_started_at,
         )
+        done_event = {
+            "type": "done",
+            "generation_id": generation_id,
+            "reply": reply,
+        }
+        if chat.include_messages:
+            done_event["messages"] = _messages(item.conversation_id, item.profile_id)
+        yield _json_line(done_event)
     except GenerationCancelled:
         _log("cancelled", f"conversation={item.conversation_id}")
         yield _json_line({"type": "cancelled", "generation_id": generation_id})
@@ -350,9 +364,9 @@ def _app_state_payload(
     *,
     include_messages: bool = True,
 ) -> dict:
-    conversation = get_state_store().public_conversation(conversation_id, profile_id)
+    conversation = get_store().public_conversation(conversation_id, profile_id)
     payload = {
-        "model": ModelManager.get_instance().status(),
+        "model": InferenceRuntime.get_instance().status(),
         "internal_state": session_state_snapshot(conversation_id, profile_id),
         "version": int(float(conversation.get("updated_at") or 0.0) * 1000),
     }
@@ -363,7 +377,7 @@ def _app_state_payload(
 
 def _start_model_loading() -> None:
     global _MODEL_LOAD_THREAD
-    manager = ModelManager.get_instance()
+    manager = InferenceRuntime.get_instance()
     status = manager.status()
     if status["loaded"]:
         return
@@ -390,14 +404,21 @@ def _start_model_loading() -> None:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     load_character_profile()
-    store = get_state_store()
+    store = get_store()
+    if SETTINGS.prompt_debug:
+        _log(
+            "runtime",
+            f"cwd={str(Path.cwd())!r} executable={sys.executable!r} "
+            f"module={str(Path(__file__).resolve())!r} project_root={str(SETTINGS.project_root.resolve())!r}",
+        )
+        _log("state", f"path={Path(store.path).expanduser().resolve()}")
     public_sessions = None
     if PUBLIC_API_SETTINGS.enabled:
         public_sessions = PublicSessionManager(store, PUBLIC_API_SETTINGS)
         public_sessions.start()
     app.state.public_sessions = public_sessions
     _RUNTIME_SHUTDOWN.clear()
-    start_background_service()
+    start_autonomy()
     _start_model_loading()
     try:
         yield
@@ -406,8 +427,9 @@ async def _lifespan(app: FastAPI):
         if public_sessions is not None:
             public_sessions.shutdown()
         app.state.public_sessions = None
-        stop_background_service()
+        stop_autonomy()
         cancel_all_generations()
+        InferenceRuntime.get_instance().close()
 
 
 def create_app() -> FastAPI:
@@ -422,7 +444,7 @@ def create_app() -> FastAPI:
     cors_origins = (
         PUBLIC_API_SETTINGS.allowed_origins
         if public_mode
-        else CORS_ALLOWED_ORIGINS
+        else SETTINGS.cors_allowed_origins
     )
     app.add_middleware(
         CORSMiddleware,
@@ -443,12 +465,12 @@ def create_app() -> FastAPI:
         private_request = private_request or (
             PUBLIC_API_SETTINGS.enabled and path == "/health"
         )
-        require_private_token = bool(SERVER_API_TOKEN) or PUBLIC_API_SETTINGS.enabled
+        require_private_token = bool(SETTINGS.server_api_token) or PUBLIC_API_SETTINGS.enabled
         if request.method != "OPTIONS" and private_request and require_private_token:
             bearer = request.headers.get("authorization", "")
             supplied = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
             supplied = supplied or request.headers.get("x-akane-token", "")
-            if not SERVER_API_TOKEN or not secrets.compare_digest(supplied, SERVER_API_TOKEN):
+            if not SETTINGS.server_api_token or not secrets.compare_digest(supplied, SETTINGS.server_api_token):
                 return JSONResponse({"error": "Unauthorized."}, status_code=401)
         return await call_next(request)
 
@@ -462,7 +484,7 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        status = ModelManager.get_instance().status()
+        status = InferenceRuntime.get_instance().status()
         return JSONResponse(
             {
                 "status": "ok",
@@ -515,13 +537,13 @@ def create_app() -> FastAPI:
             _app_state_payload(
                 conversation,
                 OWNER_PROFILE_ID,
-                include_messages=_coerce_bool(include_messages, True),
+                include_messages=coerce_bool(include_messages, True),
             )
         )
 
     @app.get("/api/memory")
     async def api_memory(profile_id: str = DEFAULT_PROFILE_ID):
-        return JSONResponse(get_state_store().public_memory(OWNER_PROFILE_ID))
+        return JSONResponse(get_store().public_memory(OWNER_PROFILE_ID))
 
     @app.post("/api/chat/cancel")
     async def api_cancel(request: Request):
@@ -546,38 +568,33 @@ def create_app() -> FastAPI:
         if command is not None:
             return JSONResponse(command)
         _log_chat("question", chat.chat_input, chat.chat_input.text)
-        prior_reply = get_state_store().reply_for_request(
+        prior_reply = get_store().reply_for_request(
             chat.chat_input.conversation_id,
             chat.chat_input.profile_id,
             chat.chat_input.request_id,
         )
         if prior_reply is not None:
             _log_chat("reply", chat.chat_input, prior_reply)
-            return JSONResponse(
-                {
-                    "reply": prior_reply,
-                    "messages": _messages(
-                        chat.chat_input.conversation_id,
-                        chat.chat_input.profile_id,
-                    ),
-                    "duplicate_retry": True,
-                }
-            )
+            payload = {"reply": prior_reply, "duplicate_retry": True}
+            if chat.include_messages:
+                payload["messages"] = _messages(
+                    chat.chat_input.conversation_id,
+                    chat.chat_input.profile_id,
+                )
+            return JSONResponse(payload)
         try:
             reply = await asyncio.to_thread(_generate_reply, chat)
         except Exception as exc:
             _log("error", f"type={type(exc).__name__} detail={exc}")
             return JSONResponse({"error": _safe_error(exc)}, status_code=_error_status(exc))
         _log_chat("reply", chat.chat_input, reply)
-        return JSONResponse(
-            {
-                "reply": reply,
-                "messages": _messages(
-                    chat.chat_input.conversation_id,
-                    chat.chat_input.profile_id,
-                ),
-            }
-        )
+        payload = {"reply": reply}
+        if chat.include_messages:
+            payload["messages"] = _messages(
+                chat.chat_input.conversation_id,
+                chat.chat_input.profile_id,
+            )
+        return JSONResponse(payload)
 
     @app.post("/api/chat/stream")
     async def api_chat_stream(request: Request):
@@ -605,10 +622,10 @@ def create_app() -> FastAPI:
         except (TypeError, ValueError):
             wait_seconds = 25.0
         delivery = await asyncio.to_thread(
-            claim_initiative_delivery,
+            claim_proactive_delivery,
             adapter=str(payload.get("adapter") or ""),
             conversation_id=conversation,
-            available=_coerce_bool(payload.get("available"), True),
+            available=coerce_bool(payload.get("available"), True),
             wait_seconds=wait_seconds,
         )
         return JSONResponse({"delivery": delivery})
@@ -620,12 +637,12 @@ def create_app() -> FastAPI:
             payload.get("conversation_id") or payload.get("session_id") or DEFAULT_CONVERSATION_ID
         )
         accepted = await asyncio.to_thread(
-            acknowledge_initiative_delivery,
+            acknowledge_proactive_delivery,
             opportunity_id=str(payload.get("opportunity_id") or ""),
             claim_token=str(payload.get("claim_token") or ""),
             adapter=str(payload.get("adapter") or ""),
             conversation_id=conversation,
-            success=_coerce_bool(payload.get("success"), False),
+            success=coerce_bool(payload.get("success"), False),
             message_id=str(payload.get("message_id") or ""),
         )
         return JSONResponse({"ok": accepted})
@@ -664,7 +681,7 @@ class BackgroundUvicornServer:
             self._thread.join(timeout=3.0)
 
 
-def serve(host: str = APPLICATION_HOST, port: int = APPLICATION_PORT) -> None:
+def serve(host: str = SETTINGS.application_host, port: int = SETTINGS.application_port) -> None:
     print(f"Akane web chat running at http://{host}:{port}", flush=True)
     try:
         BackgroundUvicornServer(host, port).run()
@@ -674,8 +691,8 @@ def serve(host: str = APPLICATION_HOST, port: int = APPLICATION_PORT) -> None:
 
 
 def serve_in_thread(
-    host: str = APPLICATION_HOST,
-    port: int = APPLICATION_PORT,
+    host: str = SETTINGS.application_host,
+    port: int = SETTINGS.application_port,
 ) -> tuple[BackgroundUvicornServer, threading.Thread]:
     server = BackgroundUvicornServer(host, port)
     thread = threading.Thread(target=server.run, daemon=True, name="AkaneAPIServer")

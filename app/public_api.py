@@ -15,25 +15,8 @@ import orjson
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.core.config import (
-    LLAMA_CONTEXT_WINDOW,
-    MAX_INPUT_CHARS,
-    PUBLIC_ALLOWED_ORIGINS,
-    PUBLIC_API_ENABLED,
-    PUBLIC_API_HOST,
-    PUBLIC_API_PORT,
-    PUBLIC_GENERATION_TIMEOUT_SECONDS,
-    PUBLIC_GUEST_IDLE_SECONDS,
-    PUBLIC_GUEST_MAX_LIFETIME_SECONDS,
-    PUBLIC_MAX_ACTIVE,
-    PUBLIC_MAX_GUEST_SESSIONS,
-    PUBLIC_MAX_QUEUE,
-    PUBLIC_MESSAGE_LIMIT,
-    PUBLIC_REQUEST_COOLDOWN_SECONDS,
-    PUBLIC_RESPONSE_TOKEN_LIMIT,
-)
-from app.core.memory import StateStore
-from app.core.model_loader import ModelManager
+from app.core.config import SETTINGS
+from app.core.inference import InferenceRuntime
 from app.core.session import (
     GenerationBusyError,
     GenerationCancelled,
@@ -43,6 +26,7 @@ from app.core.session import (
     normalize_chat_input,
     run_companion_turn,
 )
+from app.core.store import Store
 
 _PUBLIC_PREFIX = "public:guest:"
 
@@ -120,19 +104,19 @@ def _normalized_origin(value: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class PublicApiSettings:
-    enabled: bool = PUBLIC_API_ENABLED
-    host: str = PUBLIC_API_HOST
-    port: int = PUBLIC_API_PORT
-    allowed_origins: tuple[str, ...] = PUBLIC_ALLOWED_ORIGINS
-    guest_idle_seconds: int = PUBLIC_GUEST_IDLE_SECONDS
-    guest_max_lifetime_seconds: int = PUBLIC_GUEST_MAX_LIFETIME_SECONDS
-    max_guest_sessions: int = PUBLIC_MAX_GUEST_SESSIONS
-    max_active: int = PUBLIC_MAX_ACTIVE
-    max_queue: int = PUBLIC_MAX_QUEUE
-    message_limit: int = PUBLIC_MESSAGE_LIMIT
-    response_token_limit: int = PUBLIC_RESPONSE_TOKEN_LIMIT
-    request_cooldown_seconds: float = PUBLIC_REQUEST_COOLDOWN_SECONDS
-    generation_timeout_seconds: float = PUBLIC_GENERATION_TIMEOUT_SECONDS
+    enabled: bool = SETTINGS.public_api_enabled
+    host: str = SETTINGS.public_api_host
+    port: int = SETTINGS.public_api_port
+    allowed_origins: tuple[str, ...] = SETTINGS.public_allowed_origins
+    guest_idle_seconds: int = SETTINGS.public_guest_idle_seconds
+    guest_max_lifetime_seconds: int = SETTINGS.public_guest_max_lifetime_seconds
+    max_guest_sessions: int = SETTINGS.public_max_guest_sessions
+    max_active: int = SETTINGS.public_max_active
+    max_queue: int = SETTINGS.public_max_queue
+    message_limit: int = SETTINGS.public_message_limit
+    response_token_limit: int = SETTINGS.public_response_token_limit
+    request_cooldown_seconds: float = SETTINGS.public_request_cooldown_seconds
+    generation_timeout_seconds: float = SETTINGS.public_generation_timeout_seconds
 
     def __post_init__(self) -> None:
         origins = tuple(dict.fromkeys(_normalized_origin(item) for item in self.allowed_origins))
@@ -149,9 +133,9 @@ class PublicApiSettings:
             raise ValueError("AKANE_PUBLIC_MAX_GUEST_SESSIONS must be positive.")
         if int(self.max_active) != 1 or int(self.max_queue) < 0:
             raise ValueError("Public capacity requires one active slot and a non-negative queue.")
-        if not 1 <= int(self.message_limit) <= MAX_INPUT_CHARS:
+        if not 1 <= int(self.message_limit) <= SETTINGS.max_input_chars:
             raise ValueError("AKANE_PUBLIC_MESSAGE_LIMIT is outside the backend input limit.")
-        if not 1 <= int(self.response_token_limit) < LLAMA_CONTEXT_WINDOW:
+        if not 1 <= int(self.response_token_limit) < SETTINGS.llama_context_window:
             raise ValueError("AKANE_PUBLIC_RESPONSE_TOKEN_LIMIT is outside the model context.")
         if float(self.request_cooldown_seconds) < 0.0:
             raise ValueError("AKANE_PUBLIC_REQUEST_COOLDOWN_SECONDS cannot be negative.")
@@ -234,7 +218,7 @@ class GenerationLease:
 
 
 class PublicSessionManager:
-    def __init__(self, store: StateStore, settings: PublicApiSettings = PUBLIC_API_SETTINGS):
+    def __init__(self, store: Store, settings: PublicApiSettings = PUBLIC_API_SETTINGS):
         self.store = store
         self.settings = settings
         self._condition = threading.Condition(threading.RLock())
@@ -415,7 +399,7 @@ def _stream_error(error: Exception, lease: GenerationLease) -> PublicApiError:
         return _error("queue_full")
     if isinstance(error, GenerationCancelled):
         return _error("busy")
-    status = ModelManager.get_instance().status()
+    status = InferenceRuntime.get_instance().status()
     if not status.get("loaded"):
         return _error("model_unavailable")
     return _error("internal_error")
@@ -446,13 +430,13 @@ def public_chat_events(
             try:
                 result = run_companion_turn(
                     chat,
+                    streaming=True,
                     on_delta=lambda text: events.put(("delta", text)),
                     priority="guest",
                     max_tokens=manager.settings.response_token_limit,
                     cancellation=lease.cancellation,
                     queue_deadline=lease.deadline,
                     allow_tool_context=False,
-                    allow_initiative=False,
                 )
                 events.put(("done", result))
             except Exception as exc:
@@ -484,7 +468,7 @@ def public_chat_events(
                 continue
             if kind == "done":
                 finished = True
-                reply = value.message if value.decision.should_respond else ""
+                reply = value.message
                 _log_chat("reply", session.profile_id, reply)
                 _log("public generation completed", session.profile_id)
                 yield _json_line({"type": "done", "request_id": request_id})
@@ -534,7 +518,7 @@ def register_public_routes(
             manager = current_manager(request)
         except PublicApiError:
             return JSONResponse({"status": "offline", "streaming": True, "guest_enabled": True})
-        model = ModelManager.get_instance()
+        model = InferenceRuntime.get_instance()
         status = model.status()
         availability = (
             "offline"
@@ -565,7 +549,7 @@ def register_public_routes(
             manager = current_manager(request)
             session = manager.resolve(_bearer_token(request))
             message = _validate_message(await _payload(request), manager.settings)
-            if not ModelManager.get_instance().status().get("loaded"):
+            if not InferenceRuntime.get_instance().status().get("loaded"):
                 raise _error("model_unavailable")
             lease = manager.acquire_generation(session)
         except PublicApiError as error:

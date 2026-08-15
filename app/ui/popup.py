@@ -1,6 +1,5 @@
 import json
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlencode, urljoin, urlsplit
@@ -11,11 +10,7 @@ import time
 
 import webview
 
-from app.core.config import (
-    POPUP_BACKEND_URL,
-    SERVER_API_TOKEN,
-    popup_backend_is_local,
-)
+from app.core.config import SETTINGS, popup_backend_is_local
 
 try:
     import AppKit
@@ -33,12 +28,7 @@ COMPANION_WIDTH = 460
 COMPANION_HEIGHT = 560
 WINDOW_TITLE = "Akane"
 MOUSE_UPDATE_INTERVAL = 1 / 60
-_TIMING_ENABLED = str(os.environ.get("AKANE_TIMING", "")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+_TIMING_ENABLED = SETTINGS.timing_enabled
 
 
 def _log_popup_timing(**values: float | int) -> None:
@@ -105,8 +95,8 @@ class WindowApi:
 
     def request_headers(self) -> dict[str, str]:
         return (
-            {"Authorization": f"Bearer {SERVER_API_TOKEN}"}
-            if SERVER_API_TOKEN
+            {"Authorization": f"Bearer {SETTINGS.server_api_token}"}
+            if SETTINGS.server_api_token
             else {}
         )
 
@@ -125,7 +115,7 @@ class PopupApp:
     def __init__(self):
         self.server = None
         self.api = WindowApi(self)
-        self.backend_url = POPUP_BACKEND_URL.rstrip("/")
+        self.backend_url = SETTINGS.popup_backend_url.rstrip("/")
         self.static_index = Path(__file__).parent / "static" / "index.html"
         self.windows: dict[str, object] = {}
         self._shutting_down = False
@@ -219,8 +209,8 @@ class PopupApp:
             "Content-Type": "application/json",
             "Accept": "application/x-ndjson",
         }
-        if SERVER_API_TOKEN:
-            headers["Authorization"] = f"Bearer {SERVER_API_TOKEN}"
+        if SETTINGS.server_api_token:
+            headers["Authorization"] = f"Bearer {SETTINGS.server_api_token}"
         request = urllib.request.Request(
             urljoin(f"{self.backend_url}/", "api/chat/stream"),
             data=payload,
@@ -414,8 +404,8 @@ class PopupApp:
         if not popup_backend_is_local():
             return
         headers = {}
-        if SERVER_API_TOKEN:
-            headers["Authorization"] = f"Bearer {SERVER_API_TOKEN}"
+        if SETTINGS.server_api_token:
+            headers["Authorization"] = f"Bearer {SETTINGS.server_api_token}"
         for delay in (0.0, 0.2, 0.4):
             if delay:
                 time.sleep(delay)
@@ -564,14 +554,13 @@ class PopupApp:
             self._remove_mouse_monitors_on_main()
         elif AppHelper is not None:
             AppHelper.callAfter(self._remove_mouse_monitors_on_main)
+        if self.server:
+            self.server.shutdown()
         for window in list(self.windows.values()):
             try:
                 window.destroy()
             except Exception:
                 pass
-        if self.server:
-            self.server.shutdown()
-        os._exit(0)
 
     def run(self):
         layout = self._layout()

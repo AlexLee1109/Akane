@@ -1,221 +1,244 @@
-"""Small runtime configuration layer."""
+"""Central, typed runtime configuration for Akane."""
 
 from __future__ import annotations
 
 import os
 import platform
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
 try:
     from app.secrets import local_secrets as _local_secrets  # type: ignore
-except ImportError:  # pragma: no cover
+except ImportError:  # pragma: no cover - optional local file
     _local_secrets = None
 
 
-def _local_secret(name: str, default):
-    return getattr(_local_secrets, name, default) if _local_secrets is not None else default
-
-
-def _secret_or_env(name: str, default: str = "") -> str:
-    value = os.environ.get(f"AKANE_{name}", os.environ.get(name, _local_secret(name, default)))
+def _raw(name: str, default: str = "") -> str:
+    local = getattr(_local_secrets, name, default) if _local_secrets is not None else default
+    value = os.environ.get(f"AKANE_{name}", os.environ.get(name, local))
     return str(default if value is None else value).strip()
 
 
-def _coerce_int(value, default: int) -> int:
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return int(default)
-
-
-def _coerce_float(value, default: float) -> float:
-    try:
-        return float(str(value).strip())
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _coerce_bool(value, default: bool = False) -> bool:
+def coerce_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    normalized = str(value or "").strip().lower()
-    if not normalized:
-        return bool(default)
+    normalized = str(value or "").strip().casefold()
     if normalized in {"1", "true", "yes", "on"}:
         return True
     if normalized in {"0", "false", "no", "off"}:
         return False
-    return bool(default)
+    return default
 
 
-def _int_secret(name: str, default: int) -> int:
-    return _coerce_int(_secret_or_env(name, str(default)), default)
+def _integer(name: str, default: int) -> int:
+    try:
+        return int(_raw(name, str(default)))
+    except ValueError:
+        return default
 
 
-def _float_secret(name: str, default: float) -> float:
-    return _coerce_float(_secret_or_env(name, str(default)), default)
+def _number(name: str, default: float) -> float:
+    try:
+        return float(_raw(name, str(default)))
+    except ValueError:
+        return default
 
 
-def _bool_secret(name: str, default: bool = False) -> bool:
-    return _coerce_bool(_secret_or_env(name, "1" if default else "0"), default)
+def _strings(name: str, default: str = "") -> tuple[str, ...]:
+    return tuple(part.strip() for part in _raw(name, default).split(",") if part.strip())
 
 
-def _csv_ints(name: str, default: str = "") -> tuple[int, ...]:
+def _integers(name: str, default: str = "") -> tuple[int, ...]:
     values: list[int] = []
-    for part in _secret_or_env(name, default).split(","):
+    for part in _strings(name, default):
         try:
-            values.append(int(part.strip()))
+            values.append(int(part))
         except ValueError:
-            pass
+            continue
     return tuple(values)
 
 
-def _csv_strings(name: str, default: str = "") -> tuple[str, ...]:
-    return tuple(
-        value
-        for part in _secret_or_env(name, default).split(",")
-        if (value := part.strip())
-    )
-
-
 def _is_raspberry_pi() -> bool:
-    machine = platform.machine().lower()
-    if machine not in {"aarch64", "arm64", "armv7l", "armv8l"}:
+    if platform.machine().casefold() not in {"aarch64", "arm64", "armv7l", "armv8l"}:
         return False
-    for path in ("/proc/device-tree/model", "/sys/firmware/devicetree/base/model"):
+    for path in (Path("/proc/device-tree/model"), Path("/sys/firmware/devicetree/base/model")):
         try:
-            model = Path(path).read_text(encoding="utf-8", errors="ignore")
-            if "raspberry pi" in model.lower():
+            if "raspberry pi" in path.read_text(encoding="utf-8", errors="ignore").casefold():
                 return True
         except OSError:
-            pass
-    return "raspberry" in platform.node().lower()
+            continue
+    return "raspberry" in platform.node().casefold()
 
 
-IS_RASPBERRY_PI = _bool_secret("RASPBERRY_PI", _is_raspberry_pi())
-APP_MODE = (_secret_or_env("APP_MODE", "popup") or "popup").lower()
-TIMEZONE = _secret_or_env("TIMEZONE", "America/New_York") or "America/New_York"
-SERVER_HOST = _secret_or_env("SERVER_HOST", "127.0.0.1") or "127.0.0.1"
-SERVER_PORT = _int_secret("SERVER_PORT", 8000)
-POPUP_BACKEND_URL = _secret_or_env(
-    "POPUP_BACKEND_URL",
-    f"http://127.0.0.1:{SERVER_PORT}",
-).rstrip("/")
-DISCORD_SERVER_URL = _secret_or_env(
-    "DISCORD_SERVER_URL",
-    f"http://127.0.0.1:{SERVER_PORT}",
-).rstrip("/")
-SERVER_API_TOKEN = _secret_or_env("SERVER_API_TOKEN", "")
-CORS_ALLOWED_ORIGINS = _csv_strings(
-    "CORS_ALLOWED_ORIGINS",
-    f"http://127.0.0.1:{SERVER_PORT},http://localhost:{SERVER_PORT},null",
-)
+@dataclass(frozen=True, slots=True)
+class Settings:
+    project_root: Path
+    data_dir: Path
+    state_path: Path
+    app_mode: str
+    timezone: str
+    server_host: str
+    server_port: int
+    server_api_token: str
+    cors_allowed_origins: tuple[str, ...]
+    popup_backend_url: str
+    discord_server_url: str
+    discord_bot_token: str
+    discord_prefix: str
+    discord_allowed_channel_ids: tuple[int, ...]
+    discord_reply_to_dms: bool
+    public_api_enabled: bool
+    public_api_host: str
+    public_api_port: int
+    public_allowed_origins: tuple[str, ...]
+    public_guest_idle_seconds: int
+    public_guest_max_lifetime_seconds: int
+    public_max_guest_sessions: int
+    public_max_active: int
+    public_max_queue: int
+    public_message_limit: int
+    public_response_token_limit: int
+    public_request_cooldown_seconds: float
+    public_generation_timeout_seconds: float
+    model_path: str
+    llama_context_window: int
+    llama_batch_size: int
+    llama_ubatch_size: int
+    llama_threads: int
+    llama_threads_batch: int
+    llama_flash_attn: bool
+    llama_gpu_layers: int
+    llama_offload_kqv: bool
+    llama_op_offload: bool
+    llama_use_mmap: bool
+    llama_use_mlock: bool
+    llama_swa_full: bool
+    max_tokens: int
+    reflection_tokens: int
+    inner_life_tokens: int
+    reasoning_tokens: int
+    temperature: float
+    top_k: int
+    top_p: float
+    min_p: float
+    repetition_penalty: float
+    generation_stop_sequences: tuple[str, ...]
+    max_input_chars: int
+    max_pending_generations: int
+    generation_queue_timeout_seconds: float
+    recent_turn_limit: int
+    memory_result_limit: int
+    self_result_limit: int
+    autonomy_interval_seconds: float
+    background_idle_grace_seconds: float
+    reflection_turn_limit: int
+    reflection_input_chars: int
+    inner_life_interval_seconds: float
+    prompt_debug: bool
+    timing_enabled: bool
 
-PUBLIC_API_ENABLED = _bool_secret("PUBLIC_API_ENABLED", False)
-PUBLIC_API_HOST = _secret_or_env("PUBLIC_API_HOST", "127.0.0.1") or "127.0.0.1"
-PUBLIC_API_PORT = _int_secret("PUBLIC_API_PORT", 8000)
-PUBLIC_ALLOWED_ORIGINS = _csv_strings("PUBLIC_ALLOWED_ORIGINS", "")
-PUBLIC_GUEST_IDLE_SECONDS = _int_secret("PUBLIC_GUEST_IDLE_SECONDS", 1800)
-PUBLIC_GUEST_MAX_LIFETIME_SECONDS = _int_secret(
-    "PUBLIC_GUEST_MAX_LIFETIME_SECONDS",
-    7200,
-)
-PUBLIC_MAX_GUEST_SESSIONS = _int_secret("PUBLIC_MAX_GUEST_SESSIONS", 32)
-PUBLIC_MAX_ACTIVE = _int_secret("PUBLIC_MAX_ACTIVE", 1)
-PUBLIC_MAX_QUEUE = _int_secret("PUBLIC_MAX_QUEUE", 2)
-PUBLIC_MESSAGE_LIMIT = _int_secret("PUBLIC_MESSAGE_LIMIT", 750)
-PUBLIC_RESPONSE_TOKEN_LIMIT = _int_secret("PUBLIC_RESPONSE_TOKEN_LIMIT", 256)
-PUBLIC_REQUEST_COOLDOWN_SECONDS = _float_secret(
-    "PUBLIC_REQUEST_COOLDOWN_SECONDS",
-    8.0,
-)
-PUBLIC_GENERATION_TIMEOUT_SECONDS = _float_secret(
-    "PUBLIC_GENERATION_TIMEOUT_SECONDS",
-    90.0,
-)
-APPLICATION_HOST = PUBLIC_API_HOST if PUBLIC_API_ENABLED else SERVER_HOST
-APPLICATION_PORT = PUBLIC_API_PORT if PUBLIC_API_ENABLED else SERVER_PORT
+    @property
+    def application_host(self) -> str:
+        return self.public_api_host if self.public_api_enabled else self.server_host
 
-DISCORD_BOT_TOKEN = _secret_or_env("DISCORD_BOT_TOKEN", "")
-DISCORD_PREFIX = _secret_or_env("DISCORD_PREFIX", "!akane")
-DISCORD_ALLOWED_CHANNEL_IDS = _csv_ints("DISCORD_ALLOWED_CHANNEL_IDS", "")
-DISCORD_REPLY_TO_DMS = _bool_secret("DISCORD_REPLY_TO_DMS", True)
+    @property
+    def application_port(self) -> int:
+        return self.public_api_port if self.public_api_enabled else self.server_port
+
+    def validate(self) -> None:
+        if not 1 <= self.server_port <= 65535 or not 1 <= self.public_api_port <= 65535:
+            raise ValueError("Akane server ports must be between 1 and 65535.")
+        if self.llama_context_window < 512:
+            raise ValueError("AKANE_LLAMA_CONTEXT_WINDOW must be at least 512.")
+        if self.max_tokens >= self.llama_context_window:
+            raise ValueError("AKANE_MAX_TOKENS must be smaller than the model context window.")
+        if self.max_input_chars < 1:
+            raise ValueError("AKANE_MAX_INPUT_CHARS must be positive.")
+
+
+def load_settings() -> Settings:
+    root = Path(__file__).resolve().parents[2]
+    configured_data = Path(_raw("DATA_DIR", "data") or "data").expanduser()
+    data_dir = configured_data if configured_data.is_absolute() else root / configured_data
+    raspberry_pi = coerce_bool(_raw("RASPBERRY_PI", ""), _is_raspberry_pi())
+    cpu_count = os.cpu_count() or 4
+    context_window = max(512, _integer("LLAMA_CONTEXT_WINDOW", 4096))
+    batch_size = max(1, min(_integer("LLAMA_BATCH_SIZE", 512 if raspberry_pi else 1024), context_window))
+    server_port = _integer("SERVER_PORT", 8000)
+    settings = Settings(
+        project_root=root,
+        data_dir=data_dir,
+        state_path=data_dir / "akane_state.json",
+        app_mode=(_raw("APP_MODE", "popup") or "popup").casefold(),
+        timezone=_raw("TIMEZONE", "America/New_York") or "America/New_York",
+        server_host=_raw("SERVER_HOST", "127.0.0.1") or "127.0.0.1",
+        server_port=server_port,
+        server_api_token=_raw("SERVER_API_TOKEN"),
+        cors_allowed_origins=_strings("CORS_ALLOWED_ORIGINS", f"http://127.0.0.1:{server_port},http://localhost:{server_port},null"),
+        popup_backend_url=_raw("POPUP_BACKEND_URL", f"http://127.0.0.1:{server_port}").rstrip("/"),
+        discord_server_url=_raw("DISCORD_SERVER_URL", f"http://127.0.0.1:{server_port}").rstrip("/"),
+        discord_bot_token=_raw("DISCORD_BOT_TOKEN"),
+        discord_prefix=_raw("DISCORD_PREFIX", "!akane"),
+        discord_allowed_channel_ids=_integers("DISCORD_ALLOWED_CHANNEL_IDS"),
+        discord_reply_to_dms=coerce_bool(_raw("DISCORD_REPLY_TO_DMS", "1"), True),
+        public_api_enabled=coerce_bool(_raw("PUBLIC_API_ENABLED"), False),
+        public_api_host=_raw("PUBLIC_API_HOST", "127.0.0.1") or "127.0.0.1",
+        public_api_port=_integer("PUBLIC_API_PORT", 8000),
+        public_allowed_origins=_strings("PUBLIC_ALLOWED_ORIGINS"),
+        public_guest_idle_seconds=max(1, _integer("PUBLIC_GUEST_IDLE_SECONDS", 1800)),
+        public_guest_max_lifetime_seconds=max(1, _integer("PUBLIC_GUEST_MAX_LIFETIME_SECONDS", 7200)),
+        public_max_guest_sessions=max(1, _integer("PUBLIC_MAX_GUEST_SESSIONS", 32)),
+        public_max_active=max(1, _integer("PUBLIC_MAX_ACTIVE", 1)),
+        public_max_queue=max(0, _integer("PUBLIC_MAX_QUEUE", 2)),
+        public_message_limit=max(1, _integer("PUBLIC_MESSAGE_LIMIT", 750)),
+        public_response_token_limit=max(1, _integer("PUBLIC_RESPONSE_TOKEN_LIMIT", 256)),
+        public_request_cooldown_seconds=max(0.0, _number("PUBLIC_REQUEST_COOLDOWN_SECONDS", 8.0)),
+        public_generation_timeout_seconds=max(1.0, _number("PUBLIC_GENERATION_TIMEOUT_SECONDS", 90.0)),
+        model_path=_raw("MODEL_PATH", "models/gemma-4-E4B-it-Q4_K_M.gguf"),
+        llama_context_window=context_window,
+        llama_batch_size=batch_size,
+        llama_ubatch_size=max(1, min(_integer("LLAMA_UBATCH_SIZE", min(512, batch_size)), batch_size)),
+        llama_threads=max(1, _integer("LLAMA_THREADS", min(4, cpu_count) if raspberry_pi else max(1, cpu_count - 1))),
+        llama_threads_batch=max(1, _integer("LLAMA_THREADS_BATCH", min(4, cpu_count) if raspberry_pi else max(1, cpu_count - 1))),
+        llama_flash_attn=coerce_bool(_raw("LLAMA_FLASH_ATTN"), raspberry_pi),
+        llama_gpu_layers=_integer("LLAMA_GPU_LAYERS", 0),
+        llama_offload_kqv=coerce_bool(_raw("LLAMA_OFFLOAD_KQV"), False),
+        llama_op_offload=coerce_bool(_raw("LLAMA_OP_OFFLOAD"), False),
+        llama_use_mmap=coerce_bool(_raw("LLAMA_USE_MMAP", "1"), True),
+        llama_use_mlock=coerce_bool(_raw("LLAMA_USE_MLOCK"), False),
+        llama_swa_full=coerce_bool(_raw("LLAMA_SWA_FULL"), raspberry_pi),
+        max_tokens=max(24, min(_integer("MAX_TOKENS", 160), context_window - 256)),
+        reflection_tokens=max(32, min(_integer("REFLECTION_TOKENS", 160), context_window // 3)),
+        inner_life_tokens=max(32, min(_integer("INNER_LIFE_TOKENS", 128), context_window // 4)),
+        reasoning_tokens=max(48, min(_integer("REASONING_TOKENS", 192), context_window // 4)),
+        temperature=max(0.0, min(2.0, _number("TEMPERATURE", 0.95))),
+        top_k=max(0, _integer("TOP_K", 40)),
+        top_p=max(0.05, min(1.0, _number("TOP_P", 0.9))),
+        min_p=max(0.0, min(1.0, _number("MIN_P", 0.05))),
+        repetition_penalty=max(0.8, min(1.5, _number("REPETITION_PENALTY", 1.08))),
+        generation_stop_sequences=_strings("GENERATION_STOP_SEQUENCES"),
+        max_input_chars=max(256, _integer("MAX_INPUT_CHARS", 8000)),
+        max_pending_generations=max(0, _integer("MAX_PENDING_GENERATIONS", 4)),
+        generation_queue_timeout_seconds=max(1.0, _number("GENERATION_QUEUE_TIMEOUT_SECONDS", 120.0)),
+        recent_turn_limit=max(4, _integer("RECENT_TURN_LIMIT", 16)),
+        memory_result_limit=max(1, _integer("MEMORY_MAX_RESULTS", 4)),
+        self_result_limit=max(1, _integer("SELF_MAX_RESULTS", 8)),
+        autonomy_interval_seconds=max(2.0, _number("AUTONOMY_INTERVAL_SECONDS", 60.0)),
+        background_idle_grace_seconds=max(0.0, _number("BACKGROUND_IDLE_GRACE_SECONDS", 120.0)),
+        reflection_turn_limit=max(2, _integer("REFLECTION_TURN_LIMIT", 20)),
+        reflection_input_chars=max(512, _integer("REFLECTION_INPUT_CHARS", 6000)),
+        inner_life_interval_seconds=max(60.0, _number("INNER_LIFE_INTERVAL_SECONDS", 1800.0)),
+        prompt_debug=coerce_bool(_raw("PROMPT_DEBUG"), False),
+        timing_enabled=coerce_bool(_raw("TIMING"), False),
+    )
+    settings.validate()
+    return settings
+
+
+SETTINGS = load_settings()
 
 
 def popup_backend_is_local() -> bool:
-    hostname = (urlsplit(POPUP_BACKEND_URL).hostname or "").strip().lower()
+    hostname = (urlsplit(SETTINGS.popup_backend_url).hostname or "").strip().casefold()
     return hostname in {"", "127.0.0.1", "localhost", "0.0.0.0", "::1"}
-
-
-MODEL_PATH = _secret_or_env("MODEL_PATH", "models/gemma-4-E4B-it-Q4_K_M.gguf")
-
-_CPU_COUNT = os.cpu_count() or 4
-_PI_THREADS = min(4, _CPU_COUNT)
-
-LLAMA_CONTEXT_WINDOW = max(512, _int_secret("LLAMA_CONTEXT_WINDOW", 4096))
-_DEFAULT_BATCH_SIZE = min(512 if IS_RASPBERRY_PI else 1024, LLAMA_CONTEXT_WINDOW)
-LLAMA_BATCH_SIZE = max(
-    1,
-    min(_int_secret("LLAMA_BATCH_SIZE", _DEFAULT_BATCH_SIZE), LLAMA_CONTEXT_WINDOW),
-)
-_DEFAULT_UBATCH_SIZE = min(512, LLAMA_BATCH_SIZE)
-LLAMA_UBATCH_SIZE = max(
-    1,
-    min(_int_secret("LLAMA_UBATCH_SIZE", _DEFAULT_UBATCH_SIZE), LLAMA_BATCH_SIZE),
-)
-LLAMA_THREADS = max(
-    1,
-    _int_secret(
-        "LLAMA_THREADS",
-        _PI_THREADS if IS_RASPBERRY_PI else max(1, _CPU_COUNT - 1),
-    ),
-)
-LLAMA_THREADS_BATCH = max(1, _int_secret("LLAMA_THREADS_BATCH", LLAMA_THREADS))
-LLAMA_FLASH_ATTN = _bool_secret("LLAMA_FLASH_ATTN", IS_RASPBERRY_PI)
-LLAMA_GPU_LAYERS = _int_secret("LLAMA_GPU_LAYERS", 0)
-LLAMA_OFFLOAD_KQV = _bool_secret("LLAMA_OFFLOAD_KQV", False)
-LLAMA_OP_OFFLOAD = _bool_secret("LLAMA_OP_OFFLOAD", False)
-LLAMA_USE_MMAP = _bool_secret("LLAMA_USE_MMAP", True)
-LLAMA_USE_MLOCK = _bool_secret("LLAMA_USE_MLOCK", False)
-LLAMA_SWA_FULL = _bool_secret(
-    "LLAMA_SWA_FULL",
-    IS_RASPBERRY_PI,
-)
-LLAMA_LAST_N_TOKENS_SIZE = _int_secret("LLAMA_LAST_N_TOKENS_SIZE", 64)
-MEMORY_MAX_RESULTS = max(1, _int_secret("MEMORY_MAX_RESULTS", 3))
-MEMORY_MAX_ENTRIES_PER_PROFILE = max(
-    8,
-    _int_secret("MEMORY_MAX_ENTRIES_PER_PROFILE", 96),
-)
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_DATA_DIR_VALUE = Path(_secret_or_env("DATA_DIR", "data") or "data").expanduser()
-DATA_DIR = _DATA_DIR_VALUE if _DATA_DIR_VALUE.is_absolute() else PROJECT_ROOT / _DATA_DIR_VALUE
-MEMORY_PATH = DATA_DIR / "memory.json"
-POPUP_USER_PATH = DATA_DIR / "popup_user.json"
-LONG_TERM_MEMORY_PATH = DATA_DIR / "long_term_memory.json"
-OPINIONS_PATH = DATA_DIR / "opinions.json"
-SELF_MODEL_PATH = DATA_DIR / "self_model.json"
-STRATEGIES_PATH = DATA_DIR / "strategies.json"
-MAX_INPUT_CHARS = max(256, _int_secret("MAX_INPUT_CHARS", 8_000))
-MAX_CONVERSATIONS = max(8, _int_secret("MAX_CONVERSATIONS", 64))
-CONVERSATION_STALE_DAYS = max(1, _int_secret("CONVERSATION_STALE_DAYS", 30))
-MAX_PENDING_GENERATIONS = max(0, _int_secret("MAX_PENDING_GENERATIONS", 4))
-GENERATION_QUEUE_TIMEOUT_SECONDS = max(
-    1.0,
-    _float_secret("GENERATION_QUEUE_TIMEOUT_SECONDS", 120.0),
-)
-
-ADVISOR_ONLY = _bool_secret("ADVISOR_ONLY", False)
-
-MAX_TOKENS = max(24, min(_int_secret("MAX_TOKENS", 160), LLAMA_CONTEXT_WINDOW - 256))
-TEMPERATURE = max(0.0, min(2.0, _float_secret("TEMPERATURE", 0.95)))
-TOP_K = max(0, _int_secret("TOP_K", 40))
-TOP_P = max(0.05, min(1.0, _float_secret("TOP_P", 0.9)))
-MIN_P = max(0.0, min(1.0, _float_secret("MIN_P", 0.05)))
-REPETITION_PENALTY = max(0.8, min(1.5, _float_secret("REPETITION_PENALTY", 1.08)))
-GENERATION_STOP_SEQUENCES = _csv_strings("GENERATION_STOP_SEQUENCES", "")
-PROMPT_DEBUG = _bool_secret("PROMPT_DEBUG", False)

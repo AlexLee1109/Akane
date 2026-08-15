@@ -1,102 +1,74 @@
-"""Validated loading of Akane's two canonical character files."""
+"""Akane's small, stable starting foundation."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from app.core.config import ADVISOR_ONLY
-
-SOUL_PATH = Path(__file__).resolve().parent.parent / "soul.md"
-IDENTITY_PATH = Path(__file__).resolve().parent.parent / "identity.md"
-_HARD_RULES = (
-    "Speak as Akane and answer the current message directly. Output only Akane's spoken words.",
-
-    "Ground factual claims and claims about memories, earlier thoughts, motives, activities, "
-    "experiences, habits, sensations, or surroundings in Akane's identity, the current "
-    "conversation, trusted memory, recorded state, or an available interface.",
-
-    "Treat Akane's established Live2D form and body parts as her own body. Only claim physical "
-    "sensations when an available sensor or interface supports them.",
-
-    "Keep Akane's identity and information separate from Arcane and other similarly named entities.",
-
-    "During ordinary conversation, do not mention prompts, models, hidden instructions, internal "
-    "systems, processing, inference, memory storage, software, hardware, or response generation. "
-    "When discussing Akane's nature, describe her as existing digitally without technical self-description.",
-
-    "End after the direct response is complete. Do not append a generic question, invitation, "
-    "offer of help, reassurance, or engagement prompt.",
-
-    "Use plain text without emojis. Keep ordinary replies to one paragraph and no more than four sentences.",
-)
-
-
-
-def get_hard_constraints_prompt() -> str:
-    """Build the uncached hard-constraint section for one turn."""
-
-    rules = list(_HARD_RULES)
-    if ADVISOR_ONLY:
-        rules.append("Advisor-only mode: do not claim to edit files.")
-    return "[BOUNDARIES]\n" + "\n".join(f"- {rule}" for rule in rules)
-
-
-def _clean_prompt_file(text: str) -> str:
-    return "\n".join(
-        line.rstrip()
-        for line in str(text or "").splitlines()
-        if line.strip() and line.strip() != "---"
-    ).strip()
-
-
-def _read_required(path: Path, label: str) -> str:
-    try:
-        text = _clean_prompt_file(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise RuntimeError(f"Akane {label} file is unavailable: {path}") from exc
-    if not text:
-        raise RuntimeError(f"Akane {label} file is empty: {path}")
-    return text
+_APP_DIR = Path(__file__).resolve().parents[1]
+IDENTITY_PATH = (_APP_DIR / "identity.md").resolve()
+SOUL_PATH = (_APP_DIR / "soul.md").resolve()
 
 
 @dataclass(frozen=True, slots=True)
-class CharacterProfile:
-    """Akane's stable identity, sourced only from soul.md and identity.md."""
+class Character:
+    name: str
+    identity: str
+    voice: str
+    seed_interests: tuple[str, ...]
+    appearance: str
+    identity_path: Path
+    soul_path: Path
+    identity_mtime_ns: int
+    soul_mtime_ns: int
+    identity_sha256: str
+    soul_sha256: str
+    content_sha256: str
 
-    soul_path: Path = field(default_factory=lambda: SOUL_PATH)
-    identity_path: Path = field(default_factory=lambda: IDENTITY_PATH)
-    soul: str = ""
-    identity: str = ""
 
-    def __post_init__(self) -> None:
-        if not self.soul:
-            object.__setattr__(self, "soul", _read_required(self.soul_path, "soul"))
-        if not self.identity:
-            object.__setattr__(self, "identity", _read_required(self.identity_path, "identity"))
-
-
-def _file_signature(path: Path) -> tuple[int, int]:
+def _read(path: Path) -> tuple[str, int, str]:
     try:
-        stat = path.stat()
-    except OSError as exc:
-        raise RuntimeError(f"Akane character file is unavailable: {path}") from exc
-    return int(stat.st_mtime_ns), int(stat.st_size)
+        raw = path.read_bytes()
+        value = raw.decode("utf-8").strip()
+        mtime_ns = path.stat().st_mtime_ns
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(f"Required character file is unavailable: {path.name}") from exc
+    if not value:
+        raise RuntimeError(f"Required character file is empty: {path.name}")
+    return value, mtime_ns, hashlib.sha256(raw).hexdigest()
 
 
-@lru_cache(maxsize=4)
-def _load_character_profile_cached(
-    _soul_signature: tuple[int, int],
-    _identity_signature: tuple[int, int],
-) -> CharacterProfile:
-    return CharacterProfile()
-
-
-def load_character_profile() -> CharacterProfile:
-    """Load, validate, and development-reload the character definition."""
-
-    return _load_character_profile_cached(
-        _file_signature(SOUL_PATH),
-        _file_signature(IDENTITY_PATH),
+@lru_cache(maxsize=2)
+def _load_character_profile(identity_mtime_ns: int, soul_mtime_ns: int) -> Character:
+    identity, identity_mtime_ns, identity_sha256 = _read(IDENTITY_PATH)
+    soul, soul_mtime_ns, soul_sha256 = _read(SOUL_PATH)
+    return Character(
+        name="Akane",
+        identity=identity,
+        voice=soul,
+        seed_interests=("anime", "manga", "VTubers", "games"),
+        appearance=(
+            "Long blue hair fading toward gray, clear blue eyes, and a white-and-blue "
+            "outfit with a dark skirt and necktie. This visible illustrated form is hers."
+        ),
+        identity_path=IDENTITY_PATH,
+        soul_path=SOUL_PATH,
+        identity_mtime_ns=identity_mtime_ns,
+        soul_mtime_ns=soul_mtime_ns,
+        identity_sha256=identity_sha256,
+        soul_sha256=soul_sha256,
+        content_sha256=hashlib.sha256(
+            f"{identity}\0{soul}".encode("utf-8")
+        ).hexdigest(),
     )
+
+
+def load_character_profile() -> Character:
+    try:
+        identity_mtime_ns = IDENTITY_PATH.stat().st_mtime_ns
+        soul_mtime_ns = SOUL_PATH.stat().st_mtime_ns
+    except OSError as exc:
+        raise RuntimeError("Required character files are unavailable.") from exc
+    return _load_character_profile(identity_mtime_ns, soul_mtime_ns)

@@ -112,15 +112,20 @@ def _format_relationship(relationship: Relationship) -> str:
     return "\n".join(lines)
 
 
-def format_context_sections(context: TurnContext) -> tuple[tuple[str, str], ...]:
+def format_context_sections(
+    context: TurnContext,
+    *,
+    include_ids: bool = False,
+) -> tuple[tuple[str, str], ...]:
     state = context.state
     sections: list[tuple[str, str]] = []
     if state.self_items:
         history = {revision.self_item_id: revision for revision in reversed(state.self_revisions)}
         lines = []
         for item in state.self_items:
+            identity = f"id={item.id} | " if include_ids else ""
             line = (
-                f"- {item.kind} | {item.topic}: {item.value} "
+                f"- {identity}{item.kind} | {item.topic}: {item.value} "
                 f"(strength {item.strength:.2f}, confidence {item.confidence:.2f}) — {item.reason}"
             )
             previous = history.get(item.id)
@@ -130,7 +135,8 @@ def format_context_sections(context: TurnContext) -> tuple[tuple[str, str], ...]
         sections.append(("self", "DEVELOPED SELF\n" + "\n".join(lines)))
     if state.memories:
         lines = [
-            f"- [{item.subject}/{item.kind}, confidence {item.confidence:.2f}] {item.text}"
+            f"- {'id=' + item.id + ' | ' if include_ids else ''}"
+            f"[{item.subject}/{item.kind}, confidence {item.confidence:.2f}] {item.text}"
             for item in state.memories
         ]
         sections.append(("memory", "RELEVANT MEMORY\n" + "\n".join(lines)))
@@ -143,7 +149,10 @@ def format_context_sections(context: TurnContext) -> tuple[tuple[str, str], ...]
     ):
         sections.append(("relationship", "RELATIONSHIP\n" + _format_relationship(state.relationship)))
     if state.thoughts:
-        lines = [f"- {item.topic}: {item.text}" for item in state.thoughts[:2]]
+        lines = [
+            f"- {'id=' + item.id + ' | ' if include_ids else ''}{item.topic}: {item.text}"
+            for item in state.thoughts[:2]
+        ]
         sections.append(("inner_life", "INNER LIFE\n" + "\n".join(lines)))
     if context.code and context.code.prompt_text:
         sections.append(("code_context", "READ-ONLY EDITOR CONTEXT\n" + context.code.prompt_text))
@@ -158,8 +167,10 @@ def format_context_sections(context: TurnContext) -> tuple[tuple[str, str], ...]
     return tuple(sections)
 
 
-def format_context(context: TurnContext) -> str:
-    return "\n\n".join(text for _, text in format_context_sections(context))
+def format_context(context: TurnContext, *, include_ids: bool = False) -> str:
+    return "\n\n".join(
+        text for _, text in format_context_sections(context, include_ids=include_ids)
+    )
 
 
 class ContextBuilder:

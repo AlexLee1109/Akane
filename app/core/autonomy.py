@@ -102,7 +102,7 @@ class AutonomyCoordinator:
         context = self.context_builder.build(
             profile_id=profile_id,
             conversation_id=conversation_id,
-            message="current interests, memories, unresolved thoughts, and personally meaningful connections",
+            message="",
             allow_tool_context=False,
         )
         context_finished_at = time.perf_counter()
@@ -120,7 +120,11 @@ class AutonomyCoordinator:
         inference_finished_at = time.perf_counter()
         if reservation.preemption.is_set():
             raise InferencePreempted("InnerLife yielded before validation.")
-        proposal = validate_inner_life(output, context=context)
+        proposal = validate_inner_life(
+            output,
+            context=context,
+            last_user_message_at=self.store.latest_turn_at(profile_id, role="user"),
+        )
         parsed_at = time.perf_counter()
         if reservation.preemption.is_set():
             raise InferencePreempted("InnerLife yielded before persistence.")
@@ -141,6 +145,19 @@ class AutonomyCoordinator:
             input_tokens=timing.prompt_tokens,
             output_tokens=timing.generated_tokens,
             generation_ms=max(0.0, timing.model_finished_at - timing.model_started_at) * 1000,
+            prefill_ms=timing.prefill_seconds * 1000,
+            decode_tok_s=(
+                timing.generated_tokens / timing.decode_seconds
+                if timing.generated_tokens and timing.decode_seconds else 0.0
+            ),
+            reused_prefix_tokens=timing.reused_prefix_tokens,
+            new_prompt_eval_tokens=timing.new_prompt_eval_tokens,
+            model_wait_ms=max(0.0, reservation_acquired_at - wait_started_at) * 1000,
+            total_ms=max(0.0, committed_at - started_at) * 1000,
+            finish_reason=timing.finish_reason or "unavailable",
+            accepted_thoughts=len(proposal.thoughts),
+            accepted_self=len(proposal.self_items),
+            rejection_codes=",".join(proposal.rejected) or "none",
         )
         return proposal
 

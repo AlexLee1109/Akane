@@ -161,6 +161,11 @@ def load_settings() -> Settings:
     root = Path(__file__).resolve().parents[2]
     configured_data = Path(_raw("DATA_DIR", "data") or "data").expanduser()
     data_dir = configured_data if configured_data.is_absolute() else root / configured_data
+    configured_model = Path(
+        _raw("MODEL_PATH", "models/gemma-4-E4B-it-Q4_K_M.gguf")
+        or "models/gemma-4-E4B-it-Q4_K_M.gguf"
+    ).expanduser()
+    model_path = configured_model if configured_model.is_absolute() else root / configured_model
     raspberry_pi = coerce_bool(_raw("RASPBERRY_PI", ""), _is_raspberry_pi())
     cpu_count = os.cpu_count() or 4
     context_window = max(512, _integer("LLAMA_CONTEXT_WINDOW", 4096))
@@ -195,7 +200,7 @@ def load_settings() -> Settings:
         public_response_token_limit=max(1, _integer("PUBLIC_RESPONSE_TOKEN_LIMIT", 256)),
         public_request_cooldown_seconds=max(0.0, _number("PUBLIC_REQUEST_COOLDOWN_SECONDS", 8.0)),
         public_generation_timeout_seconds=max(1.0, _number("PUBLIC_GENERATION_TIMEOUT_SECONDS", 90.0)),
-        model_path=_raw("MODEL_PATH", "models/gemma-4-E4B-it-Q4_K_M.gguf"),
+        model_path=str(model_path),
         llama_context_window=context_window,
         llama_batch_size=batch_size,
         llama_ubatch_size=max(1, min(_integer("LLAMA_UBATCH_SIZE", min(512, batch_size)), batch_size)),

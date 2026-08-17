@@ -18,7 +18,6 @@ class Character:
     identity: str
     voice: str
     seed_interests: tuple[str, ...]
-    appearance: str
     identity_path: Path
     soul_path: Path
     identity_mtime_ns: int
@@ -41,18 +40,19 @@ def _read(path: Path) -> tuple[str, int, str]:
 
 
 @lru_cache(maxsize=2)
-def _load_character_profile(identity_mtime_ns: int, soul_mtime_ns: int) -> Character:
-    identity, identity_mtime_ns, identity_sha256 = _read(IDENTITY_PATH)
-    soul, soul_mtime_ns, soul_sha256 = _read(SOUL_PATH)
+def _load_character_profile(
+    identity: str,
+    identity_mtime_ns: int,
+    identity_sha256: str,
+    soul: str,
+    soul_mtime_ns: int,
+    soul_sha256: str,
+) -> Character:
     return Character(
         name="Akane",
         identity=identity,
         voice=soul,
         seed_interests=("anime", "manga", "VTubers", "games"),
-        appearance=(
-            "Long blue hair fading toward gray, clear blue eyes, and a white-and-blue "
-            "outfit with a dark skirt and necktie. This visible illustrated form is hers."
-        ),
         identity_path=IDENTITY_PATH,
         soul_path=SOUL_PATH,
         identity_mtime_ns=identity_mtime_ns,
@@ -66,9 +66,13 @@ def _load_character_profile(identity_mtime_ns: int, soul_mtime_ns: int) -> Chara
 
 
 def load_character_profile() -> Character:
-    try:
-        identity_mtime_ns = IDENTITY_PATH.stat().st_mtime_ns
-        soul_mtime_ns = SOUL_PATH.stat().st_mtime_ns
-    except OSError as exc:
-        raise RuntimeError("Required character files are unavailable.") from exc
-    return _load_character_profile(identity_mtime_ns, soul_mtime_ns)
+    identity, identity_mtime_ns, identity_sha256 = _read(IDENTITY_PATH)
+    soul, soul_mtime_ns, soul_sha256 = _read(SOUL_PATH)
+    return _load_character_profile(
+        identity,
+        identity_mtime_ns,
+        identity_sha256,
+        soul,
+        soul_mtime_ns,
+        soul_sha256,
+    )

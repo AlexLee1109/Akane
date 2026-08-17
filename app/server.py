@@ -204,6 +204,7 @@ def _generate_reply(chat: ChatRequestData) -> str:
         skip_memory=chat.skip_memory,
         skip_if_busy=chat.skip_if_busy,
         streaming=False,
+        allow_tool_context=item.source in {"popup", "web"},
     )
     return result.message
 
@@ -260,6 +261,7 @@ def _stream_chat_events(chat: ChatRequestData):
                     on_delta=lambda text: stream_queue.put(("delta", text)),
                     on_stream_end=lambda: stream_queue.put(("flush", None)),
                     cancellation=cancellation,
+                    allow_tool_context=item.source in {"popup", "web"},
                 )
                 stream_queue.put(("done", result))
             except Exception as exc:
@@ -403,15 +405,44 @@ def _start_model_loading() -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    load_character_profile()
+    character = load_character_profile()
     store = get_store()
     if SETTINGS.prompt_debug:
+        from app.core.prompt import stable_prompt_hash
+
+        state = store.debug_snapshot(OWNER_PROFILE_ID, DEFAULT_CONVERSATION_ID)
+        runtime = InferenceRuntime.get_instance().runtime_report()
+        options = runtime["effective_init_options"]
         _log(
             "runtime",
             f"cwd={str(Path.cwd())!r} executable={sys.executable!r} "
             f"module={str(Path(__file__).resolve())!r} project_root={str(SETTINGS.project_root.resolve())!r}",
         )
-        _log("state", f"path={Path(store.path).expanduser().resolve()}")
+        _log(
+            "state",
+            f"schema_version={state['schema_version']} revision={state['revision']} "
+            f"path={Path(store.path).expanduser().resolve()}",
+        )
+        _log(
+            "character",
+            f"identity_path={character.identity_path!s} identity_sha256={character.identity_sha256} "
+            f"soul_path={character.soul_path!s} soul_sha256={character.soul_sha256} "
+            f"stable_character_prompt_sha256={stable_prompt_hash(character)}",
+        )
+        _log(
+            "model",
+            f"path={runtime['model_path']} llama_cpp_python={runtime['llama_cpp_python']} "
+            f"context={runtime['context_window']} threads={options.get('n_threads')} "
+            f"threads_batch={options.get('n_threads_batch')} batch={options.get('n_batch')} "
+            f"ubatch={options.get('n_ubatch')} swa_full={options.get('swa_full')} "
+            f"sequence_state_api={runtime['sequence_state_api_available']}",
+        )
+        _log(
+            "sampling",
+            f"temperature={runtime['temperature']} top_k={runtime['top_k']} "
+            f"top_p={runtime['top_p']} min_p={runtime['min_p']} "
+            f"repeat_penalty={runtime['repeat_penalty']} seed_mode={runtime['seed_behavior']!r}",
+        )
     public_sessions = None
     if PUBLIC_API_SETTINGS.enabled:
         public_sessions = PublicSessionManager(store, PUBLIC_API_SETTINGS)

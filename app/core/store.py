@@ -923,6 +923,9 @@ class Store:
                 for change in proposal.self_items:
                     if self._apply_self(state, profile_id, change.action, change.target_id, change.item):
                         applied.append(f"self:{change.target_id or change.item.id}")
+                    else:
+                        item_id = change.target_id or (change.item.id if change.item is not None else "unknown")
+                        rejected.append(f"self:not-applied:{change.action}:{item_id}")
                 if proposal.mood is not None:
                     self._apply_mood(state, profile_id, proposal.mood, timestamp)
                     applied.append("mood")
@@ -966,7 +969,13 @@ class Store:
                         })
                     else:
                         existing["latest_turn_id"] = latest_turn_id
-                        existing["turn_count"] = int(existing["turn_count"]) + 2
+                        conversation = state["profiles"][profile_id]["conversations"][conversation_id]
+                        turn_ids = [str(turn["id"]) for turn in conversation["turns"]]
+                        existing["turn_count"] = (
+                            turn_ids.index(latest_turn_id)
+                            - turn_ids.index(str(existing["first_turn_id"]))
+                            + 1
+                        )
                         existing["ready"] = bool(existing["ready"] or proposal.reflection_ready)
                         existing["available_at"] = max(
                             float(existing["available_at"]),
@@ -1113,9 +1122,28 @@ class Store:
             if current is None:
                 return False
             Store._record_self_revision(profile, current)
-            current["status"] = "retired"
-            current["updated_at"] = time.time()
-            current["revision_count"] = int(current["revision_count"]) + 1
+            if item is None:
+                current["status"] = "retired"
+                current["updated_at"] = time.time()
+                current["revision_count"] = int(current["revision_count"]) + 1
+                return True
+            if item.profile_id != profile_id or item.kind != current["kind"]:
+                raise StateIntegrityError("Invalid retired Self item ownership or kind.")
+            current.update(_record(SelfItem(
+                str(current["id"]),
+                profile_id,
+                str(current["kind"]),
+                str(current["topic"]),
+                item.value.strip() or str(current["value"]),
+                clamp(item.strength, -1, 1),
+                clamp(item.confidence, 0, 1),
+                item.reason.strip() or str(current["reason"]),
+                "retired",
+                float(current["created_at"]),
+                item.updated_at,
+                item.source_ids,
+                int(current["revision_count"]) + 1,
+            )))
             return True
         if action not in {"form", "reinforce", "weaken", "revise", "complete", "abandon"} or item is None:
             raise StateIntegrityError("Invalid Self change.")
@@ -1388,26 +1416,23 @@ class Store:
                 item.id: self_relevance[item.id] * 0.7 + abs(item.strength) * 0.15 + item.confidence * 0.15
                 for item in self_items
             }
-            broad_memory = bool(query_terms & {"remember", "memory", "history", "promise", "commitment"})
-            broad_self = bool(query_terms & {
-                "interest", "interested", "preference", "like", "dislike", "opinion", "believe",
-                "changed", "change", "goal", "want", "uncertain", "unsure", "yourself",
-            }) or "who are you" in normalized_query
+            broad_memory = normalized_query in {
+                "what do you remember", "what do you remember about me", "what is our history",
+            }
+            broad_self = normalized_query in {
+                "who are you", "what do you like", "what do you want",
+                "what are your interests", "what are your opinions", "what are your goals",
+                "what have you changed your mind about", "what are you uncertain about",
+            }
             memories = [item for item in memories if broad_memory or memory_relevance[item.id] >= 0.12]
             self_items = [item for item in self_items if broad_self or self_relevance[item.id] >= 0.12]
             memories.sort(key=lambda item: memory_scores[item.id], reverse=True)
             self_items.sort(key=lambda item: self_scores[item.id], reverse=True)
-            broad_thought = bool(query_terms & {"thought", "think", "mind", "lately"}) or any(
-                phrase in normalized_query
-                for phrase in (
-                    "what are you doing", "what have you been doing", "what are you up to",
-                    "current goal",
-                )
-            )
-            thought_rows = [
+            relevant_thoughts = [
                 row for row in thought_rows
-                if broad_thought or relevance(query, f"{row['topic']} {row['text']}") >= 0.12
+                if relevance(query, f"{row['topic']} {row['text']}") >= 0.12
             ]
+            thought_rows = relevant_thoughts or thought_rows[:1]
         mood = _mood(mood_row)
         elapsed_hours = max(0.0, current - mood.updated_at) / 3600.0
         decay = 0.5 ** (elapsed_hours / 6.0) if elapsed_hours else 1.0
@@ -1450,6 +1475,19 @@ class Store:
             )
         ]
         return [{"role": str(row["role"]), "content": str(row["content"])} for row in rows]
+
+    def latest_turn_at(self, profile_id: str, *, role: str = "") -> float | None:
+        with self._lock:
+            profile = self._state["profiles"].get(profile_id)
+            if profile is None:
+                return None
+            values = (
+                float(turn["created_at"])
+                for conversation in profile["conversations"].values()
+                for turn in conversation["turns"]
+                if not role or turn["role"] == role
+            )
+            return max(values, default=None)
 
     def reply_for_request(self, conversation_id: str, profile_id: str, request_id: str) -> str | None:
         if not request_id:
@@ -1568,9 +1606,24 @@ class Store:
                 limit = SETTINGS.reflection_turn_limit
                 if limit % 2:
                     limit -= 1
-                selected = turns[first_index:min(latest_index + 1, first_index + max(2, limit))]
-                if selected and selected[-1]["role"] == "user":
-                    selected = selected[:-1]
+                available = turns[first_index:min(latest_index + 1, first_index + max(2, limit))]
+                selected = []
+                last_complete = 0
+                rendered_chars = 0
+                for turn in available:
+                    label = "USER" if turn["role"] == "user" else "AKANE"
+                    line_chars = len(label) + 2 + len(str(turn["content"])) + 1
+                    if (
+                        selected
+                        and last_complete
+                        and rendered_chars + line_chars > SETTINGS.reflection_input_chars
+                    ):
+                        break
+                    selected.append(turn)
+                    rendered_chars += line_chars
+                    if turn["role"] == "assistant":
+                        last_complete = len(selected)
+                selected = selected[:last_complete]
                 if not selected:
                     return None
                 result = copy.deepcopy(job)
@@ -1582,8 +1635,10 @@ class Store:
                         str(turn["content"]) for turn in selected if turn["role"] == "assistant"
                     ),
                     "conversation_text": "\n".join(
-                        f"{str(turn['role']).upper()}: {turn['content']}" for turn in selected
+                        f"{'USER' if turn['role'] == 'user' else 'AKANE'}: {turn['content']}"
+                        for turn in selected
                     ),
+                    "selected_turns": tuple(_turn(turn) for turn in selected),
                     "first_turn_id": str(selected[0]["id"]),
                     "latest_turn_id": str(selected[-1]["id"]),
                     "turn_count": len(selected),

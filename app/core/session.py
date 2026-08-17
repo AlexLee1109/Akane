@@ -16,28 +16,16 @@ from app.core.inference import (
     InferenceRuntime,
     InferenceTiming,
 )
-from app.core.state import MoodChange, StateChangeProposal, Turn
+from app.core.state import StateChangeProposal, Turn
 from app.core.prompt import PromptPlan, build_dialogue_prompt, build_reasoning_prompt
 from app.core.store import get_store
 from app.core.utils import (
     OWNER_PROFILE_ID,
     canonical_profile_id,
     compact_text,
-    lexical_terms,
     log_performance,
     log_timing,
 )
-
-_DELIBERATION_TERMS = {
-    "compare", "tradeoff", "plan", "debug", "contradiction", "conflict",
-    "decide", "decision", "analyze", "technical", "architecture",
-}
-_TRIVIAL_EXCHANGES = {
-    "hi", "hello", "hey", "hi there", "hello there", "hey there",
-    "ok", "okay", "thanks", "thank you", "bye", "goodbye",
-}
-_GREETING_EXCHANGES = {"hi", "hello", "hey", "hi there", "hello there", "hey there"}
-
 
 class GenerationBusyError(RuntimeError):
     pass
@@ -190,35 +178,20 @@ def normalize_chat_input(
     )
 
 
-def _simple_exchange_key(text: str) -> str:
-    return " ".join(text.casefold().strip(" \t\r\n!?.,").split())
-
-
 def _should_reflect(chat: ChatInput, reply: str, *, skip_memory: bool) -> bool:
     if skip_memory:
         return False
-    del reply
-    return _simple_exchange_key(chat.text) not in _TRIVIAL_EXCHANGES
-
-
-def _deterministic_mood(chat: ChatInput) -> MoodChange | None:
-    if _simple_exchange_key(chat.text) not in _GREETING_EXCHANGES:
-        return None
-    return MoodChange(0.05, 0.03, "friendly", "greeting")
+    # Readiness is a cheap structural gate, not a hand-built intent classifier.
+    # A substantial Akane reply can make even a one-word user turn reflectable.
+    return len(chat.text.split()) > 1 or len(reply.split()) >= 10
 
 
 def _needs_deliberation(message: str, context) -> bool:
     """Use cheap structural signals to protect casual-turn latency."""
 
-    terms = lexical_terms(message)
     if len(message) >= 420 or (message.count("?") >= 2 and len(message) >= 160):
         return True
-    reasoning_signals = terms & _DELIBERATION_TERMS
-    if reasoning_signals and (len(message) >= 120 or len(terms) >= 16):
-        return True
-    if len(reasoning_signals) >= 2 and len(message) >= 60:
-        return True
-    if context.code is not None and context.code.prompt_text:
+    if context.code is not None and context.code.prompt_text and len(message) >= 160:
         return True
     return False
 
@@ -389,6 +362,9 @@ def run_companion_turn(
                 runtime, reservation, plan, prompt_tokens,
             )
             static_prefix_hash = getattr(plan, "static_prefix_hash", "")
+            cache_fingerprint = getattr(runtime, "dialogue_cache_fingerprint", None)
+            if static_prefix_hash and callable(cache_fingerprint):
+                static_prefix_hash = cache_fingerprint(static_prefix_hash, reservation)
             cache_key = (
                 (chat.profile_id, chat.conversation_id, static_prefix_hash)
                 if static_prefix_hash else None
@@ -440,7 +416,6 @@ def run_companion_turn(
         proposal = StateChangeProposal(
             chat.profile_id,
             turns=(user_turn, assistant_turn),
-            mood=_deterministic_mood(chat),
             reflection_turn_ids=(user_turn.id, assistant_turn.id) if not skip_memory else None,
             reflection_ready=queue_reflection,
             origin="conversation",
@@ -472,12 +447,13 @@ def run_companion_turn(
             "prompt_tokens": timing.prompt_tokens,
             "prompt_token_method": timing.prompt_token_method,
             "prompt_token_breakdown": token_breakdown,
+            "static_prompt_hash": getattr(plan, "static_prefix_hash", ""),
             "selected_counts": plan.selected_counts,
             "used_reasoning": used_reasoning,
             "reflection_dirty": not skip_memory,
             "reflection_content_ready": queue_reflection,
             "reflection_inference_eligible": False,
-            "reflection_queued": queue_reflection,
+            "reflection_queued": not skip_memory,
             "revision": commit.revision,
             "store_snapshot_ms": context_builder.last_timing.get("store_snapshot_seconds", 0.0) * 1000,
             "context_build_ms": (context_finished_at - context_started_at) * 1000,
@@ -499,6 +475,7 @@ def run_companion_turn(
             "decode_ms": timing.decode_seconds * 1000,
             "generated_tokens": timing.generated_tokens,
             "generated_token_method": timing.generated_token_method,
+            "finish_reason": timing.finish_reason or "unavailable",
             "decode_tokens_per_second": _tokens_per_second(
                 timing.generated_tokens, timing.decode_seconds,
             ),

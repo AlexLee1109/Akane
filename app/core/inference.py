@@ -46,6 +46,7 @@ class InferenceTiming:
     prefill_seconds: float = 0.0
     decode_seconds: float = 0.0
     first_token_estimated: bool = False
+    finish_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +54,7 @@ class Reservation:
     llm: object
     priority: str
     preemption: threading.Event
+    queue_wait_seconds: float = 0.0
 
 
 DialogueCacheKey = tuple[str, str, str]
@@ -85,10 +87,11 @@ def _chat_formatter(llm):
     try:
         from llama_cpp import llama_chat_format
 
+        chat_format = getattr(llm, "chat_format", None)
         handler = (
-            llm.chat_handler
-            or llm._chat_handlers.get(llm.chat_format)
-            or llama_chat_format.get_chat_completion_handler(llm.chat_format)
+            getattr(llm, "chat_handler", None)
+            or getattr(llm, "_chat_handlers", {}).get(chat_format)
+            or llama_chat_format.get_chat_completion_handler(chat_format)
         )
         for cell in handler.__closure__ or ():
             if isinstance(cell.cell_contents, llama_chat_format.Jinja2ChatFormatter):
@@ -124,7 +127,8 @@ class InferenceRuntime:
         self._active_preemption: threading.Event | None = None
         self._waiters: list[tuple[int, int]] = []
         self._foreground_requests = 0
-        self._last_foreground_activity_at = 0.0
+        # Persisted background work must observe one full idle grace after startup.
+        self._last_foreground_activity_at = time.time()
         self._sequence = 0
         self._last_wait = 0.0
         self._load_count = 0
@@ -134,6 +138,8 @@ class InferenceRuntime:
         self._last_kv_snapshot_bytes = 0
         self._last_kv_restore_at = 0.0
         self._dialogue_prompt_dumped = False
+        self._system_role_supported: bool | None = None
+        self._chat_template_sha256 = ""
         self._model_calls = {
             "dialogue": 0, "deliberation": 0, "reflection": 0,
             "inner_life": 0, "autonomy": 0, "other": 0,
@@ -166,6 +172,8 @@ class InferenceRuntime:
                 "last_queue_wait_seconds": self._last_wait,
                 "model_load_count": self._load_count,
                 "gemma_thinking_disabled": self._gemma_thinking_disabled,
+                "system_role_mode": self._system_role_mode(),
+                "chat_template_sha256": self._chat_template_sha256 or "unavailable",
                 "foreground_kv_preservation": "llama single-sequence state",
                 "last_foreground_kv_snapshot_bytes": self._last_kv_snapshot_bytes,
                 "last_foreground_kv_restore_at": self._last_kv_restore_at,
@@ -242,6 +250,92 @@ class InferenceRuntime:
                 or recent
             )
 
+    def _system_role_mode(self) -> str:
+        if self._system_role_supported is True:
+            return "native"
+        if self._system_role_supported is False:
+            return "first-user fallback"
+        return "unverified"
+
+    @staticmethod
+    def _sequence_state_api_available() -> bool:
+        try:
+            from llama_cpp import llama_cpp
+        except ImportError:
+            return False
+        return all(
+            hasattr(llama_cpp, name)
+            for name in (
+                "llama_state_seq_get_size",
+                "llama_state_seq_get_data",
+                "llama_state_seq_set_data",
+            )
+        )
+
+    @staticmethod
+    def _chat_template_source(llm) -> str:
+        metadata = getattr(llm, "metadata", {}) or {}
+        return str(
+            metadata.get("tokenizer.chat_template")
+            or metadata.get("tokenizer.ggml.chat_template")
+            or getattr(llm, "chat_format", "")
+            or ""
+        )
+
+    def _configure_chat_template(self, llm) -> None:
+        template = self._chat_template_source(llm)
+        self._chat_template_sha256 = (
+            hashlib.sha256(template.encode("utf-8")).hexdigest() if template else ""
+        )
+        sentinel = "AKANE_SYSTEM_ROLE_PROBE_7B3D"
+        rendered = _render_chat_prompt(llm, (
+            {"role": "system", "content": sentinel},
+            {"role": "user", "content": "hello"},
+        ))
+        # If the exact active formatter cannot be rendered, preserving a native
+        # system role is unproven. The first-user form is safe for templates that
+        # silently discard system messages (including some Gemma formatters).
+        self._system_role_supported = rendered is not None and sentinel in rendered
+        if SETTINGS.prompt_debug:
+            print(
+                f"[Akane:debug:chat_template] sha256={self._chat_template_sha256 or 'unavailable'} "
+                f"system_role_mode={self._system_role_mode()!r}",
+                flush=True,
+            )
+
+    def _backend_messages(self, messages) -> list[dict[str, str]]:
+        values = [
+            {"role": str(message.get("role") or "user"), "content": str(message.get("content") or "")}
+            for message in messages
+        ]
+        if self._system_role_supported is not False:
+            return values
+        system = "\n\n".join(
+            message["content"] for message in values if message["role"] == "system"
+        )
+        values = [message for message in values if message["role"] != "system"]
+        if not system:
+            return values
+        for message in values:
+            if message["role"] == "user":
+                message["content"] = (
+                    f"# System instructions\n{system}\n\n# Conversation\n{message['content']}"
+                )
+                return values
+        return [{"role": "user", "content": f"# System instructions\n{system}"}, *values]
+
+    def dialogue_cache_fingerprint(
+        self,
+        static_prompt_hash: str,
+        reservation: Reservation,
+    ) -> str:
+        material = "\0".join((
+            static_prompt_hash,
+            self._chat_template_source(reservation.llm),
+            self._system_role_mode(),
+        ))
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
     def runtime_report(self, *, include_model_hash: bool = False) -> dict[str, object]:
         path = self._path.expanduser().resolve()
         digest = "not requested"
@@ -290,6 +384,9 @@ class InferenceRuntime:
             "response_cache_enabled": False,
             "gemma_thinking_disabled": self._gemma_thinking_disabled,
             "model_load_count": self._load_count,
+            "system_role_mode": self._system_role_mode(),
+            "chat_template_sha256": self._chat_template_sha256 or "unavailable",
+            "sequence_state_api_available": self._sequence_state_api_available(),
         }
 
     def _load_options(self, llama_type) -> dict[str, object]:
@@ -333,6 +430,16 @@ class InferenceRuntime:
                 metadata = getattr(self._llm, "metadata", {}) or {}
                 model_text = " ".join((str(self._path), *(str(value) for value in metadata.values()))).casefold()
                 template = metadata.get("tokenizer.chat_template") or metadata.get("tokenizer.ggml.chat_template")
+                embedded_handlers = getattr(self._llm, "_chat_handlers", {})
+                if (
+                    template
+                    and getattr(self._llm, "chat_handler", None) is None
+                    and "chat_template.default" in embedded_handlers
+                ):
+                    # Use the GGUF's actual template rather than a guessed
+                    # built-in formatter so fitting, diagnostics, and generation
+                    # all share one inspectable rendering path.
+                    self._llm.chat_format = "chat_template.default"
                 if "gemma" in model_text and not template:
                     raise RuntimeError("The configured Gemma GGUF has no embedded chat template.")
                 if "gemma" in model_text:
@@ -342,6 +449,7 @@ class InferenceRuntime:
                     if formatter is not None:
                         formatter._environment.globals["enable_thinking"] = False
                     self._gemma_thinking_disabled = True
+                self._configure_chat_template(self._llm)
                 if SETTINGS.prompt_debug:
                     self._log_character_sources(self._llm)
             except Exception as exc:
@@ -357,6 +465,8 @@ class InferenceRuntime:
             llm, self._llm = self._llm, None
             self._gemma_thinking_disabled = False
             self._live_cache_owner = None
+            self._system_role_supported = None
+            self._chat_template_sha256 = ""
         close = getattr(llm, "close", None)
         if close is not None:
             close()
@@ -370,6 +480,8 @@ class InferenceRuntime:
 
     @staticmethod
     def _log_character_sources(llm) -> None:
+        from app.core.prompt import stable_prompt_hash, stable_system_prompt
+
         character = load_character_profile()
         contents = (
             (
@@ -401,8 +513,17 @@ class InferenceRuntime:
         ))
         print(
             f"[Akane:debug:character] content_sha256={character.content_sha256} "
-            f"character_combined_tokens={combined_tokens} "
-            "reload_semantics='cached until identity or soul source mtime changes'",
+            f"character_combined_tokens={combined_tokens}",
+            flush=True,
+        )
+        stable_prompt = stable_system_prompt(character)
+        stable_tokens = len(llm.tokenize(
+            stable_prompt.encode("utf-8"), add_bos=False, special=True,
+        ))
+        print(
+            f"[Akane:debug:character] stable_character_prompt_sha256={stable_prompt_hash(character)} "
+            f"stable_character_prompt_tokens={stable_tokens} "
+            "reload_semantics='content hash checked on every load'",
             flush=True,
         )
 
@@ -551,7 +672,7 @@ class InferenceRuntime:
             llm = self.llm
             if ranks[priority] > ranks["guest"]:
                 preserved = self._capture_foreground_sequence(llm)
-            yield Reservation(llm, priority, preemption)
+            yield Reservation(llm, priority, preemption, self._last_wait)
         finally:
             try:
                 if preserved is not None:
@@ -570,9 +691,10 @@ class InferenceRuntime:
         messages: tuple[dict[str, str], ...] | list[dict[str, str]],
         reservation: Reservation,
     ) -> tuple[int, str]:
-        prompt = _render_chat_prompt(reservation.llm, messages)
+        backend_messages = self._backend_messages(messages)
+        prompt = _render_chat_prompt(reservation.llm, backend_messages)
         if prompt is None:
-            characters = sum(len(message.get("content", "")) for message in messages)
+            characters = sum(len(message.get("content", "")) for message in backend_messages)
             return max(1, characters // 4), "estimated_characters"
         try:
             tokens = reservation.llm.tokenize(prompt.encode("utf-8"), add_bos=False, special=True)
@@ -595,7 +717,8 @@ class InferenceRuntime:
             if self._dialogue_prompt_dumped:
                 return
             self._dialogue_prompt_dumped = True
-        prompt = _render_chat_prompt(llm, messages)
+        backend_messages = self._backend_messages(messages)
+        prompt = _render_chat_prompt(llm, backend_messages)
         if prompt is None:
             print(
                 "[Akane:debug:dialogue_prompt_once] rendered_prompt=unavailable",
@@ -612,6 +735,7 @@ class InferenceRuntime:
         ))
         payload = {
             "messages": list(messages),
+            "backend_messages": backend_messages,
             "section_tokens": section_tokens,
             "final_prompt_tokens": prompt_tokens,
             "final_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
@@ -648,7 +772,12 @@ class InferenceRuntime:
             perf = llama_cpp.llama_perf_context(llm._ctx.ctx)
             timing.prefill_tokens = max(0, int(perf.n_p_eval))
             timing.new_prompt_eval_tokens = timing.prefill_tokens
-            timing.reused_prefix_tokens = max(0, timing.prompt_tokens - timing.prefill_tokens)
+            directly_reused = getattr(perf, "n_reused", None)
+            timing.reused_prefix_tokens = (
+                max(0, int(directly_reused))
+                if directly_reused is not None
+                else max(0, timing.prompt_tokens - timing.prefill_tokens)
+            )
             timing.generated_tokens = max(0, int(perf.n_eval))
             timing.prefill_seconds = max(0.0, float(perf.t_p_eval_ms) / 1000.0)
             timing.decode_seconds = max(0.0, float(perf.t_eval_ms) / 1000.0)
@@ -693,7 +822,10 @@ class InferenceRuntime:
             f"[Akane:debug:inference] generation_type={self._generation_type(call_kind)} "
             f"prompt_tokens={timing.prompt_tokens} reused_prefix_tokens={reused} "
             f"new_prompt_eval_tokens={new_tokens} prompt_eval_ms={timing.prefill_seconds * 1000:.3f} "
-            f"decode_tok_s={decode_tok_s:.3f} cache_owner={self._cache_owner_label(cache_key)}",
+            f"decode_tok_s={decode_tok_s:.3f} "
+            f"generation_ms={max(0.0, timing.model_finished_at - timing.model_started_at) * 1000:.3f} "
+            f"finish_reason={timing.finish_reason or 'unavailable'} "
+            f"cache_owner={self._cache_owner_label(cache_key)}",
             flush=True,
         )
 
@@ -749,7 +881,7 @@ class InferenceRuntime:
                 timing.model_started_at = time.perf_counter()
             self._record_model_call(call_kind)
             response = reservation.llm.create_chat_completion(
-                messages=list(messages),
+                messages=self._backend_messages(messages),
                 stream=True,
                 **self._options(max_tokens, temperature=temperature),
             )
@@ -759,6 +891,8 @@ class InferenceRuntime:
                 if not choices:
                     continue
                 choice = choices[0]
+                if timing is not None and choice.get("finish_reason"):
+                    timing.finish_reason = str(choice["finish_reason"])
                 text = _content((choice.get("delta") or {}).get("content") or choice.get("text"))
                 if not text:
                     continue

@@ -398,6 +398,8 @@ class ReflectionEngine:
         parsed_at = started_at
         committed_at = started_at
         timing = InferenceTiming(started_at)
+        recovery_attempted = False
+        recovery_token_limit = 0
         applied_count = 0
         rejected_count = 0
         parse_status = "not_started"
@@ -468,6 +470,29 @@ class ReflectionEngine:
                     temperature=0.15,
                     call_kind="reflection",
                 )
+                if timing.finish_reason == "length":
+                    try:
+                        parse_reflection_json(output)
+                    except ReflectionOutputError:
+                        recovery_token_limit = min(
+                            SETTINGS.reflection_tokens + 64,
+                            256,
+                            SETTINGS.llama_context_window - prompt_tokens,
+                        )
+                        if recovery_token_limit > SETTINGS.reflection_tokens:
+                            recovery_attempted = True
+                            retry_timing = InferenceTiming(started_at)
+                            retry_timing.prompt_tokens = prompt_tokens
+                            retry_timing.prompt_token_method = prompt_method
+                            output = self.runtime.complete_messages(
+                                messages,
+                                max_tokens=recovery_token_limit,
+                                reservation=reservation,
+                                timing=retry_timing,
+                                temperature=0.1,
+                                call_kind="reflection",
+                            )
+                            timing = retry_timing
             inference_finished_at = time.perf_counter()
             if reservation.preemption.is_set():
                 raise InferencePreempted("Reflection yielded before validation.")
@@ -546,6 +571,8 @@ class ReflectionEngine:
                 model_wait_ms=max(0.0, reservation_acquired_at - wait_started_at) * 1000,
                 total_ms=max(0.0, finished_at - started_at) * 1000,
                 finish_reason=timing.finish_reason or "unavailable",
+                recovery_attempted=int(recovery_attempted),
+                recovery_token_limit=recovery_token_limit,
                 parse_status=parse_status,
                 turn_range=f"{reflected_first_id}:{reflected_latest_id}",
                 turn_count=reflected_turn_count,

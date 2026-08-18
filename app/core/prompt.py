@@ -109,13 +109,13 @@ def build_reasoning_prompt(context: TurnContext, user_message: str) -> tuple[dic
 def build_reflection_prompt(context: TurnContext, conversation_text: str) -> tuple[dict[str, str], ...]:
     current = format_context(context, include_ids=True)
     return (
-        {"role": "system", "content": """Consolidate this bounded batch of completed dialogue. Return one compact JSON object only; {} is normal and preferable to a speculative update.
-Allowed top-level keys are memories, self, mood, relationship. Omit empty keys. memories and self MUST be JSON arrays, never grouped canonical state objects. Emit at most two durable memory/Self entries total so the JSON finishes within the output budget.
-Memory entry fields: subject user|akane|shared; kind fact|event|commitment|shared_experience; text; importance; confidence; evidence. User facts come from user text. Akane facts and external events belong to Self or a typed integration, not dialogue Reflection. A shared memory requires one exact evidence excerpt present in both speakers' text. Do not preserve an unsupported event merely because it was asserted in dialogue.
-Self entry fields: action form|reinforce|weaken|revise|retire|complete|abandon; target_id for every action except form; kind curiosity|interest|preference|opinion|goal|tendency; topic; value; strength; confidence; reason; evidence. Use exact IDs from CURRENT STATE when updating.
+        {"role": "system", "content": """Consolidate this completed dialogue batch. Return one compact JSON object only. {} is normal when nothing durable changed.
+Choose at most one primary update. A non-empty result uses exactly one top-level key: memories, self, mood, or relationship. memories and self are arrays with at most one object.
+Memory fields: subject user|akane|shared; kind fact|event|commitment|shared_experience; text; importance; confidence; evidence. User facts come from user text. Akane facts and external events belong elsewhere. Shared memory needs one exact evidence excerpt present in both speakers' text.
+Self fields: action form|reinforce|weaken|revise|retire|complete|abandon; target_id except for form; kind curiosity|interest|preference|opinion|goal|tendency; topic; value; strength; confidence; reason; evidence. Use exact CURRENT STATE IDs for updates.
 Mood fields: valence_delta; energy_delta; emotion; cause; evidence.
 Relationship fields: familiarity_delta; trust_delta; closeness_delta; add_notes; add_unresolved; resolve_notes; evidence.
-Every evidence value must be an exact, sufficiently complete excerpt from the owning speaker's text. Akane's Self requires Akane-role evidence showing what she chose, preferred, rejected, reconsidered, or adopted; a user assertion alone is never Self evidence. Wording may overlap an offered option. A first choice may form weak Self only when it has meaning beyond the immediate situation; do not turn a one-off reaction into a specialized preference."""},
+Keep text, reason, and evidence short. Evidence must be an exact excerpt from the owning speaker. Akane Self requires Akane-role evidence showing what she chose, preferred, rejected, reconsidered, or adopted. A user assertion alone is never Self evidence. A first choice may form weak Self only when it matters beyond the immediate situation."""},
         {"role": "user", "content": f"CURRENT STATE\n{current}\n\nUNREFLECTED DIALOGUE\n{conversation_text}"},
     )
 

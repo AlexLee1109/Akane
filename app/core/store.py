@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, fields
 from pathlib import Path
 
+from app.core.character import load_character_profile
 from app.core.config import SETTINGS
 from app.core.state import (
     CommitResult,
@@ -846,13 +847,33 @@ class Store:
 
     @staticmethod
     def _new_profile(profile_id: str, now: float) -> dict[str, object]:
+        self_state = {group: [] for group in SELF_GROUP_BY_KIND.values()}
+        self_state["interests"] = [
+            _record(SelfItem(
+                id=(
+                    "self_seed_"
+                    + uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"akane:self-seed:{profile_id}:{interest.casefold()}",
+                    ).hex
+                ),
+                profile_id=profile_id,
+                kind="interest",
+                topic=interest,
+                value=f"Interested in {interest}.",
+                strength=0.42,
+                confidence=0.68,
+                reason="Starting interest.",
+                status="active",
+                created_at=now,
+                updated_at=now,
+            ))
+            for interest in load_character_profile().seed_interests
+        ]
         return {
             "created_at": now,
             "updated_at": now,
-            "self": {
-                **{group: [] for group in SELF_GROUP_BY_KIND.values()},
-                "revisions": [],
-            },
+            "self": {**self_state, "revisions": []},
             "mood": _record(Mood(profile_id, updated_at=now)),
             "relationship": _record(Relationship(profile_id, updated_at=now)),
             "memories": [],
@@ -976,6 +997,13 @@ class Store:
                             - turn_ids.index(str(existing["first_turn_id"]))
                             + 1
                         )
+                        if (
+                            proposal.reflection_ready
+                            and not existing["ready"]
+                            and str(existing["error"]).startswith("reflection:parse-")
+                        ):
+                            existing["attempts"] = 0
+                            existing["error"] = ""
                         existing["ready"] = bool(existing["ready"] or proposal.reflection_ready)
                         existing["available_at"] = max(
                             float(existing["available_at"]),
@@ -1420,8 +1448,9 @@ class Store:
                 "what do you remember", "what do you remember about me", "what is our history",
             }
             broad_self = normalized_query in {
-                "who are you", "what do you like", "what do you want",
-                "what are your interests", "what are your opinions", "what are your goals",
+                "who are you", "what do you like", "what do you like to do", "what do you want",
+                "what are your interests", "what are your hobbies", "what hobbies do you have",
+                "what are your opinions", "what are your goals",
                 "what have you changed your mind about", "what are you uncertain about",
             }
             memories = [item for item in memories if broad_memory or memory_relevance[item.id] >= 0.12]
@@ -1671,12 +1700,21 @@ class Store:
                 return
             if error:
                 attempts = int(job["attempts"])
+                message = str(error)[:500]
                 job["status"] = "pending"
-                job["available_at"] = current + min(
-                    _REFLECTION_RETRY_MAX_SECONDS,
-                    _REFLECTION_RETRY_BASE_SECONDS * (2 ** min(max(0, attempts - 1), 4)),
-                )
-                job["error"] = str(error)[:500]
+                if message == "reflection:parse-truncated-output" or (
+                    message.startswith("reflection:parse-") and attempts >= 2
+                ):
+                    # Preserve the range, but do not retry the same malformed
+                    # output forever. New reflectable dialogue reactivates it.
+                    job["ready"] = False
+                    job["available_at"] = current + SETTINGS.background_idle_grace_seconds
+                else:
+                    job["available_at"] = current + min(
+                        _REFLECTION_RETRY_MAX_SECONDS,
+                        _REFLECTION_RETRY_BASE_SECONDS * (2 ** min(max(0, attempts - 1), 4)),
+                    )
+                job["error"] = message
             else:
                 state["reflection_jobs"].remove(job)
             job["updated_at"] = current

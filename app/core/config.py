@@ -214,7 +214,7 @@ def load_settings() -> Settings:
         llama_use_mlock=coerce_bool(_raw("LLAMA_USE_MLOCK"), False),
         llama_swa_full=coerce_bool(_raw("LLAMA_SWA_FULL"), raspberry_pi),
         max_tokens=max(24, min(_integer("MAX_TOKENS", 160), context_window - 256)),
-        reflection_tokens=max(32, min(_integer("REFLECTION_TOKENS", 160), context_window // 3)),
+        reflection_tokens=max(32, min(_integer("REFLECTION_TOKENS", 192), context_window // 3)),
         inner_life_tokens=max(32, min(_integer("INNER_LIFE_TOKENS", 128), context_window // 4)),
         reasoning_tokens=max(48, min(_integer("REASONING_TOKENS", 192), context_window // 4)),
         temperature=max(0.0, min(2.0, _number("TEMPERATURE", 0.95))),

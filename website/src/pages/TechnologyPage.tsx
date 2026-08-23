@@ -172,10 +172,9 @@ function SectionHeading({ eyebrow, title, description, id }: { eyebrow: string; 
 function TechnologyHero() {
   return <section className="tech-hero" aria-labelledby="technology-title">
     <div className="shell tech-hero-inner">
-      <p className="tech-eyebrow">Local runtime <span>•</span> Shared continuity <span>•</span> Multiple interfaces</p>
+      <p className="tech-eyebrow">Technology</p>
       <h1 id="technology-title">How Akane works</h1>
-      <p className="tech-hero-accent">One coordinated path from message to memory.</p>
-      <p className="tech-hero-lead">Akane combines local language-model inference with persistent Self and Memory, lightweight offscreen life, and multiple interfaces through one shared backend running on a Raspberry Pi 5.</p>
+      <p className="tech-hero-lead">A local system for conversation, memory, continuity, and background reflection—all running through one shared model.</p>
     </div>
   </section>;
 }

@@ -337,7 +337,7 @@ export function DemoPage() {
 
   return <main className="demo-page">
     <section className="demo-intro shell" aria-labelledby="demo-title">
-      <div><p className="demo-eyebrow">Meet Akane</p><h1 id="demo-title">Take a moment. Say hello.</h1><p>Live conversations run through the local companion on a Raspberry Pi. When it is unavailable, you can explore an honest prerecorded preview.</p></div>
+      <div><p className="demo-eyebrow">Live Demo</p><h1 id="demo-title">Talk with Akane</h1><p>Start a temporary guest conversation with the same local companion running on my Raspberry Pi.</p></div>
       <div className="demo-header-status" aria-label="Demo status" aria-live="polite"><span className={`demo-status-dot ${connection}`} aria-hidden="true" /><div><small>Current mode</small><strong>{connectionLabel}</strong></div></div>
     </section>
 

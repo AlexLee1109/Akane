@@ -59,23 +59,15 @@
 
 .tech-hero h1 {
   margin: 0 0 7px;
-  font-size: clamp(4rem, 8vw, 7.6rem);
-  line-height: .9;
-  letter-spacing: -.07em;
-}
-
-.tech-hero-accent {
-  margin-bottom: 12px;
-  color: var(--akane-blue);
-  font-size: clamp(1.15rem, 2.1vw, 1.75rem);
-  font-weight: 680;
-  line-height: 1.25;
+  font-size: clamp(2.8rem, 4vw, 4rem);
+  line-height: .98;
+  letter-spacing: -.06em;
 }
 
 .tech-hero-lead {
-  max-width: 730px;
+  max-width: 700px;
   margin: 0;
-  font-size: 1rem;
+  font-size: clamp(1rem, 1.35vw, 1.12rem);
 }
 
 .tech-section {
@@ -627,7 +619,7 @@
   }
 
   .tech-hero h1 {
-    font-size: clamp(3rem, 14.5vw, 4.4rem);
+    font-size: clamp(2.6rem, 11vw, 3.5rem);
   }
 
   .tech-background-lane { align-items: flex-start; flex-direction: column; border-radius: 16px; gap: 7px; }

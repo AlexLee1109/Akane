@@ -25,11 +25,11 @@ function HomeHero() {
     <img className="home-hero-media" src={homepageImage} fetchPriority="high" decoding="async" alt="Akane, a blue-haired AI companion, standing in a bright room overlooking a city" />
     <div className="home-hero-wash" aria-hidden="true" />
     <div className="home-hero-copy shell">
-      <p className="eyebrow home-hero-eyebrow">Local-first AI companion</p>
-      <h1 id="home-title">Meet Akane.<br /><span>She remembers.</span></h1>
-      <p className="home-lead">A personal companion with continuity across conversations, powered by a local model running on a Raspberry Pi.</p>
-      <div className="actions home-hero-actions"><Link className="button primary" to="/demo">Try the Demo<span aria-hidden="true">→</span></Link><Link className="home-text-link" to="/technology">How she works<span aria-hidden="true">↗</span></Link></div>
-      <ul className="home-trust-list" aria-label="Project facts"><li><HomeIcon name="pi" />Runs locally</li><li><HomeIcon name="shield" />Private continuity</li><li><HomeIcon name="presence" />One companion</li></ul>
+      <p className="eyebrow home-hero-eyebrow">Local AI companion</p>
+      <h1 id="home-title">Meet Akane.</h1>
+      <p className="home-lead">A personal AI companion with memory, continuity, and a life that carries on between conversations.</p>
+      <div className="actions home-hero-actions"><Link className="button primary" to="/demo">Talk to Akane<span aria-hidden="true">→</span></Link><Link className="home-text-link" to="/technology">How Akane works<span aria-hidden="true">↗</span></Link></div>
+      <ul className="home-trust-list" aria-label="Project facts"><li><HomeIcon name="pi" />Runs locally</li><li><HomeIcon name="shield" />Private memory</li><li><HomeIcon name="presence" />Persistent continuity</li></ul>
     </div>
     <div className="home-hero-detail" aria-hidden="true"><span className="home-detail-dot" /><div><small>Continuity</small><strong>Picks up where you left off</strong></div></div>
   </section>;

@@ -4,7 +4,7 @@
 .about-hero::before { width: 440px; height: 440px; right: 8%; top: 50%; transform: translateY(-50%); box-shadow: 0 0 0 70px rgba(83, 134, 255, .035), 0 0 0 140px rgba(83, 134, 255, .025); }
 .about-hero::after { width: 9px; height: 9px; right: 26%; top: 27%; border: 0; background: white; box-shadow: 0 0 24px 8px rgba(70, 132, 255, .55); }
 .about-hero-inner { position: relative; z-index: 1; }
-.about-hero h1 { max-width: 900px; margin: 12px 0 22px; font-size: clamp(3.4rem, 7.2vw, 7rem); line-height: .94; }
+.about-hero h1 { max-width: 760px; margin: 12px 0 20px; font-size: clamp(2.8rem, 4vw, 4rem); line-height: .98; }
 .about-lead { max-width: 690px; margin: 0; font-size: clamp(1.04rem, 1.5vw, 1.2rem); }
 .about-story-grid, .about-evolution-grid, .about-creator-inner { display: grid; grid-template-columns: minmax(240px, .78fr) minmax(0, 1.22fr); gap: clamp(42px, 8vw, 120px); }
 .about-story h2, .about-evolution h2, .about-creator h2 { font-size: clamp(2.2rem, 4.1vw, 4rem); line-height: 1.02; }
@@ -36,4 +36,4 @@
 .about-creator-inner { align-items: center; }
 .about-creator-inner > div:last-child > p { font-size: 1.05rem; }
 @media (max-width: 800px) { .about-hero { min-height: 500px; } .about-story-grid, .about-evolution-grid, .about-creator-inner { grid-template-columns: 1fr; gap: 28px; } .about-principle-grid { grid-template-columns: 1fr; } .about-principle-grid article, .about-principle-grid article + article { padding: 26px 0; border-right: 0; border-bottom: 1px solid rgba(255,255,255,.16); } .about-principle-grid article:last-child { border-bottom: 0; } .about-principle-grid h3 { margin-top: 16px; } .about-evolution-heading { position: static; } }
-@media (max-width: 430px) { .about-hero { min-height: 450px; } .about-hero h1 { font-size: clamp(3rem, 15vw, 4rem); } .about-timeline li { grid-template-columns: 70px 1fr; gap: 12px; } .about-timeline li::before { left: 72px; } .about-timeline li::after { left: 68px; } .about-timeline div { padding-left: 12px; } }
+@media (max-width: 430px) { .about-hero { min-height: 420px; } .about-hero h1 { font-size: clamp(2.5rem, 11vw, 3.25rem); } .about-timeline li { grid-template-columns: 70px 1fr; gap: 12px; } .about-timeline li::before { left: 72px; } .about-timeline li::after { left: 68px; } .about-timeline div { padding-left: 12px; } }

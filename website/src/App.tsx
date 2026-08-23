@@ -120,13 +120,15 @@ function App() {
 
   return <>
     <Navbar />
-    <Routes>
-      <Route path="/" element={<HomePage />} />
-      <Route path="/demo" element={<DemoPage />} />
-      <Route path="/technology" element={<TechnologyPage />} />
-      <Route path="/about" element={<AboutPage />} />
-      <Route path="*" element={<HomePage />} />
-    </Routes>
+    <div className="route-view" key={location.pathname}>
+      <Routes>
+        <Route path="/" element={<HomePage />} />
+        <Route path="/demo" element={<DemoPage />} />
+        <Route path="/technology" element={<TechnologyPage />} />
+        <Route path="/about" element={<AboutPage />} />
+        <Route path="*" element={<HomePage />} />
+      </Routes>
+    </div>
     {location.pathname !== "/demo" && <Footer />}
   </>;
 }

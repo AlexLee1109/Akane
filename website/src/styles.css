@@ -105,6 +105,7 @@ section[id], h1[id], h2[id] { scroll-margin-top: var(--nav-offset); }
 .button.secondary:hover { border-color: rgba(53, 109, 243, .4); background: white; }
 .disabled { cursor: not-allowed; opacity: .58; }
 .actions { display: flex; flex-wrap: wrap; gap: 11px; }
+.route-view { animation: route-enter 320ms cubic-bezier(.2,.7,.2,1) both; }
 
 .footer { border-top: 1px solid var(--line); background: #f7faff; }
 .footer-inner { padding-block: 30px 32px; }
@@ -117,6 +118,8 @@ section[id], h1[id], h2[id] { scroll-margin-top: var(--nav-offset); }
 .footer-meta { justify-content: flex-start; padding-top: 18px; color: var(--quiet); font-size: .72rem; }
 .footer-meta span:last-child { margin-left: auto; }
 .footer-meta a { color: var(--blue-deep); font-weight: 760; }
+
+@keyframes route-enter { from { opacity: .72; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
 
 @media (max-width: 820px) { .shell { width: min(100% - 34px, 1240px); } }
 @media (max-width: 700px) {

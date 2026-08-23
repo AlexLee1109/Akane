@@ -1,6 +1,7 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { projectConfig } from "../config/project";
+import { useInView } from "../lib/useInView";
 import "./technology.css";
 
 type IconName = "arrow" | "brain" | "browser" | "model" | "profile" | "shield" | "stream";
@@ -180,7 +181,11 @@ function TechnologyHero() {
 }
 
 function ArchitectureAndLifecycle() {
-  return <section id="architecture" className="tech-section tech-architecture-section" aria-labelledby="architecture-title">
+  const [activeStage, setActiveStage] = useState(0);
+  const { ref, visible: isVisible } = useInView<HTMLElement>(0.25);
+  const selected = architectureStages[activeStage];
+
+  return <section ref={ref} id="architecture" className={`tech-section tech-architecture-section ${isVisible ? "is-visible" : ""}`} aria-labelledby="architecture-title">
     <div className="shell">
       <SectionHeading
         eyebrow="System architecture"
@@ -190,16 +195,20 @@ function ArchitectureAndLifecycle() {
       />
       <figure className="tech-architecture" aria-describedby="architecture-summary">
         <figcaption id="architecture-summary" className="sr-only">An interface request resolves an owner or guest profile, selects relevant context, compiles one prompt, uses the configured local model runtime, then delivers visible text and commits validated state.</figcaption>
-        <ol>
+        <ol className="tech-stage-selector" aria-label="Request lifecycle">
           {architectureStages.map((stage, index) => <li key={stage.title}>
-            <article>
+            <button type="button" className={activeStage === index ? "active" : ""} aria-pressed={activeStage === index} aria-controls="architecture-detail" onClick={() => setActiveStage(index)}>
               <span className="tech-stage-index">0{index + 1}</span>
               <TechIcon name={stage.icon} />
-              <div><h3>{stage.title}</h3><p>{stage.description}</p></div>
-            </article>
-            {index < architectureStages.length - 1 && <span className="tech-stage-arrow" aria-hidden="true">→</span>}
+              <span>{stage.title}</span>
+            </button>
           </li>)}
         </ol>
+        <article id="architecture-detail" className="tech-stage-detail" key={selected.title}>
+          <div className="tech-stage-detail-icon"><TechIcon name={selected.icon} /><span>Step 0{activeStage + 1}</span></div>
+          <div><h3>{selected.title}</h3><p>{selected.description}</p></div>
+          <div className="tech-stage-signal" aria-hidden="true"><span /><span /><span /></div>
+        </article>
       </figure>
       <div className="tech-background-lane"><span>After a completed turn</span><i aria-hidden="true">→</i><strong>Background Reflection</strong><i aria-hidden="true">→</i><span>Validated Self &amp; Memory changes</span></div>
       <details className="tech-implementation-details">
@@ -211,6 +220,24 @@ function ArchitectureAndLifecycle() {
           </section>)}
         </div>
       </details>
+    </div>
+  </section>;
+}
+
+function LocalRuntime() {
+  return <section className="tech-runtime-section" aria-labelledby="runtime-title">
+    <div className="shell tech-runtime-inner">
+      <div>
+        <p className="tech-eyebrow">Local runtime</p>
+        <h2 id="runtime-title">One small machine, one continuing companion</h2>
+        <p>Akane’s core generation path stays on personal hardware. The interfaces reach the same coordinated runtime instead of creating separate versions of her.</p>
+      </div>
+      <figure className="tech-runtime-flow" aria-label={`Raspberry Pi 5 runs llama.cpp with ${projectConfig.modelName} for Akane`}>
+        <div><span>Hardware</span><strong>Raspberry Pi 5</strong></div><i aria-hidden="true">→</i>
+        <div><span>Runtime</span><strong>llama.cpp</strong></div><i aria-hidden="true">→</i>
+        <div><span>Model</span><strong>{projectConfig.modelName}</strong></div><i aria-hidden="true">→</i>
+        <div className="akane-node"><span>Companion</span><strong>Akane</strong></div>
+      </figure>
     </div>
   </section>;
 }
@@ -228,10 +255,14 @@ function ProfileIsolation() {
       </div>
       <figure className="tech-profile-diagram" aria-describedby="profile-summary">
         <figcaption id="profile-summary" className="sr-only">Desktop popup and Discord share owner continuity. The website demo uses temporary guest continuity. Both use the same request pipeline, inference coordinator, and local model without sharing history, Memory, Self, or private profile state.</figcaption>
-        <div className="tech-profile-branches">
-          <article><TechIcon name="profile" /><span>Owner continuity</span><h3>Desktop popup</h3><h3>Discord</h3></article>
-          <article><TechIcon name="shield" /><span>Temporary guest continuity</span><h3>Website demo</h3></article>
+        <div className="tech-interface-sources">
+          <span>Desktop</span><span>Discord</span><span>Web demo</span>
         </div>
+        <div className="tech-profile-branches">
+          <article><TechIcon name="profile" /><span>Private boundary</span><h3>Owner profile</h3><p>Desktop and Discord share the owner’s conversation history, Self, and Memory.</p></article>
+          <article><TechIcon name="shield" /><span>Isolated boundary</span><h3>Temporary guest profile</h3><p>The web demo starts separate and cannot read or change the owner profile.</p></article>
+        </div>
+        <div className="tech-runtime-merge"><span aria-hidden="true">↘</span><strong>Shared coordinated runtime</strong><span aria-hidden="true">↙</span></div>
         <div className="tech-boundary-lists">
           <div><strong>Both use</strong><ul>{shared.map(item => <li key={item}>{item}</li>)}</ul></div>
           <div><strong>They do not share</strong><ul>{isolated.map(item => <li key={item}>{item}</li>)}</ul></div>
@@ -298,6 +329,7 @@ export function TechnologyPage() {
   return <main className="technology-page">
     <TechnologyHero />
     <ArchitectureAndLifecycle />
+    <LocalRuntime />
     <ProfileIsolation />
     <TechnologyStack />
     <EngineeringTradeoffs />

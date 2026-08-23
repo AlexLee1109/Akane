@@ -1,10 +1,26 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { projectConfig } from "../config/project";
+import { useInView } from "../lib/useInView";
 import "./home.css";
 
 const homepageImage = `${projectConfig.basePath}assets/homepage-image.png`;
+const characterImage = `${projectConfig.basePath}assets/akane-hero.png`;
 type HomeIconName = "desktop" | "discord" | "growth" | "memory" | "pi" | "presence" | "shield" | "web";
+type CapabilityId = "memory" | "growth" | "presence";
+type InterfaceId = "desktop" | "discord" | "web";
+
+const capabilities: readonly { id: CapabilityId; icon: HomeIconName; label: string; title: string; text: string; note: string }[] = [
+  { id: "memory", icon: "memory", label: "Memory", title: "Meaning can return.", text: "Akane can retain selected experiences and useful details, then bring them back when they genuinely matter to a later conversation.", note: "Selected context, not a transcript dump" },
+  { id: "growth", icon: "growth", label: "Development / Self", title: "A Self that can develop.", text: "Preferences, interests, and opinions can take shape over time instead of disappearing when a conversation ends.", note: "Continuity that develops gradually" },
+  { id: "presence", icon: "presence", label: "Presence", title: "There is a sense of between.", text: "Lightweight InnerLife gives Akane a small amount of offscreen continuity while keeping conversation grounded in real stored state.", note: "Quiet continuity between conversations" },
+];
+
+const interfaces: readonly { id: InterfaceId; icon: HomeIconName; label: string; eyebrow: string; title: string; text: string }[] = [
+  { id: "desktop", icon: "desktop", label: "Desktop", eyebrow: "Personal popup", title: "A quiet window on your desktop", text: "The owner interface keeps Akane close and uses the same private continuity as Discord." },
+  { id: "discord", icon: "discord", label: "Discord", eyebrow: "Owner continuity", title: "The same Akane in Discord", text: "Discord adapts the conversation to the platform without creating a separate companion or profile." },
+  { id: "web", icon: "web", label: "Web", eyebrow: "Temporary guest", title: "A safe way to meet Akane", text: "Every visitor receives an isolated temporary session that never touches the owner’s private continuity." },
+];
 
 function HomeIcon({ name }: { name: HomeIconName }) {
   const paths: Record<HomeIconName, ReactNode> = {
@@ -36,21 +52,33 @@ function HomeHero() {
 }
 
 function CompanionPillars() {
+  const [activeId, setActiveId] = useState<CapabilityId>("memory");
+  const active = capabilities.find(item => item.id === activeId) || capabilities[0];
+
   return <section className="home-section home-pillars shell" aria-labelledby="pillars-title">
     <div className="section-heading"><p className="eyebrow">Made to feel present</p><h2 id="pillars-title">Not another blank chat window.</h2><p>Akane is designed around one relationship that develops through time.</p></div>
-    <div className="home-bento">
-      <article className="home-feature home-feature-memory">
-        <div><HomeIcon name="memory" /><p className="eyebrow">Meaningful continuity</p><h3>She remembers you.</h3><p>Shared experiences and useful details can return when they genuinely matter—not as a transcript dump, but as context.</p></div>
-        <div className="memory-preview" aria-label="Illustrative memory preview"><span>Memory retained</span><p>“Popup first. Live2D later.”</p><small>Available to future conversations</small></div>
-      </article>
-      <article className="home-feature home-feature-growth"><HomeIcon name="growth" /><div><h3>Develops with you</h3><p>Durable opinions, Self, and lightweight offscreen continuity make each conversation part of something larger.</p></div><span className="feature-line" aria-hidden="true"><i /><i /><i /></span></article>
-      <article className="home-feature home-feature-presence"><HomeIcon name="presence" /><div><h3>Stays present</h3><p>Desktop and Discord connect to the same owner continuity, while web guests stay safely isolated.</p></div><div className="presence-orbit" aria-hidden="true"><i /><i /><i /><b>A</b></div></article>
+    <div className="capability-experience">
+      <div className="capability-selector" role="tablist" aria-label="Explore Akane’s continuity">
+        {capabilities.map((item, index) => <button key={item.id} type="button" role="tab" aria-selected={activeId === item.id} aria-controls="capability-panel" onClick={() => setActiveId(item.id)}>
+          <span>0{index + 1}</span><HomeIcon name={item.icon} /><strong>{item.label}</strong>
+        </button>)}
+      </div>
+      <div id="capability-panel" className={`capability-stage ${active.id}`} role="tabpanel" aria-live="polite">
+        <div className="capability-copy" key={active.id}><p className="eyebrow">{active.label}</p><h3>{active.title}</h3><p>{active.text}</p><span>{active.note}</span></div>
+        <div className={`capability-visual ${active.id}`} aria-hidden="true">
+          {active.id === "memory" && <><i>Conversation</i><b>Selected meaning</b><i>Later context</i></>}
+          {active.id === "growth" && <><i>Interest</i><i>Preference</i><b>Self</b><i>Opinion</i></>}
+          {active.id === "presence" && <><i>Conversation</i><b>InnerLife</b><i>Return</i></>}
+        </div>
+        <img className="capability-akane" src={characterImage} alt="Akane standing against a soft blue celestial backdrop" loading="lazy" decoding="async" />
+      </div>
     </div>
   </section>;
 }
 
 function ContinuityStory() {
-  return <section className="home-section home-continuity" aria-labelledby="continuity-title">
+  const { ref, visible } = useInView<HTMLElement>(0.28);
+  return <section ref={ref} className={`home-section home-continuity ${visible ? "is-visible" : ""}`} aria-labelledby="continuity-title">
     <div className="shell home-continuity-heading"><p className="eyebrow">A conversation with a past</p><h2 id="continuity-title">The thread carries forward.</h2><p>Conversation becomes selected context, then returns naturally when it can help.</p></div>
     <div className="shell continuity-scene">
       <div className="continuity-chat earlier"><span>Earlier</span><div className="bubble you">I’m finishing the popup before Live2D.</div></div>
@@ -64,11 +92,22 @@ function ContinuityStory() {
 }
 
 function InterfaceOverview() {
-  const interfaces: readonly [HomeIconName, string, string][] = [["desktop", "Desktop", "Owner continuity"], ["discord", "Discord", "Owner continuity"], ["web", "Web demo", "Temporary guest"]];
+  const [activeId, setActiveId] = useState<InterfaceId>("desktop");
+  const active = interfaces.find(item => item.id === activeId) || interfaces[0];
+
   return <section className="home-section home-interfaces" aria-labelledby="interfaces-title">
     <div className="shell"><div className="section-heading center"><p className="eyebrow">One shared companion</p><h2 id="interfaces-title">Different places. The same Akane.</h2><p>Each interface is a window into one coordinated local runtime, with clear privacy boundaries.</p></div>
       <div className="interface-showcase">
-        <div className="interface-previews">{interfaces.map(([icon, title, note]) => <article key={title} className={`interface-card ${icon}`}><header><i /><i /><i /></header><div><HomeIcon name={icon} /><strong>{title}</strong><span>{note}</span></div><p>{icon === "desktop" ? "Good morning. Ready to keep going?" : icon === "discord" ? "Akane · just now" : "Isolated session ready"}</p></article>)}</div>
+        <div className="interface-selector" role="tablist" aria-label="Akane interfaces">{interfaces.map(item => <button key={item.id} type="button" role="tab" aria-selected={activeId === item.id} aria-controls="interface-panel" onClick={() => setActiveId(item.id)}><HomeIcon name={item.icon} />{item.label}</button>)}</div>
+        <div id="interface-panel" className={`interface-stage ${active.id}`} role="tabpanel" aria-live="polite">
+          <div className="interface-stage-copy" key={active.id}><p className="eyebrow">{active.eyebrow}</p><h3>{active.title}</h3><p>{active.text}</p><small>Stylized interface preview</small></div>
+          <div className={`interface-window ${active.id}`} aria-hidden="true">
+            <header><i /><i /><i /><span>{active.label}</span></header>
+            {active.id === "desktop" && <div className="desktop-preview"><b>A</b><div><span>Akane</span><p>Owner conversation ready</p></div></div>}
+            {active.id === "discord" && <div className="discord-preview"><aside><i /><i /><i /></aside><div><span># akane</span><p><b>A</b> Same owner continuity</p></div></div>}
+            {active.id === "web" && <div className="web-preview"><span>Temporary guest</span><b>Isolated session</b><i>Owner profile untouched</i></div>}
+          </div>
+        </div>
         <div className="interface-runtime"><span className="runtime-pulse" aria-hidden="true" /><div><small>Shared local runtime</small><strong>Akane · {projectConfig.modelName}</strong></div><Link to="/technology">See architecture<span aria-hidden="true">→</span></Link></div>
       </div>
     </div>

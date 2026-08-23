@@ -11,9 +11,10 @@ export interface DemoMessage {
 interface DemoConversationProps {
   messages: readonly DemoMessage[];
   generating: boolean;
+  previewMode: boolean;
 }
 
-export function DemoConversation({ messages, generating }: DemoConversationProps) {
+export function DemoConversation({ messages, generating, previewMode }: DemoConversationProps) {
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -22,7 +23,7 @@ export function DemoConversation({ messages, generating }: DemoConversationProps
 
   return <section className="demo-conversation demo-panel" aria-labelledby="demo-conversation-title">
     <header className="demo-sidebar-header">
-      <div className="demo-sidebar-identity"><span className="demo-sidebar-avatar" aria-hidden="true">A</span><div><strong>Akane</strong><span><i className="demo-status-dot live" aria-hidden="true" />{generating ? "Responding" : "Online"}</span></div></div>
+      <div className="demo-sidebar-identity"><span className="demo-sidebar-avatar" aria-hidden="true">A</span><div><strong>Akane</strong><span><i className={`demo-status-dot ${previewMode ? "showcase" : "live"}`} aria-hidden="true" />{previewMode ? "Prerecorded preview" : generating ? "Responding" : "Online"}</span></div></div>
     </header>
     <div className="demo-sidebar-section">
       <p className="demo-sidebar-label">Chat</p>
@@ -35,7 +36,7 @@ export function DemoConversation({ messages, generating }: DemoConversationProps
       aria-relevant="additions text"
       aria-busy={generating}
     >
-      {messages.length === 0 && <div className="demo-history-empty"><span aria-hidden="true">✦</span><strong>A quiet place to begin.</strong><p>Your temporary conversation will appear here. Nothing in a guest session touches the owner profile.</p></div>}
+      {messages.length === 0 && <div className="demo-history-empty"><span aria-hidden="true">✦</span><strong>{previewMode ? "Explore the conversation space." : "A quiet place to begin."}</strong><p>{previewMode ? "Replies here are prerecorded examples. Nothing is sent to Akane." : "Your temporary conversation will appear here. Nothing in a guest session touches the owner profile."}</p></div>}
       {messages.map((message, index) => <article className={`demo-message ${message.role} ${index === messages.length - 1 ? "current" : ""}`} key={message.id}>
         <div className="demo-message-avatar" aria-hidden="true">{message.role === "akane" ? "A" : "You"}</div>
         <div className="demo-message-body">

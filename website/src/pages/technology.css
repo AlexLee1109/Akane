@@ -100,73 +100,124 @@
   margin: 0;
 }
 
-.tech-architecture ol {
+.tech-stage-selector {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   margin: 0;
   padding: 0;
-  overflow: hidden;
   border: 1px solid var(--akane-border);
-  border-radius: 22px;
-  background: #fbfdff;
-  box-shadow: var(--shadow-sm);
+  border-radius: 18px 18px 0 0;
+  background: #f4f8ff;
   list-style: none;
 }
 
-.tech-architecture li {
+.tech-stage-selector li {
   position: relative;
   min-width: 0;
 }
 
-.tech-architecture article {
-  min-height: 265px;
-  padding: 23px 21px;
+.tech-stage-selector button {
+  display: grid;
+  width: 100%;
+  min-height: 132px;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-content: center;
+  align-items: center;
+  padding: 18px;
+  border: 0;
   border-right: 1px solid var(--akane-border);
+  background: transparent;
+  color: var(--akane-text-muted);
+  text-align: left;
+  transition: background 180ms ease, color 180ms ease;
 }
 
-.tech-architecture li:last-child article {
+.tech-stage-selector li:last-child button {
   border-right: 0;
 }
 
 .tech-stage-index {
-  display: block;
-  margin-bottom: 23px;
+  grid-column: 1 / -1;
   color: #728bb4;
   font-size: 0.75rem;
   font-weight: 800;
 }
 
-.tech-architecture .tech-icon {
-  margin-bottom: 17px;
+.tech-stage-selector .tech-icon {
+  width: 24px;
+  height: 24px;
   color: var(--akane-blue);
 }
 
-.tech-architecture h3 {
-  margin-bottom: 7px;
-  font-size: 1rem;
+.tech-stage-selector button > span:last-child {
+  font-size: .82rem;
+  font-weight: 780;
+  line-height: 1.25;
 }
 
-.tech-architecture p {
-  margin: 0;
-  font-size: 0.875rem;
-  line-height: 1.52;
-}
-
-.tech-stage-arrow {
-  position: absolute;
-  z-index: 2;
-  top: 50%;
-  right: -10px;
-  display: grid;
-  width: 20px;
-  height: 20px;
-  place-items: center;
-  border-radius: 50%;
+.tech-stage-selector button:hover,
+.tech-stage-selector button.active {
   background: white;
-  color: var(--akane-blue);
-  font-size: 0.75rem;
-  transform: translateY(-50%);
+  color: var(--akane-blue-deep);
 }
+
+.tech-stage-selector button:focus-visible { position: relative; z-index: 1; }
+
+.tech-stage-detail {
+  position: relative;
+  display: grid;
+  min-height: 250px;
+  grid-template-columns: 140px minmax(0, 1fr) 160px;
+  gap: clamp(24px, 5vw, 64px);
+  align-items: center;
+  padding: clamp(28px, 5vw, 56px);
+  overflow: hidden;
+  border: 1px solid var(--akane-border);
+  border-top: 0;
+  border-radius: 0 0 22px 22px;
+  background: radial-gradient(circle at 83% 45%, rgba(107, 181, 255, .17), transparent 26%), linear-gradient(135deg, white, #f3f8ff);
+  box-shadow: var(--shadow-sm);
+  animation: tech-detail-in 240ms ease both;
+}
+
+.tech-stage-detail-icon {
+  display: grid;
+  width: 122px;
+  height: 122px;
+  place-items: center;
+  border: 1px solid rgba(41,98,255,.18);
+  border-radius: 28px;
+  background: rgba(255,255,255,.82);
+  color: var(--akane-blue);
+  box-shadow: 0 18px 42px rgba(32,74,151,.1);
+}
+
+.tech-stage-detail-icon .tech-icon { width: 40px; height: 40px; }
+.tech-stage-detail-icon span { color: var(--quiet); font-size: .65rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.tech-stage-detail h3 { margin-bottom: 8px; font-size: clamp(1.45rem, 2.5vw, 2.25rem); }
+.tech-stage-detail p { max-width: 680px; margin: 0; font-size: .98rem; line-height: 1.62; }
+.tech-stage-signal { display: flex; align-items: center; justify-content: center; gap: 8px; }
+.tech-stage-signal span { width: 12px; height: 12px; border-radius: 50%; background: #8ab7ff; box-shadow: 0 0 0 8px rgba(80,138,255,.08); animation: tech-signal 1.8s ease-in-out infinite; }
+.tech-stage-signal span:nth-child(2) { animation-delay: 180ms; }
+.tech-stage-signal span:nth-child(3) { animation-delay: 360ms; }
+.tech-architecture-section:not(.is-visible) .tech-stage-selector li { opacity: 0; transform: translateY(8px); }
+.tech-architecture-section.is-visible .tech-stage-selector li { animation: tech-step-in 360ms ease both; }
+.tech-architecture-section.is-visible .tech-stage-selector li:nth-child(2) { animation-delay: 70ms; }
+.tech-architecture-section.is-visible .tech-stage-selector li:nth-child(3) { animation-delay: 140ms; }
+.tech-architecture-section.is-visible .tech-stage-selector li:nth-child(4) { animation-delay: 210ms; }
+.tech-architecture-section.is-visible .tech-stage-selector li:nth-child(5) { animation-delay: 280ms; }
+
+.tech-runtime-section { padding-block: clamp(58px, 7vw, 86px); background: #eaf2ff; }
+.tech-runtime-inner { display: grid; grid-template-columns: minmax(260px,.7fr) minmax(0,1.3fr); gap: clamp(38px,7vw,90px); align-items: center; }
+.tech-runtime-inner h2 { margin-bottom: 10px; font-size: clamp(2rem,3.5vw,3.2rem); line-height: 1.05; }
+.tech-runtime-inner p:last-child { margin: 0; }
+.tech-runtime-flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1.15fr auto .8fr; gap: 10px; align-items: stretch; margin: 0; }
+.tech-runtime-flow > div { display: flex; min-height: 130px; min-width: 0; justify-content: center; flex-direction: column; padding: 18px; border: 1px solid var(--akane-border); border-radius: 16px; background: rgba(255,255,255,.86); }
+.tech-runtime-flow > i { align-self: center; color: var(--blue); font-style: normal; }
+.tech-runtime-flow span { margin-bottom: 7px; color: var(--quiet); font-size: .62rem; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.tech-runtime-flow strong { font-size: .82rem; overflow-wrap: anywhere; }
+.tech-runtime-flow .akane-node { border-color: rgba(65,107,221,.3); background: linear-gradient(145deg,#fff,#e8edff); color: var(--blue-deep); }
 
 .tech-background-lane {
   display: flex;
@@ -280,6 +331,23 @@
   margin: 0;
 }
 
+.tech-interface-sources {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.15fr;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.tech-interface-sources span {
+  padding: 9px 12px;
+  border: 1px solid rgba(255,255,255,.16);
+  border-radius: 999px;
+  color: rgba(255,255,255,.82);
+  font-size: .67rem;
+  font-weight: 800;
+  text-align: center;
+}
+
 .tech-profile-branches,
 .tech-boundary-lists {
   display: grid;
@@ -293,6 +361,9 @@
   padding: 24px;
   background: rgba(31, 67, 145, .8);
 }
+
+.tech-profile-branches article { border-top: 2px solid #91baff; }
+.tech-profile-branches article:last-child { border-top-color: #c4b8ff; }
 
 .tech-profile-branches .tech-icon {
   margin-bottom: 13px;
@@ -314,6 +385,11 @@
   color: white;
   font-size: 0.9375rem;
 }
+
+.tech-profile-branches p { margin: 10px 0 0; color: rgba(255,255,255,.68); font-size: .8rem; line-height: 1.5; }
+
+.tech-runtime-merge { display: flex; align-items: center; justify-content: center; gap: 22px; padding: 12px; background: rgba(255,255,255,.1); color: #bdd6ff; font-size: .7rem; }
+.tech-runtime-merge strong { color: white; font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; }
 
 .tech-boundary-lists {
   margin-top: 1px;
@@ -543,37 +619,10 @@
 }
 
 @media (max-width: 1100px) {
-  .tech-architecture ol {
-    grid-template-columns: 1fr;
-  }
-
-  .tech-architecture article {
-    display: grid;
-    min-height: 0;
-    grid-template-columns: 38px 34px 1fr;
-    gap: 14px;
-    align-items: start;
-    padding: 18px 20px;
-    border-right: 0;
-    border-bottom: 1px solid var(--akane-border);
-  }
-
-  .tech-architecture li:last-child article {
-    border-bottom: 0;
-  }
-
-  .tech-stage-index,
-  .tech-architecture .tech-icon {
-    margin: 2px 0 0;
-  }
-
-  .tech-stage-arrow {
-    top: auto;
-    right: auto;
-    bottom: -10px;
-    left: 65px;
-    transform: rotate(90deg);
-  }
+  .tech-stage-selector button { min-height: 112px; padding: 14px; }
+  .tech-stage-selector button > span:last-child { font-size: .74rem; }
+  .tech-stage-detail { grid-template-columns: 120px minmax(0,1fr) 100px; }
+  .tech-runtime-inner { grid-template-columns: 1fr; gap: 28px; }
 }
 
 @media (max-width: 900px) {
@@ -585,6 +634,10 @@
     grid-template-columns: 1fr;
     gap: 30px;
   }
+
+  .tech-runtime-flow { grid-template-columns: 1fr auto 1fr; }
+  .tech-runtime-flow > i:nth-of-type(2) { display: none; }
+  .tech-runtime-flow > div:nth-of-type(n+3) { margin-top: 8px; }
 
   .tech-detail-groups {
     grid-template-columns: 1fr;
@@ -629,6 +682,22 @@
     padding-block: 47px;
   }
 
+  .tech-stage-selector { grid-template-columns: 1fr; border-radius: 16px 16px 0 0; }
+  .tech-stage-selector button { min-height: 62px; grid-template-columns: 28px 24px 1fr; padding: 12px 16px; border-right: 0; border-bottom: 1px solid var(--akane-border); }
+  .tech-stage-selector li:last-child button { border-bottom: 0; }
+  .tech-stage-index { grid-column: auto; }
+  .tech-stage-detail { min-height: 0; grid-template-columns: 72px 1fr; padding: 24px; }
+  .tech-stage-detail-icon { width: 68px; height: 68px; border-radius: 18px; }
+  .tech-stage-detail-icon .tech-icon { width: 28px; height: 28px; }
+  .tech-stage-detail-icon span, .tech-stage-signal { display: none; }
+  .tech-runtime-flow { grid-template-columns: 1fr; }
+  .tech-runtime-flow > i { transform: rotate(90deg); }
+  .tech-runtime-flow > i:nth-of-type(2) { display: block; }
+  .tech-runtime-flow > div:nth-of-type(n+3) { margin-top: 0; }
+  .tech-runtime-flow > div { min-height: 92px; }
+  .tech-interface-sources { grid-template-columns: 1fr 1fr; }
+  .tech-interface-sources span:last-child { grid-column: 1 / -1; }
+
   .tech-profile-branches,
   .tech-boundary-lists,
   .tech-stack-grid,
@@ -666,14 +735,8 @@
     line-height: 1.7;
   }
 
-  .tech-architecture article {
-    grid-template-columns: 30px 30px 1fr;
-    gap: 10px;
-  }
-
-  .tech-stage-arrow {
-    left: 55px;
-  }
+  .tech-stage-detail { grid-template-columns: 1fr; }
+  .tech-stage-detail-icon { width: 54px; height: 54px; }
 
   .tech-tradeoffs-grid dl > div {
     grid-template-columns: 1fr;
@@ -692,7 +755,11 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .tech-button {
-    transition: none;
-  }
+  .tech-button, .tech-stage-selector button { transition: none; }
+  .tech-stage-detail, .tech-stage-signal span, .tech-architecture-section.is-visible .tech-stage-selector li { animation: none; }
+  .tech-architecture-section:not(.is-visible) .tech-stage-selector li { opacity: 1; transform: none; }
 }
+
+@keyframes tech-detail-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes tech-step-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes tech-signal { 0%,100% { opacity: .32; transform: scale(.82); } 50% { opacity: 1; transform: scale(1); } }

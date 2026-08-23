@@ -13,9 +13,9 @@ type ConnectionState = "connecting" | "live" | "showcase";
 
 const characterAsset = `${projectConfig.basePath}assets/akane-hero.png`;
 const previewReplies = [
-  "You made it. I was hoping we’d get a little time to talk—what’s been on your mind today?",
-  "That sounds like something worth holding onto. Tell me the part you don’t want to forget.",
-  "We can take it one step at a time. What would make today feel a little lighter?",
+  "Hello. It’s nice to meet you.",
+  "A quiet moment can still be worth remembering.",
+  "Some thoughts make more sense when you can return to them later.",
 ];
 const retryDelays = [5_000, 15_000, 30_000, 60_000];
 
@@ -332,7 +332,7 @@ export function DemoPage() {
     : needsSession
       ? "Message Akane to begin a guest session…"
       : previewMode
-        ? "Message the prerecorded preview…"
+        ? "Preview the conversation layout…"
         : "Message Akane…";
 
   return <main className="demo-page">
@@ -351,7 +351,7 @@ export function DemoPage() {
         isThinking={Boolean(isThinking)}
         backendPresentation={backendPresentation}
       />
-      <DemoConversation messages={messages} generating={generating} />
+      <DemoConversation messages={messages} generating={generating} previewMode={previewMode} />
       <DemoComposer
         value={input}
         placeholder={composerPlaceholder}

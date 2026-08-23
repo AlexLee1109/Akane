@@ -20,7 +20,7 @@ export function DemoConversation({ messages, generating }: DemoConversationProps
     endRef.current?.scrollIntoView({ block: "nearest" });
   }, [messages]);
 
-  return <aside className="demo-conversation demo-panel" aria-labelledby="demo-conversation-title">
+  return <section className="demo-conversation demo-panel" aria-labelledby="demo-conversation-title">
     <header className="demo-sidebar-header">
       <div className="demo-sidebar-identity"><span className="demo-sidebar-avatar" aria-hidden="true">A</span><div><strong>Akane</strong><span><i className="demo-status-dot live" aria-hidden="true" />{generating ? "Responding" : "Online"}</span></div></div>
     </header>
@@ -35,7 +35,7 @@ export function DemoConversation({ messages, generating }: DemoConversationProps
       aria-relevant="additions text"
       aria-busy={generating}
     >
-      {messages.length === 0 && <p className="demo-history-empty">Your temporary conversation will appear here.</p>}
+      {messages.length === 0 && <div className="demo-history-empty"><span aria-hidden="true">✦</span><strong>A quiet place to begin.</strong><p>Your temporary conversation will appear here. Nothing in a guest session touches the owner profile.</p></div>}
       {messages.map((message, index) => <article className={`demo-message ${message.role} ${index === messages.length - 1 ? "current" : ""}`} key={message.id}>
         <div className="demo-message-avatar" aria-hidden="true">{message.role === "akane" ? "A" : "You"}</div>
         <div className="demo-message-body">
@@ -44,12 +44,12 @@ export function DemoConversation({ messages, generating }: DemoConversationProps
             {message.preview && <span className="demo-preview-label">Preview</span>}
           </div>
           {message.text
-            ? <p>{message.role === "akane" ? "Akane responded" : message.text}</p>
+            ? <p>{message.text}</p>
             : <p className="demo-thinking"><span aria-hidden="true"><i /><i /><i /></span><span className="sr-only">Akane is thinking</span></p>}
         </div>
       </article>)}
       <div ref={endRef} />
     </div>
     <div className="demo-sidebar-footer"><span>Guest Session</span><span>Private</span><small>Temporary memory</small></div>
-  </aside>;
+  </section>;
 }

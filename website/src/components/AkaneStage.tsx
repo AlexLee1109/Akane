@@ -42,7 +42,7 @@ export function AkaneStage(props: AkaneStageProps) {
     props.backendPresentation,
   );
   return <section className="akane-stage demo-panel" aria-label="Akane stage">
-    {props.connection !== "connecting" && <span className={`akane-stage-mode ${props.connection}`}>{props.connection === "live" ? "Live" : "Preview"}</span>}
+    {props.connection !== "connecting" && <span className={`akane-stage-mode ${props.connection}`}>{props.connection === "live" ? "Live Akane" : "Prerecorded preview"}</span>}
     {(props.responseText?.trim() || props.isThinking) && <ConversationView text={props.responseText} thinking={props.isThinking} />}
     <CharacterRenderer imageSrc={props.imageSrc} state={state} />
   </section>;

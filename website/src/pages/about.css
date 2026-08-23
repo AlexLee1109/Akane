@@ -1,0 +1,39 @@
+.about-page { overflow: clip; background: var(--paper); }
+.about-hero { position: relative; min-height: 560px; display: grid; align-items: center; overflow: hidden; background: radial-gradient(circle at 82% 24%, rgba(117, 158, 255, .23), transparent 25%), radial-gradient(circle at 74% 70%, rgba(137, 216, 255, .22), transparent 24%), linear-gradient(135deg, #f8fbff 0%, #edf5ff 55%, #e9edff 100%); }
+.about-hero::before, .about-hero::after { position: absolute; content: ""; border: 1px solid rgba(61, 106, 220, .13); border-radius: 50%; pointer-events: none; }
+.about-hero::before { width: 440px; height: 440px; right: 8%; top: 50%; transform: translateY(-50%); box-shadow: 0 0 0 70px rgba(83, 134, 255, .035), 0 0 0 140px rgba(83, 134, 255, .025); }
+.about-hero::after { width: 9px; height: 9px; right: 26%; top: 27%; border: 0; background: white; box-shadow: 0 0 24px 8px rgba(70, 132, 255, .55); }
+.about-hero-inner { position: relative; z-index: 1; }
+.about-hero h1 { max-width: 900px; margin: 12px 0 22px; font-size: clamp(3.4rem, 7.2vw, 7rem); line-height: .94; }
+.about-lead { max-width: 690px; margin: 0; font-size: clamp(1.04rem, 1.5vw, 1.2rem); }
+.about-story-grid, .about-evolution-grid, .about-creator-inner { display: grid; grid-template-columns: minmax(240px, .78fr) minmax(0, 1.22fr); gap: clamp(42px, 8vw, 120px); }
+.about-story h2, .about-evolution h2, .about-creator h2 { font-size: clamp(2.2rem, 4.1vw, 4rem); line-height: 1.02; }
+.about-prose p { color: var(--ink); font-size: clamp(1.05rem, 1.45vw, 1.22rem); line-height: 1.7; }
+.about-prose p:last-child { margin-bottom: 0; color: var(--muted); }
+.about-principles { color: white; background: var(--night); }
+.about-principles h2 { color: white; }
+.about-principles .eyebrow { color: var(--blue-pale); }
+.about-principle-grid { display: grid; grid-template-columns: 1.35fr 1fr 1fr; margin-top: 40px; border-top: 1px solid rgba(255,255,255,.22); }
+.about-principle-grid article { padding: 32px 34px 16px 0; border-right: 1px solid rgba(255,255,255,.16); }
+.about-principle-grid article + article { padding-left: 34px; }
+.about-principle-grid article:last-child { border-right: 0; }
+.about-principle-grid span { color: #8db8ff; font-size: .72rem; font-weight: 800; }
+.about-principle-grid h3 { margin: 32px 0 10px; color: white; font-size: 1.25rem; }
+.about-principle-grid p { margin: 0; color: rgba(255,255,255,.68); font-size: .92rem; }
+.about-evolution { background: var(--mist); }
+.about-evolution-heading { align-self: start; position: sticky; top: 110px; }
+.about-timeline { margin: 0; padding: 0; list-style: none; }
+.about-timeline li { position: relative; display: grid; grid-template-columns: 90px 1fr; gap: 26px; padding: 0 0 42px; }
+.about-timeline li::before { position: absolute; left: 95px; top: 7px; bottom: 0; width: 1px; background: var(--line); content: ""; }
+.about-timeline li::after { position: absolute; left: 91px; top: 5px; width: 9px; height: 9px; border: 3px solid var(--mist); border-radius: 50%; background: var(--blue); content: ""; }
+.about-timeline li:last-child { padding-bottom: 0; }
+.about-timeline li:last-child::before { display: none; }
+.about-timeline > li > span { color: var(--blue-deep); font-size: .72rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.about-timeline div { padding-left: 18px; }
+.about-timeline h3 { margin-bottom: 7px; font-size: 1.2rem; }
+.about-timeline p { margin: 0; }
+.about-creator { background: white; }
+.about-creator-inner { align-items: center; }
+.about-creator-inner > div:last-child > p { font-size: 1.05rem; }
+@media (max-width: 800px) { .about-hero { min-height: 500px; } .about-story-grid, .about-evolution-grid, .about-creator-inner { grid-template-columns: 1fr; gap: 28px; } .about-principle-grid { grid-template-columns: 1fr; } .about-principle-grid article, .about-principle-grid article + article { padding: 26px 0; border-right: 0; border-bottom: 1px solid rgba(255,255,255,.16); } .about-principle-grid article:last-child { border-bottom: 0; } .about-principle-grid h3 { margin-top: 16px; } .about-evolution-heading { position: static; } }
+@media (max-width: 430px) { .about-hero { min-height: 450px; } .about-hero h1 { font-size: clamp(3rem, 15vw, 4rem); } .about-timeline li { grid-template-columns: 70px 1fr; gap: 12px; } .about-timeline li::before { left: 72px; } .about-timeline li::after { left: 68px; } .about-timeline div { padding-left: 12px; } }

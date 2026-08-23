@@ -13,9 +13,9 @@ type ConnectionState = "connecting" | "live" | "showcase";
 
 const characterAsset = `${projectConfig.basePath}assets/akane-hero.png`;
 const previewReplies = [
-  "This is a prerecorded preview. Live Akane can remember the active public profile and stream a response when the Raspberry Pi is available.",
-  "In live guest mode, memory and relationship continuity are real for this tab, but the temporary profile expires.",
-  "Akane's real conversation path uses the same prompt, memory, emotion, relationship, and shared model coordinator as her other interfaces.",
+  "You made it. I was hoping we’d get a little time to talk—what’s been on your mind today?",
+  "That sounds like something worth holding onto. Tell me the part you don’t want to forget.",
+  "We can take it one step at a time. What would make today feel a little lighter?",
 ];
 const retryDelays = [5_000, 15_000, 30_000, 60_000];
 
@@ -337,33 +337,31 @@ export function DemoPage() {
 
   return <main className="demo-page">
     <section className="demo-intro shell" aria-labelledby="demo-title">
-      <div><p className="demo-eyebrow">Akane Live Demo</p><h1 id="demo-title">Your local AI companion</h1><p>Talk with the same local companion running directly on my Raspberry Pi.</p></div>
-      <div className="demo-header-status" aria-label="Demo status" aria-live="polite"><span className={`demo-status-dot ${connection}`} aria-hidden="true" /><div><strong>{connectionLabel}</strong><small>Temporary Guest Session</small></div></div>
+      <div><p className="demo-eyebrow">Meet Akane</p><h1 id="demo-title">Take a moment. Say hello.</h1><p>Live conversations run through the local companion on a Raspberry Pi. When it is unavailable, you can explore an honest prerecorded preview.</p></div>
+      <div className="demo-header-status" aria-label="Demo status" aria-live="polite"><span className={`demo-status-dot ${connection}`} aria-hidden="true" /><div><small>Current mode</small><strong>{connectionLabel}</strong></div></div>
     </section>
 
     <section className="demo-workspace shell" aria-label="Akane demo workspace">
+      <AkaneStage
+        imageSrc={characterAsset}
+        responseText={responseText}
+        connection={connection}
+        generating={generating}
+        hasResponseText={Boolean(responseText)}
+        isThinking={Boolean(isThinking)}
+        backendPresentation={backendPresentation}
+      />
       <DemoConversation messages={messages} generating={generating} />
-      <div className="demo-center">
-        <AkaneStage
-          imageSrc={characterAsset}
-          responseText={responseText}
-          connection={connection}
-          generating={generating}
-          hasResponseText={Boolean(responseText)}
-          isThinking={Boolean(isThinking)}
-          backendPresentation={backendPresentation}
-        />
-        <DemoComposer
-          value={input}
-          placeholder={composerPlaceholder}
-          disabled={inputDisabled}
-          generating={generating}
-          error={error}
-          onChange={setInput}
-          onSend={() => { void send(); }}
-          onStop={() => { aborter.current?.abort(); }}
-        />
-      </div>
+      <DemoComposer
+        value={input}
+        placeholder={composerPlaceholder}
+        disabled={inputDisabled}
+        generating={generating}
+        error={error}
+        onChange={setInput}
+        onSend={() => { void send(); }}
+        onStop={() => { aborter.current?.abort(); }}
+      />
       <DemoControls
         connection={connection}
         guestEnabled={health?.guestEnabled === true}

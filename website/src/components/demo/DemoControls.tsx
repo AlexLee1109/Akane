@@ -21,10 +21,10 @@ export function DemoControls(props: DemoControlsProps) {
   const live = props.connection === "live";
   const preview = props.connection === "showcase";
 
-  return <aside className="demo-controls demo-panel" aria-labelledby="demo-controls-title">
-    <header className="demo-control-header"><p>Session</p><h2 id="demo-controls-title">Connection</h2></header>
+  return <details className="demo-controls demo-panel">
+    <summary><span><i className={`demo-status-dot ${live ? "live" : props.connection}`} aria-hidden="true" /><strong>Session & privacy</strong></span><small>{live ? (props.activeSession ? "Temporary guest active" : "Live connection") : preview ? "Prerecorded preview" : "Checking availability"}</small></summary>
     <div className="demo-control-body">
-      <section className="demo-control-section">
+      <section className="demo-control-section" aria-labelledby="demo-controls-title"><h2 id="demo-controls-title" className="sr-only">Session controls</h2>
         <ul className="demo-connection-list">
           <li><i className={`demo-status-dot ${live ? "live" : props.connection}`} aria-hidden="true" />{live ? "Connected" : preview ? "Preview mode" : "Connecting"}</li>
           <li>Running on Raspberry Pi</li>
@@ -41,5 +41,5 @@ export function DemoControls(props: DemoControlsProps) {
         {live && <button className="demo-control-button danger" type="button" disabled={busy || !props.activeSession} onClick={props.onEndSession}>End Guest Session</button>}
       </div>{props.retryExhausted && props.canReconnect && <p className="demo-retry-note">Automatic retries have finished. Reconnect remains available.</p>}</section>
     </div>
-  </aside>;
+  </details>;
 }

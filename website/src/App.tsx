@@ -3,9 +3,10 @@ import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { projectConfig } from "./config/project";
 import { DemoPage } from "./pages/DemoPage";
 import { HomePage } from "./pages/HomePage";
+import { AboutPage } from "./pages/AboutPage";
 import { TechnologyPage } from "./pages/TechnologyPage";
 
-const logo = `${projectConfig.basePath}assets/akane-logo.png`;
+const logo = `${projectConfig.basePath}assets/akane-logo-192.png`;
 
 interface RouteMetadata {
   title: string;
@@ -25,6 +26,10 @@ const routeMetadata: Record<string, RouteMetadata> = {
     title: "How Akane Works · Technology",
     description: "Explore Akane’s local Raspberry Pi runtime, persistent continuity, profile isolation, streaming pipeline, and interface architecture.",
   },
+  "/about": {
+    title: "About Akane · Project Story",
+    description: "The story behind Akane: a personal experiment in local inference, persistent continuity, and a companion that can grow over time.",
+  },
 };
 
 function Logo() {
@@ -40,7 +45,7 @@ function GithubLink({ children, className }: { children: ReactNode; className: s
 function Navbar() {
   const [open, setOpen] = useState(false);
   const location = useLocation();
-  const links = [["/", "Home"], ["/demo", "Demo"], ["/technology", "Technology"]] as const;
+  const links = [["/", "Home"], ["/demo", "Demo"], ["/technology", "Technology"], ["/about", "About"]] as const;
 
   useEffect(() => setOpen(false), [location.pathname]);
 
@@ -80,12 +85,13 @@ function Footer() {
           <Link to="/">Home</Link>
           <Link to="/demo">Demo</Link>
           <Link to="/technology">Technology</Link>
+          <Link to="/about">About</Link>
           <GithubLink className="plain-link">GitHub</GithubLink>
         </nav>
       </div>
       <div className="footer-row footer-meta">
         <span>Built by <a href={projectConfig.githubUrl} target="_blank" rel="noreferrer">Alexander Lee</a></span>
-        <span>MIT License</span>
+        <span>Local-first companion project</span>
         <span>© {new Date().getFullYear()} Akane</span>
       </div>
     </div>
@@ -118,6 +124,7 @@ function App() {
       <Route path="/" element={<HomePage />} />
       <Route path="/demo" element={<DemoPage />} />
       <Route path="/technology" element={<TechnologyPage />} />
+      <Route path="/about" element={<AboutPage />} />
       <Route path="*" element={<HomePage />} />
     </Routes>
     {location.pathname !== "/demo" && <Footer />}

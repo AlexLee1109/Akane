@@ -25,6 +25,7 @@ export function DemoComposer(props: DemoComposerProps) {
   }
 
   return <form className="demo-composer demo-panel" onSubmit={submit}>
+    <span className="demo-composer-spark" aria-hidden="true">✦</span>
     <label className="sr-only" htmlFor="demo-message">Message Akane</label>
     <textarea
       id="demo-message"

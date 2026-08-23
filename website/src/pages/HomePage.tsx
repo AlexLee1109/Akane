@@ -4,38 +4,7 @@ import { projectConfig } from "../config/project";
 import "./home.css";
 
 const homepageImage = `${projectConfig.basePath}assets/homepage-image.png`;
-
 type HomeIconName = "desktop" | "discord" | "growth" | "memory" | "pi" | "presence" | "shield" | "web";
-
-const companionPillars = [
-  {
-    icon: "memory",
-    title: "Remembers you",
-    text: "Meaningful memories and shared experiences carry into future conversations.",
-  },
-  {
-    icon: "growth",
-    title: "Develops with you",
-    text: "Akane maintains opinions, emotion, and relationship continuity instead of resetting.",
-  },
-  {
-    icon: "presence",
-    title: "Stays present",
-    text: "One companion architecture connects the desktop, Discord, and web.",
-  },
-] as const;
-
-const continuitySteps = [
-  { label: "Earlier", text: "“I’m finishing the popup before Live2D.”" },
-  { label: "Remembered", text: "Popup first. Live2D later." },
-  { label: "Later", text: "“Finish streaming and window behavior first. Then move to Live2D.”" },
-] as const;
-
-const interfaces = [
-  { icon: "desktop", label: "Desktop" },
-  { icon: "discord", label: "Discord" },
-  { icon: "web", label: "Web" },
-] as const;
 
 function HomeIcon({ name }: { name: HomeIconName }) {
   const paths: Record<HomeIconName, ReactNode> = {
@@ -48,122 +17,70 @@ function HomeIcon({ name }: { name: HomeIconName }) {
     shield: <><path d="M12 3 19 6v5c0 4.8-3 8.2-7 10-4-1.8-7-5.2-7-10V6l7-3Z" /><path d="m9 12 2 2 4-5" /></>,
     web: <><circle cx="12" cy="12" r="8.5" /><path d="M3.7 12h16.6M12 3.5c2.2 2.4 3.3 5.2 3.3 8.5S14.2 18.1 12 20.5C9.8 18.1 8.7 15.3 8.7 12S9.8 5.9 12 3.5Z" /></>,
   };
-
   return <svg className="home-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">{paths[name]}</svg>;
 }
 
-function Eyebrow({ children }: { children: ReactNode }) {
-  return <p className="home-eyebrow">{children}</p>;
-}
-
 function HomeHero() {
-  const trustItems: readonly [HomeIconName, string][] = [
-    ["pi", "Runs on Raspberry Pi"],
-    ["shield", "Private personal memory"],
-  ];
-
   return <section className="home-hero" aria-labelledby="home-title">
-    <img
-      className="home-hero-media"
-      src={homepageImage}
-      fetchPriority="high"
-      decoding="async"
-      alt="Akane, a blue-haired AI companion, standing in a bright room overlooking a city"
-    />
+    <img className="home-hero-media" src={homepageImage} fetchPriority="high" decoding="async" alt="Akane, a blue-haired AI companion, standing in a bright room overlooking a city" />
+    <div className="home-hero-wash" aria-hidden="true" />
     <div className="home-hero-copy shell">
-      <p className="home-hero-eyebrow">Local-first <span>•</span> Private <span>•</span> Always yours</p>
-      <h1 id="home-title">A local AI companion<br />that remembers you.</h1>
-      <p className="home-hero-accent">Always by your side.</p>
-      <p className="home-lead">Akane develops through conversation, remembers meaningful experiences, and stays present across the desktop, Discord, and the web—powered by a local model running on a Raspberry Pi 5.</p>
-      <div className="actions home-hero-actions">
-        <Link className="button primary" to="/demo">Try the Demo<span aria-hidden="true">→</span></Link>
-      </div>
-      <ul className="home-trust-list" aria-label="Project facts">
-        {trustItems.map(([icon, label]) => <li key={label}><HomeIcon name={icon} />{label}</li>)}
-      </ul>
+      <p className="eyebrow home-hero-eyebrow">Local-first AI companion</p>
+      <h1 id="home-title">Meet Akane.<br /><span>She remembers.</span></h1>
+      <p className="home-lead">A personal companion with continuity across conversations, powered by a local model running on a Raspberry Pi.</p>
+      <div className="actions home-hero-actions"><Link className="button primary" to="/demo">Try the Demo<span aria-hidden="true">→</span></Link><Link className="home-text-link" to="/technology">How she works<span aria-hidden="true">↗</span></Link></div>
+      <ul className="home-trust-list" aria-label="Project facts"><li><HomeIcon name="pi" />Runs locally</li><li><HomeIcon name="shield" />Private continuity</li><li><HomeIcon name="presence" />One companion</li></ul>
     </div>
+    <div className="home-hero-detail" aria-hidden="true"><span className="home-detail-dot" /><div><small>Continuity</small><strong>Picks up where you left off</strong></div></div>
   </section>;
 }
 
 function CompanionPillars() {
   return <section className="home-section home-pillars shell" aria-labelledby="pillars-title">
-    <div className="home-section-heading">
-      <Eyebrow>Made to feel present</Eyebrow>
-      <h2 id="pillars-title">What makes Akane different</h2>
-    </div>
-    <div className="home-pillar-grid">
-      {companionPillars.map(item => <article className="home-pillar-card" key={item.title}>
-        <HomeIcon name={item.icon} />
-        <h3>{item.title}</h3>
-        <p>{item.text}</p>
-      </article>)}
+    <div className="section-heading"><p className="eyebrow">Made to feel present</p><h2 id="pillars-title">Not another blank chat window.</h2><p>Akane is designed around one relationship that develops through time.</p></div>
+    <div className="home-bento">
+      <article className="home-feature home-feature-memory">
+        <div><HomeIcon name="memory" /><p className="eyebrow">Meaningful continuity</p><h3>She remembers you.</h3><p>Shared experiences and useful details can return when they genuinely matter—not as a transcript dump, but as context.</p></div>
+        <div className="memory-preview" aria-label="Illustrative memory preview"><span>Memory retained</span><p>“Popup first. Live2D later.”</p><small>Available to future conversations</small></div>
+      </article>
+      <article className="home-feature home-feature-growth"><HomeIcon name="growth" /><div><h3>Develops with you</h3><p>Durable opinions, Self, and lightweight offscreen continuity make each conversation part of something larger.</p></div><span className="feature-line" aria-hidden="true"><i /><i /><i /></span></article>
+      <article className="home-feature home-feature-presence"><HomeIcon name="presence" /><div><h3>Stays present</h3><p>Desktop and Discord connect to the same owner continuity, while web guests stay safely isolated.</p></div><div className="presence-orbit" aria-hidden="true"><i /><i /><i /><b>A</b></div></article>
     </div>
   </section>;
 }
 
 function ContinuityStory() {
   return <section className="home-section home-continuity" aria-labelledby="continuity-title">
-    <div className="shell home-continuity-inner">
-      <div className="home-continuity-copy">
-        <Eyebrow>Built through continuity</Eyebrow>
-        <h2 id="continuity-title">A conversation that does not start over</h2>
-        <p>Akane keeps what matters and brings it back when it genuinely changes a future conversation.</p>
-      </div>
-      <div>
-        <ol className="home-continuity-flow">
-          {continuitySteps.map((step, index) => <li key={step.label}>
-            <span aria-hidden="true">0{index + 1}</span>
-            <div><h3>{step.label}</h3><p>{step.text}</p></div>
-          </li>)}
-        </ol>
-        <p className="home-illustrative-note">Illustrative example—not a real stored conversation.</p>
-      </div>
+    <div className="shell home-continuity-heading"><p className="eyebrow">A conversation with a past</p><h2 id="continuity-title">The thread carries forward.</h2><p>Conversation becomes selected context, then returns naturally when it can help.</p></div>
+    <div className="shell continuity-scene">
+      <div className="continuity-chat earlier"><span>Earlier</span><div className="bubble you">I’m finishing the popup before Live2D.</div></div>
+      <div className="continuity-connector" aria-hidden="true"><i /><span>Meaning retained</span><i /></div>
+      <div className="continuity-memory"><HomeIcon name="memory" /><small>Remembered</small><strong>Popup first.<br />Live2D later.</strong><span>Relevant context</span></div>
+      <div className="continuity-connector" aria-hidden="true"><i /><span>Later context</span><i /></div>
+      <div className="continuity-chat later"><span>Later</span><div className="bubble akane">Let’s finish streaming and window behavior first. Then we can move to Live2D.</div><small>Akane</small></div>
     </div>
+    <p className="home-illustrative-note shell">Illustrative flow—not a real stored conversation or user record.</p>
   </section>;
 }
 
 function InterfaceOverview() {
+  const interfaces: readonly [HomeIconName, string, string][] = [["desktop", "Desktop", "Owner continuity"], ["discord", "Discord", "Owner continuity"], ["web", "Web demo", "Temporary guest"]];
   return <section className="home-section home-interfaces" aria-labelledby="interfaces-title">
-    <div className="shell">
-      <div className="home-interface-heading">
-        <Eyebrow>One shared companion</Eyebrow>
-        <h2 id="interfaces-title">The same Akane, wherever you talk</h2>
-      </div>
-      <div className="home-interface-flow" role="group" aria-label="Desktop, Discord, and Web connect to one Akane">
-        <div className="home-interface-options">
-          {interfaces.map(item => <div key={item.label}><HomeIcon name={item.icon} /><strong>{item.label}</strong></div>)}
-        </div>
-        <span className="home-interface-arrow" aria-hidden="true">→</span>
-        <div className="home-interface-akane"><strong>One Akane</strong><span>Local {projectConfig.modelName} runtime</span></div>
-      </div>
-      <div className="home-interface-notes">
-        <p>Desktop and Discord share private owner continuity. Web visitors receive isolated temporary guest sessions.</p>
-        <p><strong>Available now:</strong> local conversation, persistent memory, popup, Discord, and web demo.</p>
-        <p>Voice and Live2D remain planned.</p>
-        <Link to="/technology">View development details <span aria-hidden="true">→</span></Link>
+    <div className="shell"><div className="section-heading center"><p className="eyebrow">One shared companion</p><h2 id="interfaces-title">Different places. The same Akane.</h2><p>Each interface is a window into one coordinated local runtime, with clear privacy boundaries.</p></div>
+      <div className="interface-showcase">
+        <div className="interface-previews">{interfaces.map(([icon, title, note]) => <article key={title} className={`interface-card ${icon}`}><header><i /><i /><i /></header><div><HomeIcon name={icon} /><strong>{title}</strong><span>{note}</span></div><p>{icon === "desktop" ? "Good morning. Ready to keep going?" : icon === "discord" ? "Akane · just now" : "Isolated session ready"}</p></article>)}</div>
+        <div className="interface-runtime"><span className="runtime-pulse" aria-hidden="true" /><div><small>Shared local runtime</small><strong>Akane · {projectConfig.modelName}</strong></div><Link to="/technology">See architecture<span aria-hidden="true">→</span></Link></div>
       </div>
     </div>
   </section>;
+}
+
+function LocalPrivate() {
+  return <section className="home-local" aria-labelledby="local-title"><div className="shell home-local-inner"><div className="local-chip"><HomeIcon name="pi" /><span>Raspberry Pi 5</span></div><div><p className="eyebrow">Local by default</p><h2 id="local-title">Her core stays close.</h2><p>Core inference runs on a local model. Private owner continuity persists on personal hardware, without a cloud-first model dependency.</p></div><dl><div><dt>Model</dt><dd>{projectConfig.modelName}</dd></div><div><dt>Persistence</dt><dd>Private local state</dd></div><div><dt>Purpose</dt><dd>One personal companion</dd></div></dl></div></section>;
 }
 
 function HomeCallToAction() {
-  return <section className="home-cta" aria-labelledby="home-cta-title">
-    <div className="shell home-cta-inner">
-      <div>
-        <h2 id="home-cta-title">Ready to meet Akane?</h2>
-        <p>Talk through the live guest demo and experience the real local companion pipeline.</p>
-      </div>
-      <Link className="button home-cta-button" to="/demo">Try the Demo</Link>
-    </div>
-  </section>;
+  return <section className="home-cta" aria-labelledby="home-cta-title"><div className="shell home-cta-inner"><div><p className="eyebrow">Say hello</p><h2 id="home-cta-title">Ready to meet Akane?</h2><p>Try a temporary, isolated guest conversation—or a clearly labeled prerecorded preview when the Pi is unavailable.</p></div><Link className="button home-cta-button" to="/demo">Try the Demo<span aria-hidden="true">→</span></Link></div></section>;
 }
 
-export function HomePage() {
-  return <main className="home-page">
-    <HomeHero />
-    <CompanionPillars />
-    <ContinuityStory />
-    <InterfaceOverview />
-    <HomeCallToAction />
-  </main>;
-}
+export function HomePage() { return <main className="home-page"><HomeHero /><CompanionPillars /><ContinuityStory /><InterfaceOverview /><LocalPrivate /><HomeCallToAction /></main>; }

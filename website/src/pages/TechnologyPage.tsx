@@ -34,7 +34,7 @@ const architectureStages: readonly ArchitectureStage[] = [
   {
     icon: "profile",
     title: "Select context",
-    description: "Recent conversation and only the relevant memory, relationship, emotion, time, and presence context are selected.",
+    description: "Recent conversation and only the relevant Self, Memory, time, InnerLife, and interface context are selected.",
   },
   {
     icon: "brain",
@@ -43,13 +43,13 @@ const architectureStages: readonly ArchitectureStage[] = [
   },
   {
     icon: "model",
-    title: "Coordinate local inference",
-    description: "The request enters the shared coordinator and uses the local Gemma runtime through llama.cpp on the Raspberry Pi.",
+    title: "Run local inference",
+    description: `The shared coordinator reserves the ${projectConfig.modelName} runtime through llama.cpp on the Raspberry Pi.`,
   },
   {
     icon: "stream",
-    title: "Stream and commit",
-    description: "Visible text streams to the interface. Completed state changes are validated and committed only after successful generation.",
+    title: "Deliver and commit",
+    description: "Each interface receives either a live stream or one completed reply. State is committed only after successful generation.",
   },
 ];
 
@@ -57,26 +57,26 @@ const implementationGroups = [
   {
     title: "Context and identity",
     items: [
-      ["CharacterProfile", "Loads and validates Akane’s identity, soul, and hard behavioral rules."],
-      ["_response_context_plan", "Selects which memory and companion-state sections are relevant to the current turn."],
-      ["PromptPlan", "Budgets identity, current input, complete recent pairs, and selected context before final tokenization."],
+      ["Character", "Owns Akane’s compact identity, temperament, appearance, and seed interests."],
+      ["ContextBuilder", "Selects one bounded snapshot of relevant Self, Memory, InnerLife, time, and connected interface evidence."],
+      ["PromptPlan", "Compiles identity, current input, raw recent dialogue, and selected context for the small local model."],
     ],
   },
   {
     title: "Continuity and state",
     items: [
-      ["StateStore", "Owns schema-versioned profile, conversation, memory, relationship, emotion, and presence state."],
-      ["StateStore.commit_turn", "Commits a completed conversation turn and accepted state changes through the authoritative store."],
-      ["atomic_write_json", "Flushes a replacement document before atomically replacing the current state file."],
-      ["OffscreenPresenceWorker", "Coordinates event-driven background presence through the same model and state authorities."],
+      ["Store", "Owns one schema-versioned JSON document and every canonical state transaction."],
+      ["StateChangeProposal", "Carries validated conversation, Self, Memory, InnerLife, and Reflection-range changes."],
+      ["ReflectionEngine", "Separately extracts small post-turn changes; it never writes state directly."],
+      ["InnerLife", "Maintains lightweight current activity, previous activity, and optional focus between conversations."],
     ],
   },
   {
     title: "Runtime coordination",
     items: [
-      ["GenerationScheduler", "Bounds visible work and coordinates foreground requests around one constrained model."],
-      ["ModelManager", "Owns the singleton llama.cpp runtime, reservations, tokenization, and streamed generation."],
-      ["_VisibleReplyStream", "Separates visible response text from the optional internal state block while streaming."],
+      ["GenerationScheduler", "Bounds foreground work and prevents one profile from racing itself."],
+      ["InferenceRuntime", "Owns the singleton llama.cpp runtime, priority reservations, token accounting, and token streaming."],
+      ["AutonomyCoordinator", "Runs reflection before low-duty-cycle InnerLife without competing with visible conversation."],
     ],
   },
 ] as const;
@@ -85,7 +85,7 @@ const stackGroups: readonly StackGroup[] = [
   {
     category: "Model",
     title: projectConfig.modelName,
-    items: ["Instruction-tuned Gemma generation", "llama.cpp via llama-cpp-python", "Q4_K_M GGUF", "4,096-token configured context"],
+    items: ["Instruction-tuned local generation", "llama.cpp via llama-cpp-python", "Q4_K_M GGUF", "4,096-token configured default"],
   },
   {
     category: "Backend",
@@ -100,7 +100,7 @@ const stackGroups: readonly StackGroup[] = [
   {
     category: "Persistence",
     title: "Validated local state",
-    items: ["Schema-versioned atomic JSON", "Conversation records", "Validated companion state"],
+    items: ["One schema-versioned JSON file", "Atomic state replacement", "Conversation and reflection jobs"],
   },
   {
     category: "Developer integration",
@@ -174,8 +174,8 @@ function TechnologyHero() {
     <div className="shell tech-hero-inner">
       <p className="tech-eyebrow">Local runtime <span>•</span> Shared continuity <span>•</span> Multiple interfaces</p>
       <h1 id="technology-title">How Akane works</h1>
-      <p className="tech-hero-accent">One companion. One coordinated runtime.</p>
-      <p className="tech-hero-lead">Akane combines local language-model inference with persistent memory, relationship continuity, grounded emotion, and multiple interfaces through one shared backend running on a Raspberry Pi 5.</p>
+      <p className="tech-hero-accent">One coordinated path from message to memory.</p>
+      <p className="tech-hero-lead">Akane combines local language-model inference with persistent Self and Memory, lightweight offscreen life, and multiple interfaces through one shared backend running on a Raspberry Pi 5.</p>
     </div>
   </section>;
 }
@@ -190,7 +190,7 @@ function ArchitectureAndLifecycle() {
         id="architecture-title"
       />
       <figure className="tech-architecture" aria-describedby="architecture-summary">
-        <figcaption id="architecture-summary" className="sr-only">An interface request resolves an owner or guest profile, selects relevant context, compiles one prompt, uses the local Gemma runtime, then streams visible text and commits validated state.</figcaption>
+        <figcaption id="architecture-summary" className="sr-only">An interface request resolves an owner or guest profile, selects relevant context, compiles one prompt, uses the configured local model runtime, then delivers visible text and commits validated state.</figcaption>
         <ol>
           {architectureStages.map((stage, index) => <li key={stage.title}>
             <article>
@@ -202,8 +202,9 @@ function ArchitectureAndLifecycle() {
           </li>)}
         </ol>
       </figure>
+      <div className="tech-background-lane"><span>After a completed turn</span><i aria-hidden="true">→</i><strong>Background Reflection</strong><i aria-hidden="true">→</i><span>Validated Self &amp; Memory changes</span></div>
       <details className="tech-implementation-details">
-        <summary>View implementation details</summary>
+        <summary>Developer details <span>Classes and state ownership</span></summary>
         <div className="tech-detail-groups">
           {implementationGroups.map(group => <section key={group.title}>
             <h3>{group.title}</h3>
@@ -217,7 +218,7 @@ function ArchitectureAndLifecycle() {
 
 function ProfileIsolation() {
   const shared = ["Shared request pipeline", "Shared inference coordinator", "Same local model"];
-  const isolated = ["Conversation history", "Memory", "Relationship", "Private profile state"];
+  const isolated = ["Conversation history", "Memory", "Self", "Private profile state"];
 
   return <section className="tech-section tech-isolation-section" aria-labelledby="isolation-title">
     <div className="shell tech-isolation-inner">
@@ -227,7 +228,7 @@ function ProfileIsolation() {
         <p>Desktop and Discord share the owner’s private continuity. Every website visitor receives a separate temporary guest profile.</p>
       </div>
       <figure className="tech-profile-diagram" aria-describedby="profile-summary">
-        <figcaption id="profile-summary" className="sr-only">Desktop popup and Discord share owner continuity. The website demo uses temporary guest continuity. Both use the same request pipeline, inference coordinator, and local model without sharing history, memory, relationship, or private profile state.</figcaption>
+        <figcaption id="profile-summary" className="sr-only">Desktop popup and Discord share owner continuity. The website demo uses temporary guest continuity. Both use the same request pipeline, inference coordinator, and local model without sharing history, Memory, Self, or private profile state.</figcaption>
         <div className="tech-profile-branches">
           <article><TechIcon name="profile" /><span>Owner continuity</span><h3>Desktop popup</h3><h3>Discord</h3></article>
           <article><TechIcon name="shield" /><span>Temporary guest continuity</span><h3>Website demo</h3></article>
@@ -277,7 +278,7 @@ function PlannedPresentation() {
   return <section className="tech-section tech-roadmap-section" aria-labelledby="roadmap-title">
     <div className="shell">
       <SectionHeading eyebrow="Planned presentation" title="A richer presence, not a second personality" id="roadmap-title" />
-      <p className="tech-roadmap-principle">Personality, memory, emotion, and conversation state remain backend-owned. The presentation layer only renders voice, movement, and expression.</p>
+      <p className="tech-roadmap-principle">Personality, memory, and conversation state remain backend-owned. The presentation layer only renders voice, movement, and expression.</p>
       <div className="tech-roadmap-list">
         {roadmapItems.map(item => <div key={item.title}><strong>{item.title}</strong><span className={`tech-status ${item.status === "Planned" ? "planned" : "in-development"}`}>{item.status}</span></div>)}
       </div>

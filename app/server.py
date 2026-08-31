@@ -22,12 +22,6 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.character import load_character_profile
 from app.core.config import SETTINGS, coerce_bool
-from app.core.autonomy import (
-    acknowledge_proactive_delivery,
-    claim_proactive_delivery,
-    start_autonomy,
-    stop_autonomy,
-)
 from app.core.inference import InferenceRuntime
 from app.core.session import (
     ChatInput,
@@ -134,10 +128,9 @@ def _log(label: str, text: str = "") -> None:
 
 
 def _log_chat(role: str, item: ChatInput, text: str) -> None:
-    value = str(text or "")
     print(
         f"[Akane:chat:{role}] source={item.source} "
-        f"conversation={item.conversation_id} text={value!r}",
+        f"conversation={item.conversation_id} chars={len(str(text or ''))}",
         flush=True,
     )
 
@@ -206,6 +199,16 @@ def _generate_reply(chat: ChatRequestData) -> str:
         streaming=False,
         allow_tool_context=item.source in {"popup", "web"},
     )
+    adapter_received_at = time.perf_counter()
+    if result.handed_off_at:
+        log_timing(
+            "adapter",
+            session_to_adapter=adapter_received_at - result.handed_off_at,
+            final_token_to_adapter_receive=(
+                adapter_received_at - result.final_token_at
+                if result.final_token_at else 0.0
+            ),
+        )
     return result.message
 
 
@@ -298,6 +301,7 @@ def _stream_chat_events(chat: ChatRequestData):
                 raise value
             result = value
             finished = True
+        adapter_received_at = time.perf_counter()
         worker.join()
         generation_id = result.generation_id
         reply = result.message
@@ -307,6 +311,14 @@ def _stream_chat_events(chat: ChatRequestData):
             "stream",
             first_update=(first_delta_at or done_at) - stream_started_at,
             final_update_to_done=done_at - (final_delta_at or done_at),
+            session_to_adapter=(
+                adapter_received_at - result.handed_off_at
+                if result.handed_off_at else 0.0
+            ),
+            final_token_to_adapter_receive=(
+                adapter_received_at - result.final_token_at
+                if result.final_token_at else 0.0
+            ),
             total=done_at - stream_started_at,
         )
         done_event = {
@@ -314,9 +326,19 @@ def _stream_chat_events(chat: ChatRequestData):
             "generation_id": generation_id,
             "reply": reply,
         }
+        messages_started_at = time.perf_counter()
         if chat.include_messages:
             done_event["messages"] = _messages(item.conversation_id, item.profile_id)
-        yield _json_line(done_event)
+        messages_finished_at = time.perf_counter()
+        serialized = _json_line(done_event)
+        serialized_at = time.perf_counter()
+        log_timing(
+            "stream.done",
+            message_snapshot=messages_finished_at - messages_started_at,
+            json_serialization=serialized_at - messages_finished_at,
+            response_build=serialized_at - adapter_received_at,
+        )
+        yield serialized
     except GenerationCancelled:
         _log("cancelled", f"conversation={item.conversation_id}")
         yield _json_line({"type": "cancelled", "generation_id": generation_id})
@@ -434,14 +456,13 @@ async def _lifespan(app: FastAPI):
             f"path={runtime['model_path']} llama_cpp_python={runtime['llama_cpp_python']} "
             f"context={runtime['context_window']} threads={options.get('n_threads')} "
             f"threads_batch={options.get('n_threads_batch')} batch={options.get('n_batch')} "
-            f"ubatch={options.get('n_ubatch')} swa_full={options.get('swa_full')} "
-            f"sequence_state_api={runtime['sequence_state_api_available']}",
+            f"ubatch={options.get('n_ubatch')} swa_full={options.get('swa_full')}",
         )
         _log(
             "sampling",
             f"temperature={runtime['temperature']} top_k={runtime['top_k']} "
             f"top_p={runtime['top_p']} min_p={runtime['min_p']} "
-            f"repeat_penalty={runtime['repeat_penalty']} seed_mode={runtime['seed_behavior']!r}",
+            f"repeat_penalty={runtime['repeat_penalty']}",
         )
     public_sessions = None
     if PUBLIC_API_SETTINGS.enabled:
@@ -449,7 +470,6 @@ async def _lifespan(app: FastAPI):
         public_sessions.start()
     app.state.public_sessions = public_sessions
     _RUNTIME_SHUTDOWN.clear()
-    start_autonomy()
     _start_model_loading()
     try:
         yield
@@ -458,7 +478,6 @@ async def _lifespan(app: FastAPI):
         if public_sessions is not None:
             public_sessions.shutdown()
         app.state.public_sessions = None
-        stop_autonomy()
         cancel_all_generations()
         InferenceRuntime.get_instance().close()
 
@@ -619,13 +638,24 @@ def create_app() -> FastAPI:
             _log("error", f"type={type(exc).__name__} detail={exc}")
             return JSONResponse({"error": _safe_error(exc)}, status_code=_error_status(exc))
         _log_chat("reply", chat.chat_input, reply)
+        adapter_started_at = time.perf_counter()
         payload = {"reply": reply}
+        messages_started_at = time.perf_counter()
         if chat.include_messages:
             payload["messages"] = _messages(
                 chat.chat_input.conversation_id,
                 chat.chat_input.profile_id,
             )
-        return JSONResponse(payload)
+        messages_finished_at = time.perf_counter()
+        response = JSONResponse(payload)
+        response_ready_at = time.perf_counter()
+        log_timing(
+            "api.delivery",
+            message_snapshot=messages_finished_at - messages_started_at,
+            json_serialization=response_ready_at - messages_finished_at,
+            response_build=response_ready_at - adapter_started_at,
+        )
+        return response
 
     @app.post("/api/chat/stream")
     async def api_chat_stream(request: Request):
@@ -641,42 +671,6 @@ def create_app() -> FastAPI:
             media_type="application/x-ndjson; charset=utf-8",
             headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
         )
-
-    @app.post("/api/initiative/delivery/claim")
-    async def api_initiative_delivery_claim(request: Request):
-        payload = await _request_payload(request)
-        conversation = str(
-            payload.get("conversation_id") or payload.get("session_id") or DEFAULT_CONVERSATION_ID
-        )
-        try:
-            wait_seconds = float(payload.get("wait_seconds", 25.0))
-        except (TypeError, ValueError):
-            wait_seconds = 25.0
-        delivery = await asyncio.to_thread(
-            claim_proactive_delivery,
-            adapter=str(payload.get("adapter") or ""),
-            conversation_id=conversation,
-            available=coerce_bool(payload.get("available"), True),
-            wait_seconds=wait_seconds,
-        )
-        return JSONResponse({"delivery": delivery})
-
-    @app.post("/api/initiative/delivery/ack")
-    async def api_initiative_delivery_ack(request: Request):
-        payload = await _request_payload(request)
-        conversation = str(
-            payload.get("conversation_id") or payload.get("session_id") or DEFAULT_CONVERSATION_ID
-        )
-        accepted = await asyncio.to_thread(
-            acknowledge_proactive_delivery,
-            opportunity_id=str(payload.get("opportunity_id") or ""),
-            claim_token=str(payload.get("claim_token") or ""),
-            adapter=str(payload.get("adapter") or ""),
-            conversation_id=conversation,
-            success=coerce_bool(payload.get("success"), False),
-            message_id=str(payload.get("message_id") or ""),
-        )
-        return JSONResponse({"ok": accepted})
 
     if PUBLIC_API_SETTINGS.enabled:
         register_public_routes(app)

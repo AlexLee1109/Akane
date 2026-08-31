@@ -189,70 +189,9 @@ async def _post_chat(http, payload: dict[str, object]) -> dict[str, object]:
         }
 
 
-async def _claim_delivery(
-    http,
-    *,
-    conversation_id: str,
-    available: bool = True,
-) -> dict:
+async def _cancel_remote(http, conversation_id: str, profile_id: str) -> None:
     import aiohttp
 
-    timeout = aiohttp.ClientTimeout(total=35)
-    try:
-        async with http.post(
-            f"{SETTINGS.discord_server_url}/api/initiative/delivery/claim",
-            json={
-                "adapter": "discord",
-                "conversation_id": conversation_id,
-                "available": available,
-                "wait_seconds": 25 if available else 0,
-            },
-            headers=_headers(),
-            timeout=timeout,
-        ) as response:
-            text = await response.text()
-            try:
-                data = json.loads(text) if text else {}
-            except json.JSONDecodeError:
-                data = {"error": "Akane server returned invalid JSON."}
-            if response.status >= 400:
-                return {
-                    "error": data.get("error")
-                    or f"Akane server returned HTTP {response.status}."
-                }
-            return data if isinstance(data, dict) else {"error": "Akane server returned invalid JSON."}
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        return {"error": f"Could not reach the Akane server: {type(exc).__name__}."}
-
-
-async def _ack_delivery(
-    http,
-    *,
-    conversation_id: str,
-    delivery: dict,
-    success: bool,
-    message_id: str = "",
-) -> bool:
-    try:
-        async with http.post(
-            f"{SETTINGS.discord_server_url}/api/initiative/delivery/ack",
-            json={
-                "adapter": "discord",
-                "conversation_id": conversation_id,
-                "opportunity_id": delivery.get("opportunity_id", ""),
-                "claim_token": delivery.get("claim_token", ""),
-                "success": success,
-                "message_id": message_id,
-            },
-            headers=_headers(),
-        ) as response:
-            data = await response.json()
-            return response.status < 400 and bool(data.get("ok"))
-    except Exception:
-        return False
-
-
-async def _cancel_remote(http, conversation_id: str, profile_id: str) -> None:
     try:
         async with http.post(
             f"{SETTINGS.discord_server_url}/api/chat/cancel",
@@ -260,8 +199,8 @@ async def _cancel_remote(http, conversation_id: str, profile_id: str) -> None:
             headers=_headers(),
         ) as response:
             await response.read()
-    except Exception:
-        pass
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        _log("cancel-error", f"type={type(exc).__name__}")
 
 
 def _chunks(text: str) -> list[str]:
@@ -321,12 +260,13 @@ async def _send_completed_discord_reply(
     await _send_reply(message, text, allowed_mentions)
     finished_at = time.perf_counter()
     if SETTINGS.timing_enabled:
+        discord_send_seconds = max(0.0, finished_at - response_received_at)
         _log("foreground", f"stage=discord_send_end at={time.time():.6f}")
         _log("foreground", f"stage=foreground_complete at={time.time():.6f}")
         _log(
             "timing",
             f"server_roundtrip_ms={max(0.0, response_received_at - request_started_at) * 1000:.3f} "
-            f"integration_delivery_ms={max(0.0, finished_at - response_received_at) * 1000:.3f} "
+            f"discord_send_ms={discord_send_seconds * 1000:.3f} "
             f"foreground_total_ms={max(0.0, finished_at - received_at) * 1000:.3f}",
         )
     return text
@@ -347,26 +287,11 @@ def run_discord_bot() -> None:
 
     class AkaneDiscordClient(discord.Client):
         http_session: aiohttp.ClientSession
-        delivery_task: asyncio.Task | None = None
-        delivery_target: dict[str, object] | None = None
-        delivery_wake: asyncio.Event
 
         async def setup_hook(self) -> None:
             self.http_session = aiohttp.ClientSession()
-            self.delivery_wake = asyncio.Event()
 
         async def close(self) -> None:
-            target = self.delivery_target
-            if target is not None and hasattr(self, "http_session"):
-                await _claim_delivery(
-                    self.http_session,
-                    conversation_id=str(target["conversation_id"]),
-                    available=False,
-                )
-            if self.delivery_task is not None:
-                self.delivery_task.cancel()
-                await asyncio.gather(self.delivery_task, return_exceptions=True)
-                self.delivery_task = None
             if hasattr(self, "http_session"):
                 await self.http_session.close()
             await super().close()
@@ -376,75 +301,10 @@ def run_discord_bot() -> None:
     client = AkaneDiscordClient(intents=intents)
     allowed_mentions = discord.AllowedMentions.none()
 
-    def configured_delivery_target() -> dict[str, object] | None:
-        for channel_id in SETTINGS.discord_allowed_channel_ids:
-            channel = client.get_channel(channel_id)
-            if channel is not None:
-                return {
-                    "channel": channel,
-                    "conversation_id": f"discord:initiative:channel:{channel_id}",
-                }
-        return None
-
-    async def delivery_loop() -> None:
-        while True:
-            target = client.delivery_target or configured_delivery_target()
-            if target is None:
-                client.delivery_wake.clear()
-                await client.delivery_wake.wait()
-                continue
-            channel = target["channel"]
-            conversation_id = str(target["conversation_id"])
-            try:
-                result = await _claim_delivery(
-                    client.http_session,
-                    conversation_id=conversation_id,
-                )
-                error = compact_text(result.get("error"), 240)
-                if error:
-                    _log("delivery-wait", error)
-                    await asyncio.sleep(2.0)
-                    continue
-                delivery = result.get("delivery")
-                if not isinstance(delivery, dict):
-                    continue
-                try:
-                    sent = await channel.send(
-                        str(delivery.get("message") or ""),
-                        allowed_mentions=allowed_mentions,
-                    )
-                except Exception:
-                    await _ack_delivery(
-                        client.http_session,
-                        conversation_id=conversation_id,
-                        delivery=delivery,
-                        success=False,
-                    )
-                    continue
-                acknowledged = await _ack_delivery(
-                    client.http_session,
-                    conversation_id=conversation_id,
-                    delivery=delivery,
-                    success=True,
-                    message_id=str(getattr(sent, "id", "") or ""),
-                )
-                if acknowledged:
-                    _log("initiative-send", f"channel={channel.id}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                _log("delivery-wait", f"{type(exc).__name__}: {exc}")
-                await asyncio.sleep(2.0)
-
     @client.event
     async def on_ready() -> None:
         _log("ready", f"logged in as {client.user}")
         _log("status", f"forwarding to {SETTINGS.discord_server_url}")
-        if client.delivery_target is None:
-            client.delivery_target = configured_delivery_target()
-        if client.delivery_task is None or client.delivery_task.done():
-            client.delivery_task = asyncio.create_task(delivery_loop())
-        client.delivery_wake.set()
 
     @client.event
     async def on_message(message) -> None:
@@ -460,11 +320,6 @@ def run_discord_bot() -> None:
         conversation_id = _conversation_id(message)
         profile_id = _profile_id(message)
         payload = _payload(message, text)
-        client.delivery_target = {
-            "channel": message.channel,
-            "conversation_id": conversation_id,
-        }
-        client.delivery_wake.set()
         try:
             async with message.channel.typing():
                 await _send_completed_discord_reply(

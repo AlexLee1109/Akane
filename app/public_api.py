@@ -79,7 +79,7 @@ def _log(event: str, profile_id: str = "") -> None:
 def _log_chat(role: str, profile_id: str, text: str) -> None:
     print(
         f"[Akane:public:{role}] guest={_profile_ref(profile_id)} "
-        f"text={str(text or '')!r}",
+        f"chars={len(str(text or ''))}",
         flush=True,
     )
 
@@ -114,7 +114,6 @@ class PublicApiSettings:
     max_active: int = SETTINGS.public_max_active
     max_queue: int = SETTINGS.public_max_queue
     message_limit: int = SETTINGS.public_message_limit
-    response_token_limit: int = SETTINGS.public_response_token_limit
     request_cooldown_seconds: float = SETTINGS.public_request_cooldown_seconds
     generation_timeout_seconds: float = SETTINGS.public_generation_timeout_seconds
 
@@ -135,8 +134,6 @@ class PublicApiSettings:
             raise ValueError("Public capacity requires one active slot and a non-negative queue.")
         if not 1 <= int(self.message_limit) <= SETTINGS.max_input_chars:
             raise ValueError("AKANE_PUBLIC_MESSAGE_LIMIT is outside the backend input limit.")
-        if not 1 <= int(self.response_token_limit) < SETTINGS.llama_context_window:
-            raise ValueError("AKANE_PUBLIC_RESPONSE_TOKEN_LIMIT is outside the model context.")
         if float(self.request_cooldown_seconds) < 0.0:
             raise ValueError("AKANE_PUBLIC_REQUEST_COOLDOWN_SECONDS cannot be negative.")
         if float(self.generation_timeout_seconds) <= 0.0:
@@ -433,7 +430,6 @@ def public_chat_events(
                     streaming=True,
                     on_delta=lambda text: events.put(("delta", text)),
                     priority="guest",
-                    max_tokens=manager.settings.response_token_limit,
                     cancellation=lease.cancellation,
                     queue_deadline=lease.deadline,
                     allow_tool_context=False,
@@ -477,6 +473,8 @@ def public_chat_events(
                 value if isinstance(value, Exception) else RuntimeError("public generation failed"),
                 lease,
             )
+            failure = value if isinstance(value, Exception) else error
+            _log(f"generation failed: {type(failure).__name__}", session.profile_id)
             yield _json_line(
                 {"type": "error", "error": {"code": error.code, "message": error.message}}
             )

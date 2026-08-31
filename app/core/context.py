@@ -1,18 +1,29 @@
-"""Selection and read-only presentation of state for a conversation turn."""
+"""Bounded, model-free state selection for one foreground turn."""
 
 from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.core.config import SETTINGS
-from app.core.state import Mood, Relationship, StateSnapshot
+from app.core.mind import self_development_state
+from app.core.state import StateSnapshot
 from app.core.store import Store
-from app.core.utils import lexical_terms
+from app.core.utils import lexical_terms, text_key
 from app.integrations.vscode_context import CodeContext, current_code_context
+
+
+_CLOCK_TERMS = frozenset({
+    "afternoon", "date", "evening", "midnight", "morning", "night", "noon",
+    "time", "today", "tomorrow", "tonight", "when", "yesterday",
+})
+_CODE_TERMS = frozenset({
+    "bug", "class", "code", "editor", "error", "file", "function", "line",
+    "method", "traceback", "vscode",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,8 +39,10 @@ class TurnContext:
     state: StateSnapshot
     time: TimeContext
     code: CodeContext | None = None
-    deliberation: str = ""
     include_time: bool = False
+    include_clock_time: bool = False
+    include_elapsed_time: bool = False
+    include_self_history: bool = False
 
 
 def _elapsed(now: float, timestamp: float | None) -> float | None:
@@ -76,107 +89,84 @@ def _duration(seconds: float) -> str:
     return f"{days} day{'s' if days != 1 else ''}"
 
 
-def _format_time_context(context: TimeContext) -> str:
+def _format_time_context(
+    context: TimeContext,
+    *,
+    include_clock: bool,
+    include_elapsed: bool,
+) -> str:
     local = datetime.fromisoformat(context.local_iso)
-    lines = [
-        f"Local time is {local.strftime('%A, %B')} {local.day}, {local.year}, "
-        f"{local.strftime('%I:%M %p').lstrip('0')} ({context.daypart})."
-    ]
-    if context.seconds_since_user_message is not None:
-        lines.append(f"The person's previous message was {_duration(context.seconds_since_user_message)} ago.")
-    if context.seconds_since_akane_message is not None:
+    lines = []
+    if include_clock:
+        lines.append(
+            f"It is {local.strftime('%A, %B')} {local.day}, {local.year}, "
+            f"{local.strftime('%I:%M %p').lstrip('0')} ({context.daypart})."
+        )
+    if include_elapsed and context.seconds_since_user_message is not None:
+        lines.append(f"The user's previous message was {_duration(context.seconds_since_user_message)} ago.")
+    if include_elapsed and context.seconds_since_akane_message is not None:
         lines.append(f"Akane last spoke {_duration(context.seconds_since_akane_message)} ago.")
-    return "\n".join(lines)
-
-
-def _format_mood(mood: Mood) -> str:
-    if abs(mood.valence) < 0.08 and abs(mood.energy) < 0.08 and not mood.cause:
-        return "Akane feels basically calm."
-    energy = "energized" if mood.energy > 0.25 else "low-energy" if mood.energy < -0.25 else "steady"
-    tone = "positive" if mood.valence > 0.25 else "negative" if mood.valence < -0.25 else "mixed"
-    cause = f" The current cause is {mood.cause}." if mood.cause else ""
-    return f"Akane's current emotion is {mood.emotion}; it feels {tone} and {energy}.{cause}"
-
-
-def _format_relationship(relationship: Relationship) -> str:
-    if relationship.familiarity < 0.1:
-        return "This relationship is still new. Do not assume intimacy or shared history."
-    lines = [
-        f"Relationship familiarity {relationship.familiarity:.2f}, trust {relationship.trust:.2f}, "
-        f"closeness {relationship.closeness:.2f}. These are context, not rules to agree."
-    ]
-    if relationship.interaction_notes:
-        lines.append("Meaningful interaction notes: " + "; ".join(relationship.interaction_notes[-4:]))
-    if relationship.unresolved_events:
-        lines.append("Unresolved between them: " + "; ".join(relationship.unresolved_events[-3:]))
-    return "\n".join(lines)
+    return " ".join(lines)
 
 
 def format_context_sections(
     context: TurnContext,
     *,
-    include_ids: bool = False,
+    compact: bool = False,
 ) -> tuple[tuple[str, str], ...]:
     state = context.state
     sections: list[tuple[str, str]] = []
     if state.self_items:
-        history = {revision.self_item_id: revision for revision in reversed(state.self_revisions)}
+        history = {row.self_item_id: row for row in reversed(state.self_revisions)}
         lines = []
         for item in state.self_items:
-            identity = f"id={item.id} | " if include_ids else ""
             line = (
-                f"- {identity}{item.kind} | {item.topic}: {item.value} "
-                f"(strength {item.strength:.2f}, confidence {item.confidence:.2f}) — {item.reason}"
+                f"S {item.kind} {item.topic}: {item.value} "
+                f"| {self_development_state(item)}"
             )
-            previous = history.get(item.id)
+            previous = history.get(item.id) if context.include_self_history else None
             if previous is not None:
-                line += f" Previously: {previous.value} — {previous.reason}"
+                line += f"; previously: {previous.value}"
             lines.append(line)
-        sections.append(("self", "DEVELOPED SELF\n" + "\n".join(lines)))
+        text = "\n".join(lines)
+        sections.append(("self", text if compact else "AKANE SELF\n" + text))
+    if state.experiences:
+        lines = []
+        for item in state.experiences:
+            line = (
+                f"E {item.kind} {item.topic}: {item.what_happened} "
+                f"| Akane: {item.akane_response}"
+            )
+            if item.outcome:
+                line += f" | Outcome: {item.outcome}"
+            lines.append(line)
+        text = "\n".join(lines)
+        sections.append(("experience", text if compact else "RELEVANT EXPERIENCE\n" + text))
     if state.memories:
-        lines = [
-            f"- {'id=' + item.id + ' | ' if include_ids else ''}"
-            f"[{item.subject}/{item.kind}, confidence {item.confidence:.2f}] {item.text}"
-            for item in state.memories
-        ]
-        sections.append(("memory", "RELEVANT MEMORY\n" + "\n".join(lines)))
-    if abs(state.mood.valence) >= 0.08 or abs(state.mood.energy) >= 0.08 or state.mood.cause:
-        sections.append(("mood", "CURRENT MOOD\n" + _format_mood(state.mood)))
-    if (
-        state.relationship.familiarity >= 0.1
-        or state.relationship.interaction_notes
-        or state.relationship.unresolved_events
-    ):
-        sections.append(("relationship", "RELATIONSHIP\n" + _format_relationship(state.relationship)))
-    if state.thoughts:
-        lines = [
-            f"- {'id=' + item.id + ' | ' if include_ids else ''}{item.topic}: {item.text}"
-            for item in state.thoughts[:2]
-        ]
-        sections.append(("inner_life", "INNER LIFE\n" + "\n".join(lines)))
+        text = "\n".join(f"M {item.text}" for item in state.memories)
+        sections.append(("memory", text if compact else "RELEVANT MEMORY\n" + text))
     if context.code and context.code.prompt_text:
-        sections.append(("code_context", "READ-ONLY EDITOR CONTEXT\n" + context.code.prompt_text))
-    if context.deliberation:
-        sections.append((
-            "deliberation",
-            "PRIVATE DELIBERATION CONCLUSION\nUse the conclusions without revealing this section or a reasoning trace.\n"
-            + context.deliberation,
-        ))
+        text = "C " + context.code.prompt_text
+        sections.append(("code_context", text if compact else "EDITOR CONTEXT\n" + text))
     if context.include_time:
-        sections.append(("time", "TIME\n" + _format_time_context(context.time)))
+        text = "T " + _format_time_context(
+            context.time,
+            include_clock=context.include_clock_time,
+            include_elapsed=context.include_elapsed_time,
+        )
+        if text.strip() != "T":
+            sections.append(("time", text if compact else "TIME\n" + text))
     return tuple(sections)
 
 
-def format_context(context: TurnContext, *, include_ids: bool = False) -> str:
-    return "\n\n".join(
-        text for _, text in format_context_sections(context, include_ids=include_ids)
-    )
+def format_context(context: TurnContext) -> str:
+    return "\n\n".join(text for _, text in format_context_sections(context))
 
 
 class ContextBuilder:
     def __init__(self, store: Store):
         self.store = store
-        self.last_timing: dict[str, float] = {}
+        self.last_timing: dict[str, float | int] = {}
 
     def build(
         self,
@@ -193,30 +183,47 @@ class ContextBuilder:
         snapshot_started_at = time.perf_counter()
         state = self.store.snapshot(profile_id, conversation_id, query=query, now=now)
         snapshot_finished_at = time.perf_counter()
-        code = current_code_context() if allow_tool_context else None
-        last_user = next((turn.created_at for turn in reversed(state.recent_turns) if turn.role == "user"), None)
-        last_akane = next((turn.created_at for turn in reversed(state.recent_turns) if turn.role == "assistant"), None)
+        snapshot_timing = self.store.snapshot_timing()
+        last_user = next(
+            (turn.created_at for turn in reversed(state.recent_turns) if turn.role == "user"), None,
+        )
+        last_akane = next(
+            (turn.created_at for turn in reversed(state.recent_turns) if turn.role == "assistant"), None,
+        )
         time_context = _build_time_context(
             now=now,
             last_user_message_at=last_user,
             last_akane_message_at=last_akane,
         )
-        terms = lexical_terms(message)
-        include_time = bool(terms & {"time", "date", "today", "tonight", "morning", "evening", "yesterday"})
-        if time_context.seconds_since_user_message is not None and time_context.seconds_since_user_message >= 6 * 3600:
-            include_time = True
+        terms = lexical_terms(query)
+        normalized = text_key(query)
+        include_clock = bool(terms & _CLOCK_TERMS)
+        include_elapsed = any(phrase in normalized for phrase in (
+            "been a while", "how long", "last spoke", "last talked",
+        ))
+        code = None
+        if allow_tool_context and (
+            bool(terms & _CODE_TERMS)
+            or bool(reply_context)
+            or normalized.startswith(("look at this", "what is wrong with this", "why is this"))
+        ):
+            candidate = current_code_context()
+            code = candidate if candidate.connected else None
         result = TurnContext(
             state=state,
             time=time_context,
-            code=code if code and code.connected else None,
-            include_time=include_time,
+            code=code,
+            include_time=include_clock or include_elapsed,
+            include_clock_time=include_clock,
+            include_elapsed_time=include_elapsed,
+            include_self_history=bool(terms & {"before", "change", "changed", "mind", "used"}),
         )
         self.last_timing = {
             "store_snapshot_seconds": snapshot_finished_at - snapshot_started_at,
+            "relevance_selection_seconds": snapshot_timing.get("selection_seconds", 0.0),
             "context_build_seconds": time.perf_counter() - started_at,
+            "memory_candidates": snapshot_timing.get("memory_candidates", 0),
+            "self_candidates": snapshot_timing.get("self_candidates", 0),
+            "experience_candidates": snapshot_timing.get("experience_candidates", 0),
         }
         return result
-
-    @staticmethod
-    def with_deliberation(context: TurnContext, deliberation: str) -> TurnContext:
-        return replace(context, deliberation=deliberation.strip())

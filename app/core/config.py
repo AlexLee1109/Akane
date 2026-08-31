@@ -59,6 +59,19 @@ def _integers(name: str, default: str = "") -> tuple[int, ...]:
     return tuple(values)
 
 
+_LLAMA_CACHE_TYPES = frozenset({
+    "f16", "f32", "q8_0", "q4_0", "q4_1", "iq4_nl",
+})
+
+
+def _llama_cache_type(name: str, default: str = "") -> str:
+    value = _raw(name, default).casefold()
+    if value and value not in _LLAMA_CACHE_TYPES:
+        choices = ", ".join(sorted(_LLAMA_CACHE_TYPES))
+        raise ValueError(f"AKANE_{name} must be one of: {choices}.")
+    return value
+
+
 def _is_raspberry_pi() -> bool:
     if platform.machine().casefold() not in {"aarch64", "arm64", "armv7l", "armv8l"}:
         return False
@@ -98,7 +111,6 @@ class Settings:
     public_max_active: int
     public_max_queue: int
     public_message_limit: int
-    public_response_token_limit: int
     public_request_cooldown_seconds: float
     public_generation_timeout_seconds: float
     model_path: str
@@ -114,10 +126,10 @@ class Settings:
     llama_use_mmap: bool
     llama_use_mlock: bool
     llama_swa_full: bool
+    llama_cache_type_k: str
+    llama_cache_type_v: str
+    llama_enable_thinking: bool
     max_tokens: int
-    reflection_tokens: int
-    inner_life_tokens: int
-    reasoning_tokens: int
     temperature: float
     top_k: int
     top_p: float
@@ -128,13 +140,9 @@ class Settings:
     max_pending_generations: int
     generation_queue_timeout_seconds: float
     recent_turn_limit: int
+    recent_conversation_budget: int
     memory_result_limit: int
     self_result_limit: int
-    autonomy_interval_seconds: float
-    background_idle_grace_seconds: float
-    reflection_turn_limit: int
-    reflection_input_chars: int
-    inner_life_interval_seconds: float
     prompt_debug: bool
     timing_enabled: bool
 
@@ -169,7 +177,7 @@ def load_settings() -> Settings:
     raspberry_pi = coerce_bool(_raw("RASPBERRY_PI", ""), _is_raspberry_pi())
     cpu_count = os.cpu_count() or 4
     context_window = max(512, _integer("LLAMA_CONTEXT_WINDOW", 4096))
-    batch_size = max(1, min(_integer("LLAMA_BATCH_SIZE", 512 if raspberry_pi else 1024), context_window))
+    batch_size = max(1, min(_integer("LLAMA_BATCH_SIZE", 256 if raspberry_pi else 1024), context_window))
     server_port = _integer("SERVER_PORT", 8000)
     settings = Settings(
         project_root=root,
@@ -197,13 +205,12 @@ def load_settings() -> Settings:
         public_max_active=max(1, _integer("PUBLIC_MAX_ACTIVE", 1)),
         public_max_queue=max(0, _integer("PUBLIC_MAX_QUEUE", 2)),
         public_message_limit=max(1, _integer("PUBLIC_MESSAGE_LIMIT", 750)),
-        public_response_token_limit=max(1, _integer("PUBLIC_RESPONSE_TOKEN_LIMIT", 256)),
         public_request_cooldown_seconds=max(0.0, _number("PUBLIC_REQUEST_COOLDOWN_SECONDS", 8.0)),
         public_generation_timeout_seconds=max(1.0, _number("PUBLIC_GENERATION_TIMEOUT_SECONDS", 90.0)),
         model_path=str(model_path),
         llama_context_window=context_window,
         llama_batch_size=batch_size,
-        llama_ubatch_size=max(1, min(_integer("LLAMA_UBATCH_SIZE", min(512, batch_size)), batch_size)),
+        llama_ubatch_size=max(1, min(_integer("LLAMA_UBATCH_SIZE", min(128 if raspberry_pi else 512, batch_size)), batch_size)),
         llama_threads=max(1, _integer("LLAMA_THREADS", min(4, cpu_count) if raspberry_pi else max(1, cpu_count - 1))),
         llama_threads_batch=max(1, _integer("LLAMA_THREADS_BATCH", min(4, cpu_count) if raspberry_pi else max(1, cpu_count - 1))),
         llama_flash_attn=coerce_bool(_raw("LLAMA_FLASH_ATTN"), raspberry_pi),
@@ -213,27 +220,25 @@ def load_settings() -> Settings:
         llama_use_mmap=coerce_bool(_raw("LLAMA_USE_MMAP", "1"), True),
         llama_use_mlock=coerce_bool(_raw("LLAMA_USE_MLOCK"), False),
         llama_swa_full=coerce_bool(_raw("LLAMA_SWA_FULL"), raspberry_pi),
-        max_tokens=max(24, min(_integer("MAX_TOKENS", 160), context_window - 256)),
-        reflection_tokens=max(32, min(_integer("REFLECTION_TOKENS", 192), context_window // 3)),
-        inner_life_tokens=max(32, min(_integer("INNER_LIFE_TOKENS", 128), context_window // 4)),
-        reasoning_tokens=max(48, min(_integer("REASONING_TOKENS", 192), context_window // 4)),
-        temperature=max(0.0, min(2.0, _number("TEMPERATURE", 0.95))),
-        top_k=max(0, _integer("TOP_K", 40)),
-        top_p=max(0.05, min(1.0, _number("TOP_P", 0.9))),
-        min_p=max(0.0, min(1.0, _number("MIN_P", 0.05))),
-        repetition_penalty=max(0.8, min(1.5, _number("REPETITION_PENALTY", 1.08))),
+        llama_cache_type_k=_llama_cache_type("LLAMA_CACHE_TYPE_K", "q8_0" if raspberry_pi else ""),
+        llama_cache_type_v=_llama_cache_type("LLAMA_CACHE_TYPE_V", "q8_0" if raspberry_pi else ""),
+        llama_enable_thinking=coerce_bool(_raw("LLAMA_ENABLE_THINKING"), False),
+        max_tokens=max(24, min(_integer("MAX_TOKENS", 96), context_window - 256)),
+        temperature=max(0.0, min(2.0, _number("TEMPERATURE", 0.98))),
+        top_k=max(0, _integer("TOP_K", 64)),
+        top_p=max(0.05, min(1.0, _number("TOP_P", 0.93))),
+        min_p=max(0.0, min(1.0, _number("MIN_P", 0.04))),
+        repetition_penalty=max(
+            0.8, min(1.5, _number("REPETITION_PENALTY", 1.10)),
+        ),
         generation_stop_sequences=_strings("GENERATION_STOP_SEQUENCES"),
         max_input_chars=max(256, _integer("MAX_INPUT_CHARS", 8000)),
         max_pending_generations=max(0, _integer("MAX_PENDING_GENERATIONS", 4)),
         generation_queue_timeout_seconds=max(1.0, _number("GENERATION_QUEUE_TIMEOUT_SECONDS", 120.0)),
         recent_turn_limit=max(4, _integer("RECENT_TURN_LIMIT", 16)),
-        memory_result_limit=max(1, _integer("MEMORY_MAX_RESULTS", 4)),
-        self_result_limit=max(1, _integer("SELF_MAX_RESULTS", 8)),
-        autonomy_interval_seconds=max(2.0, _number("AUTONOMY_INTERVAL_SECONDS", 60.0)),
-        background_idle_grace_seconds=max(0.0, _number("BACKGROUND_IDLE_GRACE_SECONDS", 120.0)),
-        reflection_turn_limit=max(2, _integer("REFLECTION_TURN_LIMIT", 20)),
-        reflection_input_chars=max(512, _integer("REFLECTION_INPUT_CHARS", 6000)),
-        inner_life_interval_seconds=max(60.0, _number("INNER_LIFE_INTERVAL_SECONDS", 1800.0)),
+        recent_conversation_budget=max(64, _integer("RECENT_CONVERSATION_BUDGET", 360)),
+        memory_result_limit=min(2, max(1, _integer("MEMORY_MAX_RESULTS", 2))),
+        self_result_limit=min(2, max(1, _integer("SELF_MAX_RESULTS", 2))),
         prompt_debug=coerce_bool(_raw("PROMPT_DEBUG"), False),
         timing_enabled=coerce_bool(_raw("TIMING"), False),
     )

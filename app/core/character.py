@@ -17,7 +17,6 @@ class Character:
     name: str
     identity: str
     voice: str
-    seed_interests: tuple[str, ...]
     identity_path: Path
     soul_path: Path
     identity_mtime_ns: int
@@ -52,7 +51,6 @@ def _load_character_profile(
         name="Akane",
         identity=identity,
         voice=soul,
-        seed_interests=("anime", "manga", "VTubers", "games"),
         identity_path=IDENTITY_PATH,
         soul_path=SOUL_PATH,
         identity_mtime_ns=identity_mtime_ns,

@@ -11,11 +11,26 @@ export interface DemoMessage {
 interface DemoConversationProps {
   messages: readonly DemoMessage[];
   generating: boolean;
-  previewMode: boolean;
+  connection: "connecting" | "live" | "offline" | "preview";
 }
 
-export function DemoConversation({ messages, generating, previewMode }: DemoConversationProps) {
+export function DemoConversation({ messages, generating, connection }: DemoConversationProps) {
   const endRef = useRef<HTMLDivElement>(null);
+  const previewMode = connection === "preview";
+  const emptyTitle = connection === "offline"
+    ? "Akane is offline right now."
+    : connection === "connecting"
+      ? "Checking live availability…"
+      : previewMode
+        ? "Try the conversation layout."
+        : "A quiet place to begin.";
+  const emptyText = connection === "offline"
+    ? "You can try Preview without sending anything to Akane."
+    : connection === "connecting"
+      ? "This usually takes only a moment."
+      : previewMode
+        ? "Preview responses are simulated and are not sent to Akane."
+        : "Your first message automatically begins an isolated guest conversation.";
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "nearest" });
@@ -23,12 +38,8 @@ export function DemoConversation({ messages, generating, previewMode }: DemoConv
 
   return <section className="demo-conversation demo-panel" aria-labelledby="demo-conversation-title">
     <header className="demo-sidebar-header">
-      <div className="demo-sidebar-identity"><span className="demo-sidebar-avatar" aria-hidden="true">A</span><div><strong>Akane</strong><span><i className={`demo-status-dot ${previewMode ? "showcase" : "live"}`} aria-hidden="true" />{previewMode ? "Prerecorded preview" : generating ? "Responding" : "Online"}</span></div></div>
+      <div className="demo-sidebar-identity"><span className="demo-sidebar-avatar" aria-hidden="true">A</span><div><strong id="demo-conversation-title">Akane</strong><span>Conversation</span></div></div>
     </header>
-    <div className="demo-sidebar-section">
-      <p className="demo-sidebar-label">Chat</p>
-      <strong id="demo-conversation-title">Conversation history</strong>
-    </div>
     <div
       className="demo-messages"
       role="log"
@@ -36,7 +47,7 @@ export function DemoConversation({ messages, generating, previewMode }: DemoConv
       aria-relevant="additions text"
       aria-busy={generating}
     >
-      {messages.length === 0 && <div className="demo-history-empty"><span aria-hidden="true">✦</span><strong>{previewMode ? "Explore the conversation space." : "A quiet place to begin."}</strong><p>{previewMode ? "Replies here are prerecorded examples. Nothing is sent to Akane." : "Your temporary conversation will appear here. Nothing in a guest session touches the owner profile."}</p></div>}
+      {messages.length === 0 && <div className="demo-history-empty"><span aria-hidden="true">✦</span><strong>{emptyTitle}</strong><p>{emptyText}</p></div>}
       {messages.map((message, index) => <article className={`demo-message ${message.role} ${index === messages.length - 1 ? "current" : ""}`} key={message.id}>
         <div className="demo-message-avatar" aria-hidden="true">{message.role === "akane" ? "A" : "You"}</div>
         <div className="demo-message-body">
@@ -51,6 +62,5 @@ export function DemoConversation({ messages, generating, previewMode }: DemoConv
       </article>)}
       <div ref={endRef} />
     </div>
-    <div className="demo-sidebar-footer"><span>Guest Session</span><span>Private</span><small>Temporary memory</small></div>
   </section>;
 }

@@ -58,5 +58,5 @@ export const projectConfig: AkaneWebConfig = Object.freeze({
   demoMode: readDemoMode(import.meta.env.VITE_DEMO_MODE),
   isProduction,
   githubUrl: import.meta.env.VITE_GITHUB_URL?.trim() || "https://github.com/AlexLee1109/Akane",
-  modelName: import.meta.env.VITE_MODEL_DISPLAY_NAME?.trim() || "Gemma 4 E4B IT",
+  modelName: import.meta.env.VITE_MODEL_DISPLAY_NAME?.trim() || "Qwen3.5 9B",
 });

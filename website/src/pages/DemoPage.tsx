@@ -9,7 +9,7 @@ import { clearGuestToken, getGuestToken, storeGuestToken } from "../lib/session"
 import type { AkanePresentationState } from "../presentation";
 import "./demo.css";
 
-type ConnectionState = "connecting" | "live" | "showcase";
+type ConnectionState = "connecting" | "live" | "offline" | "preview";
 
 const characterAsset = `${projectConfig.basePath}assets/akane-hero.png`;
 const previewReplies = [
@@ -25,7 +25,7 @@ function currentTime() {
 
 export function DemoPage() {
   const initialConnection: ConnectionState =
-    projectConfig.demoMode === "showcase" || !projectConfig.apiUrl ? "showcase" : "connecting";
+    projectConfig.demoMode === "showcase" || !projectConfig.apiUrl ? "preview" : "connecting";
   const [connection, setConnection] = useState<ConnectionState>(initialConnection);
   const [health, setHealth] = useState<PublicHealth | null>(null);
   const [messages, setMessages] = useState<DemoMessage[]>([]);
@@ -40,6 +40,8 @@ export function DemoPage() {
   const [reconnectKey, setReconnectKey] = useState(0);
   const aborter = useRef<AbortController | null>(null);
 
+  useEffect(() => () => aborter.current?.abort(), []);
+
   function activateSession(session: PublicSession | null) {
     activeSessionRef.current = session;
     setActiveSession(session);
@@ -47,7 +49,7 @@ export function DemoPage() {
 
   useEffect(() => {
     if (projectConfig.demoMode === "showcase" || !projectConfig.apiUrl) {
-      setConnection("showcase");
+      setConnection("preview");
       setHealth(null);
       return;
     }
@@ -77,7 +79,7 @@ export function DemoPage() {
               clearGuestToken();
               activateSession(null);
               setMessages([]);
-              setError("That temporary guest session expired. Start a new guest session to continue.");
+              setError("That temporary conversation expired. Send a message to begin a new one.");
             } else {
               throw cause;
             }
@@ -92,7 +94,7 @@ export function DemoPage() {
       } catch (cause) {
         if (stopped || (cause as Error).name === "AbortError") return;
         setHealth(null);
-        setConnection("showcase");
+        setConnection("offline");
         if (attempt < retryDelays.length) {
           timer = window.setTimeout(() => { void probe(attempt + 1); }, retryDelays[attempt]);
         } else {
@@ -122,7 +124,7 @@ export function DemoPage() {
   }
 
   function openPreview() {
-    setConnection("showcase");
+    setConnection("preview");
     setMessages([]);
     setBackendPresentation(undefined);
     setError("");
@@ -151,21 +153,6 @@ export function DemoPage() {
     storeGuestToken(session.sessionToken);
     activateSession(session);
     return session;
-  }
-
-  async function startGuest() {
-    if (connection !== "live" || generating || actionPending) return;
-    setActionPending(true);
-    setError("");
-    try {
-      await createOrRevalidateGuest();
-      setMessages([]);
-    } catch (cause) {
-      setError((cause as Error).message);
-      if (availabilityFailed(cause)) reconnect();
-    } finally {
-      setActionPending(false);
-    }
   }
 
   async function resetConversation() {
@@ -239,10 +226,14 @@ export function DemoPage() {
       return;
     }
     if (connection === "connecting") {
-      setError("Akane is still connecting. You can send once live mode or Preview Mode is ready.");
+      setError("Akane is still connecting. You can send once Live or Preview is ready.");
       return;
     }
-    if (connection === "showcase") {
+    if (connection === "offline") {
+      setError("Akane is offline right now. Try Preview instead.");
+      return;
+    }
+    if (connection === "preview") {
       setInput("");
       setError("");
       sendPreview(message);
@@ -311,34 +302,26 @@ export function DemoPage() {
     }
   }
 
-  const previewMode = connection === "showcase";
+  const previewMode = connection === "preview";
   const needsSession = connection === "live" && !activeSession;
-  const inputDisabled = generating || actionPending || connection === "connecting"
+  const inputDisabled = generating || actionPending || connection === "connecting" || connection === "offline"
     || (needsSession && health?.guestEnabled !== true);
-  const connectionLabel = connection === "connecting"
-    ? "Connecting"
-    : previewMode
-      ? "Preview Mode · Prerecorded"
-      : health?.status === "busy"
-        ? "Live · Busy"
-        : activeSession
-          ? "Live · Temporary guest session"
-          : "Live · No guest session";
   const lastMessage = messages.at(-1);
   const responseText = lastMessage?.role === "akane" && lastMessage.text.trim() ? lastMessage.text : undefined;
   const isThinking = generating && lastMessage?.role === "akane" && !lastMessage.text.trim();
   const composerPlaceholder = connection === "connecting"
     ? "Connecting to Akane…"
-    : needsSession
-      ? "Message Akane to begin a guest session…"
+    : connection === "offline"
+      ? "Akane is offline right now."
       : previewMode
-        ? "Preview the conversation layout…"
-        : "Message Akane…";
+        ? "Try a simulated message…"
+        : needsSession
+          ? "Message Akane to begin…"
+          : "Message Akane…";
 
   return <main className="demo-page">
     <section className="demo-intro shell" aria-labelledby="demo-title">
-      <div><p className="demo-eyebrow">Live Demo</p><h1 id="demo-title">Talk with Akane</h1><p>Start a temporary guest conversation with the same local companion running on my Raspberry Pi.</p></div>
-      <div className="demo-header-status" aria-label="Demo status" aria-live="polite"><span className={`demo-status-dot ${connection}`} aria-hidden="true" /><div><small>Current mode</small><strong>{connectionLabel}</strong></div></div>
+      <p className="eyebrow">Demo</p><h1 id="demo-title">Talk with Akane</h1><p>Send a message. A private temporary conversation starts automatically.</p>
     </section>
 
     <section className="demo-workspace shell" aria-label="Akane demo workspace">
@@ -351,7 +334,7 @@ export function DemoPage() {
         isThinking={Boolean(isThinking)}
         backendPresentation={backendPresentation}
       />
-      <DemoConversation messages={messages} generating={generating} previewMode={previewMode} />
+      <DemoConversation messages={messages} generating={generating} connection={connection} />
       <DemoComposer
         value={input}
         placeholder={composerPlaceholder}
@@ -369,8 +352,7 @@ export function DemoPage() {
         generating={generating}
         actionPending={actionPending}
         retryExhausted={retryExhausted}
-        canReconnect={previewMode && projectConfig.demoMode === "live" && Boolean(projectConfig.apiUrl)}
-        onStartGuest={() => { void startGuest(); }}
+        canReconnect={connection !== "live" && projectConfig.demoMode === "live" && Boolean(projectConfig.apiUrl)}
         onOpenPreview={openPreview}
         onReconnect={reconnect}
         onReset={() => { void resetConversation(); }}
@@ -379,6 +361,5 @@ export function DemoPage() {
       />
     </section>
 
-    <p className="demo-privacy-note shell"><strong>Private guest boundary:</strong> Live messages use a temporary guest profile isolated from the owner profile. Preview Mode is prerecorded and sends nothing to Akane.</p>
   </main>;
 }

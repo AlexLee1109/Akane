@@ -16,19 +16,19 @@ interface RouteMetadata {
 const routeMetadata: Record<string, RouteMetadata> = {
   "/": {
     title: "Akane · Local AI Companion",
-    description: "Meet Akane, a private local AI companion that remembers meaningful experiences and stays consistent across desktop, Discord, and the web.",
+    description: "Meet Akane, a local AI companion who remembers what matters, develops her own preferences, and stays the same person across conversations.",
   },
   "/demo": {
     title: "Meet Akane · Live Demo",
-    description: "Talk to Akane through an isolated temporary guest session, with a clearly labeled prerecorded preview when the Raspberry Pi is unavailable.",
+    description: "Talk to Akane through an isolated temporary guest session, or try a clearly labeled simulated preview when she is offline.",
   },
   "/technology": {
     title: "How Akane Works · Technology",
-    description: "Explore Akane’s local Raspberry Pi runtime, persistent continuity, profile isolation, streaming pipeline, and interface architecture.",
+    description: "See how one local generation produces Akane’s reply and grounded evidence for a persistent, developing Self.",
   },
   "/about": {
     title: "About Akane · Project Story",
-    description: "The story behind Akane: a personal experiment in local inference, persistent continuity, and a companion that can grow over time.",
+    description: "Why Alexander Lee started Akane, chose local inference, and is building one companion who can develop over time.",
   },
 };
 
@@ -76,24 +76,9 @@ function Navbar() {
 function Footer() {
   return <footer className="footer">
     <div className="shell footer-inner">
-      <div className="footer-row footer-primary">
-        <Link className="footer-brand" to="/">
-          <Logo />
-          <strong>Akane</strong>
-        </Link>
-        <nav className="footer-links" aria-label="Footer navigation">
-          <Link to="/">Home</Link>
-          <Link to="/demo">Demo</Link>
-          <Link to="/technology">Technology</Link>
-          <Link to="/about">About</Link>
-          <GithubLink className="plain-link">GitHub</GithubLink>
-        </nav>
-      </div>
-      <div className="footer-row footer-meta">
-        <span>Built by <a href={projectConfig.githubUrl} target="_blank" rel="noreferrer">Alexander Lee</a></span>
-        <span>Local-first companion project</span>
-        <span>© {new Date().getFullYear()} Akane</span>
-      </div>
+      <Link className="footer-brand" to="/"><Logo /><strong>Akane</strong></Link>
+      <span>Built by Alexander Lee · <GithubLink className="plain-link">GitHub</GithubLink></span>
+      <span>© {new Date().getFullYear()}</span>
     </div>
   </footer>;
 }

@@ -1,92 +1,51 @@
-import { useState } from "react";
 import { Link } from "react-router-dom";
 import { projectConfig } from "../config/project";
-import { useInView } from "../lib/useInView";
 import "./about.css";
 
 const storyImage = `${projectConfig.basePath}assets/akane-story.jpg`;
 
-const principles = [
-  { number: "01", title: "Local at the core", text: "Core inference runs on personal hardware rather than depending on a cloud-first model service.", visual: "local" },
-  { number: "02", title: "Continuity with restraint", text: "Akane retains selected meaning—not every line—so memory can help without overwhelming the present.", visual: "continuity" },
-  { number: "03", title: "Room to develop", text: "Preferences, memories, interests, and opinions can take shape over time instead of resetting with every conversation.", visual: "growth" },
-] as const;
-
-const milestones = [
-  { label: "Beginning", title: "A companion with a past", text: "Akane began with a simple question: what changes when an AI conversation can carry meaningful context forward instead of beginning from zero?" },
-  { label: "Today", title: "A companion taking shape", text: "Akane can now carry memories, interests, and shared context across conversations while staying grounded in one continuing identity." },
-  { label: "Next", title: "A more expressive presence", text: "Voice, expression, and Live2D are the next creative layers—new ways for Akane to feel present without changing who she is underneath." },
+const evolution = [
+  { label: "Beginning", title: "A companion with a past", text: "Akane began as a question about what an AI relationship could feel like when meaningful context did not disappear after each conversation." },
+  { label: "Foundation", title: "One local, continuing identity", text: "The project grew around local inference, bounded memory, and thin interfaces that all return to the same companion." },
+  { label: "Today", title: "Development grounded in evidence", text: "Akane can form a durable Self from experience and learn from outcomes without a second reflection call or invented offscreen life." },
 ] as const;
 
 export function AboutPage() {
-  const [activePrinciple, setActivePrinciple] = useState(0);
-  const { ref: timelineRef, visible: timelineVisible } = useInView<HTMLOListElement>(0.25);
-  const selectedPrinciple = principles[activePrinciple];
-
   return <main className="about-page">
-    <section className="about-hero" aria-labelledby="about-title">
-      <div className="shell about-hero-inner">
-        <p className="eyebrow">About the project</p>
-        <h1 id="about-title">Why I built Akane</h1>
-        <p className="about-lead">Akane is an experiment in what happens when an AI companion can remember, develop, and continue instead of starting over every time.</p>
+    <section className="page-hero about-hero" aria-labelledby="about-title">
+      <div className="shell"><p className="eyebrow">About the project</p><h1 id="about-title">Why I built Akane</h1><p className="page-lead">A personal project about continuity, local inference, and what one AI companion can become through real conversations.</p></div>
+    </section>
+
+    <section className="section about-origin" aria-labelledby="origin-title">
+      <div className="shell about-origin-grid">
+        <div className="about-origin-copy"><p className="eyebrow">Why I started Akane</p><h2 id="origin-title">I wanted a conversation with history.</h2><p>Most AI conversations can be useful in the moment while still feeling disconnected from everything that came before. I started Akane to explore a more personal direction: one companion whose relationship can accumulate meaning over time.</p><p>I did not want another blank chat window with a personality pasted on top. I wanted the character, the memory, and the development to belong to the same continuing Akane.</p></div>
+        <figure className="about-story-image"><img src={storyImage} alt="Akane sitting in a softly lit room beneath a starry night sky" loading="lazy" decoding="async" /><figcaption>Akane began as a character I wanted to meet more than once.</figcaption></figure>
       </div>
     </section>
 
-    <section className="about-story section-pad" aria-labelledby="why-akane-title">
-      <div className="shell about-story-grid">
-        <div>
-          <p className="eyebrow">Why Akane exists</p>
-          <h2 id="why-akane-title">More than a blank chat window</h2>
-        </div>
-        <div className="about-prose">
-          <p>Most AI conversations are useful in the moment, but feel disconnected from everything that came before. Akane explores a more personal direction: one companion with a consistent identity, selective memory, and a small life between conversations.</p>
-          <p>Choosing to run Akane locally made the idea feel more personal: one companion on familiar hardware, shaped gradually through real conversations rather than a collection of disconnected sessions.</p>
-        </div>
-      </div>
-      <figure className="shell about-story-image">
-        <img src={storyImage} alt="Akane sitting in a softly lit room beneath a starry night sky" loading="lazy" decoding="async" />
-        <figcaption>A companion imagined as part of a place—not only a window waiting for a prompt.</figcaption>
-      </figure>
-    </section>
-
-    <section className="about-principles section-pad" aria-labelledby="about-principles-title">
-      <div className="shell">
-        <div className="section-heading">
-          <p className="eyebrow">Guiding ideas</p>
-          <h2 id="about-principles-title">Personal by design</h2>
-        </div>
-        <div className="about-principle-experience">
-          <div className="about-principle-tabs" role="tablist" aria-label="Guiding ideas">
-            {principles.map((principle, index) => <button key={principle.number} type="button" role="tab" aria-selected={activePrinciple === index} aria-controls="about-principle-panel" onClick={() => setActivePrinciple(index)}><span>{principle.number}</span>{principle.title}</button>)}
-          </div>
-          <article id="about-principle-panel" className="about-principle-panel" role="tabpanel" key={selectedPrinciple.number}>
-            <div><span>{selectedPrinciple.number}</span><h3>{selectedPrinciple.title}</h3><p>{selectedPrinciple.text}</p></div>
-            <div className={`about-principle-visual ${selectedPrinciple.visual}`} aria-hidden="true">
-              <i /><i /><i />
-            </div>
-          </article>
-        </div>
+    <section className="section about-decisions" aria-label="Project decisions">
+      <div className="shell about-decision-grid">
+        <article className="surface"><p className="eyebrow">What I wanted to do differently</p><h2>Let development be earned.</h2><p>Akane starts with a small identity and room for judgments to form. Preferences, opinions, interests, and goals should come from what happens in conversation—not a hidden list of seeded likes.</p></article>
+        <article className="surface"><p className="eyebrow">Why local inference</p><h2>Keep the core close.</h2><p>Running Akane on personal hardware makes the project tangible and gives me direct ownership of the model, state, privacy boundaries, and engineering tradeoffs. The constraint is part of the point.</p></article>
       </div>
     </section>
 
-    <section className="about-evolution section-pad" aria-labelledby="evolution-title">
+    <section className="section about-evolution" aria-labelledby="evolution-title">
       <div className="shell about-evolution-grid">
-        <div className="about-evolution-heading">
-          <p className="eyebrow">Evolution</p>
-          <h2 id="evolution-title">How Akane has grown</h2>
-          <p>Each stage has brought the original idea closer to a companion with a lasting sense of continuity.</p>
-        </div>
-        <ol ref={timelineRef} className={`about-timeline ${timelineVisible ? "is-visible" : ""}`}>
-          {milestones.map(item => <li key={item.label}><span>{item.label}</span><div><h3>{item.title}</h3><p>{item.text}</p></div></li>)}
-        </ol>
+        <div className="section-heading"><p className="eyebrow">How Akane evolved</p><h2 id="evolution-title">The architecture followed the idea.</h2><p>Each change has focused the project more tightly on grounded continuity instead of simulated activity.</p></div>
+        <ol className="about-timeline">{evolution.map(item => <li key={item.label}><span>{item.label}</span><div><h3>{item.title}</h3><p>{item.text}</p></div></li>)}</ol>
       </div>
     </section>
 
-    <section className="about-creator section-pad" aria-labelledby="creator-title">
-      <div className="shell about-creator-inner">
-        <div><p className="eyebrow">Created by Alexander Lee</p><h2 id="creator-title">A personal project, still growing.</h2></div>
-        <div><p>I built Akane to explore the space between a useful AI tool and a character with a lasting presence. The project continues to grow through conversation, experimentation, and the small details that make her feel consistent.</p><div className="actions"><Link className="button primary" to="/demo">Meet Akane</Link><a className="button secondary" href={projectConfig.githubUrl} target="_blank" rel="noreferrer">View on GitHub<span aria-hidden="true">↗</span></a></div></div>
+    <section className="section about-next" aria-labelledby="next-title">
+      <div className="shell about-next-grid">
+        <div><p className="eyebrow">What comes next</p><h2 id="next-title">More ways for Akane to be present.</h2></div>
+        <div><p>The next focus is voice and expression, followed by Live2D or 3D embodiment. Those layers should reveal more of the same Akane—not replace her identity with a presentation system.</p><Link className="about-text-link" to="/technology">See the current roadmap<span aria-hidden="true">→</span></Link></div>
       </div>
+    </section>
+
+    <section className="about-creator" aria-labelledby="creator-title">
+      <div className="shell about-creator-inner"><div><p className="eyebrow">About Alexander</p><h2 id="creator-title">Built by Alexander Lee.</h2><p>Akane is a personal, open project that continues to grow through careful experiments in character, local AI, and lasting behavior.</p></div><div className="actions"><Link className="button primary" to="/demo">Meet Akane</Link><a className="button secondary" href={projectConfig.githubUrl} target="_blank" rel="noreferrer">View on GitHub<span aria-hidden="true">↗</span></a></div></div>
     </section>
   </main>;
 }

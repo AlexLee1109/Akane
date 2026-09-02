@@ -21,7 +21,7 @@ export interface AkanePresentationState {
 }
 
 export function presentationStateMachine(
-  connection: "connecting" | "live" | "showcase",
+  connection: "connecting" | "live" | "offline" | "preview",
   generating: boolean,
   hasResponseText: boolean,
   backendState?: AkanePresentationState,
@@ -29,8 +29,11 @@ export function presentationStateMachine(
   if (connection === "connecting") {
     return { activity: "connecting", expression: "neutral", mouthLevel: 0 };
   }
-  if (connection === "showcase") {
+  if (connection === "offline") {
     return { activity: "offline", expression: "neutral", mouthLevel: 0 };
+  }
+  if (connection === "preview") {
+    return { activity: "idle", expression: "neutral", mouthLevel: 0 };
   }
   if (backendState) return backendState;
   if (generating) {

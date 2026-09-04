@@ -11,7 +11,7 @@ def main() -> None:
     mode = str(sys.argv[1]).strip().lower() if len(sys.argv) > 1 else SETTINGS.app_mode
     if mode == "server":
         from app.server import serve
-        serve(host=SETTINGS.application_host, port=SETTINGS.application_port)
+        serve(host=SETTINGS.server_host, port=SETTINGS.server_port)
         return
     if mode == "popup":
         from app.ui.popup import launch_popup

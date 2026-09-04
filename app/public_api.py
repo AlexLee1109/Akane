@@ -105,8 +105,6 @@ def _normalized_origin(value: str) -> str:
 @dataclass(frozen=True, slots=True)
 class PublicApiSettings:
     enabled: bool = SETTINGS.public_api_enabled
-    host: str = SETTINGS.public_api_host
-    port: int = SETTINGS.public_api_port
     allowed_origins: tuple[str, ...] = SETTINGS.public_allowed_origins
     guest_idle_seconds: int = SETTINGS.public_guest_idle_seconds
     guest_max_lifetime_seconds: int = SETTINGS.public_guest_max_lifetime_seconds
@@ -120,10 +118,6 @@ class PublicApiSettings:
     def __post_init__(self) -> None:
         origins = tuple(dict.fromkeys(_normalized_origin(item) for item in self.allowed_origins))
         object.__setattr__(self, "allowed_origins", origins)
-        if self.host != "127.0.0.1":
-            raise ValueError("AKANE_PUBLIC_API_HOST must be 127.0.0.1.")
-        if not 1 <= int(self.port) <= 65535:
-            raise ValueError("AKANE_PUBLIC_API_PORT must be between 1 and 65535.")
         if self.enabled and not origins:
             raise ValueError("AKANE_PUBLIC_ALLOWED_ORIGINS is required in public mode.")
         if int(self.guest_idle_seconds) <= 0 or int(self.guest_max_lifetime_seconds) <= 0:

@@ -9,7 +9,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.core.config import SETTINGS
-from app.core.mind import self_development_state
+from app.core.mind import (
+    behavioral_tendency_state,
+    curiosity_state,
+    developmental_goal_state,
+    self_development_state,
+    strategy_state,
+)
 from app.core.state import StateSnapshot
 from app.core.store import Store
 from app.core.utils import lexical_terms, text_key
@@ -109,6 +115,17 @@ def _format_time_context(
     return " ".join(lines)
 
 
+def _append_section(
+    sections: list[tuple[str, str]],
+    name: str,
+    heading: str,
+    lines: list[str],
+    compact: bool,
+) -> None:
+    text = "\n".join(lines)
+    sections.append((name, text if compact else f"{heading}\n{text}"))
+
+
 def format_context_sections(
     context: TurnContext,
     *,
@@ -128,8 +145,40 @@ def format_context_sections(
             if previous is not None:
                 line += f"; previously: {previous.value}"
             lines.append(line)
-        text = "\n".join(lines)
-        sections.append(("self", text if compact else "AKANE SELF\n" + text))
+        _append_section(sections, "self", "AKANE SELF", lines, compact)
+    if state.behavioral_tendencies:
+        lines = [
+            f"B {item.context}: {item.behavior} -> {item.expected_effect} "
+            f"| {behavioral_tendency_state(item)}"
+            for item in state.behavioral_tendencies
+        ]
+        _append_section(
+            sections, "behavioral_tendency", "LEARNED BEHAVIOR", lines, compact,
+        )
+    if state.strategies:
+        lines = [
+            f"R {item.context}: {item.procedure} | {strategy_state(item)}"
+            for item in state.strategies
+        ]
+        _append_section(
+            sections, "strategy", "REUSABLE STRATEGY", lines, compact,
+        )
+    if state.curiosities:
+        lines = [
+            f"A {item.topic}: {item.focus} | {curiosity_state(item)}"
+            for item in state.curiosities
+        ]
+        _append_section(
+            sections, "curiosity", "DEVELOPMENTAL ATTENTION", lines, compact,
+        )
+    if state.developmental_goals:
+        lines = [
+            f"G {item.topic}: {item.goal} | {developmental_goal_state(item)}"
+            for item in state.developmental_goals
+        ]
+        _append_section(
+            sections, "developmental_goal", "DEVELOPMENTAL GOAL", lines, compact,
+        )
     if state.experiences:
         lines = []
         for item in state.experiences:
@@ -140,11 +189,17 @@ def format_context_sections(
             if item.outcome:
                 line += f" | Outcome: {item.outcome}"
             lines.append(line)
-        text = "\n".join(lines)
-        sections.append(("experience", text if compact else "RELEVANT EXPERIENCE\n" + text))
+        _append_section(
+            sections, "experience", "RELEVANT EXPERIENCE", lines, compact,
+        )
     if state.memories:
-        text = "\n".join(f"M {item.text}" for item in state.memories)
-        sections.append(("memory", text if compact else "RELEVANT MEMORY\n" + text))
+        _append_section(
+            sections,
+            "memory",
+            "RELEVANT MEMORY",
+            [f"M {item.text}" for item in state.memories],
+            compact,
+        )
     if context.code and context.code.prompt_text:
         text = "C " + context.code.prompt_text
         sections.append(("code_context", text if compact else "EDITOR CONTEXT\n" + text))
@@ -225,5 +280,13 @@ class ContextBuilder:
             "memory_candidates": snapshot_timing.get("memory_candidates", 0),
             "self_candidates": snapshot_timing.get("self_candidates", 0),
             "experience_candidates": snapshot_timing.get("experience_candidates", 0),
+            "behavioral_tendency_candidates": snapshot_timing.get(
+                "behavioral_tendency_candidates", 0,
+            ),
+            "strategy_candidates": snapshot_timing.get("strategy_candidates", 0),
+            "curiosity_candidates": snapshot_timing.get("curiosity_candidates", 0),
+            "developmental_goal_candidates": snapshot_timing.get(
+                "developmental_goal_candidates", 0,
+            ),
         }
         return result

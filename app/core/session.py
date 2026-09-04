@@ -17,7 +17,14 @@ from app.core.inference import (
     InferenceRuntime,
     InferenceTiming,
 )
-from app.core.mind import derive_durable_changes, self_development_state
+from app.core.mind import (
+    behavioral_tendency_state,
+    curiosity_state,
+    derive_developmental_goal_changes,
+    developmental_goal_state,
+    self_development_state,
+    strategy_state,
+)
 from app.core.state import StateChangeProposal, Turn
 from app.core.prompt import PromptPlan, build_dialogue_prompt
 from app.core.store import get_store
@@ -530,14 +537,37 @@ def run_companion_turn(
         memory_changes = ()
         self_changes = ()
         experience_changes = ()
+        outcome_changes = ()
+        prediction_changes = ()
+        tendency_changes = ()
+        strategy_changes = ()
+        curiosity_changes = ()
+        developmental_goal_changes = ()
         if not skip_memory:
-            memory_changes, self_changes, experience_changes = derive_durable_changes(
+            (
+                memory_changes,
+                self_changes,
+                experience_changes,
+                outcome_changes,
+                prediction_changes,
+                tendency_changes,
+                strategy_changes,
+                curiosity_changes,
+                developmental_goal_changes,
+            ) = derive_developmental_goal_changes(
                 chat.profile_id,
                 store.self_items(chat.profile_id),
                 store.memories(chat.profile_id),
                 user_turn,
                 assistant_turn,
                 experiences=store.experiences(chat.profile_id),
+                outcomes=store.outcomes(chat.profile_id),
+                predictions=store.predictions(chat.profile_id),
+                behavioral_tendencies=store.behavioral_tendencies(chat.profile_id),
+                strategies=store.strategies(chat.profile_id),
+                curiosities=store.curiosities(chat.profile_id),
+                developmental_goals=store.developmental_goals(chat.profile_id),
+                recent_turns=context.state.recent_turns,
                 semantic_evidence=sidecar.semantic_evidence,
                 now=committed_at,
             )
@@ -547,6 +577,12 @@ def run_companion_turn(
             turns=(user_turn, assistant_turn),
             memories=memory_changes,
             experiences=experience_changes,
+            outcomes=outcome_changes,
+            predictions=prediction_changes,
+            behavioral_tendencies=tendency_changes,
+            strategies=strategy_changes,
+            curiosities=curiosity_changes,
+            developmental_goals=developmental_goal_changes,
             self_items=self_changes,
             origin="conversation",
         )
@@ -561,6 +597,38 @@ def run_companion_turn(
             self_changes[0]
             if self_changes and f"self:{self_changes[0].action}" in commit.applied else None
         )
+        new_outcome = (
+            outcome_changes[0]
+            if outcome_changes and "outcome:form" in commit.applied else None
+        )
+        formed_prediction = next((
+            change.prediction for change in prediction_changes
+            if change.action == "form"
+        ), None) if "prediction:form" in commit.applied else None
+        resolved_prediction = next((
+            change.prediction for change in prediction_changes
+            if change.action == "resolve"
+        ), None) if "prediction:resolve" in commit.applied else None
+        expired_predictions = [
+            change.prediction.id for change in prediction_changes
+            if change.action == "expire"
+        ][:commit.applied.count("prediction:expire")]
+        changed_tendency = next((
+            change for change in tendency_changes
+            if f"tendency:{change.action}" in commit.applied
+        ), None)
+        changed_strategy = next((
+            change for change in strategy_changes
+            if f"strategy:{change.action}" in commit.applied
+        ), None)
+        changed_curiosity = next((
+            change for change in curiosity_changes
+            if f"curiosity:{change.action}" in commit.applied
+        ), None)
+        changed_developmental_goal = next((
+            change for change in developmental_goal_changes
+            if f"developmental_goal:{change.action}" in commit.applied
+        ), None)
         model_finished_at = timing.model_finished_at or reservation_released_at
         log_timing(
             "session",
@@ -599,7 +667,13 @@ def run_companion_turn(
             "selected_counts": plan.selected_counts,
             "durable_updates": [
                 item for item in commit.applied
-                if item.startswith(("self:", "memory:", "experience:"))
+                if item.startswith((
+                    "self:", "memory:", "experience:", "outcome:", "prediction:",
+                    "tendency:",
+                    "strategy:",
+                    "curiosity:",
+                    "developmental_goal:",
+                ))
             ],
             "new_experience": (
                 {
@@ -610,6 +684,134 @@ def run_companion_turn(
                     "linked_self_item_ids": list(new_experience.self_item_ids),
                 }
                 if new_experience is not None else None
+            ),
+            "new_outcome": (
+                {
+                    "id": new_outcome.id,
+                    "result": new_outcome.result,
+                    "action": new_outcome.action,
+                    "action_turn_id": new_outcome.action_turn_id,
+                    "linked_experience_ids": list(new_outcome.experience_ids),
+                    "reason": new_outcome.reason,
+                }
+                if new_outcome is not None else None
+            ),
+            "prediction_formed": (
+                {
+                    "id": formed_prediction.id,
+                    "action": formed_prediction.action,
+                    "action_turn_id": formed_prediction.action_turn_id,
+                    "expected_result": formed_prediction.expected_result,
+                    "confidence": formed_prediction.confidence,
+                    "expires_at": formed_prediction.expires_at,
+                }
+                if formed_prediction is not None else None
+            ),
+            "prediction_resolved": (
+                {
+                    "id": resolved_prediction.id,
+                    "expected_result": resolved_prediction.expected_result,
+                    "actual_outcome_id": resolved_prediction.outcome_id,
+                    "actual_result": resolved_prediction.actual_result,
+                    "error_category": resolved_prediction.error_category,
+                    "error_value": resolved_prediction.error_value,
+                }
+                if resolved_prediction is not None else None
+            ),
+            "predictions_expired": expired_predictions,
+            "behavioral_tendency": (
+                {
+                    "id": changed_tendency.tendency.id,
+                    "action": changed_tendency.action,
+                    "context": changed_tendency.tendency.context,
+                    "behavior": changed_tendency.tendency.behavior,
+                    "expected_effect": changed_tendency.tendency.expected_effect,
+                    "expected_result": changed_tendency.tendency.expected_result,
+                    "state": behavioral_tendency_state(
+                        changed_tendency.tendency,
+                    ),
+                    "strength": changed_tendency.tendency.strength,
+                    "confidence": changed_tendency.tendency.confidence,
+                    "supporting_outcome_ids": list(
+                        changed_tendency.tendency.supporting_outcome_ids,
+                    ),
+                    "contradiction_outcome_ids": list(
+                        changed_tendency.tendency.contradiction_outcome_ids,
+                    ),
+                    "reason": f"grounded-outcome:{changed_tendency.action}",
+                }
+                if changed_tendency is not None else None
+            ),
+            "behavioral_tendency_count": len(
+                store.behavioral_tendencies(chat.profile_id),
+            ),
+            "strategy": (
+                {
+                    "id": changed_strategy.strategy.id,
+                    "action": changed_strategy.action,
+                    "context": changed_strategy.strategy.context,
+                    "procedure": changed_strategy.strategy.procedure,
+                    "expected_result": changed_strategy.strategy.expected_result,
+                    "state": strategy_state(changed_strategy.strategy),
+                    "strength": changed_strategy.strategy.strength,
+                    "confidence": changed_strategy.strategy.confidence,
+                    "supporting_outcome_ids": list(
+                        changed_strategy.strategy.supporting_outcome_ids,
+                    ),
+                    "contradiction_outcome_ids": list(
+                        changed_strategy.strategy.contradiction_outcome_ids,
+                    ),
+                    "reason": f"grounded-outcome:{changed_strategy.action}",
+                }
+                if changed_strategy is not None else None
+            ),
+            "strategy_count": len(store.strategies(chat.profile_id)),
+            "curiosity": (
+                {
+                    "id": changed_curiosity.curiosity.id,
+                    "action": changed_curiosity.action,
+                    "topic": changed_curiosity.curiosity.topic,
+                    "focus": changed_curiosity.curiosity.focus,
+                    "state": curiosity_state(changed_curiosity.curiosity),
+                    "strength": changed_curiosity.curiosity.strength,
+                    "confidence": changed_curiosity.curiosity.confidence,
+                    "source_ids": list(changed_curiosity.curiosity.source_ids),
+                    "resolution_ids": list(
+                        changed_curiosity.curiosity.resolution_ids,
+                    ),
+                    "reason": f"grounded-development:{changed_curiosity.action}",
+                }
+                if changed_curiosity is not None else None
+            ),
+            "curiosity_count": len(store.curiosities(chat.profile_id)),
+            "developmental_goal": (
+                {
+                    "id": changed_developmental_goal.goal.id,
+                    "action": changed_developmental_goal.action,
+                    "topic": changed_developmental_goal.goal.topic,
+                    "goal": changed_developmental_goal.goal.goal,
+                    "state": developmental_goal_state(
+                        changed_developmental_goal.goal,
+                    ),
+                    "strength": changed_developmental_goal.goal.strength,
+                    "confidence": changed_developmental_goal.goal.confidence,
+                    "source_ids": list(
+                        changed_developmental_goal.goal.source_ids,
+                    ),
+                    "progress_outcome_ids": list(
+                        changed_developmental_goal.goal.progress_outcome_ids,
+                    ),
+                    "contradiction_ids": list(
+                        changed_developmental_goal.goal.contradiction_ids,
+                    ),
+                    "reason": (
+                        f"grounded-development:{changed_developmental_goal.action}"
+                    ),
+                }
+                if changed_developmental_goal is not None else None
+            ),
+            "developmental_goal_count": len(
+                store.developmental_goals(chat.profile_id),
             ),
             "self_development": (
                 {
@@ -639,6 +841,22 @@ def run_companion_turn(
             "self_candidates": int(context_builder.last_timing.get("self_candidates", 0)),
             "experience_candidates": int(
                 context_builder.last_timing.get("experience_candidates", 0)
+            ),
+            "behavioral_tendency_candidates": int(
+                context_builder.last_timing.get(
+                    "behavioral_tendency_candidates", 0,
+                )
+            ),
+            "strategy_candidates": int(
+                context_builder.last_timing.get("strategy_candidates", 0)
+            ),
+            "curiosity_candidates": int(
+                context_builder.last_timing.get("curiosity_candidates", 0)
+            ),
+            "developmental_goal_candidates": int(
+                context_builder.last_timing.get(
+                    "developmental_goal_candidates", 0,
+                )
             ),
             "context_build_ms": (context_finished_at - context_started_at) * 1000,
             "prompt_build_ms": prompt_build_seconds * 1000,
@@ -883,6 +1101,14 @@ def debug_state_report(conversation_id: str, profile_id: str, *, verbose: bool =
     snapshot = session_state_snapshot(conversation_id, profile_id)
     last = snapshot.get("last_turn", {})
     new_experience = last.get("new_experience")
+    new_outcome = last.get("new_outcome")
+    prediction_formed = last.get("prediction_formed")
+    prediction_resolved = last.get("prediction_resolved")
+    predictions_expired = last.get("predictions_expired", ())
+    tendency_change = last.get("behavioral_tendency")
+    strategy_change = last.get("strategy")
+    curiosity_change = last.get("curiosity")
+    developmental_goal_change = last.get("developmental_goal")
     self_development = last.get("self_development")
     self_counts = snapshot["self_counts"]
     development_counts = snapshot["self_development_counts"]
@@ -898,10 +1124,130 @@ def debug_state_report(conversation_id: str, profile_id: str, *, verbose: bool =
         f"Selected memories: {len(snapshot['selected_memories'])}",
         f"Experiences: {snapshot['experience_count']}",
         f"Selected experiences: {len(snapshot['selected_experiences'])}",
+        f"Outcomes: {snapshot['outcome_count']}",
+        f"Predictions: {snapshot['prediction_count']} "
+        f"(unresolved={snapshot['prediction_status_counts']['unresolved']}, "
+        f"resolved={snapshot['prediction_status_counts']['resolved']}, "
+        f"expired={snapshot['prediction_status_counts']['expired']})",
+        f"Behavioral tendencies: {snapshot['behavioral_tendency_count']} "
+        "(" + ", ".join(
+            f"{state}={count}"
+            for state, count in snapshot[
+                "behavioral_tendency_state_counts"
+            ].items()
+        ) + ")",
+        "Selected behavioral tendencies: "
+        f"{len(snapshot['selected_behavioral_tendencies'])}",
+        f"Strategies: {snapshot['strategy_count']} "
+        "(" + ", ".join(
+            f"{state}={count}"
+            for state, count in snapshot["strategy_state_counts"].items()
+        ) + ")",
+        f"Selected strategies: {len(snapshot['selected_strategies'])}",
+        f"Curiosities: {snapshot['curiosity_count']} "
+        "(" + ", ".join(
+            f"{state}={count}"
+            for state, count in snapshot["curiosity_state_counts"].items()
+        ) + ")",
+        f"Selected curiosities: {len(snapshot['selected_curiosities'])}",
+        f"Developmental Goals: {snapshot['developmental_goal_count']} "
+        "(" + ", ".join(
+            f"{state}={count}"
+            for state, count in snapshot[
+                "developmental_goal_state_counts"
+            ].items()
+        ) + ")",
+        "Selected developmental Goals: "
+        f"{len(snapshot['selected_developmental_goals'])}",
         (
             f"New experience: {new_experience['id']} because {new_experience['why']}; "
             f"Self links: {', '.join(new_experience['linked_self_item_ids']) or 'none'}"
             if isinstance(new_experience, dict) else "New experience: none"
+        ),
+        (
+            f"New outcome: {new_outcome['id']} {new_outcome['result']}; "
+            f"action: {new_outcome['action']} ({new_outcome['action_turn_id']}); "
+            f"Experience links: "
+            f"{', '.join(new_outcome['linked_experience_ids']) or 'none'}; "
+            f"because {new_outcome['reason']}"
+            if isinstance(new_outcome, dict) else "New outcome: none"
+        ),
+        (
+            f"Prediction formed: {prediction_formed['id']}; "
+            f"expected={prediction_formed['expected_result']} "
+            f"confidence={prediction_formed['confidence']:.2f}; "
+            f"action: {prediction_formed['action']} "
+            f"({prediction_formed['action_turn_id']})"
+            if isinstance(prediction_formed, dict) else "Prediction formed: none"
+        ),
+        (
+            f"Prediction resolved: {prediction_resolved['id']}; "
+            f"expected={prediction_resolved['expected_result']}; "
+            f"actual={prediction_resolved['actual_result']} "
+            f"({prediction_resolved['actual_outcome_id']}); "
+            f"error={prediction_resolved['error_category']} "
+            f"{prediction_resolved['error_value']:.2f}"
+            if isinstance(prediction_resolved, dict) else "Prediction resolved: none"
+        ),
+        f"Predictions expired: {', '.join(predictions_expired) or 'none'}",
+        (
+            f"Behavioral tendency: {tendency_change['action']} "
+            f"{tendency_change['id']} -> {tendency_change['state']} "
+            f"({tendency_change['strength']:.2f}/"
+            f"{tendency_change['confidence']:.2f}); "
+            f"{tendency_change['context']}: {tendency_change['behavior']}; "
+            f"expected {tendency_change['expected_result']} "
+            f"({tendency_change['expected_effect']}); "
+            f"evidence: "
+            f"{', '.join(tendency_change['supporting_outcome_ids']) or 'none'}; "
+            f"contradictions: "
+            f"{', '.join(tendency_change['contradiction_outcome_ids']) or 'none'}; "
+            f"because {tendency_change['reason']}"
+            if isinstance(tendency_change, dict)
+            else "Behavioral tendency: none"
+        ),
+        (
+            f"Strategy: {strategy_change['action']} {strategy_change['id']} "
+            f"-> {strategy_change['state']} "
+            f"({strategy_change['strength']:.2f}/"
+            f"{strategy_change['confidence']:.2f}); "
+            f"{strategy_change['context']}: {strategy_change['procedure']}; "
+            f"evidence: "
+            f"{', '.join(strategy_change['supporting_outcome_ids']) or 'none'}; "
+            f"contradictions: "
+            f"{', '.join(strategy_change['contradiction_outcome_ids']) or 'none'}; "
+            f"because {strategy_change['reason']}"
+            if isinstance(strategy_change, dict) else "Strategy: none"
+        ),
+        (
+            f"Curiosity: {curiosity_change['action']} {curiosity_change['id']} "
+            f"-> {curiosity_change['state']} "
+            f"({curiosity_change['strength']:.2f}/"
+            f"{curiosity_change['confidence']:.2f}); "
+            f"{curiosity_change['topic']}: {curiosity_change['focus']}; "
+            f"evidence: {', '.join(curiosity_change['source_ids']) or 'none'}; "
+            f"resolutions: "
+            f"{', '.join(curiosity_change['resolution_ids']) or 'none'}; "
+            f"because {curiosity_change['reason']}"
+            if isinstance(curiosity_change, dict) else "Curiosity: none"
+        ),
+        (
+            f"Developmental Goal: {developmental_goal_change['action']} "
+            f"{developmental_goal_change['id']} -> "
+            f"{developmental_goal_change['state']} "
+            f"({developmental_goal_change['strength']:.2f}/"
+            f"{developmental_goal_change['confidence']:.2f}); "
+            f"{developmental_goal_change['topic']}: "
+            f"{developmental_goal_change['goal']}; "
+            f"sources: "
+            f"{', '.join(developmental_goal_change['source_ids']) or 'none'}; "
+            f"progress: "
+            f"{', '.join(developmental_goal_change['progress_outcome_ids']) or 'none'}; "
+            f"contradictions: "
+            f"{', '.join(developmental_goal_change['contradiction_ids']) or 'none'}; "
+            f"because {developmental_goal_change['reason']}"
+            if isinstance(developmental_goal_change, dict)
+            else "Developmental Goal: none"
         ),
         (
             f"Self development: {self_development['action']} {self_development['id']} "

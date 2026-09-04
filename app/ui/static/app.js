@@ -28,6 +28,9 @@ const elements = {
 
 let currentMessages = [];
 let isSending = false;
+let isQuitting = false;
+let refreshStatusIntervalId = null;
+const activeFetchControllers = new Set();
 let preservePreview = false;
 let lastRenderedMessagesKey = "";
 let lastKnownStateVersion = -1;
@@ -51,6 +54,9 @@ function apiUrl(path) {
 }
 
 async function initializeRequestHeaders() {
+  if (isQuitting) {
+    return;
+  }
   if (
     POPUP_ROLE === "companion" &&
     !window.pywebview?.api?.request_headers
@@ -69,6 +75,9 @@ async function initializeRequestHeaders() {
     ]);
   }
 
+  if (isQuitting) {
+    return;
+  }
   try {
     const bridgeHeaders =
       (await window.pywebview?.api?.request_headers?.()) || {};
@@ -77,16 +86,29 @@ async function initializeRequestHeaders() {
 }
 
 function apiFetch(path, options = {}) {
+  if (isQuitting) {
+    return Promise.reject(
+      new DOMException("Popup is closing.", "AbortError"),
+    );
+  }
+  const controller = new AbortController();
+  activeFetchControllers.add(controller);
   return fetch(apiUrl(path), {
     ...options,
+    signal: controller.signal,
     headers: {
       ...apiRequestHeaders,
       ...(options.headers || {}),
     },
+  }).finally(() => {
+    activeFetchControllers.delete(controller);
   });
 }
 
 async function callWindowApi(methodName) {
+  if (isQuitting && methodName !== "close_window") {
+    return;
+  }
   if (!window.pywebview?.api?.[methodName]) {
     return;
   }
@@ -94,7 +116,9 @@ async function callWindowApi(methodName) {
   try {
     await window.pywebview.api[methodName]();
   } catch {
-    showNotice("Window action failed.", "error");
+    if (!isQuitting) {
+      showNotice("Window action failed.", "error");
+    }
   }
 }
 
@@ -328,6 +352,9 @@ window.__akaneSetBubbleText = setBubbleText;
 window.__akanePendingMessage = "";
 
 window.__akaneStreamEvent = (event) => {
+  if (isQuitting) {
+    return;
+  }
   if (
     event.type === "done" ||
     event.type === "error" ||
@@ -981,7 +1008,7 @@ function handleStreamEvent(
 }
 
 async function refreshStatus() {
-  if (isSending) {
+  if (isQuitting || isSending) {
     return;
   }
 
@@ -1034,6 +1061,9 @@ async function refreshStatus() {
 }
 
 async function reportPopupAvailability(available) {
+  if (isQuitting) {
+    return null;
+  }
   return apiFetch("/api/initiative/delivery/claim", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1077,7 +1107,7 @@ async function initiativeDeliveryLoop() {
   if (POPUP_ROLE !== "companion") {
     return;
   }
-  while (true) {
+  while (!isQuitting) {
     if (document.visibilityState !== "visible") {
       try {
         await reportPopupAvailability(false);
@@ -1094,7 +1124,13 @@ async function initiativeDeliveryLoop() {
     try {
       const response =
         await reportPopupAvailability(true);
+      if (isQuitting || !response) {
+        return;
+      }
       const payload = await response.json();
+      if (isQuitting) {
+        return;
+      }
       const delivery = payload.delivery;
       if (!delivery?.message) {
         continue;
@@ -1129,6 +1165,9 @@ async function initiativeDeliveryLoop() {
       );
       lastKnownStateVersion = -1;
     } catch {
+      if (isQuitting) {
+        return;
+      }
       await new Promise((resolve) => {
         window.setTimeout(resolve, 1000);
       });
@@ -1138,6 +1177,9 @@ async function initiativeDeliveryLoop() {
 
 async function handleComposerSubmit(event) {
   event.preventDefault();
+  if (isQuitting) {
+    return;
+  }
 
   if (elements.send) {
     elements.send.disabled = false;
@@ -1238,10 +1280,34 @@ elements.minimizeButton?.addEventListener(
 
 elements.closeButton?.addEventListener(
   "click",
-  () => {
-    void callWindowApi(
-      "close_window",
+  async () => {
+    if (isQuitting) {
+      return;
+    }
+    isQuitting = true;
+    elements.closeButton.disabled = true;
+    elements.closeButton.setAttribute(
+      "aria-disabled",
+      "true",
     );
+    clearBubbleHideTimer();
+    for (const controller of activeFetchControllers) {
+      controller.abort();
+    }
+    activeFetchControllers.clear();
+    if (refreshStatusIntervalId !== null) {
+      window.clearInterval(
+        refreshStatusIntervalId,
+      );
+      refreshStatusIntervalId = null;
+    }
+    window.speechSynthesis?.cancel?.();
+    try {
+      await window.pywebview?.api
+        ?.close_window?.();
+    } catch {
+      // Native teardown can dispose the bridge before its promise settles.
+    }
   },
 );
 
@@ -1288,6 +1354,7 @@ let memoryPanelVisible = false;
 
 function syncInteractiveRegions() {
   if (
+    isQuitting ||
     POPUP_ROLE !== "companion" ||
     !window.pywebview?.api
       ?.update_interactive_regions
@@ -1441,6 +1508,9 @@ async function boot() {
 
   autosizeInput();
   await initializeRequestHeaders();
+  if (isQuitting) {
+    return;
+  }
 
   try {
     await fetchState();
@@ -1453,7 +1523,11 @@ async function boot() {
 
   }
 
-  window.setInterval(
+  if (isQuitting) {
+    return;
+  }
+
+  refreshStatusIntervalId = window.setInterval(
     refreshStatus,
     2500,
   );
@@ -1461,7 +1535,9 @@ async function boot() {
   void initiativeDeliveryLoop();
 
   window.addEventListener("pagehide", () => {
-    void reportPopupAvailability(false);
+    if (!isQuitting) {
+      void reportPopupAvailability(false);
+    }
   });
 
   focusComposerInput();

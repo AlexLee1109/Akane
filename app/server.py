@@ -706,7 +706,7 @@ class BackgroundUvicornServer:
             self._thread.join(timeout=3.0)
 
 
-def serve(host: str = SETTINGS.application_host, port: int = SETTINGS.application_port) -> None:
+def serve(host: str = SETTINGS.server_host, port: int = SETTINGS.server_port) -> None:
     print(f"Akane web chat running at http://{host}:{port}", flush=True)
     try:
         BackgroundUvicornServer(host, port).run()
@@ -716,8 +716,8 @@ def serve(host: str = SETTINGS.application_host, port: int = SETTINGS.applicatio
 
 
 def serve_in_thread(
-    host: str = SETTINGS.application_host,
-    port: int = SETTINGS.application_port,
+    host: str = SETTINGS.server_host,
+    port: int = SETTINGS.server_port,
 ) -> tuple[BackgroundUvicornServer, threading.Thread]:
     server = BackgroundUvicornServer(host, port)
     thread = threading.Thread(target=server.run, daemon=True, name="AkaneAPIServer")

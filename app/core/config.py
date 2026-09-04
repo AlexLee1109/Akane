@@ -102,8 +102,6 @@ class Settings:
     discord_allowed_channel_ids: tuple[int, ...]
     discord_reply_to_dms: bool
     public_api_enabled: bool
-    public_api_host: str
-    public_api_port: int
     public_allowed_origins: tuple[str, ...]
     public_guest_idle_seconds: int
     public_guest_max_lifetime_seconds: int
@@ -146,17 +144,9 @@ class Settings:
     prompt_debug: bool
     timing_enabled: bool
 
-    @property
-    def application_host(self) -> str:
-        return self.public_api_host if self.public_api_enabled else self.server_host
-
-    @property
-    def application_port(self) -> int:
-        return self.public_api_port if self.public_api_enabled else self.server_port
-
     def validate(self) -> None:
-        if not 1 <= self.server_port <= 65535 or not 1 <= self.public_api_port <= 65535:
-            raise ValueError("Akane server ports must be between 1 and 65535.")
+        if not 1 <= self.server_port <= 65535:
+            raise ValueError("AKANE_SERVER_PORT must be between 1 and 65535.")
         if self.llama_context_window < 512:
             raise ValueError("AKANE_LLAMA_CONTEXT_WINDOW must be at least 512.")
         if self.max_tokens >= self.llama_context_window:
@@ -196,8 +186,6 @@ def load_settings() -> Settings:
         discord_allowed_channel_ids=_integers("DISCORD_ALLOWED_CHANNEL_IDS"),
         discord_reply_to_dms=coerce_bool(_raw("DISCORD_REPLY_TO_DMS", "1"), True),
         public_api_enabled=coerce_bool(_raw("PUBLIC_API_ENABLED"), False),
-        public_api_host=_raw("PUBLIC_API_HOST", "127.0.0.1") or "127.0.0.1",
-        public_api_port=_integer("PUBLIC_API_PORT", 8000),
         public_allowed_origins=_strings("PUBLIC_ALLOWED_ORIGINS"),
         public_guest_idle_seconds=max(1, _integer("PUBLIC_GUEST_IDLE_SECONDS", 1800)),
         public_guest_max_lifetime_seconds=max(1, _integer("PUBLIC_GUEST_MAX_LIFETIME_SECONDS", 7200)),

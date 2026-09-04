@@ -1,5 +1,6 @@
 import json
 import math
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlencode, urljoin, urlsplit
@@ -28,7 +29,12 @@ COMPANION_WIDTH = 460
 COMPANION_HEIGHT = 560
 WINDOW_TITLE = "Akane"
 MOUSE_UPDATE_INTERVAL = 1 / 60
+# Let pywebview resolve the JS bridge call before destroying its WKWebView.
+CUSTOM_CLOSE_DELAY = 0.05
 _TIMING_ENABLED = SETTINGS.timing_enabled
+SHUTDOWN_RUNNING = "running"
+SHUTDOWN_CLOSING = "closing"
+SHUTDOWN_CLOSED = "closed"
 
 
 def _log_popup_timing(**values: float | int) -> None:
@@ -118,10 +124,15 @@ class PopupApp:
         self.backend_url = SETTINGS.popup_backend_url.rstrip("/")
         self.static_index = Path(__file__).parent / "static" / "index.html"
         self.windows: dict[str, object] = {}
-        self._shutting_down = False
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_state = SHUTDOWN_RUNNING
+        self._native_close_requested = False
+        self._cleanup_started = False
         self._composer_visible = False
         self._stream_lock = threading.Lock()
         self._stream_thread: threading.Thread | None = None
+        self._stream_response = None
+        self._stream_cancelled = threading.Event()
         self._region_lock = threading.Lock()
         self._interactive_regions: tuple[Frame, ...] = ()
         self._passthrough_regions: tuple[Frame, ...] = ()
@@ -132,9 +143,14 @@ class PopupApp:
         self._mouse_capture = False
         self._ensure_server()
 
+    def _shutdown_started(self) -> bool:
+        return getattr(self, "_shutdown_state", SHUTDOWN_RUNNING) != SHUTDOWN_RUNNING
+
     def _emit_stream_event(self, payload: dict) -> None:
+        if self._shutdown_started():
+            return
         window = self.windows.get("companion")
-        if window is None:
+        if window is None or self._shutdown_started():
             return
         try:
             event = json.dumps(payload)
@@ -151,12 +167,16 @@ class PopupApp:
         first_delta_at = None
         line_count = 0
         message = str(message or "").strip()
+        if self._shutdown_started():
+            return
         if not message:
             self._emit_stream_event({"type": "error", "error": "Message is empty."})
             return
         session_id = DEFAULT_SESSION_ID
         try:
             for line in self._remote_stream_lines(message, session_id):
+                if self._shutdown_started():
+                    break
                 line_count += 1
                 line_at = time.perf_counter()
                 if first_line_at is None:
@@ -179,7 +199,8 @@ class PopupApp:
                 total=done_at - started_at,
                 lines=line_count,
             )
-            self._emit_stream_event({"type": "error", "error": str(exc)})
+            if not self._shutdown_started():
+                self._emit_stream_event({"type": "error", "error": str(exc)})
         finally:
             with self._stream_lock:
                 if self._stream_thread is threading.current_thread():
@@ -196,6 +217,8 @@ class PopupApp:
         return event
 
     def _remote_stream_lines(self, message: str, session_id: str):
+        stream_cancelled = getattr(self, "_stream_cancelled", threading.Event())
+        stream_lock = getattr(self, "_stream_lock", threading.Lock())
         payload = json.dumps(
             {
                 "message": message,
@@ -217,9 +240,20 @@ class PopupApp:
             headers=headers,
             method="POST",
         )
+        response = None
         try:
-            with urllib.request.urlopen(request, timeout=600) as response:
+            if stream_cancelled.is_set():
+                return
+            response = urllib.request.urlopen(request, timeout=600)
+            with stream_lock:
+                if stream_cancelled.is_set():
+                    response.close()
+                    return
+                self._stream_response = response
+            with response:
                 while True:
+                    if stream_cancelled.is_set():
+                        break
                     line = response.readline()
                     if not line:
                         break
@@ -241,19 +275,26 @@ class PopupApp:
             raise RuntimeError(f"Remote backend returned HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
             raise RuntimeError(f"Could not reach remote backend at {self.backend_url}: {exc.reason}") from exc
+        finally:
+            with stream_lock:
+                if getattr(self, "_stream_response", None) is response:
+                    self._stream_response = None
 
     def send_message_stream(self, message: str) -> None:
-        with self._stream_lock:
-            if self._stream_thread is not None and self._stream_thread.is_alive():
-                raise RuntimeError("A reply is already in progress.")
-            thread = threading.Thread(
-                target=self._run_message_stream,
-                args=(message,),
-                daemon=True,
-                name="AkanePopupStream",
-            )
-            self._stream_thread = thread
-            thread.start()
+        with self._shutdown_lock:
+            if self._shutdown_state != SHUTDOWN_RUNNING:
+                return
+            with self._stream_lock:
+                if self._stream_thread is not None and self._stream_thread.is_alive():
+                    raise RuntimeError("A reply is already in progress.")
+                thread = threading.Thread(
+                    target=self._run_message_stream,
+                    args=(message,),
+                    daemon=True,
+                    name="AkanePopupStream",
+                )
+                self._stream_thread = thread
+                thread.start()
 
     @staticmethod
     def _parse_regions(regions: list[dict]) -> tuple[Frame, ...]:
@@ -277,16 +318,18 @@ class PopupApp:
         regions: list[dict],
         passthrough_regions: list[dict],
     ) -> None:
+        if self._shutdown_started():
+            return
         with self._region_lock:
             self._interactive_regions = self._parse_regions(regions)
             self._passthrough_regions = self._parse_regions(passthrough_regions)
         self._schedule_mouse_passthrough_update()
 
     def _schedule_mouse_passthrough_update(self, _event=None) -> None:
-        if AppHelper is None:
+        if AppHelper is None or self._shutdown_started():
             return
         with self._region_lock:
-            if self._mouse_update_pending:
+            if self._shutdown_started() or self._mouse_update_pending:
                 return
             self._mouse_update_pending = True
             delay = max(
@@ -302,6 +345,8 @@ class PopupApp:
     def _run_scheduled_mouse_update(self) -> None:
         with self._region_lock:
             self._mouse_update_pending = False
+            if self._shutdown_started():
+                return
             self._last_mouse_update_at = time.monotonic()
         self._update_mouse_passthrough()
 
@@ -310,7 +355,7 @@ class PopupApp:
         return event
 
     def _update_mouse_passthrough(self) -> None:
-        if AppKit is None:
+        if AppKit is None or self._shutdown_started():
             return
         window = self.windows.get("companion")
         native = getattr(window, "native", None)
@@ -346,12 +391,16 @@ class PopupApp:
             return
 
     def _configure_mouse_passthrough(self) -> None:
-        if AppHelper is None:
+        if AppHelper is None or self._shutdown_started():
             return
         AppHelper.callAfter(self._configure_mouse_passthrough_on_main)
 
     def _configure_mouse_passthrough_on_main(self) -> None:
-        if AppKit is None or self._local_mouse_monitor is not None:
+        if (
+            AppKit is None
+            or self._shutdown_started()
+            or self._local_mouse_monitor is not None
+        ):
             return
         window = self.windows.get("companion")
         native = getattr(window, "native", None)
@@ -390,8 +439,8 @@ class PopupApp:
         for attribute in ("_local_mouse_monitor", "_global_mouse_monitor"):
             monitor = getattr(self, attribute, None)
             if monitor is not None:
-                AppKit.NSEvent.removeMonitor_(monitor)
                 setattr(self, attribute, None)
+                AppKit.NSEvent.removeMonitor_(monitor)
 
     @staticmethod
     def _window_call(window, method: str, *args) -> None:
@@ -486,7 +535,7 @@ class PopupApp:
             transparent=True,
             on_top=True,
         )
-        window.events.closed += self._on_window_closed
+        window.events.closing += self._on_window_closing
         self.windows["companion"] = window
         return window
 
@@ -509,6 +558,8 @@ class PopupApp:
     # ── Composer visibility ───────────────────────────────────────────────
 
     def _set_composer_visible(self, visible: bool) -> None:
+        if self._shutdown_started():
+            return
         self._composer_visible = bool(visible)
         window = self.windows.get("companion")
         if window is None:
@@ -526,17 +577,29 @@ class PopupApp:
     # ── Event handlers ────────────────────────────────────────────────────
 
     def _on_start(self) -> None:
+        if self._shutdown_started():
+            return
         self._position_windows()
         self._configure_mouse_passthrough()
 
-    def _on_window_closed(self) -> None:
-        if self._shutting_down:
-            return
-        self.close_all_windows()
+    def _on_window_closing(self) -> None:
+        self._begin_shutdown()
+        self._remove_mouse_monitors_on_main()
+
+    def _finalize_window_closed(self) -> None:
+        with self._shutdown_lock:
+            if self._shutdown_state == SHUTDOWN_CLOSED:
+                return
+            self._shutdown_state = SHUTDOWN_CLOSED
+            self._stream_cancelled.set()
+            self.windows.clear()
+        self._start_cleanup_worker()
 
     # ── Public API ────────────────────────────────────────────────────────
 
     def minimize_all_windows(self) -> None:
+        if self._shutdown_started():
+            return
         for window in self.windows.values():
             try:
                 window.minimize()
@@ -544,19 +607,79 @@ class PopupApp:
                 pass
 
     def toggle_composer(self) -> None:
+        if self._shutdown_started():
+            return
         self._set_composer_visible(not self._composer_visible)
 
     def close_all_windows(self) -> None:
-        if self._shutting_down:
+        if not self._begin_shutdown():
             return
-        self._shutting_down = True
-        if AppKit is not None and AppKit.NSThread.isMainThread():
-            self._remove_mouse_monitors_on_main()
-        elif AppHelper is not None:
-            AppHelper.callAfter(self._remove_mouse_monitors_on_main)
-        if self.server:
-            self.server.shutdown()
-        for window in list(self.windows.values()):
+        with self._shutdown_lock:
+            self._native_close_requested = True
+        if AppHelper is not None:
+            AppHelper.callLater(
+                CUSTOM_CLOSE_DELAY,
+                self._request_native_window_close,
+            )
+        else:
+            self._request_native_window_close()
+
+    def _begin_shutdown(self) -> bool:
+        with self._shutdown_lock:
+            if self._shutdown_state != SHUTDOWN_RUNNING:
+                return False
+            self._shutdown_state = SHUTDOWN_CLOSING
+            self._stream_cancelled.set()
+        self._start_cleanup_worker()
+        return True
+
+    def _start_cleanup_worker(self) -> None:
+        with self._shutdown_lock:
+            if self._cleanup_started:
+                return
+            self._cleanup_started = True
+        threading.Thread(
+            target=self._cleanup_background_resources,
+            daemon=True,
+            name="AkanePopupCleanup",
+        ).start()
+
+    def _cleanup_background_resources(self) -> None:
+        with self._stream_lock:
+            response = self._stream_response
+
+        if response is not None:
+            raw_socket = getattr(
+                getattr(getattr(response, "fp", None), "raw", None),
+                "_sock",
+                None,
+            )
+            if isinstance(raw_socket, socket.socket):
+                try:
+                    raw_socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            try:
+                response.close()
+            except (OSError, ValueError):
+                pass
+
+        server = self.server
+        self.server = None
+        if server is not None:
+            server.shutdown()
+
+    def _request_native_window_close(self) -> None:
+        with self._shutdown_lock:
+            if (
+                self._shutdown_state != SHUTDOWN_CLOSING
+                or not self._native_close_requested
+            ):
+                return
+            self._native_close_requested = False
+
+        windows = list(self.windows.values())
+        for window in windows:
             try:
                 window.destroy()
             except Exception:
@@ -567,6 +690,7 @@ class PopupApp:
         frame = layout.frames["companion"]
         self._create_window(width=frame.width, height=frame.height)
         webview.start(self._on_start)
+        self._finalize_window_closed()
 
 
 def launch_popup():

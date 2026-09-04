@@ -13,11 +13,9 @@ from app.core.context import TurnContext, format_context_sections
 from app.core.streaming import SEMANTIC_SIDECAR_END, SEMANTIC_SIDECAR_START
 
 
-_STABLE_RULES = f"""# Runtime protocol
-Spoken: Akane; no label/narration/tags/reasoning. U is literal user text; STATE is application context and newer patches win.
-For grounded evidence append:
-{SEMANTIC_SIDECAR_START}{{"k":"p","t":"subject","s":"+","d":"c","e":"exact spoken span"}}{SEMANTIC_SIDECAR_END}
-Codes: k=p preference,o opinion,i interest,g goal,c correction,f+/f- feedback,t+/t- task result,n none; s=+/-/0/cmp; d=c candidate,tmp/hyp/task/n. Omit otherwise. e is Akane's exact span, never the user's. Comparisons add v=selected side. Metadata last."""
+_STABLE_RULES = f"""A=Akane;U=user;STATE=context;no labels/reasoning.
+{SEMANTIC_SIDECAR_START}{{"k":"p","t":"topic","s":"+","d":"c","e":"exact span"}}{SEMANTIC_SIDECAR_END}
+p/o/i/g=self pref/opinion/interest/goal;c=correct;f/t±=feedback/task result;x±=prediction;u±=open/resolved curiosity;j±=goal commit/drop;n=none. s=+/-/0/cmp;d=c/tmp/hyp/task/n. Self:e=A. Outcome:e=U,a=prior act,b/f=behavior/effect,r=procedure,j=goal. Predict:d=task,e/a=expect/action,q=h/l. Curiosity:w=focus,e=A/U for u+/-;not a question mandate. Goal:j=intention,e=A;context-only,no autonomous action. v=choice;omit unsupported."""
 
 STATE_MARKER = "STATE"
 USER_MARKER = "U"
@@ -120,44 +118,65 @@ def _model_state_items(
 ) -> tuple[ModelStateItem, ...]:
     section_map = dict(sections)
     items: list[ModelStateItem] = []
-    for item, wire in zip(
-        context.state.self_items,
-        section_map.get("self", "").splitlines(),
-    ):
-        items.append(ModelStateItem(
-            key=f"self:{item.id}",
-            section="self",
-            wire=wire,
-            version=f"{item.revision_count}:{item.updated_at:.6f}:{item.status}",
-            clear_wire=f"S- {item.kind} {item.topic}",
-            persistent=True,
-        ))
-    for item, wire in zip(
-        context.state.memories,
-        section_map.get("memory", "").splitlines(),
-    ):
-        items.append(ModelStateItem(
-            key=f"memory:{item.id}",
-            section="memory",
-            wire=wire,
-            version=f"{item.updated_at:.6f}",
-            clear_wire=f"M- {item.text}",
-            persistent=True,
-        ))
-    for item, wire in zip(
-        context.state.experiences,
-        section_map.get("experience", "").splitlines(),
-    ):
-        items.append(ModelStateItem(
-            key=f"experience:{item.id}",
-            section="experience",
-            wire=wire,
-            version=f"{item.created_at:.6f}",
-            clear_wire=f"E- {item.kind} {item.topic}",
-            persistent=True,
-        ))
+    persistent_sections = (
+        (
+            "self",
+            context.state.self_items,
+            lambda item: f"{item.revision_count}:{item.updated_at:.6f}:{item.status}",
+            lambda item: f"S- {item.kind} {item.topic}",
+        ),
+        (
+            "behavioral_tendency",
+            context.state.behavioral_tendencies,
+            lambda item: f"{item.revision_count}:{item.updated_at:.6f}:{item.status}",
+            lambda item: f"B- {item.context} {item.behavior}",
+        ),
+        (
+            "strategy",
+            context.state.strategies,
+            lambda item: f"{item.revision_count}:{item.updated_at:.6f}:{item.status}",
+            lambda item: f"R- {item.context} {item.procedure}",
+        ),
+        (
+            "curiosity",
+            context.state.curiosities,
+            lambda item: f"{item.updated_at:.6f}:{item.status}",
+            lambda item: f"A- {item.topic} {item.focus}",
+        ),
+        (
+            "developmental_goal",
+            context.state.developmental_goals,
+            lambda item: f"{item.updated_at:.6f}:{item.status}",
+            lambda item: f"G- {item.topic} {item.goal}",
+        ),
+        (
+            "memory",
+            context.state.memories,
+            lambda item: f"{item.updated_at:.6f}",
+            lambda item: f"M- {item.text}",
+        ),
+        (
+            "experience",
+            context.state.experiences,
+            lambda item: f"{item.created_at:.6f}",
+            lambda item: f"E- {item.kind} {item.topic}",
+        ),
+    )
+    for section, state_items, version, clear_wire in persistent_sections:
+        for item, wire in zip(
+            state_items, section_map.get(section, "").splitlines(),
+        ):
+            items.append(ModelStateItem(
+                key=f"{section}:{item.id}",
+                section=section,
+                wire=wire,
+                version=version(item),
+                clear_wire=clear_wire(item),
+                persistent=True,
+            ))
+    persistent_section_names = {section for section, *_ in persistent_sections}
     for section, wire in sections:
-        if section in {"self", "memory", "experience"}:
+        if section in persistent_section_names:
             continue
         items.append(ModelStateItem(
             key=section,
@@ -221,6 +240,10 @@ def build_dialogue_prompt(
             "self_items": len(context.state.self_items),
             "memories": len(context.state.memories),
             "experiences": len(context.state.experiences),
+            "behavioral_tendencies": len(context.state.behavioral_tendencies),
+            "strategies": len(context.state.strategies),
+            "curiosities": len(context.state.curiosities),
+            "developmental_goals": len(context.state.developmental_goals),
         },
         token_sections=token_sections,
         static_prefix_hash=stable_prompt_hash(character),

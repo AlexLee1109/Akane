@@ -1,4 +1,4 @@
-"""Canonical value objects for Akane's durable schema-14 state."""
+"""Canonical value objects for Akane's durable schema-15 state."""
 
 from __future__ import annotations
 
@@ -218,6 +218,95 @@ class SelfRevision:
 
 
 @dataclass(frozen=True, slots=True)
+class WorldSource:
+    kind: str
+    id: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorldEntity:
+    id: str
+    profile_id: str
+    label: str
+    created_at: float
+    updated_at: float
+    sources: tuple[WorldSource, ...]
+    kind: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class WorldState:
+    id: str
+    profile_id: str
+    entity_id: str
+    attribute: str
+    value: str
+    confidence: float
+    created_at: float
+    updated_at: float
+    sources: tuple[WorldSource, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorldFact:
+    id: str
+    profile_id: str
+    subject_id: str
+    predicate: str
+    value: str
+    confidence: float
+    created_at: float
+    sources: tuple[WorldSource, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorldRelation:
+    id: str
+    profile_id: str
+    subject_id: str
+    relation: str
+    object_id: str
+    confidence: float
+    created_at: float
+    updated_at: float
+    sources: tuple[WorldSource, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorldEvent:
+    id: str
+    profile_id: str
+    entity_ids: tuple[str, ...]
+    kind: str
+    confidence: float
+    created_at: float
+    sources: tuple[WorldSource, ...]
+    attribute: str = ""
+    before: str = ""
+    after: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class WorldSnapshot:
+    entities: tuple[WorldEntity, ...] = ()
+    states: tuple[WorldState, ...] = ()
+    facts: tuple[WorldFact, ...] = ()
+    relations: tuple[WorldRelation, ...] = ()
+    events: tuple[WorldEvent, ...] = ()
+
+    def current_state(self, entity_id: str, attribute: str) -> WorldState | None:
+        key = attribute.strip().casefold()
+        return next((item for item in self.states
+                     if item.entity_id == entity_id and item.attribute == key), None)
+
+
+@dataclass(frozen=True, slots=True)
+class WorldChange:
+    action: str
+    record: WorldEntity | WorldState | WorldFact | WorldRelation | WorldEvent
+
+
+@dataclass(frozen=True, slots=True)
 class StateSnapshot:
     profile_id: str
     conversation_id: str
@@ -298,6 +387,7 @@ class StateChangeProposal:
     self_items: tuple[SelfChange, ...] = ()
     origin: str = "conversation"
     rejected: tuple[str, ...] = field(default_factory=tuple)
+    world: tuple[WorldChange, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from app.core.config import SETTINGS
 from app.core.context import ContextBuilder
+from app.core.situation import RuntimeSituation, derive_situation_changes, external_evidence
 from app.core.inference import (
     InferenceCancelled,
     InferenceQueueTimeout,
@@ -21,6 +22,7 @@ from app.core.mind import (
     behavioral_tendency_state,
     curiosity_state,
     derive_developmental_goal_changes,
+    derive_world_changes,
     developmental_goal_state,
     self_development_state,
     strategy_state,
@@ -288,6 +290,7 @@ def run_companion_turn(
     cancellation: threading.Event | None = None,
     queue_deadline: float | None = None,
     allow_tool_context: bool = True,
+    runtime_situation: RuntimeSituation | None = None,
 ) -> CompanionTurnResult:
     chat = chat_input
     session_started_at = time.perf_counter()
@@ -325,6 +328,7 @@ def run_companion_turn(
             reply_context=chat.reply_context,
             allow_tool_context=allow_tool_context,
             now=chat.timestamp,
+            runtime_situation=runtime_situation,
         )
         context_finished_at = time.perf_counter()
         handle.check()
@@ -495,6 +499,7 @@ def run_companion_turn(
                 handle.check()
                 deliver_spoken(sidecar.feed(chunk))
             deliver_spoken(sidecar.finish())
+            runtime.finalize_dialogue_reply(cache_key, "".join(chunks))
             log_performance("foreground_event", stage="dialogue_end", at=time.time())
         reservation_released_at = time.perf_counter()
         final_token_at = timing.final_token_at or last_delta_delivered_at
@@ -543,6 +548,7 @@ def run_companion_turn(
         strategy_changes = ()
         curiosity_changes = ()
         developmental_goal_changes = ()
+        world_changes = ()
         if not skip_memory:
             (
                 memory_changes,
@@ -571,6 +577,19 @@ def run_companion_turn(
                 semantic_evidence=sidecar.semantic_evidence,
                 now=committed_at,
             )
+            world_changes = derive_world_changes(
+                external_evidence(sidecar.semantic_evidence, store.world(chat.profile_id)), user_turn, assistant_turn,
+                world=store.world(chat.profile_id),
+                recent_turns=context.state.recent_turns,
+                memories=store.memories(chat.profile_id),
+                experiences=store.experiences(chat.profile_id),
+                now=committed_at,
+            )
+            world_changes += derive_situation_changes(
+                sidecar.semantic_evidence, user_turn, assistant_turn,
+                world=store.world(chat.profile_id), now=committed_at,
+                runtime=runtime_situation,
+            )
         development_finished_at = time.perf_counter()
         proposal = StateChangeProposal(
             chat.profile_id,
@@ -584,6 +603,7 @@ def run_companion_turn(
             curiosities=curiosity_changes,
             developmental_goals=developmental_goal_changes,
             self_items=self_changes,
+            world=world_changes,
             origin="conversation",
         )
         persist_started_at = time.perf_counter()

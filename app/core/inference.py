@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from app.core.character import load_character_profile
@@ -104,7 +104,9 @@ DialogueCacheKey = tuple[str, str, str]
 @dataclass(frozen=True, slots=True)
 class _ConversationInferenceState:
     owner: DialogueCacheKey
+    # Exact model sequence, including hidden evidence and any unevaluated tail.
     token_ids: tuple[int, ...]
+    # The session finalizes the assistant turn with its authoritative visible reply.
     canonical_history: tuple[tuple[str, str], ...]
     state_revision: int
     state_section_fingerprints: tuple[tuple[str, str], ...] = ()
@@ -169,8 +171,9 @@ def _chat_formatter(llm):
     return None
 
 
-def _render_chat_prompt(llm, messages) -> str | None:
-    formatter = _chat_formatter(llm)
+def _render_chat_prompt(llm, messages, formatter=None) -> str | None:
+    if formatter is None:
+        formatter = _chat_formatter(llm)
     if formatter is None:
         return None
     try:
@@ -179,10 +182,11 @@ def _render_chat_prompt(llm, messages) -> str | None:
         return None
 
 
-def _render_chat_tokens(llm, messages) -> tuple[tuple[int, ...], str]:
+def _render_chat_tokens(llm, messages, formatter=None) -> tuple[tuple[int, ...], str]:
     """Tokenize exactly as the active Jinja chat handler does when inspectable."""
 
-    formatter = _chat_formatter(llm)
+    if formatter is None:
+        formatter = _chat_formatter(llm)
     if formatter is not None:
         try:
             rendered = formatter(messages=list(messages))
@@ -194,7 +198,7 @@ def _render_chat_tokens(llm, messages) -> tuple[tuple[int, ...], str]:
             return tuple(int(token) for token in tokens), "exact_active_chat_handler"
         except (AttributeError, TypeError, ValueError):
             pass
-    prompt = _render_chat_prompt(llm, messages)
+    prompt = _render_chat_prompt(llm, messages, formatter)
     if prompt is None:
         return (), "unavailable"
     try:
@@ -242,6 +246,7 @@ class InferenceRuntime:
         self._dialogue_prompt_dumped = False
         self._system_role_supported: bool | None = None
         self._chat_template_sha256 = ""
+        self._formatter = None
         self._model_calls = {
             "dialogue": 0, "other": 0,
         }
@@ -347,6 +352,7 @@ class InferenceRuntime:
         )
 
     def _configure_chat_template(self, llm) -> None:
+        self._formatter = _chat_formatter(llm)
         template = self._chat_template_source(llm)
         self._chat_template_sha256 = (
             hashlib.sha256(template.encode("utf-8")).hexdigest() if template else ""
@@ -355,7 +361,7 @@ class InferenceRuntime:
         rendered = _render_chat_prompt(llm, (
             {"role": "system", "content": sentinel},
             {"role": "user", "content": "hello"},
-        ))
+        ), self._formatter)
         # If the exact active formatter cannot be rendered, preserving a native
         # system role is unproven. The first-user form is safe for templates that
         # silently discard system messages (including some Gemma formatters).
@@ -396,10 +402,10 @@ class InferenceRuntime:
         second_next = (*second, {"role": "user", "content": "X_AKANE_NEXT_3A19"})
         first_other = (*first, {"role": "user", "content": "Y_AKANE_NEXT_6C42"})
         second_other = (*second, {"role": "user", "content": "Y_AKANE_NEXT_6C42"})
-        first_tokens, first_method = _render_chat_tokens(llm, first_next)
-        second_tokens, second_method = _render_chat_tokens(llm, second_next)
-        other_first_tokens, other_first_method = _render_chat_tokens(llm, first_other)
-        other_second_tokens, other_second_method = _render_chat_tokens(llm, second_other)
+        first_tokens, first_method = _render_chat_tokens(llm, first_next, self._formatter)
+        second_tokens, second_method = _render_chat_tokens(llm, second_next, self._formatter)
+        other_first_tokens, other_first_method = _render_chat_tokens(llm, first_other, self._formatter)
+        other_second_tokens, other_second_method = _render_chat_tokens(llm, second_other, self._formatter)
         suffix_length = self._token_suffix_length(first_tokens, second_tokens)
         other_suffix_length = self._token_suffix_length(other_first_tokens, other_second_tokens)
         suffix = first_tokens[-suffix_length:] if suffix_length else ()
@@ -427,7 +433,7 @@ class InferenceRuntime:
         self._chat_continuation_status = "verified"
 
     def _chat_template_stop_sequences(self, llm, messages) -> tuple[str, ...]:
-        formatter = _chat_formatter(llm)
+        formatter = self._formatter
         if formatter is None:
             return ()
         try:
@@ -455,8 +461,8 @@ class InferenceRuntime:
             return ()
         first = (*state.first_probe, {"role": "user", "content": user_content})
         second = (*state.second_probe, {"role": "user", "content": user_content})
-        first_tokens, first_method = _render_chat_tokens(llm, first)
-        second_tokens, second_method = _render_chat_tokens(llm, second)
+        first_tokens, first_method = _render_chat_tokens(llm, first, self._formatter)
+        second_tokens, second_method = _render_chat_tokens(llm, second, self._formatter)
         suffix_length = self._token_suffix_length(first_tokens, second_tokens)
         suffix = first_tokens[-suffix_length:] if suffix_length else ()
         if (
@@ -748,6 +754,7 @@ class InferenceRuntime:
                 self._active_cache_types = {"k": "", "v": ""}
                 self._chat_continuation_state = None
                 self._chat_continuation_status = "model load failed"
+                self._formatter = None
                 self._system_role_supported = None
                 self._chat_template_sha256 = ""
                 self._load_error = exc
@@ -792,6 +799,7 @@ class InferenceRuntime:
                 self._conversation_state = None
                 self._chat_continuation_state = None
                 self._chat_continuation_status = "runtime closed"
+                self._formatter = None
                 self._pending_prompt_tokens = None
                 self._cache_epoch += 1
                 self._last_cache_invalidated_reason = "runtime-closed"
@@ -993,7 +1001,7 @@ class InferenceRuntime:
         reservation: Reservation,
     ) -> tuple[int, str]:
         backend_messages = self._backend_messages(messages)
-        prompt_tokens, method = _render_chat_tokens(reservation.llm, backend_messages)
+        prompt_tokens, method = _render_chat_tokens(reservation.llm, backend_messages, self._formatter)
         if not prompt_tokens:
             characters = sum(len(message.get("content", "")) for message in backend_messages)
             return max(1, characters // 4), "estimated_characters"
@@ -1027,7 +1035,7 @@ class InferenceRuntime:
         pending = self._pending_prompt_tokens
         if pending is not None and pending[0] == key:
             return pending[1], pending[2]
-        return _render_chat_tokens(llm, backend_messages)
+        return _render_chat_tokens(llm, backend_messages, self._formatter)
 
     @staticmethod
     def _canonical_history(messages) -> tuple[tuple[str, str], ...]:
@@ -1058,6 +1066,27 @@ class InferenceRuntime:
         slack = max(2, SETTINGS.recent_turn_limit // 2)
         slack -= slack % 2
         return len(stored) - len(current) <= slack
+
+    def finalize_dialogue_reply(self, cache_key: DialogueCacheKey | None, reply: str) -> None:
+        """Set logical assistant text while the session still holds its reservation.
+
+        Use the same filtered reply that will be persisted, without changing any
+        raw token IDs or native state. A discarded/replaced cache stays discarded.
+        """
+
+        with self._condition:
+            state = self._conversation_state
+            if (
+                state is None
+                or state.owner != cache_key
+                or self._live_cache_owner != cache_key
+                or state.cache_epoch != self._cache_epoch
+            ):
+                return
+            self._conversation_state = replace(
+                state,
+                canonical_history=state.canonical_history[:-1] + (("assistant", reply),),
+            )
 
     @staticmethod
     def _state_section_fingerprints(
@@ -1169,7 +1198,7 @@ class InferenceRuntime:
             )
             continuation = self._continuation_tokens(llm, content)
             n_tokens = max(0, int(getattr(llm, "n_tokens", 0)))
-            resident = tuple(int(token) for token in getattr(llm, "input_ids", ())[:n_tokens])
+            resident = getattr(llm, "input_ids", ())[:n_tokens]
             resident_lcp = self._token_lcp(resident, state.token_ids)
             resident_is_valid = (
                 n_tokens <= len(state.token_ids)
@@ -1251,16 +1280,24 @@ class InferenceRuntime:
         cache_key: DialogueCacheKey,
         prompt_tokens: tuple[int, ...],
         invalidated_reason: str,
+        *,
+        direct_prefix_tokens: int | None = None,
     ) -> None:
         previous = self._previous_dialogue_prompt
         previous_tokens = previous[1] if previous is not None and previous[0] == cache_key else ()
-        actual_lcp = self._token_lcp(previous_tokens, prompt_tokens)
         n_tokens = max(0, int(getattr(llm, "n_tokens", 0)))
-        resident = getattr(llm, "input_ids", ())[:n_tokens]
-        # llama-cpp-python deliberately leaves the final prompt token to evaluate
-        # so it has fresh logits even when the entire preceding prefix matches.
-        backend_reused = self._token_lcp(resident, prompt_tokens[:-1])
-        timing.previous_prompt_tokens = len(previous_tokens)
+        if direct_prefix_tokens is not None:
+            # Selection already verified the resident sequence for reset=False.
+            actual_lcp = direct_prefix_tokens
+            backend_reused = n_tokens
+        else:
+            actual_lcp = self._token_lcp(previous_tokens, prompt_tokens)
+            resident = getattr(llm, "input_ids", ())[:n_tokens]
+            # reset=True leaves the final prompt token to evaluate for fresh logits.
+            backend_reused = self._token_lcp(resident, prompt_tokens[:-1])
+        timing.previous_prompt_tokens = (
+            direct_prefix_tokens if direct_prefix_tokens is not None else len(previous_tokens)
+        )
         timing.current_prompt_tokens = len(prompt_tokens)
         timing.actual_token_lcp = actual_lcp
         timing.actual_lcp_percent = (
@@ -1463,7 +1500,8 @@ class InferenceRuntime:
 
     @staticmethod
     def _performance_health() -> dict[str, object]:
-        if not (SETTINGS.prompt_debug or SETTINGS.timing_enabled):
+        # Timing-only requests must not run subprocesses or process-stat probes.
+        if not SETTINGS.prompt_debug:
             return {}
         result: dict[str, object] = {}
         for name, path, divisor in (
@@ -1577,7 +1615,12 @@ class InferenceRuntime:
             for value in (*template_stop_sequences, *SETTINGS.generation_stop_sequences)
             if value
         ))
-        retained = max((len(value) for value in stop_sequences), default=1) - 1
+        stop_prefixes = {
+            value[:length]
+            for value in stop_sequences
+            for length in range(1, len(value))
+        }
+        longest_prefix = max(map(len, stop_prefixes), default=0)
         pending = b""
         stopped = False
         try:
@@ -1607,7 +1650,14 @@ class InferenceRuntime:
                     stop_observed_at[:] = [time.perf_counter()]
                     stopped = True
                     break
-                safe_length = max(0, len(pending) - retained)
+                # Only hold bytes that could become a stop marker next token.
+                # A fixed longest-marker tail delays unrelated visible text.
+                held = 0
+                for length in range(min(len(pending), longest_prefix), 0, -1):
+                    if pending[-length:] in stop_prefixes:
+                        held = length
+                        break
+                safe_length = len(pending) - held
                 text, consumed = self._decodable_prefix(pending, safe_length)
                 if text:
                     pending = pending[consumed:]
@@ -1713,17 +1763,11 @@ class InferenceRuntime:
                         cache_key,
                         prompt_tokens,
                         invalidated_reason,
+                        direct_prefix_tokens=(
+                            len(prior_state.token_ids)
+                            if selection.direct_append and prior_state is not None else None
+                        ),
                     )
-                    if selection.direct_append and prior_state is not None:
-                        timing.previous_prompt_tokens = len(prior_state.token_ids)
-                        timing.actual_token_lcp = len(prior_state.token_ids)
-                        timing.actual_lcp_percent = (
-                            len(prior_state.token_ids) * 100.0 / len(prompt_tokens)
-                            if prompt_tokens else 0.0
-                        )
-                        timing.tokens_after_lcp = max(
-                            0, len(prompt_tokens) - len(prior_state.token_ids),
-                        )
                     timing.prompt_architecture = architecture
                     timing.static_prefix_tokens = max(0, int(static_prefix_tokens))
                     timing.historical_prefix_tokens = max(
@@ -1874,7 +1918,7 @@ class InferenceRuntime:
                 )
                 timing.model_finished_at = time.perf_counter()
                 timing.health_after_decode = self._performance_health()
-                if SETTINGS.prompt_debug or SETTINGS.timing_enabled:
+                if SETTINGS.prompt_debug:
                     timing.sequence_state_bytes = self._sequence_state_size(reservation.llm)
                 self._log_inference_debug(call_kind, timing, cache_key)
             close = getattr(response, "close", None)

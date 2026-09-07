@@ -96,8 +96,8 @@ class WindowApi:
     def minimize_window(self) -> None:
         self.app.minimize_all_windows()
 
-    def send_message_stream(self, message: str) -> None:
-        self.app.send_message_stream(message)
+    def send_message_stream(self, message: str, request_id: str = "", trace_ttft: bool = False) -> None:
+        self.app.send_message_stream(message, request_id, trace_ttft)
 
     def request_headers(self) -> dict[str, str]:
         return (
@@ -161,10 +161,12 @@ class PopupApp:
         except Exception:
             return
 
-    def _run_message_stream(self, message: str) -> None:
-        started_at = time.perf_counter()
+    def _run_message_stream(self, message: str, request_id: str = "",
+                            trace_ttft: bool = False, started_at: float = 0.0) -> None:
+        started_at = started_at or time.perf_counter()
         first_line_at = None
         first_delta_at = None
+        trace_metrics = {} if trace_ttft else None
         line_count = 0
         message = str(message or "").strip()
         if self._shutdown_started():
@@ -174,15 +176,16 @@ class PopupApp:
             return
         session_id = DEFAULT_SESSION_ID
         try:
-            for line in self._remote_stream_lines(message, session_id):
+            for line in self._remote_stream_lines(message, session_id, request_id, trace_ttft):
                 if self._shutdown_started():
                     break
                 line_count += 1
                 line_at = time.perf_counter()
                 if first_line_at is None:
                     first_line_at = line_at
-                event = self._emit_stream_line(line)
-                if first_delta_at is None and event and event.get("type") == "delta":
+                event = self._emit_stream_line(line, trace_metrics, started_at, line_at)
+                if (first_delta_at is None and event and event.get("type") == "delta"
+                        and str(event.get("content", "")).strip()):
                     first_delta_at = line_at
             done_at = time.perf_counter()
             _log_popup_timing(
@@ -206,17 +209,32 @@ class PopupApp:
                 if self._stream_thread is threading.current_thread():
                     self._stream_thread = None
 
-    def _emit_stream_line(self, line: str | bytes) -> dict | None:
+    def _emit_stream_line(self, line: str | bytes, trace_metrics: dict | None = None,
+                          started_at: float = 0.0, line_at: float = 0.0) -> dict | None:
         if isinstance(line, bytes):
             line = line.decode("utf-8", errors="replace")
         line = str(line or "").strip()
         if not line:
             return None
         event = json.loads(line)
+        first_visible = (
+            trace_metrics is not None and "popup_first_readline_ms" not in trace_metrics
+            and event.get("type") == "delta" and str(event.get("content", "")).strip()
+        )
+        if first_visible:
+            trace_metrics["popup_first_readline_ms"] = (line_at - started_at) * 1000
+        if trace_metrics is not None and event.get("type") == "done":
+            event["popup_ttft"] = dict(trace_metrics)
+        bridge_started_at = time.perf_counter() if first_visible else 0.0
         self._emit_stream_event(event)
+        if first_visible:
+            trace_metrics["popup_first_evaluate_js_ms"] = (
+                time.perf_counter() - bridge_started_at
+            ) * 1000
         return event
 
-    def _remote_stream_lines(self, message: str, session_id: str):
+    def _remote_stream_lines(self, message: str, session_id: str,
+                             request_id: str = "", trace_ttft: bool = False):
         stream_cancelled = getattr(self, "_stream_cancelled", threading.Event())
         stream_lock = getattr(self, "_stream_lock", threading.Lock())
         payload = json.dumps(
@@ -225,6 +243,8 @@ class PopupApp:
                 "session_id": session_id,
                 "source": "popup",
                 "skip_memory": False,
+                "request_id": request_id,
+                "trace_ttft": trace_ttft,
             },
             ensure_ascii=False,
         ).encode("utf-8")
@@ -280,7 +300,8 @@ class PopupApp:
                 if getattr(self, "_stream_response", None) is response:
                     self._stream_response = None
 
-    def send_message_stream(self, message: str) -> None:
+    def send_message_stream(self, message: str, request_id: str = "", trace_ttft: bool = False) -> None:
+        started_at = time.perf_counter()
         with self._shutdown_lock:
             if self._shutdown_state != SHUTDOWN_RUNNING:
                 return
@@ -289,7 +310,7 @@ class PopupApp:
                     raise RuntimeError("A reply is already in progress.")
                 thread = threading.Thread(
                     target=self._run_message_stream,
-                    args=(message,),
+                    args=(message, request_id, trace_ttft, started_at),
                     daemon=True,
                     name="AkanePopupStream",
                 )

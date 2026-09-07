@@ -75,6 +75,35 @@ class ChatRequestData:
     skip_memory: bool = False
     skip_if_busy: bool = False
     include_messages: bool = True
+    trace_ttft: bool = False
+
+
+class StreamTTFTMiddleware:
+    """Time private streaming requests at ASGI ingress and transport handoff."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] != "/api/chat/stream":
+            return await self.app(scope, receive, send)
+        trace = {"started_at": time.perf_counter(), "enabled": False, "metrics": {}}
+        scope.setdefault("state", {})["ttft_trace"] = trace
+
+        async def traced_send(message):
+            metrics = trace["metrics"]
+            if (trace["enabled"] and message["type"] == "http.response.body"
+                    and message.get("body") and "server_ttft_ms" not in metrics):
+                for line in message["body"].splitlines():
+                    event = orjson.loads(line)
+                    if event.get("type") == "delta" and str(event.get("content", "")).strip():
+                        metrics["server_ttft_ms"] = (
+                            time.perf_counter() - trace["started_at"]
+                        ) * 1000
+                        break
+            await send(message)
+
+        await self.app(scope, receive, traced_send)
 
 
 def _messages(conversation_id: str, profile_id: str) -> list[dict[str, str]]:
@@ -113,6 +142,7 @@ def _parse_chat_request(payload: dict) -> ChatRequestData:
         skip_memory=coerce_bool(payload.get("skip_memory", False)),
         skip_if_busy=coerce_bool(payload.get("skip_if_busy", False)),
         include_messages=coerce_bool(payload.get("include_messages", True), True),
+        trace_ttft=coerce_bool(payload.get("trace_ttft", False)),
     )
 
 
@@ -237,7 +267,7 @@ def _review_vscode_context(decision: ReviewDecision | None = None) -> str:
     return "" if reply.upper().rstrip(".! ") == "[SILENT]" else reply
 
 
-def _stream_chat_events(chat: ChatRequestData):
+def _stream_chat_events(chat: ChatRequestData, trace: dict | None = None):
     item = chat.chat_input
     stream_started_at = time.perf_counter()
     first_delta_at = 0.0
@@ -246,13 +276,27 @@ def _stream_chat_events(chat: ChatRequestData):
     cancellation = threading.Event()
     worker: threading.Thread | None = None
     finished = False
+
+    def serialize(event):
+        if trace is not None:
+            event["request_id"] = item.request_id
+        return _json_line(event)
+
     try:
         _log_chat("question", item, item.text)
         start_event = {"type": "start", "generation_id": generation_id}
         if chat.include_messages:
             start_event["messages"] = _messages_with_user(item)
-        yield _json_line(start_event)
+        yield serialize(start_event)
         stream_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+
+        def enqueue_delta(text):
+            if (trace is not None and text.strip()
+                    and "ingress_to_filtered_delta_ms" not in trace["metrics"]):
+                trace["metrics"]["ingress_to_filtered_delta_ms"] = (
+                    time.perf_counter() - trace["started_at"]
+                ) * 1000
+            stream_queue.put(("delta", text))
 
         def generate() -> None:
             try:
@@ -261,7 +305,7 @@ def _stream_chat_events(chat: ChatRequestData):
                     skip_memory=chat.skip_memory,
                     skip_if_busy=chat.skip_if_busy,
                     streaming=True,
-                    on_delta=lambda text: stream_queue.put(("delta", text)),
+                    on_delta=enqueue_delta,
                     on_stream_end=lambda: stream_queue.put(("flush", None)),
                     cancellation=cancellation,
                     allow_tool_context=item.source in {"popup", "web"},
@@ -284,7 +328,12 @@ def _stream_chat_events(chat: ChatRequestData):
                 if not first_delta_at:
                     first_delta_at = delta_at
                 final_delta_at = delta_at
-                yield _json_line(
+                if trace is not None and str(value).strip():
+                    trace["metrics"].setdefault(
+                        "ingress_to_delta_dequeued_ms",
+                        (delta_at - trace["started_at"]) * 1000,
+                    )
+                yield serialize(
                     {
                         "type": "delta",
                         "generation_id": generation_id,
@@ -293,7 +342,7 @@ def _stream_chat_events(chat: ChatRequestData):
                 )
                 continue
             if kind == "flush":
-                yield _json_line({"type": "flush", "generation_id": generation_id})
+                yield serialize({"type": "flush", "generation_id": generation_id})
                 continue
             if kind == "error":
                 if not isinstance(value, Exception):
@@ -326,11 +375,13 @@ def _stream_chat_events(chat: ChatRequestData):
             "generation_id": generation_id,
             "reply": reply,
         }
+        if trace is not None:
+            done_event["ttft"] = dict(trace["metrics"])
         messages_started_at = time.perf_counter()
         if chat.include_messages:
             done_event["messages"] = _messages(item.conversation_id, item.profile_id)
         messages_finished_at = time.perf_counter()
-        serialized = _json_line(done_event)
+        serialized = serialize(done_event)
         serialized_at = time.perf_counter()
         log_timing(
             "stream.done",
@@ -341,13 +392,13 @@ def _stream_chat_events(chat: ChatRequestData):
         yield serialized
     except GenerationCancelled:
         _log("cancelled", f"conversation={item.conversation_id}")
-        yield _json_line({"type": "cancelled", "generation_id": generation_id})
+        yield serialize({"type": "cancelled", "generation_id": generation_id})
     except Exception as exc:
         _log(
             "error",
             f"conversation={item.conversation_id} type={type(exc).__name__} detail={exc}",
         )
-        yield _json_line(
+        yield serialize(
             {
                 "type": "error",
                 "generation_id": generation_id,
@@ -666,8 +717,11 @@ def create_app() -> FastAPI:
         command = handle_builtin_command(chat.chat_input)
         if command is not None:
             return JSONResponse(command)
+        trace = request.state.ttft_trace if chat.trace_ttft else None
+        if trace is not None:
+            trace["enabled"] = True
         return StreamingResponse(
-            _stream_chat_events(chat),
+            _stream_chat_events(chat, trace),
             media_type="application/x-ndjson; charset=utf-8",
             headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
         )
@@ -683,6 +737,7 @@ def create_app() -> FastAPI:
         path, media_type = static
         return FileResponse(path, media_type=media_type)
 
+    app.add_middleware(StreamTTFTMiddleware)
     return app
 
 

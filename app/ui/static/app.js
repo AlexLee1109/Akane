@@ -41,6 +41,68 @@ let bubbleHideTimer = null;
 let bubbleStreaming = false;
 let streamingAssistantText = "";
 
+// Opt in from the popup console; independent of native health diagnostics.
+let activeTTFT = null;
+window.__akaneTTFTSamples = [];
+
+function beginTTFT() {
+  activeTTFT = null;
+  if (!window.__akaneTTFTEnabled) {
+    return "";
+  }
+  activeTTFT = {
+    request_id: window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+    send_at: performance.now(),
+    client_ttft_ms: null,
+    status: "pending",
+  };
+  window.__akaneTTFTSamples.push(activeTTFT);
+  if (window.__akaneTTFTSamples.length > 100) {
+    window.__akaneTTFTSamples.shift();
+  }
+  return activeTTFT.request_id;
+}
+
+function recordTTFT(event, receivedAt) {
+  const sample = activeTTFT;
+  if (!sample || event.request_id !== sample.request_id) {
+    return;
+  }
+  if (["done", "error", "cancelled"].includes(event.type)) {
+    sample.status = event.type;
+    sample.generation_id = event.generation_id;
+    sample.server = event.ttft || null;
+    sample.popup = event.popup_ttft || null;
+  }
+  if (event.type !== "delta" || !String(event.content || "").trim()) {
+    return;
+  }
+  sample.first_js_delta_ms ??= receivedAt - sample.send_at;
+  const responseElement = POPUP_ROLE === "companion" ? elements.messages :
+    elements.messages?.lastElementChild?.querySelector(".bubble-body");
+  if (sample.first_dom_update_ms !== undefined || !responseElement?.textContent?.trim()) {
+    return;
+  }
+  sample.first_dom_update_ms = performance.now() - receivedAt;
+  const visible = () => document.visibilityState === "visible" &&
+    responseElement.getClientRects().length > 0 &&
+    getComputedStyle(responseElement).visibility === "visible";
+  if (!visible()) {
+    sample.render_unavailable = "document or response is hidden";
+    return;
+  }
+  // Two frames bracket a render opportunity; this is not a pixel-paint sensor.
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      if (activeTTFT !== sample || !visible()) {
+        sample.render_unavailable = "response replaced or hidden before frame";
+        return;
+      }
+      sample.client_ttft_ms = performance.now() - sample.send_at;
+    });
+  });
+}
+
 const messageTimestampCache = new Map();
 const API_BASE =
   SEARCH_PARAMS.get("api_base")?.replace(/\/$/, "") || "";
@@ -717,6 +779,7 @@ async function loadStatePayload(
 }
 
 async function sendMessage(message) {
+  const requestId = message.startsWith("/") ? "" : beginTTFT();
   preservePreview = false;
 
   if (message.startsWith("/")) {
@@ -737,7 +800,7 @@ async function sendMessage(message) {
 
     try {
       await window.pywebview.api
-        .send_message_stream(message);
+        .send_message_stream(message, requestId, Boolean(requestId));
     } catch (error) {
       showNotice(
         error?.message ||
@@ -763,6 +826,8 @@ async function sendMessage(message) {
           message,
           session_id: SESSION_ID,
           source: "popup",
+          request_id: requestId,
+          trace_ttft: Boolean(requestId),
         }),
       },
     );
@@ -900,6 +965,10 @@ function handleStreamEvent(
   event,
   userMessage,
 ) {
+  const receivedAt = activeTTFT ? performance.now() : 0;
+  if (event.type !== "delta") {
+    recordTTFT(event, receivedAt);
+  }
   if (event.type === "start") {
     bubbleStreaming = true;
     streamingAssistantText = "";
@@ -933,6 +1002,7 @@ function handleStreamEvent(
       streamingAssistantText,
       userMessage,
     );
+    recordTTFT(event, receivedAt);
 
     return;
   }

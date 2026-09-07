@@ -16,7 +16,9 @@ from app.core.mind import (
     self_development_state,
     strategy_state,
 )
-from app.core.state import StateSnapshot
+from app.core.situation import RuntimeSituation, situation_context
+from app.core.retrieval import world_context, wants_situation
+from app.core.state import StateSnapshot, WorldSnapshot
 from app.core.store import Store
 from app.core.utils import lexical_terms, text_key
 from app.integrations.vscode_context import CodeContext, current_code_context
@@ -49,6 +51,8 @@ class TurnContext:
     include_clock_time: bool = False
     include_elapsed_time: bool = False
     include_self_history: bool = False
+    situation: str = ""
+    world: str = ""
 
 
 def _elapsed(now: float, timestamp: float | None) -> float | None:
@@ -133,6 +137,10 @@ def format_context_sections(
 ) -> tuple[tuple[str, str], ...]:
     state = context.state
     sections: list[tuple[str, str]] = []
+    if context.situation:
+        sections.append(("situation", context.situation))
+    if context.world:
+        sections.append(("world", context.world))
     if state.self_items:
         history = {row.self_item_id: row for row in reversed(state.self_revisions)}
         lines = []
@@ -232,11 +240,15 @@ class ContextBuilder:
         reply_context: str = "",
         allow_tool_context: bool = True,
         now: float | None = None,
+        runtime_situation: RuntimeSituation | None = None,
     ) -> TurnContext:
         started_at = time.perf_counter()
         query = " ".join(part for part in (message, reply_context) if part).strip()
+        selection_query = "" if text_key(query) in {
+            "hello", "hi", "hey", "hello akane", "hi akane", "good morning", "good evening",
+        } else query
         snapshot_started_at = time.perf_counter()
-        state = self.store.snapshot(profile_id, conversation_id, query=query, now=now)
+        state = self.store.snapshot(profile_id, conversation_id, query=selection_query, now=now)
         snapshot_finished_at = time.perf_counter()
         snapshot_timing = self.store.snapshot_timing()
         last_user = next(
@@ -264,8 +276,15 @@ class ContextBuilder:
         ):
             candidate = current_code_context()
             code = candidate if candidate.connected else None
+        world = self.store.world(profile_id)
+        current_time = time.time() if now is None else now
         result = TurnContext(
             state=state,
+            situation=situation_context(
+                world if wants_situation(query) or runtime_situation else WorldSnapshot(), profile_id,
+                current_time, query, runtime_situation,
+            ),
+            world=world_context(world, profile_id, selection_query, state.recent_turns, current_time),
             time=time_context,
             code=code,
             include_time=include_clock or include_elapsed,

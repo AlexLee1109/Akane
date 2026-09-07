@@ -10,16 +10,38 @@ from functools import lru_cache
 from app.core.character import Character, load_character_profile
 from app.core.config import SETTINGS
 from app.core.context import TurnContext, format_context_sections
+from app.core.situation import SITUATION_RULES
+from app.core.retrieval import RETRIEVAL_RULES
 from app.core.streaming import SEMANTIC_SIDECAR_END, SEMANTIC_SIDECAR_START
 
 
 _STABLE_RULES = f"""A=Akane;U=user;STATE=context;no labels/reasoning.
-{SEMANTIC_SIDECAR_START}{{"k":"p","t":"topic","s":"+","d":"c","e":"exact span"}}{SEMANTIC_SIDECAR_END}
-p/o/i/g=self pref/opinion/interest/goal;c=correct;f/t±=feedback/task result;x±=prediction;u±=open/resolved curiosity;j±=goal commit/drop;n=none. s=+/-/0/cmp;d=c/tmp/hyp/task/n. Self:e=A. Outcome:e=U,a=prior act,b/f=behavior/effect,r=procedure,j=goal. Predict:d=task,e/a=expect/action,q=h/l. Curiosity:w=focus,e=A/U for u+/-;not a question mandate. Goal:j=intention,e=A;context-only,no autonomous action. v=choice;omit unsupported."""
+When asked for your view or choice, form a present judgment naturally, even with empty Self. This is a present stance, not proof of past experience.
+STEP 1 — choose domain:
+WORLD first: the CURRENT U turn directly establishes external entities/state/events/relations. U's direct report takes priority over A's reaction; no sensory/physical/tool access needed.
+SELF otherwise: A expresses a meaningful preference/opinion/interest/etc., or eligible Development evidence. d=c is a weak candidate; no prior history needed.
+NONE: neither domain has eligible evidence. Recall questions, hypotheticals/imagined statements and neutral greetings: n. They are not new World evidence. Never replay old evidence.
+STEP 2 — if WORLD, choose kind:
+ws: one entity has a mutable current state/property; d="na".
+wr: two distinct entities relate/link/connect/belong/point to each other; use wr, NOT wf; d="na".
+wf: durable proposition about one entity, NOT an entity-to-entity relation; d="da".
+wv: newly reported historical occurrence; k,t,a,d="pa"; no v.
+we: entity existence; k,t,d="na". wr-: remove relation; k,t,a,v,d="nn".
+STEP 3 — emit exactly one existing shape; never mix Self and World fields or invent kinds/scope codes.
+SELF p/o/i/g=preference/opinion/interest/goal: k,t,s,d. NEVER e or a; v only for comparative s=cmp.
+{{"k":"p","t":"topic","s":"+","d":"c"}}
+WORLD STATE / FACT / RELATION: k,t,a,v,d. NEVER e or s for current reports.
+{{"k":"ws","t":"entity","a":"attribute","v":"value","d":"na"}}
+{{"k":"wr","t":"subject","a":"relation","v":"target","d":"na"}}
+NONE: {{"k":"n"}}
+Substitute actual subjects/values. Runtime binds Self to A's complete visible reply and direct World to the complete current U turn, with their source IDs. Do not emit alternate sources. World v must occur in U; reuse entity labels/IDs and attribute keys. Uncertainty, third-party reports and generated claims are not World evidence. Ambiguity means n; never infer opposite values from negation. ws records transition history. wr:b=old target replaces an edge. Only prior-source wf/wv add z=existing Memory/Experience ID and e=its complete original U quote.
+Existing Development witness grammar (separate from current Self/World):
+k: c=correction;f+/f-=feedback;t+/t-=task result;x+/x-=prediction;u+/u-=open/resolved curiosity;j+/j-=goal commit/drop. Required k,t,s,d,e. s=+/-/0/cmp;d=c/tmp/hyp/task/n. Events:e=U,a=prior act,b/f=behavior/effect,r=procedure,j=goal;generated event claims alone are not evidence. Predict:d=task,e/a=expect/action,q=h/l. Curiosity:w=focus,e=A/U for u+/u-;not a question mandate. Goal:j=intention,e=A;context-only,no autonomous action. Omit unused fields.
+After one short visible sentence, append {SEMANTIC_SIDECAR_START}JSON{SEMANTIC_SIDECAR_END}, replacing JSON with the chosen object. Always emit the literal {SEMANTIC_SIDECAR_END}, including NONE; nothing after it."""
 
 STATE_MARKER = "STATE"
 USER_MARKER = "U"
-TRANSIENT_STATE_SECTIONS = frozenset({"time", "code_context"})
+TRANSIENT_STATE_SECTIONS = frozenset({"time", "code_context", "situation", "world"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,14 +83,14 @@ def _stable_prompt_parts(
 def stable_system_prompt(character: Character | None = None) -> str:
     character = character or load_character_profile()
     return _stable_prompt_parts(
-        character.content_sha256, character.identity, character.voice, _STABLE_RULES,
+        character.content_sha256, character.identity, character.voice, _STABLE_RULES + "\n" + SITUATION_RULES + "\n" + RETRIEVAL_RULES,
     )[0]
 
 
 def stable_prompt_hash(character: Character | None = None) -> str:
     character = character or load_character_profile()
     return _stable_prompt_parts(
-        character.content_sha256, character.identity, character.voice, _STABLE_RULES,
+        character.content_sha256, character.identity, character.voice, _STABLE_RULES + "\n" + SITUATION_RULES + "\n" + RETRIEVAL_RULES,
     )[1]
 
 
@@ -225,7 +247,7 @@ def build_dialogue_prompt(
     token_sections = {
         "identity": character.identity,
         "soul": character.voice,
-        "stable_rules": _STABLE_RULES,
+        "stable_rules": _STABLE_RULES + "\n" + SITUATION_RULES + "\n" + RETRIEVAL_RULES,
         "state_wrapper": f"{STATE_MARKER}\n{USER_MARKER}" if context_sections else USER_MARKER,
         **dict(context_sections),
         "recent_dialogue": "" if append_only else "\n".join(turn.content for turn in recent),

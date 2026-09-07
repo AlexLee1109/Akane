@@ -31,6 +31,14 @@ from app.core.state import (
     Strategy,
     StrategyChange,
     Turn,
+    WorldChange,
+    WorldEntity,
+    WorldEvent,
+    WorldFact,
+    WorldRelation,
+    WorldSnapshot,
+    WorldSource,
+    WorldState,
     clamp,
 )
 from app.core.utils import compact_text, lexical_terms, relevance, text_key
@@ -570,6 +578,39 @@ def _valid_semantic_phrase(value: str) -> bool:
     return bool(self_topic_terms(value)) and "\n" not in value and "\r" not in value
 
 
+_WORLD_EVIDENCE_KINDS = frozenset({"we", "ws", "wf", "wr", "wr-", "wv"})
+
+
+def _semantic_records(raw: str) -> tuple[dict, ...]:
+    """One object, or one Development + one World object in the same suffix."""
+    if not isinstance(raw, str) or not raw or len(raw) > 1024:
+        return ()
+
+    def unique_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate semantic key")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(raw, object_pairs_hook=unique_keys)
+    except (TypeError, ValueError):
+        return ()
+    records = (payload,) if isinstance(payload, dict) else payload
+    if not isinstance(records, (list, tuple)) or not 1 <= len(records) <= 2:
+        return ()
+    if any(not isinstance(item, dict) or not isinstance(item.get("k"), str) for item in records):
+        return ()
+    if len(records) == 2 and not (
+        sum(item["k"] in _WORLD_EVIDENCE_KINDS for item in records) == 1
+        and sum(item["k"] in _SEMANTIC_KIND_CODES for item in records) == 1
+    ):
+        return ()
+    return tuple(records)
+
+
 def validate_semantic_evidence(
     raw: str,
     user_turn: Turn,
@@ -590,12 +631,17 @@ def validate_semantic_evidence(
         or user_turn.conversation_id != assistant_turn.conversation_id
     ):
         return None
-    try:
-        payload = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
+    payload = next((item for item in _semantic_records(raw)
+                    if item["k"] in _SEMANTIC_KIND_CODES), None)
+    if payload is None:
         return None
-    if not isinstance(payload, dict):
-        return None
+    kind = _SEMANTIC_KIND_CODES.get(payload["k"], "")
+    current_self = kind in _SELF_EVIDENCE_KINDS
+    if current_self:
+        # Current Self has exactly one source; the model cannot replace it.
+        if "e" in payload:
+            return None
+        payload = {**payload, "e": assistant_turn.content}
     keys = set(payload)
     if (
         not _SEMANTIC_REQUIRED_KEYS <= keys
@@ -605,11 +651,10 @@ def validate_semantic_evidence(
         return None
     if any(not isinstance(payload[key], str) for key in keys):
         return None
-    kind = _SEMANTIC_KIND_CODES.get(payload["k"], "")
     topic = payload["t"].strip()
     stance = _SEMANTIC_STANCE_CODES.get(payload["s"], "")
     durability = _SEMANTIC_DURABILITY_CODES.get(payload["d"], "")
-    evidence = payload["e"].strip()
+    evidence = payload["e"] if current_self else payload["e"].strip()
     value = payload.get("v", "").strip()
     action = payload.get("a", "").strip()
     behavior = payload.get("b", "").strip()
@@ -623,7 +668,7 @@ def validate_semantic_evidence(
         or stance not in _SEMANTIC_STANCES
         or durability not in _SEMANTIC_DURABILITY
         or len(topic) > 120
-        or len(evidence) > 280
+        or (not current_self and len(evidence) > 280)
         or len(value) > 80
         or len(action) > 280
         or len(behavior) > 120
@@ -728,9 +773,13 @@ def validate_semantic_evidence(
             action_turn_id=assistant_turn.id,
             confidence_band=confidence_band,
         )
-    if kind in _EVENT_EVIDENCE_KINDS and action:
+    if kind in _EVENT_EVIDENCE_KINDS:
         if evidence_key not in user_key or value:
             return None
+        if not action:
+            if behavior or effect or strategy or developmental_goal:
+                return None
+            return SemanticEvidence(kind, topic, stance, durability, evidence)
         action_key = _normalized_evidence(action)
         if not self_topic_terms(action):
             return None
@@ -764,6 +813,194 @@ def validate_semantic_evidence(
     elif value:
         return None
     return SemanticEvidence(kind, topic, stance, durability, evidence, value)
+
+
+def _world_span(span: str, text: str) -> bool:
+    """Exact normalized lexical witness, never a language/meaning classifier."""
+    span, text = _normalized_evidence(span), _normalized_evidence(text)
+    start = text.find(span)
+    while span and start >= 0:
+        end = start + len(span)
+        if (start == 0 or not text[start - 1].isalnum()) and (
+            end == len(text) or not text[end].isalnum()
+        ):
+            return True
+        start = text.find(span, start + 1)
+    return False
+
+
+def _world_source_is_asserted(text: str) -> bool:
+    """Conservative source rejection, never inference of a World kind/value."""
+    normalized = _normalized_evidence(text)
+    return bool(normalized) and not (
+        normalized.startswith(_HYPOTHETICAL_OPENERS)
+        or any(marker in normalized for marker in _HYPOTHETICAL_MARKERS)
+        or re.search(r"\b(?:if|whether|maybe|perhaps|possibly|probably|may|might|could|"
+                     r"hypothetical|hypothetically|imagine|imagined|pretend|suppose|"
+                     r"uncertain|unsure|apparently|reportedly)\b", normalized)
+        or re.search(r"\b(?:according to|said|says|think|thinks|believe|believes)\b", normalized)
+        or re.match(r"(?:who|what|when|where|why|how|is|are|was|were|does|do|did|"
+                    r"can|could|would|should|will|has|have)\b", normalized)
+        or re.match(r"[^.!?\n]*\?", normalized)
+    )
+
+
+def derive_world_changes(
+    raw: str, user_turn: Turn, assistant_turn: Turn, *,
+    world: WorldSnapshot,
+    recent_turns: tuple[Turn, ...] = (),
+    memories: tuple[Memory, ...] = (),
+    experiences: tuple[Experience, ...] = (),
+    now: float | None = None,
+) -> tuple[WorldChange, ...]:
+    """Validate semantic source witnesses before proposing Phase 3A mutations.
+
+    The current user turn is the source, never model-supplied text. Conservative
+    framing guards reject nonassertions; values and identities need source spans.
+    This does not independently prove arbitrary natural-language entailment.
+    """
+    payload = next((item for item in _semantic_records(raw)
+                    if item["k"] in _WORLD_EVIDENCE_KINDS), None)
+    if payload is None or (
+        user_turn.role != "user" or assistant_turn.role != "assistant"
+        or not user_turn.id or not assistant_turn.id or user_turn.id == assistant_turn.id
+        or user_turn.profile_id != assistant_turn.profile_id
+        or user_turn.conversation_id != assistant_turn.conversation_id
+    ):
+        return ()
+    kind = payload["k"]
+    required = {"k", "t", "d"}
+    if "z" in payload:
+        required.add("e")
+    if kind != "we":
+        required.add("a")
+    if kind in {"ws", "wf", "wr", "wr-"}:
+        required.add("v")
+    optional = {"z", "b"} if kind == "wr" else {"z"}
+    if not required <= set(payload) or set(payload) - required - optional:
+        return ()
+    if any(not isinstance(value, str) or not value.strip() or len(value) > 280
+           for value in payload.values()):
+        return ()
+    expected_scope = {"we": "na", "ws": "na", "wf": "da", "wr": "na",
+                      "wr-": "nn", "wv": "pa"}
+    if payload["d"] != expected_scope[kind]:
+        return ()
+    profile_id = user_turn.profile_id
+    prior_users = tuple(turn for turn in recent_turns if (
+        turn.role == "user" and turn.profile_id == profile_id
+        and turn.conversation_id == user_turn.conversation_id
+        and turn.id != user_turn.id and turn.created_at <= user_turn.created_at
+    ))
+    source_turn = user_turn
+    sources = (WorldSource("user_turn", user_turn.id),)
+    if "z" in payload:
+        # Historical evidence can establish a durable fact/occurrence, never
+        # silently revive an old mutable value as current.
+        if kind not in {"wf", "wv"}:
+            return ()
+        matches = [item for item in (*memories, *experiences)
+                   if item.id == payload["z"] and item.profile_id == profile_id]
+        if len(matches) != 1:
+            return ()
+        source = matches[0]
+        if isinstance(source, Experience) and source.kind not in _EVENT_EVIDENCE_KINDS:
+            return ()
+        if isinstance(source, Memory) and source.subject != "user":
+            return ()
+        quotes = [turn for turn in prior_users if turn.id in source.source_turn_ids
+                  and _normalized_evidence(turn.content) == _normalized_evidence(payload["e"])]
+        if len(quotes) != 1:
+            return ()
+        source_turn = quotes[0]
+        sources = (WorldSource("memory" if isinstance(source, Memory) else "experience", source.id),
+                   WorldSource("user_turn", source_turn.id))
+    # Prior sources still require their complete explicit witness. Current
+    # sources are bound directly, so qualifiers cannot be cropped or replaced.
+    evidence = source_turn.content
+    if not _world_source_is_asserted(evidence):
+        return ()
+    if kind != "wr-" and re.search(r"\b(?:not|never|no longer)\b",
+                                  _normalized_evidence(evidence)):
+        return ()
+    timestamp = time.time() if now is None else float(now)
+    entities = tuple(item for item in world.entities if item.profile_id == profile_id)
+    formed: list[WorldChange] = []
+
+    def resolve(label: str, *, discourse: bool = False) -> WorldEntity | None:
+        reference = label.strip()
+        label = _normalized_evidence(label)
+        if not label or len(label) > 200:
+            return None
+        matches = [item for item in entities
+                   if item.id == reference or _normalized_evidence(item.label) == label]
+        if len(matches) > 1:
+            return None
+        if matches:
+            item = matches[0]
+            if _world_span(item.label, evidence) or _world_span(item.id, evidence):
+                return item
+            if discourse and source_turn == user_turn and prior_users:
+                previous = max(prior_users, key=lambda turn: turn.created_at)
+                mentioned = [item for item in entities if _world_span(item.label, previous.content)]
+                if len(mentioned) == 1 and mentioned[0].id == item.id:
+                    return item
+            return None
+        if not _world_span(label, evidence):
+            return None
+        item = WorldEntity(_stable_id("world_entity", profile_id, label), profile_id,
+                           label, timestamp, timestamp, sources)
+        if all(change.record.id != item.id for change in formed):
+            formed.append(WorldChange("upsert", item))
+        return item
+
+    subject = resolve(payload["t"], discourse=True)
+    if subject is None:
+        return ()
+    if kind == "we":
+        return tuple(formed)
+    attribute = _normalized_evidence(payload["a"])
+    if not attribute or len(attribute) > 200:
+        return ()
+    value = payload.get("v", "").strip()
+    if kind in {"ws", "wf"} and not _world_span(value, evidence):
+        return ()
+    if kind == "ws":
+        current = world.current_state(subject.id, attribute)
+        if current:
+            sources += (WorldSource("world", current.id),)
+        item = WorldState(_stable_id("world_state", subject.id, attribute), profile_id,
+                          subject.id, attribute, value, 0.85, timestamp, timestamp, sources)
+    elif kind == "wf":
+        item = WorldFact(_stable_id("world_fact", subject.id, attribute, value), profile_id,
+                         subject.id, attribute, value, 0.85, source_turn.created_at, sources)
+    elif kind == "wv":
+        if not _world_span(attribute, evidence):
+            return ()
+        item = WorldEvent(_stable_id("world_event", source_turn.id, subject.id, attribute),
+                          profile_id, (subject.id,), attribute, 0.85,
+                          source_turn.created_at, sources)
+    else:
+        target = resolve(value)
+        if target is None:
+            return ()
+        current = None
+        if kind == "wr-" or "b" in payload:
+            old = resolve(payload.get("b", value))
+            if old is None:
+                return ()
+            matches = [item for item in world.relations if item.profile_id == profile_id
+                       and (item.subject_id, item.relation, item.object_id)
+                       == (subject.id, attribute, old.id)]
+            if len(matches) != 1:
+                return ()
+            current = matches[0]
+            sources += (WorldSource("world", current.id),)
+        item = WorldRelation(
+            current.id if current else _stable_id("world_relation", subject.id, attribute, target.id),
+            profile_id, subject.id, attribute, target.id, 0.85, timestamp, timestamp, sources,
+        )
+    return (*formed, WorldChange("remove" if kind == "wr-" else "upsert", item))
 
 
 def memory_topic(text: str) -> str:
@@ -972,7 +1209,7 @@ def _event_evidence_experience(
             if semantic.kind == "correction"
             else f"user:{semantic.kind.replace('_', '-')}"
         ),
-        akane_response=semantic.evidence,
+        akane_response=assistant_turn.content,
         now=now,
     )
 

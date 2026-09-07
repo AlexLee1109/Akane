@@ -66,11 +66,17 @@ from app.core.state import (
     Strategy,
     StrategyChange,
     Turn,
+    WorldSnapshot,
+    WorldState,
 )
 from app.core.utils import OWNER_PROFILE_ID, lexical_terms, relevance, text_key
+from app.core.world import (
+    apply_world_change, empty_world, known_world_sources, validate_world,
+    world_snapshot,
+)
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 CONVERSATION_TURN_LIMIT = max(32, SETTINGS.recent_turn_limit * 2)
 MEMORY_LIMIT = 128
 EXPERIENCE_LIMIT = 64
@@ -92,7 +98,7 @@ _ROOT_KEYS = {"schema_version", "revision", "updated_at", "profiles"}
 _PROFILE_KEYS = {
     "created_at", "updated_at", "self", "memories", "experiences", "outcomes",
     "predictions", "behavioral_tendencies", "strategies", "curiosities",
-    "developmental_goals", "conversations",
+    "developmental_goals", "conversations", "world",
 }
 _SELF_KEYS = {*SELF_GROUP_BY_KIND.values(), "revisions"}
 _CONVERSATION_KEYS = {"created_at", "updated_at", "turns"}
@@ -205,6 +211,7 @@ def _new_profile(now: float) -> dict[str, object]:
         "strategies": [],
         "curiosities": [],
         "developmental_goals": [],
+        "world": empty_world(),
         "conversations": {},
     }
 
@@ -954,6 +961,10 @@ def _validate_state(value: object) -> None:
                 if item.id in all_turn_ids:
                     raise StateIntegrityError("Turn IDs must be globally unique.")
                 all_turn_ids.add(item.id)
+        try:
+            validate_world(profile["world"], profile_id)
+        except ValueError as exc:
+            raise StateIntegrityError(str(exc)) from exc
 
 def _migrate_legacy(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or not isinstance(value.get("profiles"), dict):
@@ -961,6 +972,14 @@ def _migrate_legacy(value: object) -> dict[str, object]:
     version = value.get("schema_version")
     if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version < SCHEMA_VERSION:
         raise StateIntegrityError(f"Unsupported state schema: {version!r}.")
+    if version == 14:
+        migrated = copy.deepcopy(value)
+        migrated["schema_version"] = SCHEMA_VERSION
+        for profile in migrated["profiles"].values():
+            _mapping(profile, _PROFILE_KEYS - {"world"}, "schema-14 profile")
+            profile["world"] = empty_world()
+        _validate_state(migrated)
+        return migrated
     migrated = _empty_state()
     migrated["revision"] = int(value.get("revision") or 0)
     migrated["updated_at"] = _finite(value.get("updated_at") or time.time(), "state update time")
@@ -1190,9 +1209,13 @@ def _broad_self_kinds(query: str) -> frozenset[str]:
         return frozenset(SELF_KINDS)
     if "your interests" in normalized or "your hobbies" in normalized:
         return frozenset({"interest"})
-    if "your opinions" in normalized:
+    if "your opinion" in normalized:
         return frozenset({"opinion"})
-    if "your goals" in normalized or normalized == "what do you want":
+    if "favorite" in terms or "favourite" in terms:
+        return frozenset({"preference"})
+    if normalized == "what do you want":
+        return frozenset({"goal", "preference"})
+    if "your goals" in normalized:
         return frozenset({"goal"})
     if normalized in {"what do you like", "what do you prefer"}:
         return frozenset({"interest", "preference"})
@@ -2068,6 +2091,13 @@ class Store:
                     continue
                 result = self._apply_self(profile, change, current)
                 (applied if result else rejected).append(result or "self:invalid")
+            if proposal.world:
+                known_sources = known_world_sources(profile)
+                for change in proposal.world:
+                    accepted, result = apply_world_change(
+                        profile["world"], change, proposal.profile_id, known_sources,
+                    )
+                    (applied if accepted else rejected).append(result)
             mutation_seconds = time.perf_counter() - mutation_started
             if not applied:
                 return CommitResult(
@@ -2140,6 +2170,8 @@ class Store:
             curiosity_rows = profile["curiosities"]
             developmental_goal_rows = profile["developmental_goals"]
             query_terms = lexical_terms(query) - _GENERIC_QUERY_TERMS
+            if query_terms & {"eat", "meal", "hungry"}:
+                query_terms.add("food")
             broad = _broad_self_kinds(query)
             memory_topic_query = _memory_query_topic(query)
             self_ranked = []
@@ -2304,6 +2336,16 @@ class Store:
 
     def memories(self, profile_id: str) -> tuple[Memory, ...]:
         return self._profile_items(profile_id, "memories", _memory)
+
+    def world(self, profile_id: str) -> WorldSnapshot:
+        with self._lock:
+            profile = self._state["profiles"].get(profile_id)
+            return world_snapshot(profile["world"], profile_id) if profile else WorldSnapshot()
+
+    def current_world_state(
+        self, profile_id: str, entity_id: str, attribute: str,
+    ) -> WorldState | None:
+        return self.world(profile_id).current_state(entity_id, attribute)
 
     def experiences(self, profile_id: str) -> tuple[Experience, ...]:
         return self._profile_items(profile_id, "experiences", _experience)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import copy
 import json
 import math
@@ -9,10 +10,16 @@ import os
 import tempfile
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from app.core.config import SETTINGS
+from app.core.attention import _evaluate_attention
+from app.core.cognition import _build_frame, _percept_query
+from app.core.deliberation import _assess_frame
+from app.core.actions import ActionSelection
+from app.core.episodes import EpisodeBook, outcome_id, result_proposal, validate_producer
+from app.core.perception import PerceptBuffer
 from app.core.mind import (
     behavioral_tendency_state,
     curiosity_state,
@@ -1203,7 +1210,7 @@ def _migrate_legacy(value: object) -> dict[str, object]:
 def _broad_self_kinds(query: str) -> frozenset[str]:
     normalized = text_key(query)
     terms = lexical_terms(query)
-    if "yourself" in terms or normalized == "who are you":
+    if "yourself" in terms or normalized in {"who are you", "what are you like"}:
         return frozenset(SELF_KINDS)
     if normalized == "what have you changed your mind about":
         return frozenset(SELF_KINDS)
@@ -1284,6 +1291,193 @@ class Store:
         self._lock = threading.RLock()
         self._timing = threading.local()
         self._state = self._load_state()
+        self._perception = PerceptBuffer()
+        self._action_selection = ActionSelection()
+        self._episodes = EpisodeBook()
+        self.cognition = None
+
+    def start_cognition(self, **kwargs):
+        """Attach the process-local coordinator at runtime startup, not migration."""
+        from app.core.autonomy import CognitionCoordinator
+        with self._lock:
+            if self.cognition is None:
+                self.cognition = CognitionCoordinator(self, **kwargs)
+                self._perception.on_admit = self.cognition._notify
+                self.cognition.start()
+            return self.cognition
+
+    def close(self):
+        coordinator = self.cognition
+        if coordinator is not None:
+            coordinator.close()
+            with self._lock:
+                if self.cognition is coordinator:
+                    self._perception.on_admit = None
+                    self.cognition = None
+
+    def cognition_step(self, profile_id, percept_id, *, now, temporal=()):
+        """Trusted coordinator path: current frame → assessment → decision once."""
+        from app.core.cognition import FRAME_MAX_BYTES
+        with self._lock:
+            frame = self.cognitive_frame(profile_id, percept_id, now=now)
+            if frame is None:
+                return None
+            timed = replace(frame, temporal=temporal)
+            if len(timed.to_json().encode('utf-8')) <= FRAME_MAX_BYTES:
+                frame = timed
+            assessment = _assess_frame(frame)
+            decision = self._action_selection.decide(frame, assessment) if assessment else None
+            return frame, assessment, decision
+
+    def percepts(self, profile_id: str):
+        """Read passive, transient inputs for exactly one profile."""
+        with self._lock:
+            return self._perception.snapshot(profile_id)
+
+    def last_interaction_at(self, profile_id):
+        with self._lock:
+            profile = self._state['profiles'].get(profile_id, {})
+            return max((t['created_at'] for c in profile.get('conversations', {}).values()
+                        for t in c['turns'] if t['role'] == 'user'), default=None)
+
+    def attention(self, profile_id: str, *, now: float | None = None):
+        """Bounded, passive attention view; never accepts caller-supplied percepts."""
+        current = time.time() if now is None else now
+        if type(current) not in (int, float) or not math.isfinite(current) or current < 0:
+            raise ValueError("Attention time must be finite and nonnegative.")
+        with self._lock:
+            percepts = self._perception.snapshot(profile_id)
+            if not percepts:
+                return ()
+            return _evaluate_attention(
+                profile_id, percepts, world=self.world(profile_id),
+                self_items=self.self_items(profile_id),
+                tendencies=self.behavioral_tendencies(profile_id),
+                curiosities=self.curiosities(profile_id),
+                goals=self.developmental_goals(profile_id),
+                predictions=self.predictions(profile_id), outcomes=self.outcomes(profile_id),
+                now=current,
+            )
+
+    def record_percept_receipt(self, profile_id: str, *, source: str,
+                               producer: str, source_id: str, content: str,
+                               timestamp: float, subject: str = ""):
+        """Trusted local runtime/tool/task adapter; not an untrusted input API."""
+        with self._lock:
+            return self._perception.receipt(
+                profile_id, source=source, producer=producer, source_id=source_id,
+                content=content, timestamp=timestamp, subject=subject,
+            )
+
+    def cognitive_frame(self, profile_id: str, percept_id: str, *, now: float | None = None):
+        """Reconstruct one currently attended percept; no cache or durable write."""
+        current = time.time() if now is None else now
+        with self._lock:
+            attention = next((a for a in self.attention(profile_id, now=current)
+                              if a.percept_id == percept_id), None)
+            if attention is None:
+                return None
+            percept = next((p for p in self._perception.snapshot(profile_id)
+                            if p.id == percept_id), None)
+            if percept is None:
+                return None
+            world = self.world(profile_id)
+            query = _percept_query(percept, world)
+            return _build_frame(
+                percept, attention, query=query, world=world,
+                state=self.snapshot(profile_id, '', query=query, now=current),
+                predictions=self.predictions(profile_id) if 'surprise' in attention.reason_codes else (),
+                outcomes=self.outcomes(profile_id) if 'surprise' in attention.reason_codes else (),
+                now=current,
+            )
+
+    def deliberation_assessment(self, profile_id: str, percept_id: str, *, now: float | None = None):
+        """Assess a freshly reconstructed frame; no caller-provided/stale frames."""
+        with self._lock:
+            frame = self.cognitive_frame(profile_id, percept_id, now=now)
+            return _assess_frame(frame) if frame is not None else None
+
+    def action_decision(self, profile_id: str, percept_id: str, *, now: float | None = None):
+        """Explicit Phase 4E selection; only transient objectives may change."""
+        with self._lock:
+            frame = self.cognitive_frame(profile_id, percept_id, now=now)
+            if frame is None:
+                return None
+            assessment = _assess_frame(frame)
+            return self._action_selection.decide(frame, assessment) if assessment else None
+
+    def active_goals(self, profile_id: str):
+        with self._lock:
+            return self._action_selection.active(profile_id)
+
+    def finish_active_goal(self, profile_id: str, goal_id: str, *, status: str):
+        """Explicit local lifecycle operation, without outcome learning."""
+        with self._lock:
+            return self._action_selection.finish(profile_id, goal_id, status)
+
+    def start_action_episode(self, profile_id: str, percept_id: str, *, source: str,
+                             producer: str, occurrence_id: str, now: float | None = None):
+        """Trusted local producer reserves a later result for a current decision."""
+        validate_producer(source, producer, occurrence_id)
+        with self._lock:
+            decision = self.action_decision(profile_id, percept_id, now=now)
+            if decision is None:
+                return None
+            return self._track_action_decision(decision, source=source,
+                producer=producer, occurrence_id=occurrence_id)
+
+    def _track_action_decision(self, decision, *, source, producer, occurrence_id):
+        """Locked internal path also used by the coordinator's freshly built decision."""
+        goal = next((g for g in self.active_goals(decision.profile_id) if g.id == decision.active_goal_id), None)
+        strategy = next((s for s in self.strategies(decision.profile_id) if s.id == decision.strategy_id), None)
+        return self._episodes.start(decision, goal=goal, strategy=strategy,
+            source=source, producer=producer, occurrence_id=occurrence_id)
+
+    def action_episodes(self, profile_id: str):
+        with self._lock:
+            return self._episodes.snapshot(profile_id)
+
+    def resolve_action_episode(self, profile_id: str, episode_id: str, percept_id: str, *,
+                               result: str, completed_goal_id: str = '', now: float | None = None):
+        """Trusted local result adapter, never an HTTP/model-output ingress.
+
+        The caller supplies an observed result code, not a conclusion parsed from
+        receipt text. The pre-bound producer/occurrence and episode subject must
+        match an admitted Phase 4A receipt. All learning uses one existing commit.
+        """
+        if not isinstance(result, str) or result not in {'success', 'failure', 'inconclusive'}:
+            raise ValueError('Invalid action result.')
+        if not isinstance(completed_goal_id, str):
+            raise ValueError('Invalid completed goal reference.')
+        current = time.time() if now is None else now
+        if type(current) not in (int, float) or not math.isfinite(current) or current < 0:
+            raise ValueError('Result time must be finite and nonnegative.')
+        with self._lock:
+            receipt = next((p for p in self.percepts(profile_id) if p.id == percept_id), None)
+            if receipt is None:
+                return None
+            episode = self._episodes.match(profile_id, episode_id, receipt, current)
+            if episode is None:
+                return None
+            if completed_goal_id and (result != 'success' or receipt.source != 'task'
+                                     or completed_goal_id != episode.active_goal_id):
+                raise ValueError('Objective completion requires a matching successful task receipt.')
+            if result == 'inconclusive':
+                return self._episodes.finish(episode, receipt)
+            outcomes = self.outcomes(profile_id)
+            if any(o.id == outcome_id(receipt) for o in outcomes):
+                return None
+            proposal, resolved = result_proposal(
+                episode, receipt, result, strategies=self.strategies(profile_id),
+                tendencies=self.behavioral_tendencies(profile_id), outcomes=outcomes, now=current,
+            )
+            committed = self.commit(proposal, now=current)
+            if 'outcome:form' not in committed.applied:
+                return None
+            finished = self._episodes.finish(episode, receipt, outcome_id=outcome_id(receipt), prediction=resolved)
+            if completed_goal_id:
+                self._action_selection.finish(profile_id, completed_goal_id, 'completed')
+            return finished
 
     def _load_state(self) -> dict[str, object]:
         if not self.path.exists():
@@ -1528,14 +1722,11 @@ class Store:
     @staticmethod
     def _apply_experience(profile: dict[str, object], item: Experience) -> str:
         rows = profile["experiences"]
-        independently_grounded = {
-            "unresolved_curiosity", "resolved_curiosity",
-            "developmental_goal", "developmental_goal_release",
-        }
-        if rows and item.kind not in independently_grounded:
-            previous = _experience(rows[-1], item.profile_id)
-            if same_experience(previous, item):
-                return "experience:duplicate"
+        if any(
+            row["id"] == item.id or same_experience(_experience(row, item.profile_id), item)
+            for row in rows
+        ):
+            return "experience:duplicate"
         rows.append(_experience_row(item))
         protected = {
             source_id
@@ -1583,6 +1774,7 @@ class Store:
         rows = profile["outcomes"]
         if any(
             row["id"] == item.id
+            or row["source_turn_ids"] == list(item.source_turn_ids)
             or (
                 row["result"] == item.result
                 and row["action_turn_id"] == item.action_turn_id
@@ -1871,6 +2063,8 @@ class Store:
             candidate, profile = self._candidate(proposal.profile_id, current)
             applied: list[str] = []
             rejected = list(proposal.rejected)
+            perceived_turns = []
+            before_world = profile["world"] if not proposal.world else copy.deepcopy(profile["world"])
             mutation_started = time.perf_counter()
             for turn in proposal.turns:
                 if turn.profile_id != proposal.profile_id:
@@ -1878,6 +2072,7 @@ class Store:
                     continue
                 if self._append_turn(profile, turn, current):
                     applied.append(f"turn:{turn.role}")
+                    perceived_turns.append(turn)
                 else:
                     rejected.append("turn:duplicate")
             for change in proposal.memories:
@@ -2113,6 +2308,11 @@ class Store:
             validation_seconds = time.perf_counter() - validation_started
             write_metrics = self._write_state(candidate)
             self._state = candidate
+            self._perception.committed(
+                proposal.profile_id, perceived_turns, before_world,
+                profile["world"] if proposal.world else {},
+                candidate["revision"], current,
+            )
             lock_held = time.perf_counter() - lock_acquired
         return CommitResult(
             int(candidate["revision"]), tuple(applied), tuple(rejected),
@@ -2458,7 +2658,12 @@ class Store:
 
     def clear_profile(self, profile_id: str) -> None:
         with self._lock:
+            if self.cognition is not None:
+                self.cognition.clear(profile_id)
             if profile_id not in self._state["profiles"]:
+                self._perception.clear(profile_id)
+                self._action_selection.clear(profile_id)
+                self._episodes.clear(profile_id)
                 return
             now = time.time()
             candidate = dict(self._state)
@@ -2472,6 +2677,10 @@ class Store:
             _validate_state(candidate)
             self._write_state(candidate)
             self._state = candidate
+
+            self._perception.clear(profile_id)
+            self._action_selection.clear(profile_id)
+            self._episodes.clear(profile_id)
 
     def debug_snapshot(self, profile_id: str, conversation_id: str, query: str = "") -> dict[str, object]:
         state = self.snapshot(profile_id, conversation_id, query=query)
@@ -2558,4 +2767,6 @@ def get_store() -> Store:
         with _STORE_LOCK:
             if _STORE is None:
                 _STORE = Store()
+                _STORE.start_cognition()
+                atexit.register(_STORE.close)
     return _STORE

@@ -52,8 +52,7 @@ _GENERIC_TOPIC_TERMS = frozenset({
     "versus", "vs", "with", "would", "you", "your",
 })
 
-# These remaining language cues serve user Memory extraction only. Developed Self
-# evidence arrives through the structured sidecar validated below.
+# These cues guard Memory extraction and structured Self candidate admission.
 _TEMPORARY_MARKERS = (
     "at the moment", "for this one", "for now", "in this situation",
     "just this once", "pretend", "right now", "roleplay", "temporary",
@@ -71,6 +70,10 @@ _MEMORY_CUES = re.compile(
     re.IGNORECASE,
 )
 _HYPOTHETICAL_OPENERS = ("if ", "imagine ", "maybe ", "pretend ", "suppose ")
+_CURRENT_WANT = re.compile(
+    r"\b(?:i(?:'m| am) craving|i crave|for this task|for this meal)\b",
+    re.IGNORECASE,
+)
 _OTHER_PERSON_CLAIM = re.compile(
     r"\b(?:my\s+(?:brother|coworker|dad|father|friend|mother|mom|sister)|"
     r"he|she|someone|somebody|they)\s+"
@@ -245,10 +248,17 @@ def _adjust_strength_confidence(
 def _same_self_topic(kind: str, left: object, right: object) -> bool:
     left_key = text_key(left)
     right_key = text_key(right)
-    left_is_comparison = bool({"vs", "versus"} & set(left_key.split()))
-    right_is_comparison = bool({"vs", "versus"} & set(right_key.split()))
+    comparison = r"\b(?:vs|versus|over|rather than|more than|better than)\b"
+    left_is_comparison = bool(re.search(comparison, left_key))
+    right_is_comparison = bool(re.search(comparison, right_key))
     if kind == "preference" and left_is_comparison != right_is_comparison:
         return False
+    if kind == "preference":
+        left_terms = self_topic_terms(left)
+        right_terms = self_topic_terms(right)
+        return left_key == right_key or (
+            len(left_terms & right_terms) / max(1, len(left_terms | right_terms)) >= 0.67
+        )
     return self_topic_similarity(left, right) >= 0.67
 
 
@@ -719,6 +729,8 @@ def validate_semantic_evidence(
     if kind in _SELF_EVIDENCE_KINDS and (
         _has_non_durable_framing(user_key)
         or _has_non_durable_framing(evidence_key)
+        or _CURRENT_WANT.search(user_key)
+        or _CURRENT_WANT.search(evidence_key)
     ):
         return None
     if kind in _CURIOSITY_EVIDENCE_KINDS:
@@ -738,6 +750,13 @@ def validate_semantic_evidence(
             curiosity_focus=curiosity_focus,
         )
     if kind in _DEVELOPMENTAL_GOAL_EVIDENCE_KINDS:
+        if (
+            _has_non_durable_framing(user_key)
+            or _has_non_durable_framing(evidence_key)
+            or _CURRENT_WANT.search(user_key)
+            or _CURRENT_WANT.search(evidence_key)
+        ):
+            return None
         expected_stance = (
             "positive" if kind == "developmental_goal" else "negative"
         )
@@ -795,6 +814,14 @@ def validate_semantic_evidence(
         )
         if len(matches) != 1:
             return None
+        if re.fullmatch(r"(?:it|that) (?:worked|failed|helped)[.!]?", evidence_key):
+            latest = next((turn for turn in reversed(recent_turns)
+                           if turn.role == "assistant"
+                           and turn.profile_id == user_turn.profile_id
+                           and turn.conversation_id == user_turn.conversation_id
+                           and turn.id != assistant_turn.id), None)
+            if latest is None or latest.id != matches[0].id:
+                return None
         return SemanticEvidence(
             kind, topic, stance, durability, evidence,
             action=action, action_turn_id=matches[0].id,
@@ -920,10 +947,15 @@ def derive_world_changes(
     evidence = source_turn.content
     if not _world_source_is_asserted(evidence):
         return ()
+    if re.search(r'["“”]', evidence) or evidence.lstrip().startswith('>'):
+        return ()
     if kind != "wr-" and re.search(r"\b(?:not|never|no longer)\b",
                                   _normalized_evidence(evidence)):
         return ()
-    timestamp = time.time() if now is None else float(now)
+    current_time = time.time() if now is None else float(now)
+    if source_turn.created_at > current_time:
+        return ()
+    timestamp = source_turn.created_at
     entities = tuple(item for item in world.entities if item.profile_id == profile_id)
     formed: list[WorldChange] = []
 
@@ -940,7 +972,8 @@ def derive_world_changes(
             item = matches[0]
             if _world_span(item.label, evidence) or _world_span(item.id, evidence):
                 return item
-            if discourse and source_turn == user_turn and prior_users:
+            if (discourse and source_turn == user_turn and prior_users
+                    and re.search(r"\b(?:it|that)\b", evidence, re.I)):
                 previous = max(prior_users, key=lambda turn: turn.created_at)
                 mentioned = [item for item in entities if _world_span(item.label, previous.content)]
                 if len(mentioned) == 1 and mentioned[0].id == item.id:
@@ -961,6 +994,8 @@ def derive_world_changes(
         return tuple(formed)
     attribute = _normalized_evidence(payload["a"])
     if not attribute or len(attribute) > 200:
+        return ()
+    if kind == "wf" and attribute in {"status", "activity", "focus", "intention"}:
         return ()
     value = payload.get("v", "").strip()
     if kind in {"ws", "wf"} and not _world_span(value, evidence):
@@ -1167,7 +1202,11 @@ def same_experience(previous: Experience, candidate: Experience) -> bool:
         ).ratio() >= 0.82
     )
     return (
-        previous.kind == candidate.kind
+        previous.profile_id == candidate.profile_id
+        and (
+            previous.kind == candidate.kind
+            or {previous.kind, candidate.kind} <= (_SELF_EVIDENCE_KINDS | {"mind_change"})
+        )
         and previous.subject == candidate.subject
         and previous.source_turn_ids == candidate.source_turn_ids
         and same_topic
@@ -1255,6 +1294,14 @@ def behavioral_tendency_state(item: BehavioralTendency) -> str:
     return "reinforced"
 
 
+def _development_similarity(left: str, right: str) -> float:
+    """Require overlap across both learning targets, not just the shorter one."""
+    if text_key(left) == text_key(right):
+        return 1.0
+    left_terms, right_terms = self_topic_terms(left), self_topic_terms(right)
+    return len(left_terms & right_terms) / max(1, len(left_terms | right_terms))
+
+
 def find_behavioral_tendency(
     tendencies: tuple[BehavioralTendency, ...],
     context: str,
@@ -1263,8 +1310,8 @@ def find_behavioral_tendency(
     return _best_match(
         tendencies,
         lambda item: min(
-            self_topic_similarity(context, item.context),
-            self_topic_similarity(behavior, item.behavior),
+            _development_similarity(context, item.context),
+            _development_similarity(behavior, item.behavior),
         ),
     )
 
@@ -1393,8 +1440,8 @@ def find_strategy(
     return _best_match(
         strategies,
         lambda item: min(
-            self_topic_similarity(context, item.context),
-            self_topic_similarity(procedure, item.procedure),
+            _development_similarity(context, item.context),
+            _development_similarity(procedure, item.procedure),
         ),
     )
 
@@ -1481,7 +1528,7 @@ def _strategy_change_from_outcome(
     replacement_candidates = tuple(
         item for item in strategies
         if item.status in {"uncertain", "retired"}
-        and self_topic_similarity(semantic.topic, item.context) >= 0.67
+        and _development_similarity(semantic.topic, item.context) >= 0.67
     )
     if len(replacement_candidates) == 1:
         replaced = replacement_candidates[0]
@@ -1539,7 +1586,7 @@ def find_curiosity(
 ) -> Curiosity | None:
     return _best_match(
         curiosities,
-        lambda item: self_topic_similarity(topic, item.topic),
+        lambda item: _development_similarity(topic, item.topic),
     )
 
 
@@ -1689,8 +1736,8 @@ def find_developmental_goal(
     return _best_match(
         goals,
         lambda item: min(
-            self_topic_similarity(topic, item.topic),
-            self_topic_similarity(goal, item.goal),
+            _development_similarity(topic, item.topic),
+            _development_similarity(goal, item.goal),
         ),
     )
 
@@ -2105,6 +2152,8 @@ def derive_curiosity_changes(
         experience = _developmental_goal_evidence_experience(
             profile_id, user_turn, assistant_turn, semantic, now=current,
         )
+        if any(same_experience(item, experience) for item in experiences):
+            return ((memory,) if memory else (), (), (), (), tuple(prediction_changes), (), (), ())
         return (
             (memory,) if memory else (), (), (experience,), (),
             tuple(prediction_changes), (), (), (),
@@ -2113,6 +2162,8 @@ def derive_curiosity_changes(
         experience = _curiosity_evidence_experience(
             profile_id, user_turn, assistant_turn, semantic, now=current,
         )
+        if any(same_experience(item, experience) for item in experiences):
+            return ((memory,) if memory else (), (), (), (), tuple(prediction_changes), (), (), ())
         existing_curiosity = find_curiosity(curiosities, semantic.topic)
         curiosity_change = None
         if semantic.kind == "unresolved_curiosity":
@@ -2124,7 +2175,7 @@ def derive_curiosity_changes(
                 prior = tuple(
                     item for item in experiences
                     if item.kind == "unresolved_curiosity"
-                    and self_topic_similarity(item.topic, semantic.topic) >= 0.67
+                    and _development_similarity(item.topic, semantic.topic) >= 0.67
                 )
                 if prior:
                     curiosity_change = _form_curiosity(
@@ -2146,8 +2197,8 @@ def derive_curiosity_changes(
     if semantic.kind in _EVENT_EVIDENCE_KINDS:
         if semantic.action_turn_id:
             duplicate = any(
-                item.result == semantic.kind
-                and item.action_turn_id == semantic.action_turn_id
+                (item.result == semantic.kind and item.action_turn_id == semantic.action_turn_id)
+                or user_turn.id in item.source_turn_ids
                 for item in outcomes
             )
             outcome = None if duplicate else _grounded_outcome(
@@ -2290,7 +2341,7 @@ def derive_curiosity_changes(
         self_item_id=self_item_id,
         existing=existing, now=current,
     )
-    if experiences and same_experience(experiences[-1], experience):
+    if any(same_experience(previous, experience) for previous in experiences):
         return (
             (memory,) if memory else (), (), (), (),
             tuple(prediction_changes), (), (), (),

@@ -10,34 +10,25 @@ from functools import lru_cache
 from app.core.character import Character, load_character_profile
 from app.core.config import SETTINGS
 from app.core.context import TurnContext, format_context_sections
-from app.core.situation import SITUATION_RULES
-from app.core.retrieval import RETRIEVAL_RULES
 from app.core.streaming import SEMANTIC_SIDECAR_END, SEMANTIC_SIDECAR_START
 
 
-_STABLE_RULES = f"""A=Akane;U=user;STATE=context;no labels/reasoning.
-When asked for your view or choice, form a present judgment naturally, even with empty Self. This is a present stance, not proof of past experience.
-STEP 1 — choose domain:
-WORLD first: the CURRENT U turn directly establishes external entities/state/events/relations. U's direct report takes priority over A's reaction; no sensory/physical/tool access needed.
-SELF otherwise: A expresses a meaningful preference/opinion/interest/etc., or eligible Development evidence. d=c is a weak candidate; no prior history needed.
-NONE: neither domain has eligible evidence. Recall questions, hypotheticals/imagined statements and neutral greetings: n. They are not new World evidence. Never replay old evidence.
-STEP 2 — if WORLD, choose kind:
-ws: one entity has a mutable current state/property; d="na".
-wr: two distinct entities relate/link/connect/belong/point to each other; use wr, NOT wf; d="na".
-wf: durable proposition about one entity, NOT an entity-to-entity relation; d="da".
-wv: newly reported historical occurrence; k,t,a,d="pa"; no v.
-we: entity existence; k,t,d="na". wr-: remove relation; k,t,a,v,d="nn".
-STEP 3 — emit exactly one existing shape; never mix Self and World fields or invent kinds/scope codes.
-SELF p/o/i/g=preference/opinion/interest/goal: k,t,s,d. NEVER e or a; v only for comparative s=cmp.
+_STATE_RULES = """Use relevant state naturally, not as a script or a list to recite.
+For present questions, answer directly from AKANE_NOW/WORLD_NOW; BEFORE/HISTORY is past, never current or proof of continuity. Each turn's NOW lists replace earlier retrieval; omitted slots are unknown.
+Describe yourself from Identity and actually developed Self, not generic undeveloped traits. S is a view with its stated development level; a present judgment is not an established trait. Preferences do not prove physical events. Current intention/desire answers what you want now, independently of lasting preferences or developmental goals.
+M/E and history ground remembered claims; preserve whose experience or preference each record describes. An expressed judgment proves only that it was expressed. Use supplied time for time questions; do not guess the clock or mention time unasked. Keep state labels out of ordinary replies."""
+
+_STABLE_RULES = f"""A=Akane's visible reply; U=current user turn.
+After the natural reply append {SEMANTIC_SIDECAR_START}JSON{SEMANTIC_SIDECAR_END}; always close it, with nothing afterward. Keep protocol markup and reasoning out of the visible reply. JSON is one object from the forms below; omit unused fields.
+Choose World for a direct U report; otherwise meaningful A Self or grounded Development evidence. Greetings, recall-only turns and no eligible evidence: {{"k":"n"}}. Uncertain, hypothetical, quoted, third-party or generated external claims are not World evidence; ambiguity/negation is not an opposite fact.
+Self: k=p/o/i/g (preference/opinion/interest/goal), t=concrete topic, s=+/-/0/cmp, d=c/tmp/hyp/task/n (candidate/temporary/hypothetical/task-local/none). Candidate needs no prior history. Never e or a. For cmp only, v=preferred target verbatim in A; t names both compared targets. Keep specific preferences specific, including their domain when useful.
+World: k=we (entity), ws (mutable state), wf (durable fact), wr (relation), wr- (remove relation), wv (past event). Required k,t,d; add a except we; add v for ws/wf/wr/wr-. d=na for we/ws/wr, da for wf, nn for wr-, pa for wv. t=entity, a=attribute/predicate/relation/event, v=value/target. Relations connect entities; never encode them as facts. wr may add b=old target for replacement.
+Current Self and World sources are bound by runtime: no e or source IDs. World values must occur in U; reuse entity labels/IDs and attribute keys. Only prior-source wf/wv add z=existing Memory/Experience ID and e=complete original U quote.
+Present Akane situation uses ws,t=Akane,a=activity/focus/status/intention,v=exact A span,d=na. Physical activity needs dialogue/runtime support; no invented offscreen activity.
+Development: required k,t,s,d,e. k=c (correction), f+/f- (feedback), t+/t- (task result), x+/x- (expected success/failure), u+/u- (open/resolve curiosity), j+/j- (growth goal/drop). s=+/-/0/cmp; d uses Self codes. e=exact evidence: U for results, A for predictions/goals, A/U for u+/u-.
+Results may add a=unique prior A action, b/f=behavior/effect together, r=procedure, j=explicit growth goal. Predictions require d=task,a=action in A,q=h/l confidence. Curiosity requires w=focus; no question requirement. Growth goals require j=lasting growth direction, not immediate task intention.
 {{"k":"p","t":"topic","s":"+","d":"c"}}
-WORLD STATE / FACT / RELATION: k,t,a,v,d. NEVER e or s for current reports.
-{{"k":"ws","t":"entity","a":"attribute","v":"value","d":"na"}}
-{{"k":"wr","t":"subject","a":"relation","v":"target","d":"na"}}
-NONE: {{"k":"n"}}
-Substitute actual subjects/values. Runtime binds Self to A's complete visible reply and direct World to the complete current U turn, with their source IDs. Do not emit alternate sources. World v must occur in U; reuse entity labels/IDs and attribute keys. Uncertainty, third-party reports and generated claims are not World evidence. Ambiguity means n; never infer opposite values from negation. ws records transition history. wr:b=old target replaces an edge. Only prior-source wf/wv add z=existing Memory/Experience ID and e=its complete original U quote.
-Existing Development witness grammar (separate from current Self/World):
-k: c=correction;f+/f-=feedback;t+/t-=task result;x+/x-=prediction;u+/u-=open/resolved curiosity;j+/j-=goal commit/drop. Required k,t,s,d,e. s=+/-/0/cmp;d=c/tmp/hyp/task/n. Events:e=U,a=prior act,b/f=behavior/effect,r=procedure,j=goal;generated event claims alone are not evidence. Predict:d=task,e/a=expect/action,q=h/l. Curiosity:w=focus,e=A/U for u+/u-;not a question mandate. Goal:j=intention,e=A;context-only,no autonomous action. Omit unused fields.
-After one short visible sentence, append {SEMANTIC_SIDECAR_START}JSON{SEMANTIC_SIDECAR_END}, replacing JSON with the chosen object. Always emit the literal {SEMANTIC_SIDECAR_END}, including NONE; nothing after it."""
+{{"k":"ws","t":"entity","a":"attribute","v":"value","d":"na"}}"""
 
 STATE_MARKER = "STATE"
 USER_MARKER = "U"
@@ -83,14 +74,14 @@ def _stable_prompt_parts(
 def stable_system_prompt(character: Character | None = None) -> str:
     character = character or load_character_profile()
     return _stable_prompt_parts(
-        character.content_sha256, character.identity, character.voice, _STABLE_RULES + "\n" + SITUATION_RULES + "\n" + RETRIEVAL_RULES,
+        character.content_sha256, character.identity, character.voice, _STATE_RULES + "\n" + _STABLE_RULES,
     )[0]
 
 
 def stable_prompt_hash(character: Character | None = None) -> str:
     character = character or load_character_profile()
     return _stable_prompt_parts(
-        character.content_sha256, character.identity, character.voice, _STABLE_RULES + "\n" + SITUATION_RULES + "\n" + RETRIEVAL_RULES,
+        character.content_sha256, character.identity, character.voice, _STATE_RULES + "\n" + _STABLE_RULES,
     )[1]
 
 
@@ -247,7 +238,7 @@ def build_dialogue_prompt(
     token_sections = {
         "identity": character.identity,
         "soul": character.voice,
-        "stable_rules": _STABLE_RULES + "\n" + SITUATION_RULES + "\n" + RETRIEVAL_RULES,
+        "stable_rules": _STATE_RULES + "\n" + _STABLE_RULES,
         "state_wrapper": f"{STATE_MARKER}\n{USER_MARKER}" if context_sections else USER_MARKER,
         **dict(context_sections),
         "recent_dialogue": "" if append_only else "\n".join(turn.content for turn in recent),

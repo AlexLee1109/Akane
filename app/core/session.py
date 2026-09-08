@@ -314,6 +314,8 @@ def run_companion_turn(
         if streaming and on_speakable is not None else None
     )
     try:
+        if store.cognition is not None:
+            store.cognition.foreground_started()
         log_performance("foreground_event", stage="request_start", at=time.time())
         runtime.foreground_started()
         prior_reply = store.reply_for_request(chat.conversation_id, chat.profile_id, chat.request_id)
@@ -1069,6 +1071,8 @@ def run_companion_turn(
         if speech_dispatcher is not None:
             speech_dispatcher.close()
         runtime.foreground_finished()
+        if store.cognition is not None:
+            store.cognition.foreground_finished()
         _SCHEDULER.finish(handle)
 
 

@@ -203,6 +203,15 @@ def apply_world_change(
         return False, f"{label}:duplicate" if duplicate else f"{label}:immutable"
     if change.action == "remove" and (by_id is None or _key(item) != _key(by_id)):
         return False, f"{label}:target-mismatch"
+    if current is None and isinstance(item, WorldRelation) and any(
+        event["kind"] == "relation_transition"
+        and event["attribute"] == item.relation
+        and item.subject_id == event["entity_ids"][0]
+        and item.object_id == event["before"]
+        and item.updated_at <= event["created_at"]
+        for event in world["events"]
+    ):
+        return False, f"{label}:stale"
     if current:
         item = replace(item, id=current.id, created_at=current.created_at)
         if item == current:

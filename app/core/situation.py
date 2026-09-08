@@ -113,8 +113,11 @@ def external_evidence(raw, world):
 def derive_situation_changes(raw, user_turn, assistant_turn, *, world, now, runtime=None):
     if (user_turn.role != "user" or assistant_turn.role != "assistant"
             or user_turn.profile_id != assistant_turn.profile_id
-            or user_turn.conversation_id != assistant_turn.conversation_id):
+            or user_turn.conversation_id != assistant_turn.conversation_id
+            or not user_turn.id or not assistant_turn.id or user_turn.id == assistant_turn.id
+            or user_turn.created_at > now or assistant_turn.created_at > now):
         return ()
+    now = assistant_turn.created_at
     profile_id = user_turn.profile_id
     entity = akane_entity(world, profile_id)
     if entity is None and any(e.label.casefold() == "akane" for e in world.entities):

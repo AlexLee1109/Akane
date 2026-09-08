@@ -480,6 +480,7 @@ def _start_model_loading() -> None:
 async def _lifespan(app: FastAPI):
     character = load_character_profile()
     store = get_store()
+    store.start_cognition()
     if SETTINGS.prompt_debug:
         from app.core.prompt import stable_prompt_hash
 
@@ -530,6 +531,7 @@ async def _lifespan(app: FastAPI):
             public_sessions.shutdown()
         app.state.public_sessions = None
         cancel_all_generations()
+        store.close()
         InferenceRuntime.get_instance().close()
 
 

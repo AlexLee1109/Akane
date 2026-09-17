@@ -20,11 +20,11 @@ const routeMetadata: Record<string, RouteMetadata> = {
   },
   "/demo": {
     title: "Meet Akane · Live Demo",
-    description: "Talk to Akane through an isolated temporary guest session, or try a clearly labeled simulated preview when she is offline.",
+    description: "Talk to Akane in a private temporary conversation, or try a clearly labeled simulated preview when she is offline.",
   },
   "/technology": {
     title: "How Akane Works · Technology",
-    description: "See how one local generation produces Akane’s reply and grounded evidence for a persistent, developing Self.",
+    description: "See how one local generation produces Akane’s reply and evidence that can shape her developing Self.",
   },
   "/about": {
     title: "About Akane · Project Story",
@@ -44,16 +44,24 @@ function GithubLink({ children, className }: { children: ReactNode; className: s
 
 function Navbar() {
   const [open, setOpen] = useState(false);
+  const [scrolled, setScrolled] = useState(false);
   const location = useLocation();
   const links = [["/", "Home"], ["/demo", "Demo"], ["/technology", "Technology"], ["/about", "About"]] as const;
 
   useEffect(() => setOpen(false), [location.pathname]);
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 24);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
 
-  return <header className={`site-header ${location.pathname === "/" ? "home-header" : ""}`}>
+  return <header className={`site-header ${location.pathname === "/" ? `home-header ${scrolled ? "is-scrolled" : ""}` : ""}`}>
     <nav className="nav shell" aria-label="Primary navigation">
       <Link className="brand" to="/" aria-label="Akane home">
         <Logo />
         <strong>Akane</strong>
+        {location.pathname === "/" && <span className="home-brand-tagline">A more human tomorrow</span>}
       </Link>
       <button
         className="menu-button"
@@ -67,7 +75,7 @@ function Navbar() {
       </button>
       <div id="nav-links" className={`nav-links ${open ? "open" : ""}`}>
         {links.map(([to, label]) => <NavLink key={to} to={to} end={to === "/"}>{label}</NavLink>)}
-        <GithubLink className="nav-github">GitHub</GithubLink>
+        {location.pathname === "/" ? <Link className="home-nav-cta" to="/demo">Try Demo <span aria-hidden="true">→</span></Link> : <GithubLink className="nav-github">GitHub</GithubLink>}
       </div>
     </nav>
   </header>;

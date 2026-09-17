@@ -20,16 +20,16 @@ const runtimeFacts = [
 ] as const;
 
 const interfaces = [
-  { title: "Desktop popup", text: "A thin private owner interface for keeping Akane nearby." },
+  { title: "Desktop popup", text: "A private owner interface for keeping Akane nearby." },
   { title: "Discord", text: "The same owner profile and continuing companion in Discord." },
   { title: "Website guest", text: "A temporary isolated profile that never accesses private owner memory." },
 ] as const;
 
 const roadmap = [
-  { label: "Now", title: "Developmental Self + consequence learning", text: "Grounded experience can shape durable judgments and future behavior." },
+  { label: "Now", title: "Developmental Self + consequence learning", text: "What follows her choices can shape lasting judgments and future behavior." },
   { label: "Next", title: "Voice + expression", text: "A more expressive presentation for the same continuing Akane." },
   { label: "Then", title: "Live2D / 3D embodiment", text: "A richer visual presence without moving identity into the renderer." },
-  { label: "Later", title: "Deeper world modeling", text: "More capable learned adaptation, developed carefully from grounded evidence." },
+  { label: "Later", title: "Deeper world modeling", text: "A richer understanding of situations, consequences, and which strategies work over time." },
 ] as const;
 
 function SectionHeading({ eyebrow, title, description, id }: { eyebrow: string; title: string; description?: string; id: string }) {
@@ -38,7 +38,7 @@ function SectionHeading({ eyebrow, title, description, id }: { eyebrow: string; 
 
 function TechnologyHero() {
   return <section className="page-hero tech-hero" aria-labelledby="technology-title">
-    <div className="shell"><p className="eyebrow">Technology</p><h1 id="technology-title">How Akane works</h1><p className="page-lead">One local generation carries the dialogue path. Grounded evidence from that same turn can shape a persistent, developing Self.</p></div>
+    <div className="shell"><p className="eyebrow">Technology</p><h1 id="technology-title">How Akane works</h1><p className="page-lead">Each reply comes from one local generation. Evidence from that same turn can shape Akane’s developing Self over time.</p></div>
   </section>;
 }
 
@@ -58,8 +58,8 @@ function DevelopmentFlow() {
   return <section className="section tech-development" aria-labelledby="development-title">
     <div className="shell tech-development-grid">
       <div>
-        <SectionHeading eyebrow="How Akane develops" title="A Self built from evidence, not seed interests." description="Akane begins with a minimal fixed identity. Preferences and opinions are not filled in ahead of time; they can form from judgments she actually makes and experiences grounded in conversation." id="development-title" />
-        <p className="tech-development-note">Outcomes can resolve predictions and shape behavioral tendencies or strategies. Unresolved questions and recurring evidence can also support curiosity and developmental goals.</p>
+        <SectionHeading eyebrow="How Akane develops" title="A Self shaped by what actually happens." description="Akane begins with a minimal fixed identity. Her preferences and opinions are not filled in ahead of time; they can form from judgments she actually makes in conversation." id="development-title" />
+        <p className="tech-development-note">Over time, consequences can strengthen or weaken expectations and ways of responding. Unresolved questions can also grow into curiosity or goals.</p>
       </div>
       <figure className="tech-development-map" aria-labelledby="development-map-caption">
         <figcaption id="development-map-caption" className="sr-only">Conversation enters Qwen, which produces a spoken response and hidden semantic evidence. Evidence can form an Experience, Developed Self, Outcomes, and learned behavior.</figcaption>
@@ -71,7 +71,7 @@ function DevelopmentFlow() {
           <article><small>Visible</small><strong>Spoken response</strong><p>What Akane says to you.</p></article>
           <article className="evidence"><small>Hidden</small><strong>Semantic evidence</strong><p>Structured meaning from the same generation.</p><span aria-hidden="true">↓</span><b>Grounded Experience</b><span aria-hidden="true">↓</span><div><b>Developed Self</b><b>Outcomes</b></div></article>
         </div>
-        <div className="tech-learning-row"><span>Predictions</span><span>Behavioral tendencies</span><span>Strategies</span><span>Curiosity</span><span>Developmental goals</span></div>
+        <div className="tech-learning"><strong>Learns from consequences</strong><div className="tech-learning-row"><span>Predictions</span><span>Tendencies</span><span>Strategies</span><span>Curiosity</span><span>Goals</span></div></div>
       </figure>
     </div>
   </section>;
@@ -89,7 +89,7 @@ function Runtime() {
 function Interfaces() {
   return <section className="section tech-interfaces" aria-labelledby="tech-interfaces-title">
     <div className="shell tech-interfaces-grid">
-      <SectionHeading eyebrow="Where Akane appears" title="Thin interfaces around one companion." description="Presentation changes by surface; identity and state ownership do not." id="tech-interfaces-title" />
+      <SectionHeading eyebrow="Where Akane appears" title="Different interfaces, one companion." description="Each interface changes the presentation, not Akane’s identity or saved state." id="tech-interfaces-title" />
       <div>{interfaces.map(item => <article key={item.title}><h3>{item.title}</h3><p>{item.text}</p></article>)}</div>
     </div>
   </section>;

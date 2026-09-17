@@ -37,7 +37,7 @@ export function DemoControls(props: DemoControlsProps) {
   return <div className="demo-controls demo-panel">
     <div className="status-pill" aria-label={`Demo status: ${statusLabels[props.connection]}`} aria-live="polite"><i className={`demo-status-dot ${props.connection}`} aria-hidden="true" />{statusLabels[props.connection]}</div>
     {props.connection === "offline" && <div className="demo-mode-note"><span>Akane is offline right now.</span><button type="button" onClick={props.onOpenPreview}>Try Preview</button></div>}
-    {preview && <span className="demo-mode-note">Preview responses are simulated and are not sent to Akane.</span>}
+    {preview && <span className="demo-mode-note">Simulated responses. Nothing is sent to Akane.</span>}
     {live && !props.guestEnabled && <span className="demo-mode-note">Guest messages are unavailable right now.</span>}
     <details className="demo-options">
       <summary aria-label="Open conversation options"><span aria-hidden="true">•••</span> Options</summary>

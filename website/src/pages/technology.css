@@ -33,7 +33,9 @@
 .tech-map-branches .evidence > b { display: block; padding: 9px; border-radius: 9px; background: rgba(255,255,255,.1); color: white; font-size: .75rem; }
 .tech-map-branches .evidence > div { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 7px; }
 .tech-map-branches .evidence > div b { padding: 9px 7px; border-radius: 9px; background: rgba(123,220,244,.13); color: white; font-size: .72rem; }
-.tech-learning-row { display: flex; width: 100%; flex-wrap: wrap; justify-content: center; gap: 7px; margin-top: 14px; }
+.tech-learning { width: 100%; margin-top: 14px; text-align: center; }
+.tech-learning > strong { color: white; font-size: .78rem; }
+.tech-learning-row { display: flex; width: 100%; flex-wrap: wrap; justify-content: center; gap: 7px; margin-top: 8px; }
 .tech-learning-row span { padding: 7px 10px; border: 1px solid rgba(255,255,255,.14); border-radius: 999px; color: rgba(255,255,255,.73); font-size: .68rem; }
 
 .tech-runtime { background: var(--mist); }
@@ -61,4 +63,4 @@
 
 @media (max-width: 980px) { .tech-response-flow ol { grid-template-columns: repeat(2,minmax(0,1fr)); } .tech-response-flow li + li { border-left: 0; } .tech-response-flow li:nth-child(even) { border-left: 1px solid var(--line); } .tech-response-flow li + li::before { display: none; } .tech-development-grid { grid-template-columns: 1fr; } .tech-runtime-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } .tech-roadmap ol { grid-template-columns: repeat(2,minmax(0,1fr)); } .tech-roadmap li:nth-child(3) { border-left: 0; } }
 @media (max-width: 720px) { .tech-hero::after { right: -180px; } .tech-response-flow ol, .tech-runtime-grid, .tech-roadmap ol { grid-template-columns: 1fr; } .tech-response-flow li:nth-child(even), .tech-roadmap li + li { border-left: 0; } .tech-development-grid { gap: 30px; } .tech-map-branches { grid-template-columns: 1fr; } .tech-interfaces-grid { grid-template-columns: 1fr; gap: 12px; } .tech-interfaces article { grid-template-columns: 1fr; gap: 7px; } .tech-roadmap-heading { align-items: flex-start; flex-direction: column; } .tech-roadmap-heading .button { margin: -15px 0 34px; } }
-@media (max-width: 420px) { .tech-map-branches .evidence > div { grid-template-columns: 1fr; } .tech-learning-row { justify-content: flex-start; } }
+@media (max-width: 420px) { .tech-map-branches .evidence > div { grid-template-columns: 1fr; } .tech-learning { text-align: left; } .tech-learning-row { justify-content: flex-start; } }

@@ -13,9 +13,11 @@ type ConnectionState = "connecting" | "live" | "offline" | "preview";
 
 const characterAsset = `${projectConfig.basePath}assets/akane-hero.png`;
 const previewReplies = [
-  "Hello. It’s nice to meet you.",
-  "A quiet moment can still be worth remembering.",
-  "Some thoughts make more sense when you can return to them later.",
+  "Hey. Nice to meet you.",
+  "Hmm, I think I’d pick ramen.",
+  "That sounds kind of fun, actually.",
+  "I’m not sure yet, but I have a feeling I’d like it.",
+  "Okay, yeah. I can see the appeal.",
 ];
 const retryDelays = [5_000, 15_000, 30_000, 60_000];
 

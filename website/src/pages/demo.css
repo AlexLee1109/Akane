@@ -61,7 +61,7 @@
 
 .demo-controls { position: relative; display: flex; min-height: 56px; align-items: center; gap: 14px; padding: 10px 14px; border-top: 1px solid var(--line); border-radius: 0 0 25px 25px; background: #f8faff; }
 .demo-controls .status-pill { flex: 0 0 auto; }
-.demo-mode-note { display: flex; min-width: 0; align-items: center; gap: 10px; color: var(--quiet); font-size: .76rem; }
+.demo-mode-note { display: flex; min-width: 0; align-items: center; gap: 10px; color: var(--muted); font-size: .76rem; }
 .demo-mode-note button { padding: 0; border: 0; background: transparent; color: var(--blue-deep); font-weight: 800; white-space: nowrap; }
 .demo-options { position: relative; flex: 0 0 auto; margin-left: auto; }
 .demo-options > summary { display: inline-flex; min-height: 34px; align-items: center; gap: 7px; padding: 6px 10px; border-radius: 999px; color: var(--muted); cursor: pointer; font-size: .75rem; font-weight: 760; list-style: none; }

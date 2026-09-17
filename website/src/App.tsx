@@ -82,6 +82,15 @@ function Navbar() {
 }
 
 function Footer() {
+  const location = useLocation();
+  if (location.pathname === "/") return <footer className="home-footer">
+    <div className="home-wrap">
+      <div className="home-footer-top"><div><Link className="footer-brand" to="/"><Logo /><strong>Akane</strong></Link><p>A more human tomorrow.</p></div>
+        <nav aria-label="Footer navigation"><Link to="/">Home</Link><Link to="/demo">Demo</Link><Link to="/technology">Technology</Link><Link to="/about">About</Link><GithubLink className="plain-link">GitHub</GithubLink></nav>
+      </div>
+      <div className="home-footer-bottom"><span>© {new Date().getFullYear()} Akane · Built by Alexander Lee</span><span>A continuing project. A shared sky.</span></div>
+    </div>
+  </footer>;
   return <footer className="footer">
     <div className="shell footer-inner">
       <Link className="footer-brand" to="/"><Logo /><strong>Akane</strong></Link>

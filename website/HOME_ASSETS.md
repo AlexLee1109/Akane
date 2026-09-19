@@ -5,12 +5,14 @@ The Home page preserves the seated night hero and uses existing canonical artwor
 ## Included
 
 - Hero: `akane-night-hero.webp`, `akane-night-hero-1280.webp`, `akane-night-mobile.webp`; existing responsive artwork.
-- Hero media card: existing `akane-night-thumb.webp`.
+- Hero passive glass note: existing `akane-night-thumb.webp`.
 - Meet Akane: `akane-standing.webp`, optimized from the official `akane-hero.png` (full body, transparent background).
 - Conversation: `akane-conversation.webp` and `akane-conversation-600.webp`, optimized from `akane-story.jpg` (alternate window portrait).
 - Local runtime and footer: existing `akane-logo-192.png`.
 
-## Artwork still needed
+## Supplied artwork pending location
+
+The polish brief refers to four supplied images, but its attachment contains only text. Their source files must be located before image replacement, responsive exports, crop validation, and final payload measurements can be completed.
 
 `HomeArtworkPlaceholder` in `src/pages/HomePage.tsx` provides intentional CSS atmosphere studies, not finished character illustrations. Each slot is named using `data-artwork-slot` and has a visible study label. Replace the placeholder with a responsive image when artwork is available, retaining the overlay copy.
 
@@ -24,3 +26,7 @@ The Home page preserves the seated night hero and uses existing canonical artwor
 Preserve the official blue hair, blue eyes, white/blue outerwear, dark skirt, dark tie, and celestial details. Use the official full-body reference. Do not derive these scenes by repeating the hero.
 
 Export optimized WebP/AVIF with explicit dimensions, responsive variants, and lazy loading. Reserve each existing scene's layout height. Remove the study label when actual artwork replaces it.
+
+## Loading behavior
+
+Home adds route-scoped, media-matched hero image preload hints, matching its responsive picture sources. The hero is high priority and eagerly loaded; the hints are removed on route exit. Standing and conversation artwork remain lazy-loaded with explicit dimensions. Conversation uses 600px and 1000px variants. The illustrative chat avatar reuses the already loaded standing asset.

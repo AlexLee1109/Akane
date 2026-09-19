@@ -1,4 +1,4 @@
-import type { MouseEvent, ReactNode } from "react";
+import { useLayoutEffect, type MouseEvent, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { projectConfig } from "../config/project";
 import "./home.css";
@@ -19,9 +19,9 @@ function HomeIcon({ name }: { name: HomeIconName }) {
 }
 
 const heroFeatures = [
-  { icon: "memory", title: "Natural Conversations", text: <>More than answers.<br />Real understanding.</> },
-  { icon: "presence", title: "Always With You", text: <>Support, inspire,<br />and grow together.</> },
-  { icon: "growth", title: "A Kinder Future", text: <>Technology that<br />brings us closer.</> },
+  { icon: "presence", title: "Natural Conversations", text: "Continuity and individual perspective." },
+  { icon: "memory", title: "Persistent Memory", text: "Context that can carry into later conversations." },
+  { icon: "growth", title: "Develops Over Time", text: "Preferences and interests shaped by experience." },
 ] as const;
 
 function scrollToMeet(event: MouseEvent<HTMLAnchorElement>) {
@@ -32,6 +32,25 @@ function scrollToMeet(event: MouseEvent<HTMLAnchorElement>) {
 }
 
 function HomeHero() {
+  // Route-scoped hints match the picture sources without preloading Home on other pages.
+  useLayoutEffect(() => {
+    const sources = [
+      { media: "(max-width: 700px)", href: `${projectConfig.basePath}assets/akane-night-mobile.webp` },
+      { media: "(min-width: 701px)", href: homepageImage, srcSet: `${projectConfig.basePath}assets/akane-night-hero-1280.webp 1280w, ${homepageImage} 1672w` },
+    ];
+    const links = sources.map(source => {
+      const link = document.createElement("link");
+      link.rel = "preload";
+      link.as = "image";
+      link.href = source.href;
+      link.media = source.media;
+      link.setAttribute("fetchpriority", "high");
+      if (source.srcSet) { link.imageSrcset = source.srcSet; link.imageSizes = "100vw"; }
+      document.head.appendChild(link);
+      return link;
+    });
+    return () => links.forEach(link => link.remove());
+  }, []);
   return <section className="home-hero" aria-labelledby="home-title">
     <picture className="home-hero-artwork">
       <source media="(max-width: 700px)" srcSet={`${projectConfig.basePath}assets/akane-night-mobile.webp`} />
@@ -41,7 +60,7 @@ function HomeHero() {
     <div className="home-hero-copy">
       <p className="home-eyebrow"><span aria-hidden="true">✦</span> Always by your side</p>
       <h1 id="home-title">A more<br /><em>human AI</em><br />companion</h1>
-      <p className="home-lead">Akane is a local, evolving AI companion —<br className="home-desktop-break" /> not just smarter, but kinder, more understanding,<br className="home-desktop-break" /> and truly present in your everyday life.</p>
+      <p className="home-lead">Akane is a local, evolving AI companion —<br className="home-desktop-break" /> with persistent memory, an individual perspective,<br className="home-desktop-break" /> and a personality shaped by experience.</p>
       <div className="home-hero-actions">
         <Link className="button primary" to="/demo">Try the Demo <span aria-hidden="true">→</span></Link>
         <a className="home-text-link" href="#meet-akane" onClick={scrollToMeet}>Meet Akane <span aria-hidden="true">↓</span></a>
@@ -50,8 +69,8 @@ function HomeHero() {
     <div className="home-hero-features">{heroFeatures.map(item => <article key={item.title}><HomeIcon name={item.icon} /><h2>{item.title}</h2><p>{item.text}</p></article>)}</div>
     <div className="home-handwritten" aria-hidden="true">Same sky.<br />A brighter tomorrow.<span>— Akane</span></div>
     <div className="home-concept" aria-hidden="true">People<span>×</span>AI<span>×</span>Technology<span>×</span>A kinder<br />tomorrow</div>
-    <aside className="home-message" aria-label="Upcoming message from Akane">
-      <span className="home-play" aria-hidden="true">▷</span><div><strong>A Message from Akane</strong><small>A little hello. Coming soon.</small></div><img src={`${projectConfig.basePath}assets/akane-night-thumb.webp`} width="80" height="80" alt="" />
+    <aside className="home-message" aria-label="A message from Akane">
+      <div><strong>A Message from Akane</strong><small>A more human tomorrow.</small></div><img src={`${projectConfig.basePath}assets/akane-night-thumb.webp`} width="80" height="80" alt="" />
     </aside>
     <div className="home-hero-bottom"><p>Small connections.<br />A brighter tomorrow.</p><span className="home-star-line" aria-hidden="true">✦</span><a href="#meet-akane" onClick={scrollToMeet} className="home-scroll">Scroll<br />for more <span aria-hidden="true">↓</span></a></div>
     <div className="home-hero-ribbon" aria-hidden="true"><span>Akane</span><span>A more human tomorrow</span><span>People / Ideas / Technology / A kinder tomorrow</span></div>
@@ -84,6 +103,7 @@ function Differentiators() {
       <article><div className="home-feature-art home-growth-art" aria-hidden="true"><svg viewBox="0 0 300 180" fill="none"><path d="M150 175V104M150 104 65 55M150 104 235 55M150 104V25M65 55H25M235 55H275" /><circle cx="150" cy="104" r="10" /><circle cx="65" cy="55" r="5" /><circle cx="235" cy="55" r="5" /><circle cx="150" cy="25" r="5" /></svg><span>Interests · Opinions · Possibilities</span></div><p className="home-kicker">02 / Personality development</p><h3>Room to become.</h3><p>Preferences, opinions, tendencies, and goals can develop over time. Experience has a part in what comes next.</p></article>
       <article><div className="home-feature-art home-presence-art" aria-hidden="true"><div className="home-presence-orbit"><span>Here.<br /><em>Now.</em></span><i /></div><small>Time · Situation · Conversation</small></div><p className="home-kicker">03 / Presence</p><h3>A sense of the moment.</h3><p>The current situation, time, and conversation help shape a response that belongs to this moment.</p></article>
     </div>
+    <DevelopmentFlow />
   </div></section>;
 }
 
@@ -91,25 +111,24 @@ function ConversationExperience() {
   return <section className="home-conversation home-section" aria-labelledby="conversation-title"><div className="home-wrap home-split">
     <figure className="home-chat-scene">
       <img src={`${projectConfig.basePath}assets/akane-conversation.webp`} srcSet={`${projectConfig.basePath}assets/akane-conversation-600.webp 600w, ${projectConfig.basePath}assets/akane-conversation.webp 1000w`} sizes="(max-width: 760px) 100vw, 55vw" width="1000" height="750" loading="lazy" decoding="async" alt="Akane beside a sunlit window overlooking the city" />
-      <figcaption className="home-chat-preview"><div className="home-chat-heading"><strong>Akane</strong><span>Illustrative conversation</span></div><p className="home-chat-user">Rainy-day playlist or a walk?</p><p className="home-chat-akane">A walk. The playlist can come with us.</p><p className="home-chat-user">Even in the rain?</p><p className="home-chat-akane">Especially the quiet kind.<span className="home-chat-cursor" aria-hidden="true">▍</span></p></figcaption>
+      <figcaption className="home-chat-preview"><div className="home-chat-heading"><img src={characterImage} width="38" height="38" loading="lazy" decoding="async" alt="" /><div><strong>Akane</strong><span><i aria-hidden="true" /> Illustrative conversation</span></div><span className="home-chat-status">Preview</span></div><div className="home-chat-context">↳ Picking up from earlier <span>Example context</span></div><p className="home-chat-user">Back to that rainy-day playlist?</p><p className="home-chat-akane">I’d keep the piano track. The slower one.</p><p className="home-chat-user">And the last song?</p><p className="home-chat-akane">Still a little too loud for rain.<span className="home-chat-cursor" aria-hidden="true">▍</span></p></figcaption>
     </figure>
     <div className="home-copy"><p className="home-kicker">03 / In conversation</p><h2 id="conversation-title">A little less scripted.<br /><em>A little more Akane.</em></h2><p>A quick hello. A different take. Picking up a thought you left unfinished.</p><p>Akane can draw on remembered context and developed opinions to respond in her own way. Replies arrive as they’re written, keeping the conversation moving.</p><Link className="home-text-link" to="/demo">Start a conversation <span aria-hidden="true">↗</span></Link><p className="home-fine-print">The website demo uses a separate, temporary guest conversation.</p></div>
   </div></section>;
 }
 
-function MemoryDevelopment() {
+function DevelopmentFlow() {
   const steps = [["Conversation", "An exchange"], ["Experience", "What happens"], ["Memory", "What can stay"], ["Developing Self", "What takes shape"], ["Future conversation", "A new beginning"]];
-  return <section className="home-continuity home-section" aria-labelledby="continuity-title"><div className="home-wrap">
-    <div className="home-section-intro"><div><p className="home-kicker">04 / A thread through time</p><h2 id="continuity-title">She remembers.<br /><em>She changes.</em></h2></div><p>Memories and developed preferences can influence later conversations. A continuing thread, rather than a return to the same starting point each time.</p></div>
+  return <div className="home-development-flow">
     <ol className="home-memory-flow" aria-label="How experience can shape a future conversation">{steps.map(([title, subtitle], i) => <li key={title}><span className="home-flow-node" aria-hidden="true">{i === 2 ? "✦" : `0${i + 1}`}</span><h3>{title}</h3><p>{subtitle}</p></li>)}</ol>
-    <p className="home-flow-caption">Not every moment becomes a memory. Meaningful context can carry forward.</p>
-  </div></section>;
+    <p className="home-flow-caption">Memories and developed preferences can shape the next conversation. Not every moment becomes a memory.</p>
+  </div>;
 }
 
 function LocalFirst() {
   return <section className="home-local home-light home-section" aria-labelledby="local-title"><div className="home-wrap home-split">
-    <div className="home-copy"><p className="home-kicker">05 / Local by design</p><h2 id="local-title">Built to<br /><em>stay close.</em></h2><p>A personal companion deserves a personal foundation.</p><p>With the local setup, the model runs on your own hardware. Conversations and persistent state stay under your control, on your device.</p><p className="home-fine-print">Connected services, such as Discord, carry messages through their own platforms. The website demo has a separate guest session.</p><Link className="home-text-link" to="/technology">Explore the Technology <span aria-hidden="true">↗</span></Link></div>
-    <figure className="home-local-visual"><div className="home-device-orbit" aria-hidden="true" /><div className="home-monitor"><div className="home-monitor-bar"><span aria-hidden="true">● ● ●</span><span>Your space</span></div><div className="home-monitor-screen"><img src={`${projectConfig.basePath}assets/akane-logo-192.png`} width="72" height="72" loading="lazy" alt="" /><strong>Akane</strong><span>A conversation, close to home.</span></div></div><div className="home-device-connection" aria-hidden="true" /><div className="home-runtime"><HomeIcon name="pi" /><div><strong>Your local runtime</strong><span>Your hardware. Your control.</span></div></div><figcaption>Local model <span>✦</span> Locally held memory</figcaption></figure>
+    <div className="home-copy"><p className="home-kicker">04 / Local by design</p><h2 id="local-title">Built to<br /><em>stay close.</em></h2><p>A personal companion deserves a personal foundation.</p><p>With the local setup, the model runs on your own hardware. Conversations and persistent state stay under your control, on your device.</p><p className="home-fine-print">Connected services, such as Discord, carry messages through their own platforms. The website demo has a separate guest session.</p><Link className="home-text-link" to="/technology">Explore the Technology <span aria-hidden="true">↗</span></Link></div>
+    <figure className="home-local-visual"><div className="home-device-orbit" aria-hidden="true" /><div className="home-monitor"><div className="home-monitor-bar"><span aria-hidden="true">● ● ●</span><span>Your space</span></div><div className="home-monitor-screen"><img src={`${projectConfig.basePath}assets/akane-logo-192.png`} width="72" height="72" loading="lazy" alt="" /><strong>Akane</strong><span>A conversation, close to home.</span></div></div><div className="home-device-connection" aria-hidden="true">↕</div><div className="home-runtime"><HomeIcon name="pi" /><div><strong>Local LLM Runtime</strong><span>Model + locally held memory</span></div></div><div className="home-device-connection" aria-hidden="true">↕</div><figcaption className="home-device-label">Your Device <span>Computer / Raspberry Pi</span></figcaption></figure>
   </div></section>;
 }
 
@@ -119,14 +138,14 @@ function HomeArtworkPlaceholder({ scene }: { scene: "morning" | "desktop" | "eve
 }
 
 function EverydayLife() {
-  const moments = [{ scene: "morning", time: "Morning", title: "A small beginning.", text: "A hello before the day gets going." }, { scene: "desktop", time: "At your desk", title: "A moment between things.", text: "A desktop conversation, when you want one." }, { scene: "evening", time: "Evening", title: "Somewhere to return.", text: "Pick up a thought. Or start a new one." }] as const;
-  return <section className="home-everyday home-section" aria-labelledby="everyday-title"><div className="home-wrap"><div className="home-section-intro"><div><p className="home-kicker">06 / The everyday</p><h2 id="everyday-title">Small moments.<br /><em>A familiar presence.</em></h2></div><p>Not every conversation needs a reason.<br />Sometimes, it’s just nice to say hello.</p></div><div className="home-moments">{moments.map(moment => <article key={moment.scene}><HomeArtworkPlaceholder scene={moment.scene} /><div className="home-moment-copy"><p className="home-kicker">{moment.time}</p><h3>{moment.title}</h3><p>{moment.text}</p></div></article>)}</div></div></section>;
+  const moments = [{ scene: "morning", time: "Morning", title: "A small beginning.", text: "A hello before the day gets going." }, { scene: "desktop", time: "At your desk", title: "A moment between things.", text: "Akane close by while you’re working or browsing." }, { scene: "evening", time: "Evening", title: "Somewhere to return.", text: "Pick up a thought or start something new." }] as const;
+  return <section className="home-everyday home-section" aria-labelledby="everyday-title"><div className="home-wrap"><div className="home-section-intro"><div><p className="home-kicker">05 / The everyday</p><h2 id="everyday-title">Small moments.<br /><em>A familiar presence.</em></h2></div><p>Not every conversation needs a reason.<br />Sometimes, it’s just nice to say hello.</p></div><div className="home-moments">{moments.map(moment => <article key={moment.scene}><HomeArtworkPlaceholder scene={moment.scene} /><div className="home-moment-copy"><p className="home-kicker">{moment.time}</p><h3>{moment.title}</h3><p>{moment.text}</p></div></article>)}</div></div></section>;
 }
 
 function HomeFinale() {
-  return <section className="home-finale" aria-labelledby="finale-title"><HomeArtworkPlaceholder scene="finale" /><div className="home-finale-copy"><p className="home-kicker">The journey continues</p><h2 id="finale-title">A more human<br /><em>tomorrow.</em></h2><p>An ongoing project exploring more personal, persistent, and private AI companionship. One conversation at a time.</p><div className="home-final-actions"><Link className="button primary" to="/demo">Talk With Akane <span aria-hidden="true">→</span></Link><Link className="home-text-link" to="/about">About the Project <span aria-hidden="true">↗</span></Link></div><span className="home-finale-note">Built locally. Room to grow.</span></div></section>;
+  return <section className="home-finale" aria-labelledby="finale-title"><HomeArtworkPlaceholder scene="finale" /><div className="home-finale-copy"><p className="home-kicker">The journey continues</p><h2 id="finale-title">A more human<br /><em>tomorrow.</em></h2><p>Akane is an ongoing project exploring what a more personal, persistent, and private AI companion can become.</p><div className="home-final-actions"><Link className="button primary" to="/demo">Talk With Akane <span aria-hidden="true">→</span></Link><Link className="home-text-link" to="/about">About the Project <span aria-hidden="true">↗</span></Link></div></div></section>;
 }
 
 export function HomePage() {
-  return <main className="home-page"><HomeHero /><MeetAkane /><Differentiators /><ConversationExperience /><MemoryDevelopment /><LocalFirst /><EverydayLife /><HomeFinale /></main>;
+  return <main className="home-page"><HomeHero /><MeetAkane /><Differentiators /><ConversationExperience /><LocalFirst /><EverydayLife /><HomeFinale /></main>;
 }

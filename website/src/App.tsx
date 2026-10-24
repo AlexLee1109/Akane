@@ -1,10 +1,10 @@
-import { type ReactNode, useEffect, useState } from "react";
+import { lazy, Suspense, type ReactNode, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { projectConfig } from "./config/project";
-import { DemoPage } from "./pages/DemoPage";
-import { HomePage } from "./pages/HomePage";
-import { AboutPage } from "./pages/AboutPage";
-import { TechnologyPage } from "./pages/TechnologyPage";
+const HomePage = lazy(() => import("./pages/HomePage").then(module => ({ default: module.HomePage })));
+const DemoPage = lazy(() => import("./pages/DemoPage").then(module => ({ default: module.DemoPage })));
+const AboutPage = lazy(() => import("./pages/AboutPage").then(module => ({ default: module.AboutPage })));
+const TechnologyPage = lazy(() => import("./pages/TechnologyPage").then(module => ({ default: module.TechnologyPage })));
 
 const logo = `${projectConfig.basePath}assets/akane-logo-192.png`;
 
@@ -24,7 +24,7 @@ const routeMetadata: Record<string, RouteMetadata> = {
   },
   "/technology": {
     title: "How Akane Works · Technology",
-    description: "See how one local generation produces Akane’s reply and evidence that can shape her developing Self.",
+    description: "Explore Akane’s local inference, grounded memory, developing Self, and isolated public sessions.",
   },
   "/about": {
     title: "About Akane · Project Story",
@@ -33,7 +33,7 @@ const routeMetadata: Record<string, RouteMetadata> = {
 };
 
 function Logo() {
-  return <img className="logo" src={logo} alt="Akane logo" />;
+  return <img className="logo" src={logo} width="32" height="32" alt="" />;
 }
 
 function GithubLink({ children, className }: { children: ReactNode; className: string }) {
@@ -46,9 +46,26 @@ function Navbar() {
   const [open, setOpen] = useState(false);
   const [scrolled, setScrolled] = useState(false);
   const location = useLocation();
+  const headerRef = useRef<HTMLElement>(null);
+  const menuRef = useRef<HTMLButtonElement>(null);
   const links = [["/", "Home"], ["/demo", "Demo"], ["/technology", "Technology"], ["/about", "About"]] as const;
 
   useEffect(() => setOpen(false), [location.pathname]);
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setOpen(false); menuRef.current?.focus(); }
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      if (!headerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [open]);
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 24);
     onScroll();
@@ -56,15 +73,16 @@ function Navbar() {
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
-  return <header className={`site-header ${location.pathname === "/" ? `home-header ${scrolled ? "is-scrolled" : ""}` : ""}`}>
+  return <header ref={headerRef} className={`site-header ${scrolled ? "is-scrolled" : ""}`}>
     <nav className="nav shell" aria-label="Primary navigation">
       <Link className="brand" to="/" aria-label="Akane home">
         <Logo />
         <strong>Akane</strong>
-        {location.pathname === "/" && <span className="home-brand-tagline">A more human tomorrow</span>}
+        <span className="brand-subtitle">A continuing companion</span>
       </Link>
       <button
         className="menu-button"
+        ref={menuRef}
         type="button"
         aria-expanded={open}
         aria-controls="nav-links"
@@ -75,27 +93,19 @@ function Navbar() {
       </button>
       <div id="nav-links" className={`nav-links ${open ? "open" : ""}`}>
         {links.map(([to, label]) => <NavLink key={to} to={to} end={to === "/"}>{label}</NavLink>)}
-        {location.pathname === "/" ? <Link className="home-nav-cta" to="/demo">Try Demo <span aria-hidden="true">→</span></Link> : <GithubLink className="nav-github">GitHub</GithubLink>}
+        <Link className="button primary nav-cta" to="/demo">Talk to Akane <span aria-hidden="true">↗</span></Link>
       </div>
     </nav>
   </header>;
 }
 
 function Footer() {
-  const location = useLocation();
-  if (location.pathname === "/") return <footer className="home-footer">
-    <div className="home-wrap">
-      <div className="home-footer-top"><div><Link className="footer-brand" to="/"><Logo /><strong>Akane</strong></Link><p>A more human tomorrow.</p></div>
-        <nav aria-label="Footer navigation"><Link to="/">Home</Link><Link to="/demo">Demo</Link><Link to="/technology">Technology</Link><Link to="/about">About</Link><GithubLink className="plain-link">GitHub</GithubLink></nav>
-      </div>
-      <div className="home-footer-bottom"><span>© {new Date().getFullYear()} Akane · Built by Alexander Lee</span><span>A continuing project. A shared sky.</span></div>
-    </div>
-  </footer>;
   return <footer className="footer">
-    <div className="shell footer-inner">
-      <Link className="footer-brand" to="/"><Logo /><strong>Akane</strong></Link>
-      <span>Built by Alexander Lee · <GithubLink className="plain-link">GitHub</GithubLink></span>
-      <span>© {new Date().getFullYear()}</span>
+    <div className="shell">
+      <div className="footer-top"><div><Link className="footer-brand" to="/"><Logo /><strong>Akane</strong></Link><p>A continuing companion. Built close to home.</p></div>
+        <nav aria-label="Footer navigation"><Link to="/demo">Meet Akane</Link><Link to="/technology">Technology</Link><Link to="/about">Our story</Link><GithubLink className="plain-link">GitHub</GithubLink></nav>
+      </div>
+      <div className="footer-bottom"><span>© {new Date().getFullYear()} · Built by Alexander Lee</span><span>Local-first AI · An independent project</span></div>
     </div>
   </footer>;
 }
@@ -121,15 +131,19 @@ function App() {
   }, [location.pathname]);
 
   return <>
+    <a className="skip-link" href="#main-content" onClick={event => {
+      event.preventDefault();
+      document.getElementById("main-content")?.focus();
+    }}>Skip to content</a>
     <Navbar />
     <div className="route-view" key={location.pathname}>
-      <Routes>
+      <Suspense fallback={<div className="route-loading" role="status">Opening Akane’s world…</div>}><Routes>
         <Route path="/" element={<HomePage />} />
         <Route path="/demo" element={<DemoPage />} />
         <Route path="/technology" element={<TechnologyPage />} />
         <Route path="/about" element={<AboutPage />} />
         <Route path="*" element={<HomePage />} />
-      </Routes>
+      </Routes></Suspense>
     </div>
     {location.pathname !== "/demo" && <Footer />}
   </>;

@@ -1,109 +1,36 @@
 import { Link } from "react-router-dom";
+import type { MouseEvent } from "react";
+import { Architecture } from "../components/Architecture";
 import { projectConfig } from "../config/project";
 import "./technology.css";
 
-const responseSteps = [
-  { title: "Interface", text: "Desktop, Discord, or an isolated website guest sends a message." },
-  { title: "Relevant context", text: "Only useful recent and persistent state is selected for this turn." },
-  { title: "One Qwen generation", text: "One local model call produces the complete dialogue result." },
-  { title: "Reply + evidence", text: "The stream separates Akane’s visible reply from hidden semantic evidence." },
-  { title: "Validated persistence", text: "Grounded changes and the completed turn are written in one atomic commit." },
-] as const;
-
-const runtimeFacts = [
-  ["Hardware", "Raspberry Pi 5"],
-  ["Model", projectConfig.modelName],
-  ["Inference", "llama.cpp / llama-cpp-python"],
-  ["Server", "FastAPI"],
-  ["State", "Atomic JSON persistence"],
-  ["Delivery", "Streamed responses"],
-] as const;
-
-const interfaces = [
-  { title: "Desktop popup", text: "A private owner interface for keeping Akane nearby." },
-  { title: "Discord", text: "The same owner profile and continuing companion in Discord." },
-  { title: "Website guest", text: "A temporary isolated profile that never accesses private owner memory." },
-] as const;
-
-const roadmap = [
-  { label: "Now", title: "Developmental Self + consequence learning", text: "What follows her choices can shape lasting judgments and future behavior." },
-  { label: "Next", title: "Voice + expression", text: "A more expressive presentation for the same continuing Akane." },
-  { label: "Then", title: "Live2D / 3D embodiment", text: "A richer visual presence without moving identity into the renderer." },
-  { label: "Later", title: "Deeper world modeling", text: "A richer understanding of situations, consequences, and which strategies work over time." },
-] as const;
-
-function SectionHeading({ eyebrow, title, description, id }: { eyebrow: string; title: string; description?: string; id: string }) {
-  return <div className="section-heading"><p className="eyebrow">{eyebrow}</p><h2 id={id}>{title}</h2>{description && <p>{description}</p>}</div>;
-}
-
-function TechnologyHero() {
-  return <section className="page-hero tech-hero" aria-labelledby="technology-title">
-    <div className="shell"><p className="eyebrow">Technology</p><h1 id="technology-title">How Akane works</h1><p className="page-lead">Each reply comes from one local generation. Evidence from that same turn can shape Akane’s developing Self over time.</p></div>
-  </section>;
-}
-
-function ResponseFlow() {
-  return <section className="section tech-response" aria-labelledby="response-title">
-    <div className="shell">
-      <SectionHeading eyebrow="How Akane responds" title="One generation, one completed turn." description="The critical path stays small enough for local hardware and clear enough to reason about." id="response-title" />
-      <figure className="tech-response-flow" aria-labelledby="response-caption">
-        <figcaption id="response-caption" className="sr-only">An interface selects relevant context for one Qwen generation, which produces a reply and semantic evidence before validated persistence.</figcaption>
-        <ol>{responseSteps.map((step, index) => <li key={step.title}><span>0{index + 1}</span><h3>{step.title}</h3><p>{step.text}</p></li>)}</ol>
-      </figure>
-    </div>
-  </section>;
-}
-
-function DevelopmentFlow() {
-  return <section className="section tech-development" aria-labelledby="development-title">
-    <div className="shell tech-development-grid">
-      <div>
-        <SectionHeading eyebrow="How Akane develops" title="A Self shaped by what actually happens." description="Akane begins with a minimal fixed identity. Her preferences and opinions are not filled in ahead of time; they can form from judgments she actually makes in conversation." id="development-title" />
-        <p className="tech-development-note">Over time, consequences can strengthen or weaken expectations and ways of responding. Unresolved questions can also grow into curiosity or goals.</p>
-      </div>
-      <figure className="tech-development-map" aria-labelledby="development-map-caption">
-        <figcaption id="development-map-caption" className="sr-only">Conversation enters Qwen, which produces a spoken response and hidden semantic evidence. Evidence can form an Experience, Developed Self, Outcomes, and learned behavior.</figcaption>
-        <div className="tech-map-node input"><small>Present moment</small><strong>Conversation</strong></div>
-        <span className="tech-map-arrow" aria-hidden="true">↓</span>
-        <div className="tech-map-node model"><small>One local generation</small><strong>Qwen</strong></div>
-        <span className="tech-map-arrow" aria-hidden="true">↓</span>
-        <div className="tech-map-branches">
-          <article><small>Visible</small><strong>Spoken response</strong><p>What Akane says to you.</p></article>
-          <article className="evidence"><small>Hidden</small><strong>Semantic evidence</strong><p>Structured meaning from the same generation.</p><span aria-hidden="true">↓</span><b>Grounded Experience</b><span aria-hidden="true">↓</span><div><b>Developed Self</b><b>Outcomes</b></div></article>
-        </div>
-        <div className="tech-learning"><strong>Learns from consequences</strong><div className="tech-learning-row"><span>Predictions</span><span>Tendencies</span><span>Strategies</span><span>Curiosity</span><span>Goals</span></div></div>
-      </figure>
-    </div>
-  </section>;
-}
-
-function Runtime() {
-  return <section className="section tech-runtime" aria-labelledby="runtime-title">
-    <div className="shell">
-      <SectionHeading eyebrow="How Akane runs" title="A compact local stack." description="The website is a static interface. Akane’s model, state, and developmental path stay with the local backend." id="runtime-title" />
-      <dl className="tech-runtime-grid">{runtimeFacts.map(([term, detail]) => <div className="surface" key={term}><dt>{term}</dt><dd>{detail}</dd></div>)}</dl>
-    </div>
-  </section>;
-}
-
-function Interfaces() {
-  return <section className="section tech-interfaces" aria-labelledby="tech-interfaces-title">
-    <div className="shell tech-interfaces-grid">
-      <SectionHeading eyebrow="Where Akane appears" title="Different interfaces, one companion." description="Each interface changes the presentation, not Akane’s identity or saved state." id="tech-interfaces-title" />
-      <div>{interfaces.map(item => <article key={item.title}><h3>{item.title}</h3><p>{item.text}</p></article>)}</div>
-    </div>
-  </section>;
-}
-
-function Roadmap() {
-  return <section className="section tech-roadmap" aria-labelledby="roadmap-title">
-    <div className="shell">
-      <div className="tech-roadmap-heading"><SectionHeading eyebrow="Roadmap" title="Build outward from the same Akane." id="roadmap-title" /><Link className="button secondary" to="/demo">Talk to Akane<span aria-hidden="true">→</span></Link></div>
-      <ol>{roadmap.map(item => <li key={item.label}><span>{item.label}</span><div><h3>{item.title}</h3><p>{item.text}</p></div></li>)}</ol>
-    </div>
-  </section>;
-}
+const steps = [
+  ["Authorize", "Resolve the profile and conversation. Public guests receive a temporary profile and a session token."],
+  ["Select context", "Build a bounded snapshot of recent dialogue and relevant stored context, rather than sending the entire store."],
+  ["Generate locally", "The configured GGUF runs through one shared llama.cpp runtime. Visible reply text streams to the interface."],
+  ["Ground changes", "Post-turn processing derives candidate changes from conversation evidence, including validated semantic evidence when available."],
+  ["Commit together", "Validate state, write and sync a temporary file, then atomically replace the canonical store."],
+];
+const records = [
+  ["Character", "A recognizable foundation", "Identity and Soul files establish Akane’s starting identity and voice. They stay separate from the state that develops through experience.", "Starting identity / Voice"],
+  ["Memory", "Context worth returning to", "Useful user facts, events, and shared commitments can be retained and selected for a relevant future conversation.", "User facts / Shared commitments"],
+  ["Self + Experience", "A perspective with evidence", "Grounded Experience can support Akane’s preferences, opinions, and interests. Compatible evidence can reinforce them; contradictions can prompt revision.", "Preferences / Interests / Opinions"],
+];
 
 export function TechnologyPage() {
-  return <main className="technology-page"><TechnologyHero /><ResponseFlow /><DevelopmentFlow /><Runtime /><Interfaces /><Roadmap /></main>;
+  function followConversation(event: MouseEvent<HTMLAnchorElement>) {
+    event.preventDefault();
+    const section = document.getElementById("conversation-path");
+    section?.focus({ preventScroll: true });
+    section?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
+  }
+
+  return <main id="main-content" tabIndex={-1} className="technology-page">
+    <section className="tech-hero shell"><div><p className="eyebrow">The engineering behind the companion</p><h1>A voice is a start.<br /><em>Continuity is<br />built.</em></h1><p className="page-lead">A local language model gives Akane a voice. Carefully selected context and persistent state give the next conversation a foundation.</p><a className="text-link" href="#conversation-path" onClick={followConversation}>Follow a conversation <span aria-hidden="true">↓</span></a><div className="tech-hero-tags"><span>Local inference</span><span>Grounded development</span><span>Inspectable state</span></div></div><Architecture /></section>
+    <section className="section light-section" id="conversation-path" tabIndex={-1}><div className="shell"><div className="section-intro split-intro"><div><p className="eyebrow">01 / One conversation, end to end</p><h2>A message comes in.<br /><em>Context carries forward.</em></h2></div><p>The conversation path keeps generation, evidence, and persistence connected, with explicit profile boundaries.</p></div><ol className="response-steps">{steps.map(([title, text], index) => <li key={title}><span>0{index + 1}</span><h3>{title}</h3><p>{text}</p></li>)}</ol></div></section>
+    <section className="section shell"><div className="tech-section-heading"><div><p className="eyebrow">02 / Memory & identity</p><h2>Different kinds of context.<br /><em>Distinct responsibilities.</em></h2></div><p>A character’s foundation, useful memory, and developed judgments play different roles. Keeping them separate makes change easier to inspect.</p></div><div className="state-records">{records.map(([name, title, text, footer], index) => <article key={name}><div className="record-heading"><span className="record-number">0{index + 1}</span><p className="eyebrow">{name}</p></div><h3>{title}</h3><p>{text}</p><span className="record-fields">{footer}</span></article>)}</div><aside className="engineering-note"><span>WHAT THIS MEANS</span><p>These are software mechanisms for continuity and development. They do not establish consciousness or human emotion, and do not retrain the model’s weights. Mood, Relationship, and InnerLife are not separate canonical records in the current state model.</p></aside></section>
+    <section className="section runtime-section light-section"><div className="shell runtime-grid"><div><p className="eyebrow">03 / The local foundation</p><h2>Your hardware.<br /><em>A deliberate architecture.</em></h2><p>One runtime owns the loaded model and one active llama sequence. It can continue valid conversation context; profile changes and correctness boundaries can require a rebuild.</p><p>Local operation puts model selection and durable state under the operator’s control. Hardware limits, context budgets, and latency remain real engineering tradeoffs.</p></div><div className="runtime-spec-panel"><div className="runtime-spec-title"><span className="diagram-dot" /> SYSTEM SPECIFICATION</div><dl className="runtime-specs">{[["Inference", "llama.cpp / llama-cpp-python"], ["Model", projectConfig.modelName], ["Backend", "Python / FastAPI"], ["Persistence", "Validated, atomic JSON store"], ["Frontend", "React / TypeScript / Vite"], ["Deployment", "GitHub Pages + HTTPS API"]].map(([term, value]) => <div key={term}><dt>{term}</dt><dd>{value}</dd></div>)}</dl></div></div></section>
+    <section className="section shell tech-boundaries"><div><p className="eyebrow">04 / Development beyond a reply</p><h2>Give change a reason.<br /><em>Keep the evidence.</em></h2><p>Foreground turns can derive memory, experience, and developmental changes after generation. The current implementation also includes outcomes, predictions, behavioral tendencies, strategies, curiosities, goals, and structured world context.</p><p>An event-driven background coordinator handles observations, deadlines, and action results, and yields to foreground conversations. Its behavior depends on configuration and enabled integrations.</p><p className="fine-print">Development is bounded by validation and available evidence. It is an evolving implementation, with no claim of an invented life between conversations.</p></div><div className="profile-boundary"><p className="eyebrow">05 / Interfaces & isolation</p><h3>One core. Clear boundaries.</h3><div><span className="boundary-label">OWNER</span><strong>A continuing private profile</strong><p>Desktop popup, private web chat, and Discord share the owner conversation path. An optional VS Code bridge supplies workspace context.</p></div><div><span className="boundary-label">GUEST</span><strong>A temporary public conversation</strong><p>The HTTPS API creates an isolated guest profile. The browser keeps its token in session storage; owner memory stays outside that conversation.</p></div><div><span className="boundary-label">PREVIEW</span><strong>A clearly labeled simulation</strong><p>Local, scripted replies let visitors explore the interface. Preview messages never reach the model.</p></div></div></section>
+    <section className="section light-section"><div className="shell"><div className="tech-section-heading"><div><p className="eyebrow">06 / Built, building, exploring</p><h2>A working foundation.<br /><em>An open-ended project.</em></h2></div><a className="text-link" href={projectConfig.githubUrl} target="_blank" rel="noreferrer">Read the source <span aria-hidden="true">↗</span></a></div><ol className="roadmap"><li><span>IMPLEMENTED</span><h3>Local conversations & state</h3><p>Streamed dialogue, isolated guests, grounded development, and validated persistence.</p></li><li><span>ONGOING ENGINEERING</span><h3>Continuity & responsiveness</h3><p>Refining context selection, inference latency, and evidence-backed development.</p></li><li><span>FUTURE DIRECTIONS</span><h3>Voice & embodiment</h3><p>Richer audio, expression, and Live2D or 3D presentation. This website currently uses static artwork.</p></li></ol><Link className="text-link" to="/demo">Experience the interface <span aria-hidden="true">→</span></Link></div></section>
+  </main>;
 }

@@ -1,3 +1,5 @@
+import { useEffect, useRef } from "react";
+
 type DemoConnection = "connecting" | "live" | "offline" | "preview";
 
 interface DemoControlsProps {
@@ -23,6 +25,24 @@ const statusLabels: Record<DemoConnection, string> = {
 };
 
 export function DemoControls(props: DemoControlsProps) {
+  const optionsRef = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    const outside = (event: PointerEvent) => {
+      if (optionsRef.current && !optionsRef.current.contains(event.target as Node)) optionsRef.current.open = false;
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && optionsRef.current?.open) {
+        optionsRef.current.open = false;
+        optionsRef.current.querySelector("summary")?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("keydown", escape);
+    };
+  }, []);
   const busy = props.generating || props.actionPending;
   const live = props.connection === "live";
   const preview = props.connection === "preview";
@@ -36,10 +56,13 @@ export function DemoControls(props: DemoControlsProps) {
 
   return <div className="demo-controls demo-panel">
     <div className="status-pill" aria-label={`Demo status: ${statusLabels[props.connection]}`} aria-live="polite"><i className={`demo-status-dot ${props.connection}`} aria-hidden="true" />{statusLabels[props.connection]}</div>
-    {props.connection === "offline" && <div className="demo-mode-note"><span>Akane is offline right now.</span><button type="button" onClick={props.onOpenPreview}>Try Preview</button></div>}
+    {props.connection === "offline" && <div className="demo-mode-note"><span>Live Akane is unavailable.</span><button type="button" onClick={props.onOpenPreview}>Try Preview</button>{props.canReconnect && <button type="button" onClick={props.onReconnect}>Reconnect</button>}</div>}
     {preview && <span className="demo-mode-note">Simulated responses. Nothing is sent to Akane.</span>}
     {live && !props.guestEnabled && <span className="demo-mode-note">Guest messages are unavailable right now.</span>}
-    <details className="demo-options">
+    {live && props.guestEnabled && <span className="demo-mode-note">Isolated guest conversation</span>}
+    <details className="demo-options" ref={optionsRef} onClick={event => {
+      if ((event.target as Element).closest("button") && optionsRef.current) optionsRef.current.open = false;
+    }}>
       <summary aria-label="Open conversation options"><span aria-hidden="true">•••</span> Options</summary>
       <div className="demo-options-body">
         <p>{privacyText}</p>

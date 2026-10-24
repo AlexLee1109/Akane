@@ -1,32 +1,15 @@
-# Home artwork
+# Website artwork and type
 
-The Home page preserves the seated night hero and uses existing canonical artwork for the introduction and conversation. No hero artwork is repeated below the hero.
+The website is complete using the existing official Akane artwork. All image references resolve under the configured Vite base path; no scene placeholders or visible study labels remain.
 
-## Included
+- Home hero: `akane-night-hero-1280.webp` / `akane-night-hero.webp`; small phones use `akane-night-mobile.webp`. High-priority eager loading, explicit dimensions, and a character-centered crop in a framed scene.
+- Home conversation: `akane-conversation-600.webp`, lazy-loaded behind a clearly labeled written conversation example.
+- About: responsive `akane-conversation-600.webp` / `akane-conversation.webp`, cropped inside an editorial frame.
+- Demo: transparent `akane-standing.webp`, presented at character scale on desktop and as a compact portrait on mobile. This is static artwork with subtle CSS idle movement, not animated facial embodiment.
+- Closing: `akane-standing.webp`, lazy-loaded in a separate portrait composition.
+- Brand, welcome state, and messages: `akane-logo-192.png`.
+- Existing source images, social artwork, and unused variants are retained.
 
-- Hero: `akane-night-hero.webp`, `akane-night-hero-1280.webp`, `akane-night-mobile.webp`; existing responsive artwork.
-- Hero passive glass note: existing `akane-night-thumb.webp`.
-- Meet Akane: `akane-standing.webp`, optimized from the official `akane-hero.png` (full body, transparent background).
-- Conversation: `akane-conversation.webp` and `akane-conversation-600.webp`, optimized from `akane-story.jpg` (alternate window portrait).
-- Local runtime and footer: existing `akane-logo-192.png`.
+Manrope is self-hosted as the 25KB variable Latin WOFF2 in `public/assets/manrope-latin.woff2`, preloaded from the configured base path. Its SIL Open Font License is included in `public/assets/manrope-OFL.txt`. Editorial italic headings use the system Georgia font.
 
-## Supplied artwork pending location
-
-The polish brief refers to four supplied images, but its attachment contains only text. Their source files must be located before image replacement, responsive exports, crop validation, and final payload measurements can be completed.
-
-`HomeArtworkPlaceholder` in `src/pages/HomePage.tsx` provides intentional CSS atmosphere studies, not finished character illustrations. Each slot is named using `data-artwork-slot` and has a visible study label. Replace the placeholder with a responsive image when artwork is available, retaining the overlay copy.
-
-| Slot | Suggested file | Brief | Suggested source size |
-| --- | --- | --- | --- |
-| `akane-morning` | `akane-morning.webp` | Akane beside a softly lit morning window; character above the lower text area. | 1000 × 1400 |
-| `akane-desktop` | `akane-desktop.webp` | A quiet working desk with Akane visible in a desktop popup; blue dusk lighting. | 1000 × 1400 |
-| `akane-evening` | `akane-evening.webp` | Akane in an evening room, relaxed alternate pose with city lights. | 1000 × 1400 |
-| `akane-finale` | `akane-finale.webp` | Wide night skyline or balcony, small Akane figure at the right; open center for text, environment dominant. | 2400 × 1200 plus a mobile crop |
-
-Preserve the official blue hair, blue eyes, white/blue outerwear, dark skirt, dark tie, and celestial details. Use the official full-body reference. Do not derive these scenes by repeating the hero.
-
-Export optimized WebP/AVIF with explicit dimensions, responsive variants, and lazy loading. Reserve each existing scene's layout height. Remove the study label when actual artwork replaces it.
-
-## Loading behavior
-
-Home adds route-scoped, media-matched hero image preload hints, matching its responsive picture sources. The hero is high priority and eagerly loaded; the hints are removed on route exit. Standing and conversation artwork remain lazy-loaded with explicit dimensions. Conversation uses 600px and 1000px variants. The illustrative chat avatar reuses the already loaded standing asset.
+Optional future artwork: an alternate seated conversational pose matching the official design, exported as a transparent WebP around 800 × 1200 with space around hair and sleeves, could add variety to the demo. The implemented site does not depend on it.

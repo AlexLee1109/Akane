@@ -11,7 +11,7 @@ import "./demo.css";
 
 type ConnectionState = "connecting" | "live" | "offline" | "preview";
 
-const characterAsset = `${projectConfig.basePath}assets/akane-hero.png`;
+const characterAsset = `${projectConfig.basePath}assets/akane-standing.webp`;
 const previewReplies = [
   "Hey. Nice to meet you.",
   "Hmm, I think I’d pick ramen.",
@@ -29,6 +29,7 @@ export function DemoPage() {
   const initialConnection: ConnectionState =
     projectConfig.demoMode === "showcase" || !projectConfig.apiUrl ? "preview" : "connecting";
   const [connection, setConnection] = useState<ConnectionState>(initialConnection);
+  const [previewSelected, setPreviewSelected] = useState(initialConnection === "preview");
   const [health, setHealth] = useState<PublicHealth | null>(null);
   const [messages, setMessages] = useState<DemoMessage[]>([]);
   const [input, setInput] = useState("");
@@ -50,7 +51,7 @@ export function DemoPage() {
   }
 
   useEffect(() => {
-    if (projectConfig.demoMode === "showcase" || !projectConfig.apiUrl) {
+    if (previewSelected || projectConfig.demoMode === "showcase" || !projectConfig.apiUrl) {
       setConnection("preview");
       setHealth(null);
       return;
@@ -74,9 +75,10 @@ export function DemoPage() {
         if (currentToken) {
           try {
             const resumed = await akaneClient.revalidateSession(currentToken);
+            if (stopped) return;
             activateSession(resumed);
-            setMessages([]);
           } catch (cause) {
+            if (stopped) return;
             if (cause instanceof PublicApiError && ["session_expired", "unauthorized"].includes(cause.code)) {
               clearGuestToken();
               activateSession(null);
@@ -88,7 +90,6 @@ export function DemoPage() {
           }
         }
 
-        setMessages([]);
         setBackendPresentation(undefined);
         setHealth(result);
         setConnection("live");
@@ -111,11 +112,13 @@ export function DemoPage() {
       controller.abort();
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [reconnectKey]);
+  }, [reconnectKey, previewSelected]);
 
-  function reconnect() {
+  function reconnect(clearError = true) {
     if (projectConfig.demoMode !== "live" || !projectConfig.apiUrl) return;
-    setError("");
+    if (clearError) setError("");
+    if (previewSelected) setMessages([]);
+    setPreviewSelected(false);
     setReconnectKey(current => current + 1);
   }
 
@@ -126,6 +129,7 @@ export function DemoPage() {
   }
 
   function openPreview() {
+    setPreviewSelected(true);
     setConnection("preview");
     setMessages([]);
     setBackendPresentation(undefined);
@@ -177,7 +181,7 @@ export function DemoPage() {
       setBackendPresentation(undefined);
     } catch (cause) {
       setError((cause as Error).message);
-      if (availabilityFailed(cause)) reconnect();
+      if (availabilityFailed(cause)) reconnect(false);
     } finally {
       setActionPending(false);
     }
@@ -253,7 +257,7 @@ export function DemoPage() {
         session = await createOrRevalidateGuest();
       } catch (cause) {
         setError((cause as Error).message);
-        if (availabilityFailed(cause)) reconnect();
+        if (availabilityFailed(cause)) reconnect(false);
         return;
       } finally {
         setActionPending(false);
@@ -282,8 +286,13 @@ export function DemoPage() {
         onPresentation: setBackendPresentation,
       }, controller.signal);
     } catch (cause) {
-      setMessages(current => current.filter(item => item.id !== replyId));
-      if ((cause as Error).name !== "AbortError") {
+      if ((cause as Error).name === "AbortError") {
+        setMessages(current => completed.trim()
+          ? current.map(item => item.id === replyId ? { ...item, interrupted: true } : item)
+          : current.filter(item => item.id !== replyId));
+      } else {
+        setMessages(current => current.filter(item => item.id !== replyId));
+        setInput(message);
         if (cause instanceof PublicApiError && cause.code === "session_expired") {
           try { await renewExpiredGuest(); }
           catch (renewalError) {
@@ -294,7 +303,7 @@ export function DemoPage() {
           }
         } else {
           setError((cause as Error).message);
-          if (availabilityFailed(cause)) reconnect();
+          if (availabilityFailed(cause)) reconnect(false);
         }
       }
     } finally {
@@ -310,7 +319,6 @@ export function DemoPage() {
     || (needsSession && health?.guestEnabled !== true);
   const lastMessage = messages.at(-1);
   const responseText = lastMessage?.role === "akane" && lastMessage.text.trim() ? lastMessage.text : undefined;
-  const isThinking = generating && lastMessage?.role === "akane" && !lastMessage.text.trim();
   const composerPlaceholder = connection === "connecting"
     ? "Connecting to Akane…"
     : connection === "offline"
@@ -321,22 +329,21 @@ export function DemoPage() {
           ? "Message Akane to begin…"
           : "Message Akane…";
 
-  return <main className="demo-page">
+  return <main id="main-content" tabIndex={-1} className="demo-page">
     <section className="demo-intro shell" aria-labelledby="demo-title">
-      <p className="eyebrow">Demo</p><h1 id="demo-title">Talk with Akane</h1><p>Send a message. A private temporary conversation starts automatically.</p>
+      <p className="eyebrow">A little space to connect</p><h1 id="demo-title">Say hello to Akane.</h1><p>{previewMode ? "Explore the interface with clearly labeled simulated replies." : "Your first message begins a private, temporary guest conversation."}</p>
     </section>
 
     <section className="demo-workspace shell" aria-label="Akane demo workspace">
       <AkaneStage
         imageSrc={characterAsset}
-        responseText={responseText}
         connection={connection}
         generating={generating}
         hasResponseText={Boolean(responseText)}
-        isThinking={Boolean(isThinking)}
         backendPresentation={backendPresentation}
       />
-      <DemoConversation messages={messages} generating={generating} connection={connection} />
+      <div className="demo-chat-panel">
+      <DemoConversation messages={messages} generating={generating} connection={connection} onSuggestion={setInput} />
       <DemoComposer
         value={input}
         placeholder={composerPlaceholder}
@@ -356,11 +363,12 @@ export function DemoPage() {
         retryExhausted={retryExhausted}
         canReconnect={connection !== "live" && projectConfig.demoMode === "live" && Boolean(projectConfig.apiUrl)}
         onOpenPreview={openPreview}
-        onReconnect={reconnect}
+        onReconnect={() => reconnect()}
         onReset={() => { void resetConversation(); }}
         onEndSession={() => { void endGuestSession(); }}
         onClearPreview={clearPreview}
       />
+      </div>
     </section>
 
   </main>;

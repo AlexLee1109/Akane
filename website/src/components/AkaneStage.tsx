@@ -2,11 +2,9 @@ import { type AkanePresentationState, presentationStateMachine } from "../presen
 
 interface AkaneStageProps {
   imageSrc: string;
-  responseText?: string;
   connection: "connecting" | "live" | "offline" | "preview";
   generating: boolean;
   hasResponseText: boolean;
-  isThinking: boolean;
   backendPresentation?: AkanePresentationState;
 }
 
@@ -16,22 +14,12 @@ function CharacterRenderer({ imageSrc, state }: { imageSrc: string; state: Akane
     src={imageSrc}
     alt="Akane, a blue-haired anime-style companion in a white jacket"
     decoding="async"
+    width="335"
+    height="1147"
     data-activity={state.activity}
     data-expression={state.expression}
     data-mouth-level={state.mouthLevel}
   />;
-}
-
-function SpeechBubble({ text, thinking }: { text?: string; thinking: boolean }) {
-  return <div className={`akane-stage-bubble ${thinking ? "thinking" : ""}`}>
-    {thinking
-      ? <><span className="akane-thinking-dots" aria-hidden="true"><i /><i /><i /></span><span className="sr-only">Akane is thinking</span></>
-      : text}
-  </div>;
-}
-
-function ConversationView({ text, thinking }: { text?: string; thinking: boolean }) {
-  return <SpeechBubble text={text} thinking={thinking} />;
 }
 
 export function AkaneStage(props: AkaneStageProps) {
@@ -41,8 +29,13 @@ export function AkaneStage(props: AkaneStageProps) {
     props.hasResponseText,
     props.backendPresentation,
   );
+  const activity = props.connection === "preview" ? "Simulated preview"
+    : props.connection === "offline" ? "Waiting for a connection"
+      : props.connection === "connecting" ? "Connecting to Akane…"
+        : props.generating ? (props.hasResponseText ? "Writing a reply…" : "Thinking…") : "Ready when you are";
   return <section className="akane-stage demo-panel" aria-label="Akane stage">
-    {(props.responseText?.trim() || props.isThinking) && <ConversationView text={props.responseText} thinking={props.isThinking} />}
+    <div className="akane-stage-heading"><span>YOUR COMPANION</span><span lang="ja">茜</span></div>
     <CharacterRenderer imageSrc={props.imageSrc} state={state} />
+    <div className="akane-stage-caption"><p>Akane<span className="stage-caption-line">A familiar presence.</span></p><span role="status">{activity}</span></div>
   </section>;
 }

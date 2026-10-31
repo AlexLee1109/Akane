@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import queue
 import secrets
@@ -21,9 +22,9 @@ from app.core.session import (
     GenerationBusyError,
     GenerationCancelled,
     GenerationQueueFullError,
-    clear_conversation_caches,
     clear_profile_caches,
     normalize_chat_input,
+    reset_conversation,
     run_companion_turn,
 )
 from app.core.store import Store
@@ -241,8 +242,6 @@ class PublicSessionManager:
             deadline = time.monotonic() + 2.0
             while self._inflight and time.monotonic() < deadline:
                 self._condition.wait(timeout=0.05)
-        for session in sessions:
-            self._clear_profile(session.profile_id)
         with self._condition:
             self._sessions.clear()
 
@@ -306,8 +305,10 @@ class PublicSessionManager:
             return session
 
     def reset(self, session: PublicSession) -> None:
-        clear_conversation_caches(session.conversation_id, session.profile_id)
-        self.store.clear_conversation(session.conversation_id, session.profile_id)
+        with self._condition:
+            if self._sessions.get(session.token_hash) is not session or session.retired:
+                raise _error("session_expired")
+            reset_conversation(session.conversation_id, session.profile_id, store=self.store)
         _log("guest conversation reset", session.profile_id)
 
     def delete(self, token: str) -> None:
@@ -404,6 +405,7 @@ def public_chat_events(
 ):
     events: queue.Queue[tuple[str, object]] = queue.Queue()
     worker: threading.Thread | None = None
+    worker_started = False
     finished = False
     try:
         lease.activate()
@@ -436,6 +438,7 @@ def public_chat_events(
 
         worker = threading.Thread(target=generate, daemon=True, name="AkanePublicGuest")
         worker.start()
+        worker_started = True
         yield _json_line({"type": "start", "request_id": request_id})
         while True:
             remaining = lease.deadline - time.monotonic()
@@ -474,7 +477,6 @@ def public_chat_events(
             )
             return
     except PublicApiError as error:
-        manager.finish_generation(lease)
         yield _json_line(
             {"type": "error", "error": {"code": error.code, "message": error.message}}
         )
@@ -482,7 +484,10 @@ def public_chat_events(
         if worker is not None and worker.is_alive() and not finished:
             lease.cancellation.set()
             worker.join(timeout=0.25)
-        manager.finish_generation(lease)
+        # A disconnected client can stop reading before native inference stops.
+        # The worker owns capacity and retired-profile cleanup until it exits.
+        if not worker_started:
+            manager.finish_generation(lease)
 
 
 def _session_payload(session: PublicSession, token: str) -> dict[str, object]:
@@ -515,7 +520,7 @@ def register_public_routes(
         availability = (
             "offline"
             if not status.get("loaded")
-            else "busy" if manager.busy() or model.inference_busy() else "available"
+            else "busy" if await asyncio.to_thread(manager.busy) or model.inference_busy() else "available"
         )
         return JSONResponse(
             {"status": availability, "streaming": True, "guest_enabled": True}
@@ -528,9 +533,9 @@ def register_public_routes(
             if await _payload(request):
                 raise _error("invalid_request")
             token = _bearer_token(request, required=False)
-            session = manager.resolve(token) if token else None
+            session = await asyncio.to_thread(manager.resolve, token) if token else None
             if session is None:
-                session, token = manager.create()
+                session, token = await asyncio.to_thread(manager.create)
             return JSONResponse(_session_payload(session, token))
         except PublicApiError as error:
             return _error_response(error)
@@ -539,11 +544,11 @@ def register_public_routes(
     async def public_chat(request: Request):
         try:
             manager = current_manager(request)
-            session = manager.resolve(_bearer_token(request))
+            session = await asyncio.to_thread(manager.resolve, _bearer_token(request))
             message = _validate_message(await _payload(request), manager.settings)
             if not InferenceRuntime.get_instance().status().get("loaded"):
                 raise _error("model_unavailable")
-            lease = manager.acquire_generation(session)
+            lease = await asyncio.to_thread(manager.acquire_generation, session)
         except PublicApiError as error:
             return _error_response(error)
         return StreamingResponse(
@@ -558,7 +563,8 @@ def register_public_routes(
             manager = current_manager(request)
             if await _payload(request):
                 raise _error("invalid_request")
-            manager.reset(manager.resolve(_bearer_token(request)))
+            session = await asyncio.to_thread(manager.resolve, _bearer_token(request))
+            await asyncio.to_thread(manager.reset, session)
             return JSONResponse({"ok": True})
         except PublicApiError as error:
             return _error_response(error)
@@ -569,7 +575,7 @@ def register_public_routes(
             manager = current_manager(request)
             if await _payload(request):
                 raise _error("invalid_request")
-            manager.delete(_bearer_token(request))
+            await asyncio.to_thread(manager.delete, _bearer_token(request))
             return JSONResponse({"ok": True})
         except PublicApiError as error:
             return _error_response(error)

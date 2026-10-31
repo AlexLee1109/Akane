@@ -5,8 +5,23 @@ const SESSION_ID = SEARCH_PARAMS.get("session_id") || "popup";
 const elements = {
   messages:
     document.getElementById("messages") ||
-    document.getElementById("speechBody"),
-  speechBubble: document.getElementById("speechBubble"),
+    document.getElementById("speechBody") ||
+    document.getElementById("dialogueText"),
+  dialoguePanel: document.getElementById("dialoguePanel"),
+  dialogueText: document.getElementById("dialogueText"),
+  dialogueOpen: document.getElementById("dialogueOpen"),
+  dialoguePrevious: document.getElementById("dialoguePrevious"),
+  dialogueNext: document.getElementById("dialogueNext"),
+  dialogueLatest: document.getElementById("dialogueLatest"),
+  dialogueExpand: document.getElementById("dialogueExpand"),
+  dialogueToolbar: document.querySelector(".dialogue-toolbar"),
+  dialogueDismiss: document.getElementById("dialogueDismiss"),
+  responsePanel: document.getElementById("responsePanel"),
+  responseContent: document.getElementById("responseContent"),
+  responsePrevious: document.getElementById("responsePrevious"),
+  responseNext: document.getElementById("responseNext"),
+  responseClose: document.getElementById("responseClose"),
+  responsePosition: document.getElementById("responsePosition"),
   composer:
     document.getElementById("composer") ||
     document.getElementById("composerWrapper"),
@@ -36,10 +51,18 @@ let lastRenderedMessagesKey = "";
 let lastKnownStateVersion = -1;
 let lastInitiativeDeliveryId = "";
 
-let bubbleVisible = false;
-let bubbleHideTimer = null;
-let bubbleStreaming = false;
 let streamingAssistantText = "";
+let subtitles = null;
+let activeSubtitleId = null;
+let subtitleSequence = 0;
+let subtitleFadeTimer = null;
+let expandedReplyId = null;
+let subtitleLayoutFrame = null;
+let subtitleScrollFrame = null;
+let subtitleScrollExpected = null;
+let renderedSubtitleId = null;
+let visibleViewport = null;
+let lastInteractiveRegionsKey = "";
 
 // Opt in from the popup console; independent of native health diagnostics.
 let activeTTFT = null;
@@ -78,6 +101,9 @@ function recordTTFT(event, receivedAt) {
     return;
   }
   sample.first_js_delta_ms ??= receivedAt - sample.send_at;
+  if (subtitles && subtitles.snapshot().responseId !== activeSubtitleId) {
+    return;
+  }
   const responseElement = POPUP_ROLE === "companion" ? elements.messages :
     elements.messages?.lastElementChild?.querySelector(".bubble-body");
   if (sample.first_dom_update_ms !== undefined || !responseElement?.textContent?.trim()) {
@@ -191,6 +217,7 @@ function setComposerOpenState(open) {
     elements.composer.hidden = !open;
   }
 
+  scheduleDialogueLayout();
   syncInteractiveRegions();
 }
 
@@ -351,62 +378,325 @@ function formatMemoryForDisplay(memory) {
 }
 
 function clearBubbleHideTimer() {
-  if (!bubbleHideTimer) {
-    return;
+  if (subtitleFadeTimer !== null) {
+    window.clearTimeout(subtitleFadeTimer);
+    subtitleFadeTimer = null;
   }
-
-  window.clearTimeout(bubbleHideTimer);
-  bubbleHideTimer = null;
 }
 
-function setBubbleVisible(visible) {
-  bubbleVisible = Boolean(visible);
-
-  if (elements.speechBubble) {
-    elements.speechBubble.hidden = !bubbleVisible;
-  }
-
+function layoutDialogue() {
+  if (!elements.composer) return;
+  const rect = elements.composer.getBoundingClientRect();
+  const root = document.documentElement;
+  const gap = parseFloat(getComputedStyle(root).getPropertyValue("--dialogue-gap"));
+  const left = Math.max(0, visibleViewport?.left || 0, rect.left);
+  const right = Math.min(window.innerWidth, visibleViewport?.right ?? window.innerWidth, rect.right);
+  const width = Math.max(1, right - left);
+  const bottom = Math.min(rect.top - gap, visibleViewport?.bottom ?? window.innerHeight, window.innerHeight);
+  root.style.setProperty("--dialogue-left", `${left}px`);
+  root.style.setProperty("--dialogue-width", `${width}px`);
+  root.style.setProperty("--dialogue-bottom", `${window.innerHeight - bottom}px`);
+  root.style.setProperty("--dialogue-max-height", `${Math.max(1, bottom - (visibleViewport?.top || 0) - 26)}px`);
+  root.style.setProperty("--response-max-height", `${Math.max(1, bottom - (visibleViewport?.top || 0) - 12)}px`);
+  scheduleSubtitleScroll();
   syncInteractiveRegions();
 }
 
-function showBubbleNow() {
-  clearBubbleHideTimer();
-  bubbleStreaming = true;
-  setBubbleVisible(true);
+async function refreshVisibleViewport() {
+  const bounds = await window.pywebview?.api?.viewport_bounds?.();
+  if (bounds) visibleViewport = bounds;
+  scheduleDialogueLayout();
 }
 
-function hideBubbleSoon(delayMs = 0) {
+window.__akaneViewportChanged = refreshVisibleViewport;
+
+function scheduleDialogueLayout() {
+  if (subtitleLayoutFrame !== null) return;
+  subtitleLayoutFrame = window.requestAnimationFrame(() => {
+    subtitleLayoutFrame = null;
+    layoutDialogue();
+  });
+}
+
+function stopSubtitleScroll() {
+  if (subtitleScrollFrame !== null) window.cancelAnimationFrame(subtitleScrollFrame);
+  subtitleScrollFrame = null;
+}
+
+function subtitleAtBottom() {
+  const viewport = elements.dialogueOpen;
+  return viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop <= 6;
+}
+
+function scheduleSubtitleScroll() {
+  const state = subtitles?.snapshot();
+  if (!state?.visible || state.followPaused || elements.responsePanel && !elements.responsePanel.hidden) {
+    stopSubtitleScroll();
+    return;
+  }
+  if (subtitleScrollFrame !== null) return;
+  let previousTime;
+  const step = time => {
+    subtitleScrollFrame = null;
+    if (subtitles.snapshot().followPaused) return;
+    const viewport = elements.dialogueOpen;
+    const target = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    const distance = target - viewport.scrollTop;
+    const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const fraction = reduced ? 1 : 1 - Math.exp(-Math.min(50, time - (previousTime ?? time - 16)) / 65);
+    const movement = Math.sign(distance) * Math.max(1, Math.abs(distance * fraction));
+    subtitleScrollExpected = Math.abs(distance) <= 1 ? target : viewport.scrollTop + movement;
+    viewport.scrollTop = subtitleScrollExpected;
+    subtitleScrollExpected = viewport.scrollTop;
+    previousTime = time;
+    if (Math.abs(target - viewport.scrollTop) > 0.75) subtitleScrollFrame = window.requestAnimationFrame(step);
+  };
+  subtitleScrollFrame = window.requestAnimationFrame(step);
+}
+
+function availableReplies() {
+  const live = subtitles?.snapshot().replies || [];
+  const liveTexts = new Set(live.map(reply => reply.text));
+  return [
+    ...currentMessages.filter(message => message.role === "assistant" && message.content &&
+      !liveTexts.has(message.content)).map((message, index) => ({
+        id: `history-${index}`, text: message.content, complete: true,
+      })),
+    ...live.filter(reply => reply.text.trim()),
+  ];
+}
+
+function renderCompleteResponse() {
+  if (!elements.responsePanel || elements.responsePanel.hidden) return;
+  const replies = availableReplies();
+  let index = replies.findIndex(reply => reply.id === expandedReplyId);
+  if (index < 0) index = replies.length - 1;
+  const reply = replies[index];
+  if (!reply) return;
+  expandedReplyId = reply.id;
+  if (elements.responseContent.textContent !== reply.text) {
+    const scroll = elements.responseContent.scrollTop;
+    const previous = elements.responseContent.textContent;
+    const textNode = elements.responseContent.firstChild;
+    // Appending to the existing text node preserves an active selection.
+    if (textNode && reply.text.startsWith(previous)) textNode.appendData(reply.text.slice(previous.length));
+    else elements.responseContent.textContent = reply.text;
+    elements.responseContent.scrollTop = scroll;
+  }
+  elements.responsePosition.textContent = `${index + 1} / ${replies.length}`;
+  elements.responsePrevious.disabled = index <= 0;
+  elements.responseNext.disabled = index >= replies.length - 1;
+}
+
+function renderSubtitle(snapshot) {
+  if (!elements.dialoguePanel) return;
+  const panel = elements.dialoguePanel;
+  const expanded = !elements.responsePanel.hidden;
   clearBubbleHideTimer();
-
-  bubbleHideTimer = window.setTimeout(() => {
-    bubbleStreaming = false;
-
-    if (elements.messages) {
-      elements.messages.innerHTML = "";
+  if (snapshot.visible && !expanded) {
+    const appearing = panel.hidden || panel.dataset.visible !== "true";
+    panel.hidden = false;
+    if (renderedSubtitleId !== snapshot.responseId) {
+      renderedSubtitleId = snapshot.responseId;
+      stopSubtitleScroll();
+      elements.dialogueOpen.scrollTop = 0;
+      subtitleScrollExpected = 0;
     }
-
-    setBubbleVisible(false);
-  }, delayMs);
+    if (elements.dialogueText.textContent !== snapshot.text) {
+      const previous = elements.dialogueText.textContent;
+      const textNode = elements.dialogueText.firstChild;
+      if (textNode && snapshot.text.startsWith(previous)) textNode.appendData(snapshot.text.slice(previous.length));
+      else elements.dialogueText.textContent = snapshot.text;
+      if (activeTTFT?.first_js_delta_ms !== undefined && snapshot.responseId === activeSubtitleId) {
+        recordTTFT({ type: "delta", content: snapshot.text, request_id: activeTTFT.request_id }, performance.now());
+      }
+    }
+    if (appearing) {
+      // A layout flush establishes the start of the inexpensive opacity fade.
+      panel.getBoundingClientRect();
+    }
+    panel.dataset.visible = "true";
+  } else {
+    panel.dataset.visible = "false";
+    if (expanded || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      panel.hidden = true;
+    } else if (!panel.hidden) {
+      subtitleFadeTimer = window.setTimeout(() => {
+        panel.hidden = true;
+        syncInteractiveRegions();
+      }, 180);
+    }
+  }
+  elements.dialoguePrevious.disabled = !snapshot.hasPrevious;
+  elements.dialogueNext.disabled = !snapshot.hasNext;
+  elements.dialogueLatest.hidden = !snapshot.manual;
+  scheduleSubtitleScroll();
+  renderCompleteResponse();
+  syncInteractiveRegions();
 }
 
+function openCompleteResponse() {
+  if (!availableReplies().length) return;
+  expandedReplyId = subtitles?.snapshot().responseId || availableReplies().at(-1).id;
+  elements.responsePanel.hidden = false;
+  elements.dialogueExpand.setAttribute("aria-expanded", "true");
+  subtitles?.pause("expanded", true);
+  // Hiding a hovered/focused caption does not reliably dispatch leave events.
+  subtitles?.pause("hover", false);
+  subtitles?.pause("focus", false);
+  renderCompleteResponse();
+  elements.responseContent.focus({ preventScroll: true });
+  syncInteractiveRegions();
+}
+
+function closeCompleteResponse() {
+  elements.responsePanel.hidden = true;
+  elements.dialogueExpand.setAttribute("aria-expanded", "false");
+  subtitles?.pause("hover", false);
+  subtitles?.pause("focus", false);
+  subtitles?.pause("expanded", false);
+  const target = subtitles?.snapshot().visible ? elements.dialogueOpen : elements.input;
+  target?.focus({ preventScroll: true });
+  syncInteractiveRegions();
+}
+
+function beginSubtitle() {
+  if (!subtitles || activeSubtitleId !== null) return;
+  activeSubtitleId = `reply-${++subtitleSequence}`;
+  subtitles.begin(activeSubtitleId);
+}
+
+function finishSubtitle(finalText) {
+  if (activeSubtitleId !== null) {
+    subtitles?.finish(activeSubtitleId, finalText);
+    activeSubtitleId = null;
+  }
+}
+
+// Kept for native integrations; complete replies use the same reading lifecycle.
 function setBubbleText(text) {
-  if (!elements.messages) {
-    return;
+  const value = String(text || "");
+  if (!value.trim() || !subtitles) return;
+  const id = `reply-${++subtitleSequence}`;
+  subtitles.begin(id);
+  subtitles.append(id, value);
+  subtitles.finish(id);
+}
+
+function showBubbleNow() {
+  beginSubtitle();
+}
+
+function initializeSubtitles() {
+  if (!elements.dialoguePanel || !window.AkaneSubtitles) return;
+  layoutDialogue();
+  subtitles = new window.AkaneSubtitles({ onChange: renderSubtitle });
+  window.__akaneSubtitles = subtitles;
+  elements.dialoguePrevious.addEventListener("click", () => subtitles.previous());
+  elements.dialogueNext.addEventListener("click", () => subtitles.next());
+  elements.dialogueDismiss.addEventListener("click", () => subtitles.dismiss());
+  elements.dialogueExpand.addEventListener("click", openCompleteResponse);
+  elements.avatarHitbox?.addEventListener("dblclick", openCompleteResponse);
+  elements.messageActionButton?.addEventListener("contextmenu", event => {
+    event.preventDefault();
+    openCompleteResponse();
+  });
+  window.addEventListener("keydown", event => {
+    if (event.altKey && event.key === "ArrowUp") {
+      event.preventDefault();
+      openCompleteResponse();
+    }
+  });
+  elements.dialogueLatest.addEventListener("click", () => {
+    subtitles.pause("manual", false);
+    stopSubtitleScroll();
+    const viewport = elements.dialogueOpen;
+    subtitleScrollExpected = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    viewport.scrollTop = subtitleScrollExpected;
+    subtitleScrollExpected = viewport.scrollTop;
+  });
+  elements.dialogueOpen.addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      openCompleteResponse();
+    }
+    if (event.key === "ArrowLeft") { event.preventDefault(); subtitles.previous(); }
+    if (event.key === "ArrowRight") { event.preventDefault(); subtitles.next(); }
+  });
+  const viewport = elements.dialogueOpen;
+  let previousScrollTop = viewport.scrollTop;
+  const manualScroll = upward => {
+    stopSubtitleScroll();
+    subtitleScrollExpected = null;
+    if (upward && viewport.scrollHeight > viewport.clientHeight + 1) subtitles.pause("manual", true);
+  };
+  viewport.addEventListener("wheel", event => manualScroll(event.deltaY < 0), { passive: true });
+  viewport.addEventListener("touchstart", () => manualScroll(true), { passive: true });
+  viewport.addEventListener("keydown", event => {
+    if (["ArrowUp", "PageUp", "Home"].includes(event.key) || event.key === " " && event.shiftKey) manualScroll(true);
+    if (["ArrowDown", "PageDown", "End", " "].includes(event.key)) manualScroll(false);
+  });
+  viewport.addEventListener("scroll", () => {
+    const previous = previousScrollTop;
+    previousScrollTop = viewport.scrollTop;
+    if (subtitleScrollExpected !== null && Math.abs(viewport.scrollTop - subtitleScrollExpected) <= 1) return;
+    if (subtitleAtBottom()) subtitles.pause("manual", false);
+    else if (viewport.scrollTop < previous - 1) {
+      manualScroll(true);
+    }
+  }, { passive: true });
+  viewport.addEventListener("pointerdown", () => {
+    stopSubtitleScroll();
+    subtitles.pause("pointer", true);
+  });
+  window.addEventListener("pointerup", () => subtitles.pause("pointer", false));
+  window.addEventListener("pointercancel", () => subtitles.pause("pointer", false));
+  elements.responseClose.addEventListener("click", closeCompleteResponse);
+  for (const [button, direction] of [[elements.responsePrevious, -1], [elements.responseNext, 1]]) {
+    button.addEventListener("click", () => {
+      const replies = availableReplies();
+      const index = replies.findIndex(reply => reply.id === expandedReplyId);
+      expandedReplyId = replies[index + direction]?.id || expandedReplyId;
+      elements.responseContent.scrollTop = 0;
+      renderCompleteResponse();
+    });
   }
-
-  const nextText = String(text || "");
-
-  if (!nextText.trim()) {
-    elements.messages.innerHTML = "";
-    setBubbleVisible(false);
-    return;
+  for (const panel of [elements.dialoguePanel, elements.responsePanel]) {
+    panel.addEventListener("pointerenter", () => { subtitles.pause("hover", true); syncInteractiveRegions(); });
+    panel.addEventListener("pointerleave", () => { subtitles.pause("hover", false); syncInteractiveRegions(); });
+    panel.addEventListener("focusin", () => { subtitles.pause("focus", true); syncInteractiveRegions(); });
+    panel.addEventListener("focusout", event => {
+      if (!panel.contains(event.relatedTarget)) subtitles.pause("focus", false);
+      syncInteractiveRegions();
+    });
+    panel.addEventListener("keydown", event => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (!elements.responsePanel.hidden) closeCompleteResponse();
+        else subtitles.dismiss();
+      }
+    });
   }
-
-  setBubbleVisible(true);
-  elements.messages.innerHTML =
-    renderMessageBody(nextText);
-  elements.messages.scrollTop =
-    elements.messages.scrollHeight;
+  document.addEventListener("selectionchange", () => {
+    const selection = window.getSelection();
+    const selected = !selection?.isCollapsed && [elements.dialoguePanel, elements.responsePanel]
+      .some(panel => panel.contains(selection?.anchorNode) || panel.contains(selection?.focusNode));
+    subtitles.pause("selection", Boolean(selected));
+  });
+  document.addEventListener("visibilitychange", () => {
+    subtitles.pause("hidden", document.visibilityState !== "visible");
+  });
+  if (window.ResizeObserver) {
+    const observer = new ResizeObserver(scheduleDialogueLayout);
+    observer.observe(elements.composer);
+    observer.observe(document.querySelector(".shell"));
+    observer.observe(elements.dialoguePanel);
+    observer.observe(elements.responsePanel);
+    observer.observe(elements.dialogueText);
+  }
+  document.fonts?.ready.then(layoutDialogue);
+  void refreshVisibleViewport();
+  renderSubtitle(subtitles.snapshot());
 }
 
 window.__akaneSetBubbleText = setBubbleText;
@@ -597,7 +887,20 @@ function rememberMessages(messages) {
 }
 
 function renderMessages(messages) {
+  const previous = currentMessages.at(-1);
+  const initialized = lastRenderedMessagesKey !== "";
   rememberMessages(messages);
+
+  if (subtitles) {
+    const latest = currentMessages.at(-1);
+    if (initialized && !isSending && latest?.role === "assistant" && latest.content &&
+        (previous?.role !== "assistant" || previous.content !== latest.content) &&
+        !subtitles.snapshot().replies.some(reply => reply.text === latest.content)) {
+      setBubbleText(latest.content);
+    }
+    renderSubtitle(subtitles.snapshot());
+    return;
+  }
 
   if (!elements.messages) {
     return;
@@ -680,10 +983,11 @@ function updateStreamingAssistant(
     });
   }
 
-  if (POPUP_ROLE === "companion") {
-    setBubbleText(assistantText);
+  if (subtitles) {
+    renderCompleteResponse();
     return;
   }
+  if (POPUP_ROLE === "companion") return;
 
   const row = elements.messages?.lastElementChild;
   const body = row?.classList.contains(
@@ -789,6 +1093,7 @@ async function sendMessage(message) {
   setSendingState(true);
 
   streamingAssistantText = "";
+  beginSubtitle();
 
   upsertStreamingMessages(message, "");
 
@@ -808,6 +1113,7 @@ async function sendMessage(message) {
         "error",
       );
 
+      finishSubtitle();
       setSendingState(false);
     }
 
@@ -859,54 +1165,58 @@ async function sendMessage(message) {
 
     const decoder = new TextDecoder();
     let buffer = "";
+    try {
+      while (true) {
+        const {
+          value,
+          done,
+        } = await reader.read();
 
-    while (true) {
-      const {
-        value,
-        done,
-      } = await reader.read();
+        buffer += decoder.decode(value, {
+          stream: !done,
+        });
 
-      if (done) {
-        break;
-      }
-
-      buffer += decoder.decode(value, {
-        stream: true,
-      });
-
-      let newlineIndex =
-        buffer.indexOf("\n");
-
-      while (newlineIndex !== -1) {
-        const line = buffer
-          .slice(0, newlineIndex)
-          .trim();
-
-        buffer = buffer.slice(
-          newlineIndex + 1,
-        );
-
-        if (line) {
-          handleStreamEvent(
-            JSON.parse(line),
-            message,
-          );
-        }
-
-        newlineIndex =
+        let newlineIndex =
           buffer.indexOf("\n");
+
+        while (newlineIndex !== -1) {
+          const line = buffer
+            .slice(0, newlineIndex)
+            .trim();
+
+          buffer = buffer.slice(
+            newlineIndex + 1,
+          );
+
+          if (line) {
+            handleStreamEvent(
+              JSON.parse(line),
+              message,
+            );
+          }
+
+          newlineIndex =
+            buffer.indexOf("\n");
+        }
+        if (done) {
+          break;
+        }
       }
-    }
 
-    const finalLine = buffer.trim();
+      const finalLine = buffer.trim();
 
-    if (finalLine) {
-      handleStreamEvent(
-        JSON.parse(finalLine),
-        message,
-      );
+      if (finalLine) {
+        handleStreamEvent(
+          JSON.parse(finalLine),
+          message,
+        );
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
   } finally {
+    finishSubtitle();
     setSendingState(false);
   }
 }
@@ -970,8 +1280,8 @@ function handleStreamEvent(
     recordTTFT(event, receivedAt);
   }
   if (event.type === "start") {
-    bubbleStreaming = true;
     streamingAssistantText = "";
+    beginSubtitle();
 
     if (Array.isArray(event.messages)) {
       renderMessages([
@@ -998,6 +1308,7 @@ function handleStreamEvent(
     showBubbleNow();
 
     streamingAssistantText += incoming;
+    subtitles?.append(activeSubtitleId, incoming);
     updateStreamingAssistant(
       streamingAssistantText,
       userMessage,
@@ -1008,13 +1319,8 @@ function handleStreamEvent(
   }
 
   if (event.type === "done") {
-    bubbleStreaming = false;
 
-    /*
-     * Preserve the already-streamed companion text.
-     * Final history is stored without rerendering
-     * the visible speech bubble.
-     */
+    // Store final history without replacing the subtitle being read.
     if (Array.isArray(event.messages)) {
       if (POPUP_ROLE === "companion") {
         rememberMessages(event.messages);
@@ -1052,16 +1358,17 @@ function handleStreamEvent(
       }
     }
 
-    hideBubbleSoon(10000);
+    // Only the visible reply is queued; history and semantic sidecars never enter playback.
+    const finalReply = event.reply || (Array.isArray(event.messages)
+      ? event.messages.at(-1)?.role === "assistant" && event.messages.at(-1).content : "");
+    finishSubtitle(finalReply || streamingAssistantText);
 
     return;
   }
 
   if (event.type === "error") {
-    bubbleStreaming = false;
+    finishSubtitle();
     streamingAssistantText = "";
-
-    hideBubbleSoon(1200);
 
     throw new Error(
       event.error ||
@@ -1071,9 +1378,8 @@ function handleStreamEvent(
   }
 
   if (event.type === "cancelled") {
-    bubbleStreaming = false;
+    finishSubtitle();
     streamingAssistantText = "";
-    hideBubbleSoon(1200);
   }
 }
 
@@ -1197,6 +1503,12 @@ async function initiativeDeliveryLoop() {
       if (isQuitting || !response) {
         return;
       }
+      if (response.status === 404 || response.status === 405) {
+        return;
+      }
+      if (!response.ok) {
+        throw new Error("Initiative delivery is unavailable.");
+      }
       const payload = await response.json();
       if (isQuitting) {
         return;
@@ -1225,9 +1537,7 @@ async function initiativeDeliveryLoop() {
             content: delivery.message,
           },
         ]);
-        bubbleStreaming = false;
         setBubbleText(delivery.message);
-        hideBubbleSoon(10000);
       }
       await acknowledgeInitiative(
         delivery,
@@ -1361,6 +1671,8 @@ elements.closeButton?.addEventListener(
       "true",
     );
     clearBubbleHideTimer();
+    subtitles?.destroy();
+    stopSubtitleScroll();
     for (const controller of activeFetchControllers) {
       controller.abort();
     }
@@ -1432,38 +1744,21 @@ function syncInteractiveRegions() {
     return;
   }
 
+  const captionVisible = elements.dialoguePanel?.dataset.visible === "true";
+  const dockVisible = elements.actionDock && getComputedStyle(elements.actionDock).pointerEvents !== "none";
   const interactiveElements = [
-    elements.speechBubble,
+    captionVisible ? elements.dialoguePanel : null,
+    captionVisible ? elements.dialogueToolbar : null,
+    elements.responsePanel,
     elements.avatarHitbox,
+    dockVisible ? elements.actionDock : null,
     elements.composer,
     elements.memoryPanel,
   ];
-  const dockOpacity = elements.actionDock
-    ? Number.parseFloat(
-        getComputedStyle(elements.actionDock)
-          .opacity || "0",
-      )
-    : 0;
-
-  if (dockOpacity > 0.01) {
-    interactiveElements.push(
-      elements.memoryActionButton,
-      elements.messageActionButton,
-      elements.minimizeButton,
-      elements.closeButton,
-    );
-  }
-  const clippedRect = (
-    element,
-    includeHidden = false,
-  ) => {
-    if (
-      !element ||
-      (!includeHidden && element.hidden) ||
-      getComputedStyle(element).display === "none"
-    ) {
-      return null;
-    }
+  const clippedRect = (element) => {
+    if (!element || element.hidden || element.closest?.("[hidden]")) return null;
+    const style = getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden") return null;
     const rect = element.getBoundingClientRect();
     const left = Math.max(0, rect.left);
     const top = Math.max(0, rect.top);
@@ -1473,7 +1768,9 @@ function syncInteractiveRegions() {
     );
     const bottom = Math.min(
       window.innerHeight,
-      rect.bottom,
+      element === elements.dialogueToolbar
+        ? Math.max(rect.bottom, elements.dialoguePanel.getBoundingClientRect().top)
+        : rect.bottom,
     );
 
     if (right <= left || bottom <= top) {
@@ -1491,18 +1788,14 @@ function syncInteractiveRegions() {
     interactiveElements
       .map((element) => clippedRect(element))
       .filter(Boolean);
-  const hiddenBubbleRegion =
-    elements.speechBubble?.hidden
-      ? clippedRect(elements.speechBubble, true)
-      : null;
-
-  void window.pywebview.api
-    .update_interactive_regions(
-      interactiveRegions,
-      hiddenBubbleRegion
-        ? [hiddenBubbleRegion]
-        : [],
-    );
+  const key = JSON.stringify(interactiveRegions);
+  if (key === lastInteractiveRegionsKey) return;
+  lastInteractiveRegionsKey = key;
+  // Streaming words usually leave these rectangles unchanged. Avoid crossing
+  // the native bridge again until the actual interactive geometry changes.
+  window.pywebview.api.update_interactive_regions(interactiveRegions, [])?.catch?.(() => {
+    if (lastInteractiveRegionsKey === key) lastInteractiveRegionsKey = "";
+  });
 }
 
 async function openMemoryPanel() {
@@ -1576,7 +1869,89 @@ async function boot() {
   document.documentElement.dataset.popupRole =
     POPUP_ROLE;
 
+  initializeSubtitles();
   autosizeInput();
+  focusComposerInput();
+  syncInteractiveRegions();
+  elements.characterArt?.addEventListener(
+    "load",
+    syncInteractiveRegions,
+  );
+
+  const syncDockRegions = () => {
+    window.requestAnimationFrame(
+      syncInteractiveRegions,
+    );
+    window.setTimeout(
+      syncInteractiveRegions,
+      220,
+    );
+  };
+
+  // Reveal only in the right-side button column, including over the subtitle,
+  // without placing an invisible hitbox over text.
+  document.addEventListener("pointermove", event => {
+    const rect = elements.actionDock?.getBoundingClientRect();
+    const visible = rect && event.clientX >= rect.left && event.clientX <= rect.right &&
+      event.clientY >= rect.top && event.clientY <= rect.bottom;
+    const value = visible ? "true" : "false";
+    if (elements.actionDock && elements.actionDock.dataset.visible !== value) {
+      elements.actionDock.dataset.visible = value;
+      syncInteractiveRegions();
+    }
+  });
+  document.addEventListener("pointerleave", () => {
+    if (elements.actionDock) elements.actionDock.dataset.visible = "false";
+    syncInteractiveRegions();
+  });
+
+  for (const element of [
+    elements.avatarHitbox,
+    elements.actionDock,
+  ]) {
+    element?.addEventListener(
+      "pointerenter",
+      syncDockRegions,
+    );
+    element?.addEventListener(
+      "pointerleave",
+      syncDockRegions,
+    );
+    element?.addEventListener("focusin", syncDockRegions);
+    element?.addEventListener("focusout", syncDockRegions);
+  }
+
+  elements.memoryActionButton
+    ?.addEventListener(
+      "click",
+      (event) => {
+        event.stopPropagation();
+        toggleMemoryPanel();
+      },
+    );
+
+  elements.memoryCloseBtn
+    ?.addEventListener(
+      "click",
+      (event) => {
+        event.stopPropagation();
+        closeMemoryPanel();
+      },
+    );
+
+  elements.memoryPanel
+    ?.addEventListener(
+      "click",
+      (event) => {
+        if (
+          event.target ===
+          elements.memoryPanel
+        ) {
+          closeMemoryPanel();
+        }
+      },
+    );
+
   await initializeRequestHeaders();
   if (isQuitting) {
     return;
@@ -1610,76 +1985,16 @@ async function boot() {
     }
   });
 
-  focusComposerInput();
-  syncInteractiveRegions();
-  elements.characterArt?.addEventListener(
-    "load",
-    syncInteractiveRegions,
-  );
 
-  const syncDockRegions = () => {
-    window.requestAnimationFrame(
-      syncInteractiveRegions,
-    );
-    window.setTimeout(
-      syncInteractiveRegions,
-      220,
-    );
-  };
-
-  for (const element of [
-    elements.avatarHitbox,
-    elements.actionDock,
-  ]) {
-    element?.addEventListener(
-      "pointerenter",
-      syncDockRegions,
-    );
-    element?.addEventListener(
-      "pointerleave",
-      syncDockRegions,
-    );
-  }
-
-  elements.memoryActionButton
-    ?.addEventListener(
-      "click",
-      (event) => {
-        event.stopPropagation();
-        toggleMemoryPanel();
-      },
-    );
-
-  elements.memoryCloseBtn
-    ?.addEventListener(
-      "click",
-      (event) => {
-        event.stopPropagation();
-        closeMemoryPanel();
-      },
-    );
-
-  elements.memoryPanel
-    ?.addEventListener(
-      "click",
-      (event) => {
-        if (
-          event.target ===
-          elements.memoryPanel
-        ) {
-          closeMemoryPanel();
-        }
-      },
-    );
 }
 
 window.addEventListener(
   "pywebviewready",
-  syncInteractiveRegions,
+  () => { syncInteractiveRegions(); void refreshVisibleViewport(); },
 );
 window.addEventListener(
   "resize",
-  syncInteractiveRegions,
+  () => { scheduleDialogueLayout(); void refreshVisibleViewport(); },
 );
 
 void boot();

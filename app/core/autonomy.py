@@ -1,4 +1,4 @@
-"""Sparse runtime coordination over Phase 4 APIs; no model or executor access."""
+"""Event-driven Phase 4 coordination; autonomous inference is explicitly opt-in."""
 
 import hashlib
 import threading
@@ -10,6 +10,7 @@ from app.core.perception import _text
 from app.core.config import SETTINGS
 from app.core.situation import current_situation
 from app.core.temporal import temporal_context, time_relevant
+from app.core import initiative
 
 
 PENDING_PROFILE_LIMIT = 16
@@ -17,7 +18,7 @@ PENDING_TOTAL_LIMIT = 64
 CYCLE_PROFILE_LIMIT = 16
 CYCLE_TOTAL_LIMIT = 64
 CYCLE_TTL = 300
-# No autonomous generation path exists: the enforceable budget is zero.
+# Production/default mode has an enforceable zero generation budget.
 AUTONOMOUS_MODEL_CALLS_PER_CYCLE = 0
 AUTONOMOUS_MODEL_CALLS_PER_WINDOW = 0
 
@@ -41,6 +42,10 @@ class CognitiveCycle:
     episode_id: str = ''
     model_reasoning_requested: bool = False
     communication_requested: bool = False
+    initiative_action: str = 'wait'
+    initiative_reasons: tuple[str, ...] = ()
+    initiative_id: str = ''
+    foreground_epoch: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +80,13 @@ class CognitionCoordinator:
         self._pending = []
         self._cycles = []
         self._deadlines = []
+        for profile in store.profile_ids():
+            self._deadlines.extend(_Deadline(profile, r['id'], r['at'], r['subject'], r['goal_id'])
+                for r in store.initiative_state(profile)['schedules'] if r['status'] == 'pending')
         self._foreground = 0
+        self._foreground_epoch = 0
+        self._generation_cancel = None
+        self._drafts = []
         self._preempt = threading.Event()
         self._closed = False
         self._running = None
@@ -112,6 +123,10 @@ class CognitionCoordinator:
         self._preempt.set()  # no Store/model lock acquisition on foreground ingress
         with self._condition:
             self._foreground += 1
+            self._foreground_epoch += 1
+            if self._generation_cancel is not None:
+                self._generation_cancel.set()
+            self._drafts.clear()
             self._preempt.set()
             self._condition.notify_all()
 
@@ -138,12 +153,16 @@ class CognitionCoordinator:
             self._pending = [t for t in self._pending if t.percept.profile_id != profile_id]
             self._cycles = [(at, c) for at, c in self._cycles if c.profile_id != profile_id]
             self._deadlines = [d for d in self._deadlines if d.profile_id != profile_id]
+            self._drafts = [d for d in self._drafts if d['profile_id'] != profile_id]
+            if self._running and self._running.profile_id == profile_id and self._generation_cancel is not None:
+                self._generation_cancel.set()
             self._condition.notify_all()
 
     def cancel(self, profile_id):
         self.foreground_started()
         try:
             with self.store._lock:
+                self.store._cancel_initiatives(profile_id, now=self.clock())
                 self.clear(profile_id)
         finally:
             self.foreground_finished()
@@ -152,6 +171,8 @@ class CognitionCoordinator:
         with self._condition:
             self._closed = True
             self._preempt.set()
+            if self._generation_cancel is not None:
+                self._generation_cancel.set()
             self._pending.clear()
             self._deadlines.clear()
             self._condition.notify_all()
@@ -159,6 +180,7 @@ class CognitionCoordinator:
             self._worker.join()
         with self._condition:
             self._cycles.clear()
+            self._drafts.clear()
 
     def wait_idle(self, timeout=5):
         """Synchronization for adapters/tests; production foreground never waits."""
@@ -177,17 +199,21 @@ class CognitionCoordinator:
         if (not all(_text(v) for v in (profile_id, deadline_id, subject))
                 or not _text(goal_id, optional=True) or at < now or at - now > 86400):
             raise ValueError('Invalid explicit deadline.')
-        with self._condition:
-            if self._closed:
+        with self.store._lock:
+            with self._condition:
+                if self._closed:
+                    return False
+                if (len(self._deadlines) >= PENDING_TOTAL_LIMIT or
+                        sum(d.profile_id == profile_id for d in self._deadlines) >= PENDING_PROFILE_LIMIT):
+                    return False
+            if not self.store._schedule_initiative(profile_id, deadline_id, at=at,
+                    subject=subject, goal_id=goal_id, now=now):
                 return False
-            if any((d.profile_id, d.id) == (profile_id, deadline_id) for d in self._deadlines):
-                return False
-            if (len(self._deadlines) >= PENDING_TOTAL_LIMIT or
-                    sum(d.profile_id == profile_id for d in self._deadlines) >= PENDING_PROFILE_LIMIT):
-                return False
-            self._deadlines.append(_Deadline(profile_id, deadline_id, at, subject, goal_id))
-            self._condition.notify_all()
-            return True
+            with self._condition:
+                if not self._closed:
+                    self._deadlines.append(_Deadline(profile_id, deadline_id, at, subject, goal_id))
+                self._condition.notify_all()
+                return True
 
     def receive_result(self, profile_id, episode_id, *, source, producer, occurrence_id,
                        content, timestamp, result, completed_goal_id=''):
@@ -260,15 +286,60 @@ class CognitionCoordinator:
             self._cycles.append((time.monotonic(), cycle))
             self._cycles = self._cycles[-CYCLE_TOTAL_LIMIT:]
 
+    def drafts(self, profile_id):
+        """Local inspection only; no UI delivery or external-message authority."""
+        with self._condition:
+            self._drafts = [d for d in self._drafts if 0 <= self.clock() - d['created_at'] < CYCLE_TTL]
+            return tuple(dict(d) for d in self._drafts if d['profile_id'] == profile_id)
+
+    def _generate_pending(self, cycle):
+        if not SETTINGS.autonomous_generation_enabled or not cycle or not cycle.communication_requested:
+            return
+        cancellation = threading.Event()
+        with self.store._lock:
+            with self._condition:
+                if self._closed or self._foreground or cycle.foreground_epoch != self._foreground_epoch:
+                    return
+                epoch = self._foreground_epoch
+                self._generation_cancel = cancellation
+            observation = self.store._begin_initiative_generation(cycle.profile_id, cycle.initiative_id,
+                now=self.clock(), timezone=self.timezone)
+        if observation is None:
+            with self._condition:
+                self._generation_cancel = None
+            return
+        try:
+            from app.core.inference import InferenceRuntime
+            text = InferenceRuntime.get_instance().draft_initiative(observation, cancellation=cancellation)
+            with self.store._lock:
+                state = self.store.initiative_state(cycle.profile_id)
+                valid = any(r['id'] == cycle.initiative_id and r['status'] == 'pending'
+                            and self.clock() < r['expires_at'] for r in state['journal'])
+                with self._condition:
+                    if (text.strip() and valid and state['preferences']['enabled']
+                            and state['preferences']['availability'] == 'available'
+                            and not initiative.quiet(state['preferences'], self.clock(), self.timezone)
+                            and not cancellation.is_set() and not self._closed
+                            and epoch == self._foreground_epoch):
+                        self._drafts.append(dict(profile_id=cycle.profile_id, initiative_id=cycle.initiative_id,
+                                                text=text[:2048], created_at=self.clock()))
+                        self._drafts = self._drafts[-CYCLE_TOTAL_LIMIT:]
+        finally:
+            with self._condition:
+                self._generation_cancel = None
+
     def _cycle(self, trigger):
         p = trigger.percept
         now = self.clock()
+        epoch = self._foreground_epoch
         cycle = CognitiveCycle('cycle_' + uuid.uuid4().hex, p.profile_id, p.id,
                                'deadline' if p.producer == 'temporal' else p.source,
-                               now, now, 'ignored')
+                               now, now, 'ignored', foreground_epoch=epoch)
         if trigger.result:
             resolved = self.store.resolve_action_episode(p.profile_id, p.subject, p.id,
                 result=trigger.result, completed_goal_id=trigger.completed_goal_id, now=now)
+            if resolved:
+                self.store._initiative_result(resolved, now=now)
             return replace(cycle, status='completed' if resolved else 'ignored',
                            episode_id=resolved.id if resolved else '', finished_at=self.clock())
         if not any(a.percept_id == p.id for a in self.store.attention(p.profile_id, now=now)):
@@ -288,14 +359,71 @@ class CognitionCoordinator:
         frame, assessment, decision = step
         if decision is None:
             return replace(cycle, status='attended', attention_reference=p.id)
-        if self._preempt.is_set():
+        if self._preempt.is_set() or epoch != self._foreground_epoch:
             return None
         episode = None
+        world = self.store.world(p.profile_id)
+        virtual_projection = p.source == 'world' and any(
+            row.id == p.world_id and any(s.kind == 'environment' for s in row.sources)
+            for collection in (world.entities, world.states, world.facts, world.relations, world.events)
+            for row in collection)
+        pending_episode = next((e for e in self.store.action_episodes(p.profile_id)
+            if decision.environment is None and e.status == 'pending' and now < e.expires_at
+            and (e.active_goal_id, e.strategy_id, e.selected_action) ==
+                (decision.active_goal_id, decision.strategy_id, decision.selected_action)), None)
+        if p.source != 'user' and not virtual_projection:
+            state = self.store.initiative_state(p.profile_id)
+            selection = initiative.evaluate(frame, assessment, decision, state=state,
+                now=now, timezone=self.timezone, last_interaction=self.store.last_interaction_at(p.profile_id),
+                recent_turns=self.store.recent_interactions(p.profile_id),
+                deadline=p.producer == 'temporal' and any(r['id'] == p.source_id and r['status'] == 'fired'
+                                                        for r in state['schedules']))
+            if pending_episode and selection.action == 'act':
+                selection = initiative.InitiativeDecision(reason_codes=('awaiting_result',))
+            cycle = replace(cycle, initiative_action=selection.action, initiative_reasons=selection.reason_codes)
+            if selection.action == 'wait':
+                return replace(cycle, status='completed', attention_reference=p.id,
+                               frame_reference=assessment.frame_reference, selected_action='wait',
+                               active_goal_id=decision.active_goal_id)
+            if self._preempt.is_set() or epoch != self._foreground_epoch:
+                return None
+            if not self.store._reserve_initiative(p, selection, now=now):
+                return replace(cycle, status='completed', selected_action='wait',
+                               initiative_action='wait', initiative_reasons=('capacity_or_duplicate',))
+            cycle = replace(cycle, initiative_id=p.id,
+                            communication_requested=selection.action == 'follow_up')
+            if self._preempt.is_set() or epoch != self._foreground_epoch:
+                self.store._finish_initiative(p.profile_id, p.id, now=now, status='cancelled')
+                return replace(cycle, status='cancelled', selected_action='wait', communication_requested=False)
         # User turns already have a delivery path. Never duplicate it or turn a
         # foreground response into background execution, even if VERIFY wins.
-        if p.source != 'user' and decision.selected_action in {'inspect', 'verify', 'continue'}:
-            episode = self.store._track_action_decision(decision,
-                source='task', producer='cognition-handoff', occurrence_id=cycle.id)
+        if (p.source != 'user' and not virtual_projection
+                and decision.selected_action in {'inspect', 'verify', 'continue'}):
+            from app.core.environment import PRODUCER as ENVIRONMENT_PRODUCER
+            episode = pending_episode or self.store._track_action_decision(decision,
+                source='task', producer=ENVIRONMENT_PRODUCER if decision.environment else 'cognition-handoff',
+                occurrence_id=cycle.id)
+        if self._preempt.is_set() or epoch != self._foreground_epoch:
+            if episode:
+                self.store._episodes.cancel(p.profile_id, {episode.id})
+            if cycle.initiative_id:
+                self.store._finish_initiative(p.profile_id, p.id, now=now, status='cancelled',
+                                              episode_id=episode.id if episode else '')
+            return replace(cycle, status='cancelled', selected_action='wait', communication_requested=False)
+        if episode is not None and decision.environment is not None:
+            self.store.execute_environment(p.profile_id, episode.id, now=now)
+            resolved = next(e for e in self.store.action_episodes(p.profile_id) if e.id == episode.id)
+            self.store._finish_initiative(p.profile_id, p.id, now=now, status='completed',
+                episode_id=episode.id, outcome_id=resolved.outcome_id)
+            return replace(cycle, status='completed', attention_reference=p.id,
+                frame_reference=assessment.frame_reference,
+                assessment_reference=hashlib.sha256(assessment.to_json().encode()).hexdigest(),
+                mode=assessment.mode, active_goal_id=decision.active_goal_id,
+                selected_action=decision.selected_action, strategy_id=decision.strategy_id,
+                episode_id=episode.id, finished_at=self.clock())
+        if cycle.initiative_id:
+            self.store._finish_initiative(p.profile_id, p.id, now=now,
+                status='awaiting_result' if episode else 'completed', episode_id=episode.id if episode else '')
         return replace(cycle,
             status='awaiting_result' if episode else 'completed',
             attention_reference=p.id, frame_reference=assessment.frame_reference,
@@ -305,7 +433,7 @@ class CognitionCoordinator:
             episode_id=episode.id if episode else '', finished_at=self.clock(),
             model_reasoning_requested=(p.source != 'user' and bool(decision.active_goal_id)
                 and assessment.mode in {'deliberate', 'verify'} and decision.selected_action != 'wait'),
-            communication_requested=p.source != 'user' and decision.selected_action == 'respond')
+            communication_requested=cycle.communication_requested)
 
     def _run(self):
         while True:
@@ -329,12 +457,25 @@ class CognitionCoordinator:
                         continue
                     now = self.clock()
                     due = next((d for d in self._deadlines if d.at <= now), None)
-                    if due and len(self._pending) < PENDING_TOTAL_LIMIT and sum(t.percept.profile_id == due.profile_id for t in self._pending) < PENDING_PROFILE_LIMIT:
-                        self._deadlines.remove(due)
-                        if not due.goal_id or any(g.id == due.goal_id and now < g.expires_at for g in self.store.active_goals(due.profile_id)):
-                            self.store.record_percept_receipt(due.profile_id, source='runtime', producer='temporal',
-                                source_id=due.id, subject=due.subject, content='Deadline reached: ' + due.subject, timestamp=now)
+                    if due and (len(self._pending) >= PENDING_TOTAL_LIMIT or sum(t.percept.profile_id == due.profile_id for t in self._pending) >= PENDING_PROFILE_LIMIT):
+                        due = None
+                if due:
+                    try:
+                        fired = self.store._fire_initiative_schedule(due.profile_id, due.id, now=now)
+                    except OSError:
+                        fired = False  # No event without durable consumption; retry only after restart.
+                    with self._condition:
+                        self._deadlines = [d for d in self._deadlines if d != due]
+                    goals = (*self.store.active_goals(due.profile_id), *self.store.developmental_goals(due.profile_id),
+                             *(g for g in self.store.self_items(due.profile_id) if g.kind == 'goal'))
+                    if fired and now - due.at < 300 and (not due.goal_id or any(g.id == due.goal_id and g.status == 'active'
+                            and now < getattr(g, 'expires_at', float('inf')) for g in goals)):
+                        self.store.record_percept_receipt(due.profile_id, source='runtime', producer='temporal',
+                            source_id=due.id, subject=due.subject, content='Deadline reached: ' + due.subject, timestamp=due.at)
+                with self._condition:
                     if not self._pending:
+                        continue
+                    if self._foreground or self._closed:
                         continue
                     trigger = self._pending[0]
                     self._running = trigger.percept
@@ -352,7 +493,14 @@ class CognitionCoordinator:
                         now, self.clock(), 'cancelled'))
                     with self._condition:
                         self._pending = [t for t in self._pending if t.percept.id != trigger.percept.id]
-                finally:
-                    with self._condition:
-                        self._running = None
-                        self._condition.notify_all()
+                    cycle = None
+            # The same sleeping coordinator may draft once after the Store lock
+            # is released. No model call ever holds up foreground Store access.
+            try:
+                self._generate_pending(cycle)
+            except Exception:
+                pass  # A failed draft is still an accounted attempt, never evidence.
+            finally:
+                with self._condition:
+                    self._running = None
+                    self._condition.notify_all()

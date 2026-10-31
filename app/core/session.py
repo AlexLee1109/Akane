@@ -552,6 +552,8 @@ def run_companion_turn(
         developmental_goal_changes = ()
         world_changes = ()
         if not skip_memory:
+            memories = store.memories(chat.profile_id)
+            experiences = store.experiences(chat.profile_id)
             (
                 memory_changes,
                 self_changes,
@@ -565,10 +567,10 @@ def run_companion_turn(
             ) = derive_developmental_goal_changes(
                 chat.profile_id,
                 store.self_items(chat.profile_id),
-                store.memories(chat.profile_id),
+                memories,
                 user_turn,
                 assistant_turn,
-                experiences=store.experiences(chat.profile_id),
+                experiences=experiences,
                 outcomes=store.outcomes(chat.profile_id),
                 predictions=store.predictions(chat.profile_id),
                 behavioral_tendencies=store.behavioral_tendencies(chat.profile_id),
@@ -579,17 +581,18 @@ def run_companion_turn(
                 semantic_evidence=sidecar.semantic_evidence,
                 now=committed_at,
             )
+            world = store.world(chat.profile_id)
             world_changes = derive_world_changes(
-                external_evidence(sidecar.semantic_evidence, store.world(chat.profile_id)), user_turn, assistant_turn,
-                world=store.world(chat.profile_id),
+                external_evidence(sidecar.semantic_evidence, world), user_turn, assistant_turn,
+                world=world,
                 recent_turns=context.state.recent_turns,
-                memories=store.memories(chat.profile_id),
-                experiences=store.experiences(chat.profile_id),
+                memories=memories,
+                experiences=experiences,
                 now=committed_at,
             )
             world_changes += derive_situation_changes(
                 sidecar.semantic_evidence, user_turn, assistant_turn,
-                world=store.world(chat.profile_id), now=committed_at,
+                world=world, now=committed_at,
                 runtime=runtime_situation,
             )
         development_finished_at = time.perf_counter()
@@ -609,7 +612,12 @@ def run_companion_turn(
             origin="conversation",
         )
         persist_started_at = time.perf_counter()
-        commit = store.commit(proposal)
+        # Order publication with reset/forget and cancellation. A cleared turn
+        # must not recreate its conversation or profile after derivation ends.
+        with _SCHEDULER._lock:
+            handle.check()
+            commit = (store.commit(proposal, offered_initiative_id=context.initiative_id)
+                      if context.initiative_id else store.commit(proposal))
         persist_finished_at = time.perf_counter()
         new_experience = (
             experience_changes[0]
@@ -946,9 +954,16 @@ def run_companion_turn(
             ) * 1000,
             "generated_tokens": timing.generated_tokens,
             "generated_token_method": timing.generated_token_method,
+            "backend_decode_eval_tokens": timing.backend_decode_eval_tokens,
             "finish_reason": timing.finish_reason or "unavailable",
             "decode_tokens_per_second": _tokens_per_second(
-                timing.generated_tokens, timing.decode_seconds,
+                timing.backend_decode_eval_tokens
+                if timing.backend_decode_eval_tokens is not None else timing.generated_tokens,
+                timing.decode_seconds,
+            ),
+            "decode_evaluations_per_second": (
+                _tokens_per_second(timing.backend_decode_eval_tokens, timing.decode_seconds)
+                if timing.backend_decode_eval_tokens is not None else None
             ),
             "time_to_first_8_visible_tokens_ms": (
                 max(0.0, first_eight_visible_tokens_at - session_started_at) * 1000
@@ -1102,16 +1117,18 @@ def clear_profile_caches(profile_id: str) -> None:
                 _TURN_DEBUG.pop(key, None)
 
 
-def reset_conversation(conversation_id: str, profile_id: str) -> None:
-    cancel_generation(conversation_id, profile_id)
-    get_store().clear_conversation(conversation_id, profile_id)
-    clear_conversation_caches(conversation_id, profile_id)
+def reset_conversation(conversation_id: str, profile_id: str, *, store=None) -> None:
+    with _SCHEDULER._lock:
+        cancel_generation(conversation_id, profile_id)
+        (store if store is not None else get_store()).clear_conversation(conversation_id, profile_id)
+        clear_conversation_caches(conversation_id, profile_id)
 
 
 def forget_profile(profile_id: str) -> None:
-    _SCHEDULER.cancel_profile(profile_id)
-    get_store().clear_profile(profile_id)
-    clear_profile_caches(profile_id)
+    with _SCHEDULER._lock:
+        _SCHEDULER.cancel_profile(profile_id)
+        get_store().clear_profile(profile_id)
+        clear_profile_caches(profile_id)
 
 
 def session_state_snapshot(conversation_id: str, profile_id: str) -> dict[str, object]:

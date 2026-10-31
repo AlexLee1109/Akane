@@ -11,27 +11,41 @@ import tempfile
 import threading
 import time
 from dataclasses import asdict, replace
+from itertools import islice
 from pathlib import Path
 
+import orjson
+
 from app.core.config import SETTINGS
+from app.core import environment as virtual
 from app.core.attention import _evaluate_attention
 from app.core.cognition import _build_frame, _percept_query
 from app.core.deliberation import _assess_frame
 from app.core.actions import ActionSelection
 from app.core.episodes import EpisodeBook, outcome_id, result_proposal, validate_producer
-from app.core.perception import PerceptBuffer
+from app.core import initiative
+from app.core.perception import Percept, PerceptBuffer
+from app.core.retrieval import (
+    RecallQuery, consolidate_experiences, evidence_rank, same_memory_fact, semantic_terms,
+)
 from app.core.mind import (
+    _normalized_evidence,
     behavioral_tendency_state,
     curiosity_state,
+    dialogue_outcome_is_grounded,
+    feedback_result_is_contradicted,
     developmental_goal_state,
+    developmental_goal_completed_by_outcome,
     find_behavioral_tendency,
     find_curiosity,
     find_developmental_goal,
     find_strategy,
     find_self_item,
     memory_topic,
-    same_experience,
+    observed_self_history,
+    same_experience_source,
     self_development_state,
+    self_history_is_grounded,
     self_topic_terms,
     strategy_state,
 )
@@ -74,6 +88,7 @@ from app.core.state import (
     StrategyChange,
     Turn,
     WorldSnapshot,
+    WorldSource,
     WorldState,
 )
 from app.core.utils import OWNER_PROFILE_ID, lexical_terms, relevance, text_key
@@ -83,7 +98,7 @@ from app.core.world import (
 )
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 18
 CONVERSATION_TURN_LIMIT = max(32, SETTINGS.recent_turn_limit * 2)
 MEMORY_LIMIT = 128
 EXPERIENCE_LIMIT = 64
@@ -105,7 +120,7 @@ _ROOT_KEYS = {"schema_version", "revision", "updated_at", "profiles"}
 _PROFILE_KEYS = {
     "created_at", "updated_at", "self", "memories", "experiences", "outcomes",
     "predictions", "behavioral_tendencies", "strategies", "curiosities",
-    "developmental_goals", "conversations", "world",
+    "developmental_goals", "conversations", "world", "environment", "initiative",
 }
 _SELF_KEYS = {*SELF_GROUP_BY_KIND.values(), "revisions"}
 _CONVERSATION_KEYS = {"created_at", "updated_at", "turns"}
@@ -167,7 +182,7 @@ def _term_relevance(query_terms: set[str], candidate: object) -> float:
     candidate_terms = lexical_terms(candidate) - _GENERIC_QUERY_TERMS
     shared = len(query_terms & candidate_terms)
     return max(
-        shared / max(1, len(query_terms | candidate_terms)),
+        shared / max(1, len(query_terms) + len(candidate_terms) - shared),
         shared / max(1, min(len(query_terms), 4)),
     )
 
@@ -219,6 +234,8 @@ def _new_profile(now: float) -> dict[str, object]:
         "curiosities": [],
         "developmental_goals": [],
         "world": empty_world(),
+        "environment": {},
+        "initiative": initiative.empty_initiative(),
         "conversations": {},
     }
 
@@ -652,7 +669,7 @@ def _developmental_goal(row: object, profile_id: str) -> DevelopmentalGoal:
             status == "active"
             and len(sources) + len(progress) < 2
         )
-        or (status == "satisfied" and len(progress) < 2)
+        or (status == "satisfied" and not progress)
         or (status == "retired" and not contradictions)
     ):
         raise StateIntegrityError("Developmental Goal content is invalid.")
@@ -739,6 +756,24 @@ def _self_rows(profile: dict[str, object]):
         yield from state[group]
 
 
+def _outcome_feedback_text(profile, source_turn_ids) -> str | None:
+    """Retained source text can veto a cropped completion claim.
+
+    Normal conversation eviction leaves the admitted bounded Outcome witness;
+    malformed conversation structures are rejected by canonical validation.
+    """
+    conversations = profile.get('conversations')
+    if not isinstance(conversations, dict):
+        return None
+    for conversation in conversations.values():
+        if not isinstance(conversation, dict) or not isinstance(conversation.get('turns'), list):
+            continue
+        for turn in conversation['turns']:
+            if isinstance(turn, dict) and turn.get('id') == source_turn_ids[1]:
+                return str(turn.get('content', '')) if turn.get('role') == 'user' else ''
+    return None
+
+
 def _validate_state(value: object) -> None:
     root = _mapping(value, _ROOT_KEYS, "state")
     if root["schema_version"] != SCHEMA_VERSION:
@@ -751,9 +786,17 @@ def _validate_state(value: object) -> None:
     if not isinstance(profiles, dict):
         raise StateIntegrityError("State profiles must be an object.")
     all_turn_ids: set[str] = set()
+    scheduled_count = 0
     for profile_id, raw_profile in profiles.items():
         profile_id = _identifier(profile_id, "profile ID")
         profile = _mapping(raw_profile, _PROFILE_KEYS, "profile")
+        try:
+            initiative.validate_initiative(profile['initiative'])
+        except ValueError as exc:
+            raise StateIntegrityError(str(exc)) from exc
+        scheduled_count += sum(r['status'] == 'pending' for r in profile['initiative']['schedules'])
+        if scheduled_count > 64:
+            raise StateIntegrityError('Global initiative schedule capacity exceeded.')
         _finite(profile["created_at"], "profile creation time")
         _finite(profile["updated_at"], "profile update time")
         self_state = _mapping(profile["self"], _SELF_KEYS, "Self")
@@ -946,6 +989,16 @@ def _validate_state(value: object) -> None:
                 raise StateIntegrityError(
                     "Developmental Goal links unknown progress Outcomes.",
                 )
+            if item.status == "satisfied" and not any(
+                developmental_goal_completed_by_outcome(
+                    item, outcome_by_id[id],
+                    feedback_text=_outcome_feedback_text(profile, outcome_by_id[id].source_turn_ids),
+                )
+                for id in item.progress_outcome_ids
+            ):
+                raise StateIntegrityError(
+                    "Developmental Goal satisfaction lacks whole-goal completion evidence.",
+                )
             if set(item.contradiction_ids) - (experience_ids | outcome_ids):
                 raise StateIntegrityError(
                     "Developmental Goal links unknown contradiction evidence.",
@@ -970,7 +1023,8 @@ def _validate_state(value: object) -> None:
                 all_turn_ids.add(item.id)
         try:
             validate_world(profile["world"], profile_id)
-        except ValueError as exc:
+            virtual.validate_environment(profile['environment'], profile_id)
+        except (ValueError, TypeError, KeyError) as exc:
             raise StateIntegrityError(str(exc)) from exc
 
 def _migrate_legacy(value: object) -> dict[str, object]:
@@ -979,12 +1033,39 @@ def _migrate_legacy(value: object) -> dict[str, object]:
     version = value.get("schema_version")
     if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version < SCHEMA_VERSION:
         raise StateIntegrityError(f"Unsupported state schema: {version!r}.")
-    if version == 14:
+    if version in {14, 15, 16, 17}:
         migrated = copy.deepcopy(value)
         migrated["schema_version"] = SCHEMA_VERSION
-        for profile in migrated["profiles"].values():
-            _mapping(profile, _PROFILE_KEYS - {"world"}, "schema-14 profile")
-            profile["world"] = empty_world()
+        for profile_id, profile in migrated["profiles"].items():
+            missing = ({'initiative'} if version < 17 else set()) | ({'environment'} if version < 16 else set()) | ({'world'} if version == 14 else set())
+            _mapping(profile, _PROFILE_KEYS - missing, f"schema-{version} profile")
+            if version == 14:
+                profile["world"] = empty_world()
+            if version < 16:
+                profile['environment'] = {}
+            if version < 17:
+                profile['initiative'] = initiative.empty_initiative()
+            outcome_rows = profile['outcomes']
+            if not isinstance(outcome_rows, list) or len(outcome_rows) > OUTCOME_LIMIT:
+                raise StateIntegrityError('Outcomes are invalid or exceed their bound.')
+            outcomes = {}
+            for row in outcome_rows:
+                item = _outcome(row, profile_id)
+                outcomes[item.id] = item
+            goal_rows = profile['developmental_goals']
+            if not isinstance(goal_rows, list) or len(goal_rows) > DEVELOPMENTAL_GOAL_LIMIT:
+                raise StateIntegrityError('Developmental Goals are invalid or exceed their bound.')
+            for row in goal_rows:
+                goal = _developmental_goal(row, profile_id)
+                if goal.status == 'satisfied':
+                    if not any(developmental_goal_completed_by_outcome(
+                                   goal, outcomes[id],
+                                   feedback_text=_outcome_feedback_text(profile, outcomes[id].source_turn_ids),
+                               )
+                               for id in goal.progress_outcome_ids if id in outcomes):
+                        # Preserve every source/progress record; old success counts
+                        # establish progress, not completion of the entire goal.
+                        row['status'] = 'active'
         _validate_state(migrated)
         return migrated
     migrated = _empty_state()
@@ -1207,6 +1288,45 @@ def _migrate_legacy(value: object) -> dict[str, object]:
     return migrated
 
 
+def _learning_rows(profile, collection: str):
+    # Keep legacy evidence/history intact, but do not use learning built on a
+    # result whose own user witness contradicts its pre-fix semantic label.
+    if not profile[collection]:
+        return profile[collection]
+    contradicted = set()
+    for outcome in profile['outcomes']:
+        if not outcome['reason'].startswith('grounded:user-') or outcome['result'] == 'correction':
+            continue
+        expected = 'success' if outcome['result'] in {'task_success', 'positive_feedback'} else 'failure'
+        full_report = _outcome_feedback_text(profile, outcome['source_turn_ids'])
+        if (feedback_result_is_contradicted(outcome['description'], outcome['action'], expected)
+                or (full_report is not None
+                    and feedback_result_is_contradicted(full_report, outcome['action'], expected))):
+            contradicted.add(outcome['id'])
+    return [row for row in profile[collection]
+            if not contradicted.intersection((*row['supporting_outcome_ids'],
+                                              *row['contradiction_outcome_ids']))]
+
+
+def _grounded_self_text(profile, value: str, profile_id: str, at: float) -> bool:
+    # Most Self is a present judgment: avoid loading provenance unless the text
+    # actually needs historical authority. Existing records stay intact on disk.
+    if self_history_is_grounded(value):
+        return True
+    experiences = tuple(_experience(row, profile_id) for row in profile['experiences']
+                        if float(row['created_at']) <= at)
+    outcomes = tuple(_outcome(row, profile_id) for row in profile['outcomes']
+                     if float(row['created_at']) <= at)
+    expressions = tuple(row['content'] for conversation in profile['conversations'].values()
+                        for row in conversation['turns']
+                        if row['role'] == 'assistant' and float(row['created_at']) < at)
+    return self_history_is_grounded(value,
+        prior_expressions=expressions + tuple(item.akane_response for item in experiences
+                                             if item.created_at < at),
+        observed_events=observed_self_history(experiences, outcomes,
+            profile_id=profile_id, before=at))
+
+
 def _broad_self_kinds(query: str) -> frozenset[str]:
     normalized = text_key(query)
     terms = lexical_terms(query)
@@ -1253,18 +1373,25 @@ def _rank_developmental_rows(
     minimum_provenance: int,
     minimum_strength: float,
     minimum_confidence: float,
+    now: float = float('inf'),
 ) -> list[tuple[float, float, float, float, str, dict[str, object]]]:
     ranked = []
     for row in rows:
         provenance_count = sum(len(row[field]) for field in provenance_fields)
         if (
             row["status"] != "active"
+            or float(row['updated_at']) > now
             or provenance_count < minimum_provenance
             or float(row["strength"]) < minimum_strength
             or float(row["confidence"]) < minimum_confidence
         ):
             continue
         evidence = " ".join(str(row[field]) for field in text_fields)
+        # Learned guidance belongs to its context/topic. Shared procedure or
+        # effect words alone cannot make a different target relevant.
+        anchor = semantic_terms(' '.join(self_topic_terms(row[text_fields[0]])))
+        if not anchor or not anchor <= query_terms:
+            continue
         score = _term_relevance(query_terms, evidence) if query_terms else 0.0
         if score >= 0.24:
             ranked.append((
@@ -1315,7 +1442,7 @@ class Store:
                     self._perception.on_admit = None
                     self.cognition = None
 
-    def cognition_step(self, profile_id, percept_id, *, now, temporal=()):
+    def cognition_step(self, profile_id, percept_id, *, now, temporal=(), choice_id=None, suggested_choice_id=''):
         """Trusted coordinator path: current frame → assessment → decision once."""
         from app.core.cognition import FRAME_MAX_BYTES
         with self._lock:
@@ -1326,7 +1453,8 @@ class Store:
             if len(timed.to_json().encode('utf-8')) <= FRAME_MAX_BYTES:
                 frame = timed
             assessment = _assess_frame(frame)
-            decision = self._action_selection.decide(frame, assessment) if assessment else None
+            decision = self._action_selection.decide(frame, assessment, choice_id=choice_id,
+                suggested_choice_id=suggested_choice_id) if assessment else None
             return frame, assessment, decision
 
     def percepts(self, profile_id: str):
@@ -1340,6 +1468,158 @@ class Store:
             return max((t['created_at'] for c in profile.get('conversations', {}).values()
                         for t in c['turns'] if t['role'] == 'user'), default=None)
 
+    def recent_interactions(self, profile_id):
+        with self._lock:
+            profile = self._state['profiles'].get(profile_id, {})
+            turns = (_turn(t, profile_id, id) for id, c in profile.get('conversations', {}).items()
+                     for t in c['turns'][-8:])
+            return tuple(sorted(turns, key=lambda t: t.created_at)[-8:])
+
+    def initiative_state(self, profile_id):
+        """Operational receipts and preferences for exactly one profile."""
+        with self._lock:
+            profile = self._state['profiles'].get(profile_id)
+            return copy.deepcopy(profile['initiative'] if profile else initiative.empty_initiative())
+
+    def _save_initiative(self, profile_id, row, now):
+        candidate, profile = self._candidate(profile_id, now)
+        profile['initiative'] = row
+        profile['updated_at'] = now
+        candidate['revision'] = int(self._state['revision']) + 1
+        candidate['updated_at'] = now
+        _validate_state(candidate)
+        self._write_state(candidate)
+        self._state = candidate
+
+    def set_initiative_preferences(self, profile_id, *, now=None, **preferences):
+        """Trusted local settings API; never parse these controls from event text."""
+        current = time.time() if now is None else _finite(now, 'initiative time')
+        _identifier(profile_id, 'profile ID')
+        with self._lock:
+            row = self.initiative_state(profile_id)
+            row['preferences'].update(preferences)
+            initiative.validate_preferences(row['preferences'])
+            episode_ids = set()
+            if not row['preferences']['enabled']:
+                for item in row['journal']:
+                    if item['status'] in {'pending', 'reserved', 'awaiting_result'}:
+                        item['status'] = 'cancelled'
+                        episode_ids.add(item['episode_id'])
+            self._save_initiative(profile_id, row, current)
+            self._episodes.cancel(profile_id, episode_ids)
+
+    def _reserve_initiative(self, percept, selection, *, now):
+        """Persist intent before execution: an interrupted attempt is never replayed.
+
+        Only the coordinator supplies a decision from a freshly owned frame.
+        Reserving proves observation/admission, not completion or learning.
+        """
+        if selection.action == 'wait' or percept not in self.percepts(percept.profile_id):
+            return False
+        row = self.initiative_state(percept.profile_id)
+        if any(r['id'] == percept.id for r in row['journal']):
+            return False
+        row['journal'] = [r for r in row['journal'] if now - r['created_at'] < initiative.RETENTION_SECONDS]
+        if len(row['journal']) >= initiative.JOURNAL_LIMIT:
+            return False
+        row['journal'].append(dict(id=percept.id, fingerprint=initiative.fingerprint(percept),
+            subject=selection.subject.encode('utf-8')[:200].decode('utf-8', errors='ignore').strip(), content=percept.content,
+            created_at=now, expires_at=now + initiative.FOLLOW_UP_TTL,
+            action=selection.action, status='pending' if selection.action == 'follow_up' else 'reserved',
+            episode_id='', outcome_id='', generation_at=0, offered_turn_id=''))
+        self._save_initiative(percept.profile_id, row, now)
+        return True
+
+    def _finish_initiative(self, profile_id, id, *, now, status, episode_id='', outcome_id=''):
+        row = self.initiative_state(profile_id)
+        item = next((r for r in row['journal'] if r['id'] == id), None)
+        if item is None or item['status'] in {'cancelled', 'offered', 'expired'}:
+            return
+        item.update(episode_id=episode_id, outcome_id=outcome_id)
+        if item['action'] != 'follow_up' or status == 'cancelled':
+            item['status'] = status
+        self._save_initiative(profile_id, row, now)
+
+    def _initiative_result(self, episode, *, now):
+        row = self.initiative_state(episode.profile_id)
+        changed = False
+        for item in row['journal']:
+            if item['episode_id'] == episode.id and item['status'] in {'pending', 'awaiting_result', 'reserved'}:
+                item['outcome_id'] = episode.outcome_id
+                if item['action'] == 'act':
+                    item['status'] = 'completed'
+                changed = True
+        if changed:
+            self._save_initiative(episode.profile_id, row, now)
+
+    def _cancel_initiatives(self, profile_id, *, now):
+        row = self.initiative_state(profile_id)
+        changed = False
+        episode_ids = set()
+        for item in row['journal']:
+            if item['status'] in {'pending', 'reserved', 'awaiting_result'}:
+                item['status'] = 'cancelled'
+                episode_ids.add(item['episode_id'])
+                changed = True
+        for item in row['schedules']:
+            if item['status'] == 'pending':
+                item['status'] = 'cancelled'
+                changed = True
+        if changed:
+            self._save_initiative(profile_id, row, now)
+            self._episodes.cancel(profile_id, episode_ids)
+
+    def _schedule_initiative(self, profile_id, id, *, at, subject, goal_id, now):
+        row = self.initiative_state(profile_id)
+        row['schedules'] = [r for r in row['schedules']
+                            if r['status'] == 'pending' or now - r['at'] < initiative.RETENTION_SECONDS]
+        if any(r['id'] == id for r in row['schedules']) or len(row['schedules']) >= initiative.SCHEDULE_LIMIT:
+            return False
+        row['schedules'].append(dict(id=id, at=at, subject=subject, goal_id=goal_id, status='pending'))
+        self._save_initiative(profile_id, row, now)
+        return True
+
+    def _fire_initiative_schedule(self, profile_id, id, *, now):
+        row = self.initiative_state(profile_id)
+        item = next((r for r in row['schedules'] if r['id'] == id and r['status'] == 'pending'), None)
+        if item is None:
+            return False
+        item['status'] = 'fired'
+        self._save_initiative(profile_id, row, now)
+        return True
+
+    def initiative_offer(self, profile_id, query, *, now, timezone):
+        """One relevant, unconsumed observation; reading does not consume it."""
+        with self._lock:
+            row = self.initiative_state(profile_id)
+            prefs = row['preferences']
+            if (not prefs['enabled'] or prefs['availability'] in {'busy', 'away'}
+                    or initiative.quiet(prefs, now, timezone)):
+                return None
+            return next((r for r in row['journal'] if r['action'] == 'follow_up'
+                         and r['status'] == 'pending' and r['created_at'] <= now < r['expires_at']
+                         and initiative.relevant_offer(r, query)), None)
+
+    def _begin_initiative_generation(self, profile_id, id, *, now, timezone):
+        """Durable attempt accounting, including failures/cancellation/restarts."""
+        row = self.initiative_state(profile_id)
+        prefs = row['preferences']
+        item = next((r for r in row['journal'] if r['id'] == id and r['action'] == 'follow_up'
+                     and r['status'] == 'pending' and not r['generation_at']
+                     and r['created_at'] <= now < r['expires_at']), None)
+        last = self.last_interaction_at(profile_id)
+        attempts = sum(0 <= now - r['generation_at'] < initiative.WINDOW_SECONDS
+                       for p in self._state['profiles'].values() for r in p['initiative']['journal']
+                       if r['generation_at'])
+        if (item is None or profile_id != OWNER_PROFILE_ID or not prefs['enabled']
+                or prefs['availability'] != 'available' or initiative.quiet(prefs, now, timezone)
+                or last is not None and now - last < initiative.RECENT_INTERACTION_SECONDS
+                or attempts >= initiative.GENERATION_WINDOW_LIMIT):
+            return None
+        item['generation_at'] = now
+        self._save_initiative(profile_id, row, now)
+        return dict(subject=item['subject'], observation=item['content'])
+
     def attention(self, profile_id: str, *, now: float | None = None):
         """Bounded, passive attention view; never accepts caller-supplied percepts."""
         current = time.time() if now is None else now
@@ -1349,6 +1629,12 @@ class Store:
             percepts = self._perception.snapshot(profile_id)
             if not percepts:
                 return ()
+            rows = self._state['profiles'].get(profile_id, {}).get('environment', {})
+            if rows:
+                current_offers = {virtual.observation(activity, row).source_id for activity, row in rows.items()}
+                percepts = tuple(p for p in percepts if not (
+                    p.source == 'runtime' and p.producer == virtual.PRODUCER
+                    and p.source_id not in current_offers))
             return _evaluate_attention(
                 profile_id, percepts, world=self.world(profile_id),
                 self_items=self.self_items(profile_id),
@@ -1357,12 +1643,15 @@ class Store:
                 goals=self.developmental_goals(profile_id),
                 predictions=self.predictions(profile_id), outcomes=self.outcomes(profile_id),
                 now=current,
+                deadline_ids={r['id'] for r in self.initiative_state(profile_id)['schedules'] if r['status'] == 'fired'},
             )
 
     def record_percept_receipt(self, profile_id: str, *, source: str,
                                producer: str, source_id: str, content: str,
                                timestamp: float, subject: str = ""):
         """Trusted local runtime/tool/task adapter; not an untrusted input API."""
+        if producer == virtual.PRODUCER:
+            raise ValueError('Virtual receipts are generated only by the environment adapter.')
         with self._lock:
             return self._perception.receipt(
                 profile_id, source=source, producer=producer, source_id=source_id,
@@ -1383,12 +1672,35 @@ class Store:
                 return None
             world = self.world(profile_id)
             query = _percept_query(percept, world)
+            state = self.snapshot(profile_id, '', query=query, now=current)
+            environment, linked = None, ()
+            histories = ()
+            if percept.producer == virtual.PRODUCER:
+                row = self._state['profiles'].get(profile_id, {}).get('environment', {}).get(percept.subject)
+                if row is None:
+                    return None
+                observation = virtual.observation(percept.subject, row)
+                if (percept.source != 'runtime' or percept.source_id != observation.source_id
+                        or percept.content != observation.content):
+                    return None
+                from app.core.cognition import FrameRecord, action_histories
+                linked = tuple(FrameRecord('outcome', o.id,
+                    (('action', o.action), ('result', o.result), ('description', o.description)),
+                    o.created_at, tuple(WorldSource('environment', id) for id in o.source_turn_ids))
+                    for o in reversed(self.outcomes(profile_id))
+                    if o.reason == 'grounded:virtual_environment'
+                    and o.action.startswith(('inspect virtual ' + percept.subject + ' ',
+                                             'continue virtual ' + percept.subject + ' ',
+                                             'verify virtual ' + percept.subject + ' ')))[:2]
+                environment = observation
+                histories = action_histories(observation, row, self.outcomes(profile_id),
+                                             state.strategies, state.behavioral_tendencies)
             return _build_frame(
                 percept, attention, query=query, world=world,
-                state=self.snapshot(profile_id, '', query=query, now=current),
+                state=state,
                 predictions=self.predictions(profile_id) if 'surprise' in attention.reason_codes else (),
                 outcomes=self.outcomes(profile_id) if 'surprise' in attention.reason_codes else (),
-                now=current,
+                now=current, environment=environment, linked_evidence=linked, action_history=histories,
             )
 
     def deliberation_assessment(self, profile_id: str, percept_id: str, *, now: float | None = None):
@@ -1397,14 +1709,16 @@ class Store:
             frame = self.cognitive_frame(profile_id, percept_id, now=now)
             return _assess_frame(frame) if frame is not None else None
 
-    def action_decision(self, profile_id: str, percept_id: str, *, now: float | None = None):
+    def action_decision(self, profile_id: str, percept_id: str, *, now: float | None = None, choice_id=None,
+                        suggested_choice_id=''):
         """Explicit Phase 4E selection; only transient objectives may change."""
         with self._lock:
             frame = self.cognitive_frame(profile_id, percept_id, now=now)
             if frame is None:
                 return None
             assessment = _assess_frame(frame)
-            return self._action_selection.decide(frame, assessment) if assessment else None
+            return self._action_selection.decide(frame, assessment, choice_id=choice_id,
+                suggested_choice_id=suggested_choice_id) if assessment else None
 
     def active_goals(self, profile_id: str):
         with self._lock:
@@ -1416,13 +1730,17 @@ class Store:
             return self._action_selection.finish(profile_id, goal_id, status)
 
     def start_action_episode(self, profile_id: str, percept_id: str, *, source: str,
-                             producer: str, occurrence_id: str, now: float | None = None):
+                             producer: str, occurrence_id: str, now: float | None = None, choice_id=None,
+                             suggested_choice_id=''):
         """Trusted local producer reserves a later result for a current decision."""
         validate_producer(source, producer, occurrence_id)
         with self._lock:
-            decision = self.action_decision(profile_id, percept_id, now=now)
+            decision = self.action_decision(profile_id, percept_id, now=now, choice_id=choice_id,
+                suggested_choice_id=suggested_choice_id)
             if decision is None:
                 return None
+            if decision.environment is not None and (source != 'task' or producer != virtual.PRODUCER):
+                raise ValueError('Virtual episodes require the environment result producer.')
             return self._track_action_decision(decision, source=source,
                 producer=producer, occurrence_id=occurrence_id)
 
@@ -1459,6 +1777,8 @@ class Store:
             episode = self._episodes.match(profile_id, episode_id, receipt, current)
             if episode is None:
                 return None
+            if episode.environment is not None:
+                raise ValueError('Execute the virtual action to obtain its verified outcome.')
             if completed_goal_id and (result != 'success' or receipt.source != 'task'
                                      or completed_goal_id != episode.active_goal_id):
                 raise ValueError('Objective completion requires a matching successful task receipt.')
@@ -1471,7 +1791,7 @@ class Store:
                 episode, receipt, result, strategies=self.strategies(profile_id),
                 tendencies=self.behavioral_tendencies(profile_id), outcomes=outcomes, now=current,
             )
-            committed = self.commit(proposal, now=current)
+            committed = self.commit(proposal, now=current, _verified_outcome=proposal.outcomes[0])
             if 'outcome:form' not in committed.applied:
                 return None
             finished = self._episodes.finish(episode, receipt, outcome_id=outcome_id(receipt), prediction=resolved)
@@ -1492,12 +1812,108 @@ class Store:
         _validate_state(value)
         return value
 
+    def environment(self, profile_id: str):
+        """Isolated durable simulation state and bounded verifiable receipts."""
+        with self._lock:
+            return copy.deepcopy(self._state['profiles'].get(profile_id, {}).get('environment', {}))
+
+    def observe_environment(self, profile_id, activity, *, engage=False, now=None):
+        """Trusted local adapter; engage explicitly establishes a transient task.
+
+        Observing/considering never records an executed action or Experience.
+        No timer, model output or untrusted receipt can opt into engagement.
+        """
+        current = time.time() if now is None else _finite(now, 'environment observation time')
+        if type(engage) is not bool:
+            raise ValueError('Engagement must be explicit.')
+        virtual.initial_state(activity)
+        with self._lock:
+            rows = self._state['profiles'].get(profile_id, {}).get('environment', {})
+            if activity not in rows:
+                self.commit(StateChangeProposal(profile_id, origin='virtual_environment',
+                    environment=virtual.EnvironmentChange(activity)), now=current)
+            if engage:
+                row = self._state['profiles'][profile_id]['environment'][activity]
+                self.commit(StateChangeProposal(profile_id, origin='virtual_environment',
+                    environment=virtual.EnvironmentChange(activity, row['revision'])), now=current)
+            row = self._state['profiles'][profile_id]['environment'][activity]
+            observation = virtual.observation(activity, row)
+            p = self._perception.receipt(profile_id, source='runtime', producer=virtual.PRODUCER,
+                source_id=observation.source_id, subject=activity, content=observation.content, timestamp=current)
+            if p is None:
+                p = next((p for p in self.percepts(profile_id) if p.source_id == observation.source_id
+                          and p.producer == virtual.PRODUCER), None)
+                if p is not None and engage and self.cognition is not None and not self.cognition._notify(p):
+                    raise BufferError('Cognition queue full; retry explicit virtual engagement.')
+            if p is None:
+                raise BufferError('Virtual observation could not be admitted; retry when cognition has capacity.')
+            return p
+
+    def execute_environment(self, profile_id, episode_id, *, now=None):
+        """Execute one current bound episode, atomically with all resulting learning."""
+        current = time.time() if now is None else _finite(now, 'environment execution time')
+        with self._lock:
+            episode = next((e for e in self.action_episodes(profile_id) if e.id == episode_id), None)
+            if episode is None or episode.environment is None:
+                raise ValueError('Unknown virtual action episode.')
+            if episode.status != 'pending':
+                return None
+            self.commit(StateChangeProposal(profile_id, origin='virtual_environment', environment=
+                virtual.EnvironmentChange(episode.environment.activity, episode.environment.revision, episode.id)), now=current)
+            return copy.deepcopy(self._state['profiles'][profile_id]['environment'][episode.environment.activity]['receipts'][-1])
+
+    def _prepare_environment(self, profile_id, profile, change, now):
+        if type(change) is not virtual.EnvironmentChange or change.activity not in virtual.ACTIVITIES:
+            raise ValueError('Invalid virtual command.')
+        if type(change.expected_revision) is not int or not isinstance(change.episode_id, str):
+            raise ValueError('Invalid virtual command fields.')
+        activity = change.activity
+        previous = profile['environment'].get(activity)
+        if change.expected_revision == -1:
+            if previous is not None or change.episode_id:
+                raise ValueError('Virtual environment already exists.')
+            row = virtual.initial_environment(profile_id, activity)
+            proposal = StateChangeProposal(profile_id, world=virtual.world_changes(profile_id, activity, row, now))
+            return row, proposal, None, None, None
+        if previous is None or change.expected_revision != previous['revision']:
+            raise ValueError('Stale virtual command revision.')
+        if not change.episode_id:
+            source = previous['receipts'][-1]['id'] if previous['receipts'] else previous['instance_id']
+            proposal = StateChangeProposal(profile_id, world=virtual.situation_changes(
+                profile_id, activity, self.world(profile_id), source, now))
+            return previous, proposal, None, None, None
+        episode = next((e for e in self.action_episodes(profile_id) if e.id == change.episode_id), None)
+        if (episode is None or episode.status != 'pending' or episode.producer != virtual.PRODUCER
+                or episode.source != 'task' or episode.environment is None
+                or not episode.created_at <= now < episode.expires_at
+                or not any(g.id == episode.active_goal_id and now < g.expires_at
+                           for g in self.active_goals(profile_id))):
+            raise ValueError('Virtual action lacks a current bound episode and objective.')
+        if previous['receipts'] and now < previous['receipts'][-1]['timestamp']:
+            raise ValueError('Virtual result time precedes prior execution.')
+        row, evidence = virtual.advance(profile_id, activity, previous, episode, now)
+        receipt = Percept(evidence['percept_id'], profile_id,
+            'task', 'completion', evidence['detail'], now, virtual.PRODUCER,
+            episode.occurrence_id, episode.id)
+        proposal, resolved = result_proposal(episode, receipt, evidence['result'],
+            strategies=self.strategies(profile_id), tendencies=self.behavioral_tendencies(profile_id),
+            outcomes=self.outcomes(profile_id), now=now)
+        proposal = replace(proposal, origin='virtual_environment',
+                           world=virtual.world_changes(profile_id, activity, row, now))
+        return row, proposal, episode, receipt, resolved
+
     def _write_state(self, state: dict[str, object]) -> dict[str, float | int]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         serialized_at = time.perf_counter()
-        payload = (
-            json.dumps(state, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
-        ).encode("utf-8")
+        # Callers validate canonical state (including finite numbers) before
+        # writing. Encode directly to UTF-8, without full-size Unicode copies.
+        try:
+            payload = orjson.dumps(state, option=orjson.OPT_APPEND_NEWLINE)
+        except orjson.JSONEncodeError:
+            # Canonical revision integers have no 64-bit limit.
+            payload = (
+                json.dumps(state, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
         serialized = time.perf_counter() - serialized_at
         descriptor, temporary = tempfile.mkstemp(
             prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent,
@@ -1543,7 +1959,12 @@ class Store:
         candidate = dict(self._state)
         candidate["profiles"] = dict(self._state["profiles"])
         existing = candidate["profiles"].get(profile_id)
-        profile = copy.deepcopy(existing) if existing is not None else _new_profile(now)
+        # Turn rows are only appended/evicted, never mutated. Share dormant
+        # histories; _append_turn copies the conversation and its turn list.
+        profile = {
+            key: dict(value) if key == "conversations" else copy.deepcopy(value)
+            for key, value in existing.items()
+        } if existing is not None else _new_profile(now)
         candidate["profiles"][profile_id] = profile
         return candidate, profile
 
@@ -1579,6 +2000,8 @@ class Store:
             conversations[turn.conversation_id] = conversation
         if any(row["id"] == turn.id for row in conversation["turns"]):
             return False
+        conversation = {**conversation, "turns": list(conversation["turns"])}
+        conversations[turn.conversation_id] = conversation
         conversation["turns"].append(_turn_row(turn))
         if len(conversation["turns"]) > CONVERSATION_TURN_LIMIT:
             conversation["turns"] = conversation["turns"][-CONVERSATION_TURN_LIMIT:]
@@ -1609,7 +2032,7 @@ class Store:
                 if row["subject"] == item.subject
                 and (
                     (topic and memory_topic(row["text"]) == topic)
-                    or relevance(row["text"], item.text) >= 0.72
+                    or same_memory_fact(row["text"], item.text)
                 )
             ), None)
             index = duplicate
@@ -1621,6 +2044,11 @@ class Store:
             )[:MEMORY_LIMIT]
             return "memory:form"
         current = _memory(rows[index], item.profile_id)
+        if (item.updated_at <= current.updated_at or (
+            item.source_turn_ids
+            and not set(item.source_turn_ids) - set(current.source_turn_ids)
+        )):
+            return None
         updated = Memory(
             id=current.id,
             profile_id=item.profile_id,
@@ -1722,8 +2150,16 @@ class Store:
     @staticmethod
     def _apply_experience(profile: dict[str, object], item: Experience) -> str:
         rows = profile["experiences"]
+        if item.kind in {*SELF_KINDS, 'mind_change'} and not _grounded_self_text(
+            profile, item.akane_response, item.profile_id, item.created_at,
+        ):
+            return 'experience:unsupported-history'
+        # A summary citing only prior Experiences is derived context, not a new
+        # observation. Legacy summaries remain readable for source resolution.
+        if item.source_turn_ids and all(source.startswith('experience_') for source in item.source_turn_ids):
+            return "experience:duplicate"
         if any(
-            row["id"] == item.id or same_experience(_experience(row, item.profile_id), item)
+            row["id"] == item.id or same_experience_source(_experience(row, item.profile_id), item)
             for row in rows
         ):
             return "experience:duplicate"
@@ -1762,15 +2198,18 @@ class Store:
         if item.self_item_ids:
             protected.add(item.id)
         while len(rows) > EXPERIENCE_LIMIT:
-            removable = next((
-                index for index, row in enumerate(rows)
-                if row["id"] not in protected
-            ), 0)
+            # Preserve significant originals rather than evicting the oldest
+            # unreferenced episode regardless of its salience. The incoming
+            # record may be referenced by later mutations in this same commit.
+            removable = min((index for index, row in enumerate(rows)
+                             if row['id'] not in protected and row['id'] != item.id),
+                            key=lambda index: (float(rows[index]['salience']),
+                                               float(rows[index]['created_at'])), default=0)
             rows.pop(removable)
         return "experience:form"
 
     @staticmethod
-    def _apply_outcome(profile: dict[str, object], item: Outcome) -> str:
+    def _apply_outcome(profile: dict[str, object], item: Outcome, *, verified: bool = False) -> str:
         rows = profile["outcomes"]
         if any(
             row["id"] == item.id
@@ -1782,6 +2221,15 @@ class Store:
             for row in rows
         ):
             return "outcome:duplicate"
+        _outcome(_outcome_row(item), item.profile_id)
+        if not verified:
+            turns = tuple(
+                _turn(row, item.profile_id, conversation_id)
+                for conversation_id, conversation in profile["conversations"].items()
+                for row in conversation["turns"]
+            )
+            if not dialogue_outcome_is_grounded(item, turns):
+                return "outcome:ungrounded-result"
         rows.append(_outcome_row(item))
         if len(rows) > OUTCOME_LIMIT:
             protected = {
@@ -1845,6 +2293,11 @@ class Store:
                 ))
             ):
                 return None
+            if change.action == "resolve":
+                outcome = next((row for row in profile["outcomes"] if row["id"] == item.outcome_id), None)
+                if (outcome is None or outcome["action_turn_id"] != item.action_turn_id
+                        or _normalized_evidence(outcome["action"]) != _normalized_evidence(item.action)):
+                    return None
             rows[index] = _prediction_row(item)
         else:
             return None
@@ -1872,6 +2325,13 @@ class Store:
             if current.id == (change.target_id or item.id)
         ), None)
         if change.action == "form":
+            if (target is not None and target.context == item.context and target.behavior == item.behavior
+                    and target.id not in {row['id'] for row in _learning_rows(profile, 'behavioral_tendencies')}):
+                index = next(index for index, row in enumerate(rows) if row['id'] == target.id)
+                rows[index] = _behavioral_tendency_row(replace(
+                    item, created_at=target.created_at, revision_count=target.revision_count + 1,
+                ))
+                return "tendency:revise"
             if target is not None or find_behavioral_tendency(
                 current_items, item.context, item.behavior,
             ) is not None:
@@ -1918,6 +2378,13 @@ class Store:
             if current.id == (change.target_id or item.id)
         ), None)
         if change.action == "form":
+            if (target is not None and target.context == item.context and target.procedure == item.procedure
+                    and target.id not in {row['id'] for row in _learning_rows(profile, 'strategies')}):
+                index = next(index for index, row in enumerate(rows) if row['id'] == target.id)
+                rows[index] = _strategy_row(replace(
+                    item, created_at=target.created_at, revision_count=target.revision_count + 1,
+                ))
+                return "strategy:revise"
             if target is not None or find_strategy(
                 current_items, item.context, item.procedure,
             ) is not None:
@@ -2023,6 +2490,8 @@ class Store:
             if current.id == (change.target_id or item.id)
         ), None)
         if change.action == "form":
+            if item.status not in {"candidate", "active"}:
+                return None
             if target is not None or find_developmental_goal(
                 current_items, item.topic, item.goal,
             ) is not None:
@@ -2037,6 +2506,20 @@ class Store:
                 or item.created_at != target.created_at
             ):
                 return None
+            if item.status == "satisfied" or change.action == "satisfy":
+                new_progress = set(item.progress_outcome_ids) - set(target.progress_outcome_ids)
+                if (
+                    item.status != "satisfied" or change.action != "satisfy"
+                    or not any(
+                        row['id'] in new_progress
+                        and developmental_goal_completed_by_outcome(
+                            item, _outcome(row, item.profile_id),
+                            feedback_text=_outcome_feedback_text(profile, row['source_turn_ids']),
+                        )
+                        for row in profile['outcomes']
+                    )
+                ):
+                    return None
             index = next(
                 index for index, row in enumerate(rows)
                 if row["id"] == target.id
@@ -2055,13 +2538,26 @@ class Store:
             del rows[DEVELOPMENTAL_GOAL_LIMIT:]
         return f"developmental_goal:{change.action}"
 
-    def commit(self, proposal: StateChangeProposal, *, now: float | None = None) -> CommitResult:
+    def commit(self, proposal: StateChangeProposal, *, now: float | None = None,
+               offered_initiative_id: str = '', _verified_outcome: Outcome | None = None) -> CommitResult:
         current = time.time() if now is None else float(now)
         lock_started = time.perf_counter()
         with self._lock:
             lock_acquired = time.perf_counter()
             candidate, profile = self._candidate(proposal.profile_id, current)
-            applied: list[str] = []
+            environment_command = proposal.environment
+            environment_episode = environment_receipt = environment_prediction = None
+            if environment_command is not None:
+                if replace(proposal, environment=None, origin='conversation') != StateChangeProposal(proposal.profile_id):
+                    raise ValueError('Virtual commands cannot supply their own results or developmental changes.')
+                row, derived, environment_episode, environment_receipt, environment_prediction = self._prepare_environment(
+                    proposal.profile_id, profile, environment_command, current)
+                profile['environment'][environment_command.activity] = row
+                proposal = derived
+            elif any(item.reason == 'grounded:virtual_environment'
+                     for item in (*proposal.experiences, *proposal.outcomes)):
+                raise ValueError('Virtual evidence requires execution of a verified environment command.')
+            applied: list[str] = ['environment:update'] if environment_command is not None else []
             rejected = list(proposal.rejected)
             perceived_turns = []
             before_world = profile["world"] if not proposal.world else copy.deepcopy(profile["world"])
@@ -2099,7 +2595,10 @@ class Store:
                 if outcome.profile_id != proposal.profile_id:
                     rejected.append("outcome:profile-mismatch")
                     continue
-                result = self._apply_outcome(profile, outcome)
+                result = self._apply_outcome(
+                    profile, outcome,
+                    verified=environment_command is not None or outcome is _verified_outcome,
+                )
                 if result == "outcome:form":
                     applied.append(result)
                     accepted_outcome_ids.add(outcome.id)
@@ -2276,6 +2775,11 @@ class Store:
                 if change.item is not None and change.item.profile_id != proposal.profile_id:
                     rejected.append("self:profile-mismatch")
                     continue
+                if change.item is not None and not _grounded_self_text(
+                    profile, change.item.value, proposal.profile_id, change.item.updated_at,
+                ):
+                    rejected.append('self:unsupported-history')
+                    continue
                 evidence_ids = set(
                     (*change.item.source_ids, *change.item.contradiction_ids)
                     if change.item is not None else ()
@@ -2288,18 +2792,42 @@ class Store:
                 (applied if result else rejected).append(result or "self:invalid")
             if proposal.world:
                 known_sources = known_world_sources(profile)
+                protected = {e['id'] for e in profile['world']['entities']
+                             if e.get('kind') == virtual.VIRTUAL_KIND}
                 for change in proposal.world:
+                    record = change.record
+                    if environment_command is None and (
+                            record.id in protected or getattr(record, 'kind', '') == virtual.VIRTUAL_KIND
+                            or getattr(record, 'entity_id', '') in protected
+                            or getattr(record, 'subject_id', '') in protected
+                            or getattr(record, 'object_id', '') in protected
+                            or protected.intersection(getattr(record, 'entity_ids', ()))
+                            or any(source.kind == 'environment' for source in record.sources)):
+                        rejected.append('world:environment-authority-required')
+                        continue
                     accepted, result = apply_world_change(
                         profile["world"], change, proposal.profile_id, known_sources,
                     )
+                    if environment_command is not None and not accepted and not result.endswith(':duplicate'):
+                        raise StateIntegrityError('Virtual World projection rejected: ' + result)
                     (applied if accepted else rejected).append(result)
             mutation_seconds = time.perf_counter() - mutation_started
+            if environment_episode is not None and not {'outcome:form', 'experience:form'} <= set(applied):
+                raise StateIntegrityError('Virtual transition and its evidence must be admitted together.')
             if not applied:
                 return CommitResult(
                     int(self._state["revision"]), (), tuple(rejected),
                     {"lock_wait": lock_acquired - lock_started, "lock_held": time.perf_counter() - lock_acquired},
                 )
             profile["updated_at"] = current
+            if offered_initiative_id:
+                # Consumption shares the successful foreground turn's atomic
+                # write. Cancellation or a failed commit leaves no false offer.
+                assistant = next((t for t in reversed(proposal.turns) if t.role == 'assistant'), None)
+                for item in profile['initiative']['journal']:
+                    if (item['id'] == offered_initiative_id and item['status'] == 'pending'
+                            and current < item['expires_at'] and assistant is not None):
+                        item.update(status='offered', offered_turn_id=assistant.id)
             candidate["schema_version"] = SCHEMA_VERSION
             candidate["revision"] = int(self._state["revision"]) + 1
             candidate["updated_at"] = current
@@ -2308,6 +2836,15 @@ class Store:
             validation_seconds = time.perf_counter() - validation_started
             write_metrics = self._write_state(candidate)
             self._state = candidate
+            if environment_episode is not None:
+                self._episodes.finish(environment_episode, environment_receipt,
+                    outcome_id=outcome_id(environment_receipt), prediction=environment_prediction)
+                try:
+                    self._perception.receipt(proposal.profile_id, source='task', producer=virtual.PRODUCER,
+                        source_id=environment_episode.occurrence_id, subject=environment_episode.id,
+                        content=environment_receipt.content, timestamp=current)
+                except (BufferError, ValueError):
+                    pass  # Durable verified result is authoritative even if the passive buffer is full.
             self._perception.committed(
                 proposal.profile_id, perceived_turns, before_world,
                 profile["world"] if proposal.world else {},
@@ -2333,7 +2870,7 @@ class Store:
         query: str = "",
         now: float | None = None,
     ) -> StateSnapshot:
-        del now
+        current = time.time() if now is None else float(now)
         started = time.perf_counter()
         with self._lock:
             profile = self._state["profiles"].get(profile_id)
@@ -2358,27 +2895,44 @@ class Store:
             recent = tuple(
                 _turn(row, profile_id, conversation_id)
                 for row in (conversation["turns"][-SETTINGS.recent_turn_limit:] if conversation else [])
+                if float(row['created_at']) <= current
             )
             self_rows = [
                 row for row in _self_rows(profile)
                 if row["status"] in {"active", "uncertain"}
+                and _grounded_self_text(profile, row['value'], profile_id, float(row['updated_at']))
             ]
             memory_rows = profile["memories"]
-            experience_rows = profile["experiences"]
-            tendency_rows = profile["behavioral_tendencies"]
-            strategy_rows = profile["strategies"]
+            experience_rows = [row for row in profile['experiences']
+                if row['kind'] not in {*SELF_KINDS, 'mind_change'}
+                or _grounded_self_text(profile, row['akane_response'], profile_id,
+                                       float(row['created_at']))]
+            tendency_rows = _learning_rows(profile, "behavioral_tendencies")
+            strategy_rows = _learning_rows(profile, "strategies")
             curiosity_rows = profile["curiosities"]
             developmental_goal_rows = profile["developmental_goals"]
-            query_terms = lexical_terms(query) - _GENERIC_QUERY_TERMS
+            recall = RecallQuery.build(query, recent, profile_id=profile_id,
+                                       conversation_id=conversation_id, now=current)
+            query_terms = lexical_terms(recall.text) - _GENERIC_QUERY_TERMS
             if query_terms & {"eat", "meal", "hungry"}:
                 query_terms.add("food")
             broad = _broad_self_kinds(query)
+            broad_memory = text_key(query) in {
+                "what do you remember", "what do you remember about me",
+            }
             memory_topic_query = _memory_query_topic(query)
+            # Current goals and developed Self resolve ties among relevant
+            # memories, never turn an unrelated record into a retrieval hit.
+            active_context = set().union(*(semantic_terms(
+                f"{row['topic']} {row.get('value', row.get('goal', ''))}")
+                for row in (*self_rows, *developmental_goal_rows)
+                if row['status'] == 'active' and float(row['strength']) >= .4
+                and float(row['updated_at']) <= current))
             self_ranked = []
             for row in self_rows:
-                score = _term_relevance(
-                    query_terms, f"{row['topic']} {row['value']}",
-                ) if query_terms else 0.0
+                if float(row['updated_at']) > current:
+                    continue
+                score = recall.score(f"{row['topic']} {row['value']}")
                 if row["kind"] in broad:
                     score = max(score, 0.2 + float(row["strength"]) * 0.1)
                 if score >= 0.16:
@@ -2388,58 +2942,75 @@ class Store:
                     ))
             memory_ranked = []
             for row in memory_rows:
-                score = _term_relevance(query_terms, row["text"]) if query_terms else 0.0
+                if float(row['updated_at']) > current:
+                    continue
+                score = recall.score(row['text'], subject=row['subject'])
                 if memory_topic_query and memory_topic(str(row["text"])) == memory_topic_query:
                     score = max(score, 0.3)
-                if score >= 0.16:
-                    memory_ranked.append((score, float(row["updated_at"]), str(row["id"]), row))
+                if broad_memory:
+                    score = max(score, 0.3)
+                if score < .25:
+                    continue
+                rank = evidence_rank(score, row, current, historical=recall.historical,
+                    affinity=len(semantic_terms(row['text']) & active_context) if active_context else 0)
+                if score >= .25 and rank[0] >= .20:
+                    memory_ranked.append((rank, score, float(row["updated_at"]), str(row["id"]), row))
             experience_ranked = []
             for row in experience_rows:
+                if float(row['created_at']) > current:
+                    continue
                 evidence = " ".join((
                     str(row["topic"]), str(row["what_happened"]),
                     str(row["akane_response"]), str(row["outcome"]),
                 ))
-                score = _term_relevance(query_terms, evidence) if query_terms else 0.0
+                score = recall.score(evidence)
                 if score >= 0.24:
                     experience_ranked.append((
                         score, float(row["salience"]), float(row["created_at"]),
                         str(row["id"]), row,
                     ))
+            # Equivalence applies to complete context anchors, preserving the
+            # existing guard against cross-target strategy transfer.
+            guidance_terms = query_terms | set(recall.concepts)
             tendency_ranked = _rank_developmental_rows(
                 tendency_rows,
-                query_terms,
+                guidance_terms,
                 text_fields=("context", "behavior", "expected_effect"),
                 provenance_fields=("supporting_outcome_ids",),
                 minimum_provenance=2,
                 minimum_strength=0.45,
                 minimum_confidence=0.70,
+                now=current,
             )
             strategy_ranked = _rank_developmental_rows(
                 strategy_rows,
-                query_terms,
+                guidance_terms,
                 text_fields=("context", "procedure"),
                 provenance_fields=("supporting_outcome_ids",),
                 minimum_provenance=2,
                 minimum_strength=0.45,
                 minimum_confidence=0.70,
+                now=current,
             )
             curiosity_ranked = _rank_developmental_rows(
                 curiosity_rows,
-                query_terms,
+                guidance_terms,
                 text_fields=("topic", "focus"),
                 provenance_fields=("source_ids",),
                 minimum_provenance=3,
                 minimum_strength=0.45,
                 minimum_confidence=0.70,
+                now=current,
             )
             developmental_goal_ranked = _rank_developmental_rows(
                 developmental_goal_rows,
-                query_terms,
+                guidance_terms,
                 text_fields=("topic", "goal"),
                 provenance_fields=("source_ids", "progress_outcome_ids"),
                 minimum_provenance=2,
                 minimum_strength=0.40,
                 minimum_confidence=0.65,
+                now=current,
             )
             selected_self = tuple(
                 _self_item(row, profile_id)
@@ -2447,9 +3018,19 @@ class Store:
                     :SETTINGS.self_result_limit
                 ]
             )
+            # Prefer a complete match over a second memory sharing only a broad
+            # topic. Confidence/provenance still rank candidates within this band.
+            comparing_history = recall.historical and bool(recall.terms & {'change', 'changed', 'compare', 'different'})
+            memory_floor = (.5 if comparing_history else .75) * max(
+                (score for _, score, _, _, _ in memory_ranked), default=0)
+            selected_memory_rows = (
+                row
+                for _, score, _, _, row in sorted(memory_ranked, reverse=True)
+                if score >= memory_floor
+            )
             selected_memories = tuple(
                 _memory(row, profile_id)
-                for _, _, _, row in sorted(memory_ranked, reverse=True)[:SETTINGS.memory_result_limit]
+                for row in islice(selected_memory_rows, SETTINGS.memory_result_limit)
             )
             selected_experiences = tuple(
                 _experience(row, profile_id)
@@ -2487,7 +3068,18 @@ class Store:
                 _self_revision(row, profile_id)
                 for row in profile["self"]["revisions"]
                 if include_history and row["self_item_id"] in selected_ids
+                and _grounded_self_text(profile, row['value'], profile_id, float(row['changed_at']))
             )
+            groups = consolidate_experiences(selected_experiences,
+                tuple(_experience(row, profile_id) for row in experience_rows
+                      if float(row['created_at']) <= current),
+                tuple(_outcome(row, profile_id) for row in profile['outcomes']
+                      if float(row['created_at']) <= current),
+                tuple(_self_item(row, profile_id) for row in self_rows if float(row['updated_at']) <= current),
+                tuple(_self_revision(row, profile_id) for row in profile['self']['revisions']
+                      if float(row['changed_at']) <= current
+                      and _grounded_self_text(profile, row['value'], profile_id,
+                                              float(row['changed_at'])))) if selected_experiences else ()
         self._timing.value = {
             "selection_seconds": time.perf_counter() - started,
             "memory_candidates": len(memory_rows),
@@ -2502,7 +3094,7 @@ class Store:
             profile_id, conversation_id, recent, selected_memories,
             selected_experiences, selected_tendencies, selected_strategies,
             selected_curiosities, selected_developmental_goals,
-            selected_self, revisions, SCHEMA_VERSION, revision,
+            selected_self, revisions, SCHEMA_VERSION, revision, groups,
         )
 
     def snapshot_timing(self) -> dict[str, float | int]:
@@ -2525,6 +3117,7 @@ class Store:
             return tuple(
                 _self_item(row, profile_id) for row in _self_rows(profile)
                 if row["status"] in {"active", "uncertain"}
+                and _grounded_self_text(profile, row['value'], profile_id, float(row['updated_at']))
             )
 
     def _profile_items(self, profile_id: str, collection: str, loader) -> tuple:
@@ -2532,7 +3125,9 @@ class Store:
             profile = self._state["profiles"].get(profile_id)
             if profile is None:
                 return ()
-            return tuple(loader(row, profile_id) for row in profile[collection])
+            rows = (_learning_rows(profile, collection)
+                    if collection in {"behavioral_tendencies", "strategies"} else profile[collection])
+            return tuple(loader(row, profile_id) for row in rows)
 
     def memories(self, profile_id: str) -> tuple[Memory, ...]:
         return self._profile_items(profile_id, "memories", _memory)

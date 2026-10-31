@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 from dataclasses import asdict, dataclass, replace
+from app.core.environment import EnvironmentChoice
 
 
 ACTIVE_GOAL_LIMIT = 4
@@ -42,6 +43,7 @@ class ActiveGoal:
     priority: str
     created_at: float
     expires_at: float
+    source_interest_id: str = ''
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +59,9 @@ class ActionDecision:
     reason_codes: tuple[str, ...]
     created_at: float
 
+    environment: EnvironmentChoice | None = None
+    suggested_choice_id: str = ''
+
     def to_json(self):
         return _json(self)
 
@@ -68,18 +73,26 @@ def _objective(frame, assessment):
     goals = sorted(frame.relevant_goals, key=lambda r: 'goal' not in dict(r.values))
     if goals:
         goal = goals[0]
-        return ('continue', dict(goal.values)['topic'], goal.id, '', '')
+        return ('continue', dict(goal.values)['topic'], goal.id, '', '', '')
     curiosity = next((r for r in frame.relevant_self if r.kind == 'curiosity'), None)
     if curiosity:
-        return ('understand', dict(curiosity.values)['topic'], '', curiosity.id, '')
+        return ('understand', dict(curiosity.values)['topic'], '', curiosity.id, '', '')
     task = next((r for r in frame.situation if frame.objective and r.id == frame.objective.id), None)
     if task:
-        return ('continue', dict(task.values)['value'], '', '', task.id)
+        return ('continue', dict(task.values)['value'], '', '', task.id, '')
+    # Developed positive interest can motivate a bounded investigation, only
+    # where there is currently a useful information-bearing legal action.
+    if any(e.eligible and e.information_gain > 0 for e in assessment.action_evaluations):
+        interest = next((r for r in frame.relevant_self if r.kind == 'interest'
+            and dict(r.values).get('stance') == 'positive'
+            and dict(r.values).get('status') == 'active' and len({s.id for s in r.sources}) >= 2), None)
+        if interest:
+            return ('understand', dict(interest.values)['topic'], '', '', '', interest.id)
     if assessment.verification_needed:
         ids = {dict(r.values).get('entity_id') for r in frame.relevant_world
                if r.kind == 'world_current'} - {None, ''}
         if frame.percept.subject in ids:
-            return ('verify', frame.percept.subject, '', '', '')
+            return ('verify', frame.percept.subject, '', '', '', '')
     return None
 
 
@@ -115,10 +128,10 @@ class ActionSelection:
         objective = _objective(frame, assessment)
         if objective is None:
             return None
-        kind, subject, source_goal, source_curiosity, source_situation = objective
+        kind, subject, source_goal, source_curiosity, source_situation, source_interest = objective
         for _, goal in self._goals:
             if (goal.profile_id, goal.objective_kind, goal.subject, goal.source_goal_id,
-                goal.source_curiosity_id, goal.source_situation_id) == (frame.profile_id, *objective):
+                goal.source_curiosity_id, goal.source_situation_id, goal.source_interest_id) == (frame.profile_id, *objective):
                 return goal if goal.status == 'active' else None
         if (len(self._goals) >= ACTIVE_GOAL_TOTAL_LIMIT or
                 sum(g.profile_id == frame.profile_id for _, g in self._goals) >= ACTIVE_GOAL_LIMIT):
@@ -129,15 +142,20 @@ class ActionSelection:
             frame.profile_id, frame.percept.id, kind, subject, source_goal,
             source_curiosity, source_situation, 'active', frame.attention.priority,
             frame.created_at, frame.created_at + ACTIVE_GOAL_TTL,
+            source_interest_id=source_interest,
         )
         if len(_json(goal).encode('utf-8')) > ACTIVE_GOAL_BYTES:
             return None
         self._goals.append((time.monotonic(), goal))
         return goal
 
-    def decide(self, frame, assessment):
+    def decide(self, frame, assessment, *, choice_id=None, suggested_choice_id=''):
         self._expire()
         goal = self._activate(frame, assessment)
+        if frame.environment is not None:
+            return self._environment_decision(frame, assessment, goal, choice_id, suggested_choice_id)
+        if choice_id is not None:
+            raise ValueError('Choice IDs apply only to a current virtual observation.')
         available = {'wait'}
         if frame.percept.source == 'user':
             available.add('respond')
@@ -184,4 +202,42 @@ class ActionSelection:
             tuple(a for a in _ACTIONS if a in available), strategy_id,
             tuple(reasons), frame.created_at,
         )
+        return decision if len(decision.to_json().encode('utf-8')) <= DECISION_MAX_BYTES else None
+
+    def _environment_decision(self, frame, assessment, goal, choice_id, suggestion):
+        """Bind parameters to existing actions, with the same objective gate.
+
+        Failed result evidence removes an automatic retry candidate. A trusted
+        caller may explicitly retry a still-legal choice; WAIT always remains.
+        """
+        choices = frame.environment.choices
+        if choice_id is not None and choice_id != 'wait' and choice_id not in {c.id for c in choices}:
+            raise ValueError('Unknown or currently illegal virtual choice.')
+        if not isinstance(suggestion, str) or choice_id is not None and suggestion:
+            raise ValueError('Use an explicit choice or an advisory suggestion, not both.')
+        selected, strategy_id, reasons = None, '', ['no_action_needed']
+        evaluations = {e.choice_id: e for e in assessment.action_evaluations}
+        if goal and choice_id != 'wait':
+            if choice_id is not None:
+                selected = next(c for c in choices if c.id == choice_id)
+                reasons = ['explicit_choice', 'active_goal']
+            else:
+                eligible = [c for c in choices if c.id in evaluations and evaluations[c.id].eligible
+                            and evaluations[c.id].rank > tuple(0 for _ in evaluations[c.id].rank)
+                            and (goal.objective_kind != 'understand' or evaluations[c.id].information_gain > 0)]
+                if eligible:
+                    best = max(evaluations[c.id].rank for c in eligible)
+                    tied = [c for c in eligible if evaluations[c.id].rank == best]
+                    selected = next((c for c in tied if c.id == suggestion), tied[0])
+                    assessment_row = evaluations[selected.id]
+                    strategy_id = assessment_row.strategy_id
+                    reasons = ['strategy' if r == 'learned_strategy' else r for r in assessment_row.reason_codes]
+                    reasons.extend(('legal_choice', 'active_goal'))
+        if suggestion and (selected is None or selected.id != suggestion):
+            reasons.append('evidence_over_suggestion' if goal else 'no_objective')
+        action = selected.action if selected else 'wait'
+        decision = ActionDecision(frame.profile_id, frame.percept.id, assessment.frame_reference,
+            goal.id if goal else '', _INTENTIONS[action], action,
+            tuple(a for a in _ACTIONS if a == 'wait' or any(c.action == a for c in choices)),
+            strategy_id, tuple(reasons), frame.created_at, selected, suggestion)
         return decision if len(decision.to_json().encode('utf-8')) <= DECISION_MAX_BYTES else None

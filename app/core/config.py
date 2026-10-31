@@ -143,6 +143,7 @@ class Settings:
     self_result_limit: int
     prompt_debug: bool
     timing_enabled: bool
+    autonomous_generation_enabled: bool = False
 
     def validate(self) -> None:
         if not 1 <= self.server_port <= 65535:
@@ -160,14 +161,16 @@ def load_settings() -> Settings:
     configured_data = Path(_raw("DATA_DIR", "data") or "data").expanduser()
     data_dir = configured_data if configured_data.is_absolute() else root / configured_data
     configured_model = Path(
-        _raw("MODEL_PATH", "models/gemma-4-E4B-it-Q4_K_M.gguf")
-        or "models/gemma-4-E4B-it-Q4_K_M.gguf"
+        _raw("MODEL_PATH", "models/Qwen3.5-9B-Q4_K_M.gguf")
+        or "models/Qwen3.5-9B-Q4_K_M.gguf"
     ).expanduser()
     model_path = configured_model if configured_model.is_absolute() else root / configured_model
     raspberry_pi = coerce_bool(_raw("RASPBERRY_PI", ""), _is_raspberry_pi())
+    apple_silicon = not raspberry_pi and platform.system() == "Darwin" and platform.machine().casefold() == "arm64"
     cpu_count = os.cpu_count() or 4
+    threads = min(6, cpu_count) if apple_silicon else max(1, cpu_count - 1)
     context_window = max(512, _integer("LLAMA_CONTEXT_WINDOW", 4096))
-    batch_size = max(1, min(_integer("LLAMA_BATCH_SIZE", 256 if raspberry_pi else 1024), context_window))
+    batch_size = max(1, min(_integer("LLAMA_BATCH_SIZE", 256 if raspberry_pi else 512 if apple_silicon else 1024), context_window))
     server_port = _integer("SERVER_PORT", 8000)
     settings = Settings(
         project_root=root,
@@ -198,13 +201,13 @@ def load_settings() -> Settings:
         model_path=str(model_path),
         llama_context_window=context_window,
         llama_batch_size=batch_size,
-        llama_ubatch_size=max(1, min(_integer("LLAMA_UBATCH_SIZE", min(128 if raspberry_pi else 512, batch_size)), batch_size)),
-        llama_threads=max(1, _integer("LLAMA_THREADS", min(4, cpu_count) if raspberry_pi else max(1, cpu_count - 1))),
-        llama_threads_batch=max(1, _integer("LLAMA_THREADS_BATCH", min(4, cpu_count) if raspberry_pi else max(1, cpu_count - 1))),
-        llama_flash_attn=coerce_bool(_raw("LLAMA_FLASH_ATTN"), raspberry_pi),
-        llama_gpu_layers=_integer("LLAMA_GPU_LAYERS", 0),
-        llama_offload_kqv=coerce_bool(_raw("LLAMA_OFFLOAD_KQV"), False),
-        llama_op_offload=coerce_bool(_raw("LLAMA_OP_OFFLOAD"), False),
+        llama_ubatch_size=max(1, min(_integer("LLAMA_UBATCH_SIZE", min(128 if raspberry_pi else 256 if apple_silicon else 512, batch_size)), batch_size)),
+        llama_threads=max(1, _integer("LLAMA_THREADS", min(2, cpu_count) if raspberry_pi else threads)),
+        llama_threads_batch=max(1, _integer("LLAMA_THREADS_BATCH", min(4, cpu_count) if raspberry_pi else threads)),
+        llama_flash_attn=coerce_bool(_raw("LLAMA_FLASH_ATTN"), raspberry_pi or apple_silicon),
+        llama_gpu_layers=_integer("LLAMA_GPU_LAYERS", -1 if apple_silicon else 0),
+        llama_offload_kqv=coerce_bool(_raw("LLAMA_OFFLOAD_KQV"), apple_silicon),
+        llama_op_offload=coerce_bool(_raw("LLAMA_OP_OFFLOAD"), apple_silicon),
         llama_use_mmap=coerce_bool(_raw("LLAMA_USE_MMAP", "1"), True),
         llama_use_mlock=coerce_bool(_raw("LLAMA_USE_MLOCK"), False),
         llama_swa_full=coerce_bool(_raw("LLAMA_SWA_FULL"), raspberry_pi),
@@ -229,6 +232,7 @@ def load_settings() -> Settings:
         self_result_limit=min(2, max(1, _integer("SELF_MAX_RESULTS", 2))),
         prompt_debug=coerce_bool(_raw("PROMPT_DEBUG"), False),
         timing_enabled=coerce_bool(_raw("TIMING"), False),
+        autonomous_generation_enabled=coerce_bool(_raw("AUTONOMOUS_GENERATION_ENABLED"), False),
     )
     settings.validate()
     return settings

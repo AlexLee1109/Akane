@@ -43,7 +43,7 @@ def canonical_profile_id(value: object) -> str:
     folded = profile.casefold()
     if folded in {OWNER_PROFILE_ID, "local", "popup", "discord:owner"}:
         return OWNER_PROFILE_ID
-    if folded.startswith(("local:", "popup:", "discord:user:")):
+    if folded.startswith(("local:", "popup:")):
         return OWNER_PROFILE_ID
     return profile
 
@@ -72,6 +72,10 @@ def relevance(query: object, candidate: object) -> float:
     query_terms = lexical_terms(query)
     candidate_terms = lexical_terms(candidate)
     shared = len(query_terms & candidate_terms)
-    jaccard = shared / max(1, len(query_terms | candidate_terms))
+    jaccard = shared / max(1, len(query_terms) + len(candidate_terms) - shared)
     query_coverage = shared / max(1, min(len(query_terms), 4))
-    return max(jaccard, query_coverage, SequenceMatcher(None, text_key(query), text_key(candidate)).ratio() * 0.35)
+    score = max(jaccard, query_coverage)
+    # Fuzzy similarity contributes at most 0.35 to the existing score.
+    if score >= 0.35:
+        return score
+    return max(score, SequenceMatcher(None, text_key(query), text_key(candidate)).ratio() * 0.35)

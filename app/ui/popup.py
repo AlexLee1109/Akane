@@ -23,8 +23,8 @@ except ImportError:  # pragma: no cover - macOS-only popup behavior
 AVATAR_RIGHT_MARGIN = -145
 AVATAR_BOTTOM_MARGIN = -50
 DEFAULT_SESSION_ID = "popup"
-# Single companion window — wide enough for the bubble, tall enough for
-# the bubble + avatar with a comfortable overlap between them.
+# Single transparent companion window. Its existing off-screen margins keep
+# the avatar and bottom-anchored conversation controls in their current place.
 COMPANION_WIDTH = 460
 COMPANION_HEIGHT = 560
 WINDOW_TITLE = "Akane"
@@ -109,6 +109,9 @@ class WindowApi:
     def toggle_composer(self) -> None:
         self.app.toggle_composer()
 
+    def viewport_bounds(self) -> dict[str, float] | None:
+        return self.app.viewport_bounds()
+
     def update_interactive_regions(
         self,
         regions: list[dict],
@@ -128,7 +131,7 @@ class PopupApp:
         self._shutdown_state = SHUTDOWN_RUNNING
         self._native_close_requested = False
         self._cleanup_started = False
-        self._composer_visible = False
+        self._composer_visible = True
         self._stream_lock = threading.Lock()
         self._stream_thread: threading.Thread | None = None
         self._stream_response = None
@@ -317,6 +320,46 @@ class PopupApp:
                 self._stream_thread = thread
                 thread.start()
 
+    def viewport_bounds(self) -> dict[str, float] | None:
+        """Visible display intersection in WKWebView's logical CSS coordinates."""
+        if self._shutdown_started():
+            return None
+        if AppHelper is not None and threading.current_thread() is not threading.main_thread():
+            result = []
+            ready = threading.Event()
+
+            def read_bounds():
+                result.append(self._viewport_bounds_on_main())
+                ready.set()
+
+            AppHelper.callAfter(read_bounds)
+            return result[0] if ready.wait(1) else None
+        return self._viewport_bounds_on_main()
+
+    def _viewport_bounds_on_main(self) -> dict[str, float] | None:
+        if self._shutdown_started():
+            return None
+        window = self.windows.get("companion")
+        native = getattr(window, "native", None)
+        if native is None:
+            return None
+        try:
+            content = native.contentRectForFrameRect_(native.frame())
+            screen = native.screen().frame()
+            left = max(0.0, float(screen.origin.x - content.origin.x))
+            top = max(0.0, float(
+                content.origin.y + content.size.height - screen.origin.y - screen.size.height
+            ))
+            right = min(float(content.size.width), float(
+                screen.origin.x + screen.size.width - content.origin.x
+            ))
+            bottom = min(float(content.size.height), float(
+                content.origin.y + content.size.height - screen.origin.y
+            ))
+            return {"left": left, "top": top, "right": max(left, right), "bottom": max(top, bottom)}
+        except Exception:
+            return None
+
     @staticmethod
     def _parse_regions(regions: list[dict]) -> tuple[Frame, ...]:
         parsed = []
@@ -346,8 +389,13 @@ class PopupApp:
             self._passthrough_regions = self._parse_regions(passthrough_regions)
         self._schedule_mouse_passthrough_update()
 
-    def _schedule_mouse_passthrough_update(self, _event=None) -> None:
+    def _schedule_mouse_passthrough_update(self, _event=None, *, allow_capture=False) -> None:
         if AppHelper is None or self._shutdown_started():
+            return
+        if _event is not None:
+            # Cocoa monitor callbacks are on the main thread. Refresh before
+            # dispatching this event so a quick move/click cannot use old state.
+            self._run_scheduled_mouse_update(allow_capture=allow_capture)
             return
         with self._region_lock:
             if self._shutdown_started() or self._mouse_update_pending:
@@ -363,19 +411,19 @@ class PopupApp:
         else:
             AppHelper.callAfter(self._run_scheduled_mouse_update)
 
-    def _run_scheduled_mouse_update(self) -> None:
+    def _run_scheduled_mouse_update(self, *, allow_capture=False) -> None:
         with self._region_lock:
             self._mouse_update_pending = False
             if self._shutdown_started():
                 return
             self._last_mouse_update_at = time.monotonic()
-        self._update_mouse_passthrough()
+        self._update_mouse_passthrough(allow_capture=allow_capture)
 
     def _handle_local_mouse_event(self, event):
-        self._schedule_mouse_passthrough_update()
+        self._schedule_mouse_passthrough_update(event, allow_capture=True)
         return event
 
-    def _update_mouse_passthrough(self) -> None:
+    def _update_mouse_passthrough(self, *, allow_capture=True) -> None:
         if AppKit is None or self._shutdown_started():
             return
         window = self.windows.get("companion")
@@ -384,7 +432,9 @@ class PopupApp:
             return
         try:
             point = AppKit.NSEvent.mouseLocation()
-            frame = native.frame()
+            # AppKit screen coordinates and WKWebView CSS pixels are logical
+            # points, including on Retina displays. Do not apply backing scale.
+            frame = native.contentRectForFrameRect_(native.frame())
             dom_x = float(point.x - frame.origin.x)
             dom_y = float(frame.origin.y + frame.size.height - point.y)
             with self._region_lock:
@@ -401,7 +451,7 @@ class PopupApp:
             pressed = bool(AppKit.NSEvent.pressedMouseButtons())
             if pressed and self._mouse_capture:
                 interactive = True
-            elif pressed and interactive and not native.ignoresMouseEvents():
+            elif pressed and interactive and allow_capture and not native.ignoresMouseEvents():
                 self._mouse_capture = True
             elif not pressed:
                 self._mouse_capture = False
@@ -499,10 +549,8 @@ class PopupApp:
         self.server, _ = serve_in_thread(host=host, port=port)
 
     def _build_start_url(self) -> str:
-        params = urlencode({"popup_role": "companion"})
-        if popup_backend_is_local():
-            return f"{self.backend_url}/?{params}"
-
+        # Load companion UI from this checkout even if the backend was started
+        # before a new UI asset was added to its in-memory route manifest.
         query = urlencode(
             {
                 "api_base": self.backend_url,
@@ -557,8 +605,20 @@ class PopupApp:
             on_top=True,
         )
         window.events.closing += self._on_window_closing
+        window.events.moved += self._notify_viewport_changed
+        window.events.resized += self._notify_viewport_changed
         self.windows["companion"] = window
         return window
+
+    def _notify_viewport_changed(self, *_args) -> None:
+        if self._shutdown_started():
+            return
+        window = self.windows.get("companion")
+        if window is not None:
+            self._window_call(
+                window, "evaluate_js",
+                "window.__akaneViewportChanged && window.__akaneViewportChanged();",
+            )
 
     def _position_windows(self) -> None:
         layout = self._layout()
@@ -570,11 +630,26 @@ class PopupApp:
             return
 
         frame = layout.frames["companion"]
+        if AppHelper is not None and getattr(window, "native", None) is not None:
+            AppHelper.callAfter(self._position_native_window, window.native, layout, frame)
+            return
         # Convert global screen coords → local (relative to the screen origin).
         x = frame.x - sx
         y = frame.y - sy
         self._window_call(window, "resize", frame.width, frame.height)
         self._window_call(window, "move", x, y)
+
+    @staticmethod
+    def _position_native_window(native, layout: PopupLayout, frame: Frame) -> None:
+        # pywebview.move() is relative to its original screen. Use global Cocoa
+        # coordinates so a companion opened on another display stays there.
+        bottom = (
+            layout.screen_y + layout.screen_height
+            - (frame.y - layout.screen_y) - frame.height
+        )
+        native.setFrame_display_(
+            AppKit.NSMakeRect(frame.x, bottom, frame.width, frame.height), True,
+        )
 
     # ── Composer visibility ───────────────────────────────────────────────
 

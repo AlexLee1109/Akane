@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import queue
+import re
 import secrets
 import sys
 import threading
@@ -59,12 +60,11 @@ WEBSITE_DIST_DIR = Path(__file__).resolve().parents[1] / "website" / "dist"
 DEFAULT_PROFILE_ID = OWNER_PROFILE_ID
 DEFAULT_CONVERSATION_ID = "popup:default"
 _DEBUG_STATE_COMMAND = "/debug_state"
-_MODEL_LOAD_LOCK = threading.Lock()
-_MODEL_LOAD_THREAD: threading.Thread | None = None
 _RUNTIME_SHUTDOWN = threading.Event()
 _STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/subtitles.js": ("subtitles.js", "application/javascript; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
 }
 
@@ -126,13 +126,14 @@ async def _request_payload(request: Request) -> dict:
 
 
 def _parse_chat_request(payload: dict) -> ChatRequestData:
-    source = str(payload.get("source") or "web")
+    source = str(payload.get("source") or "web").strip().casefold()
     default_conversation = DEFAULT_CONVERSATION_ID
+    conversation = payload.get("conversation_id", payload.get("session_id", default_conversation))
     return ChatRequestData(
         chat_input=normalize_chat_input(
             text=payload.get("message", ""),
-            profile_id=OWNER_PROFILE_ID,
-            conversation_id=payload.get("conversation_id", payload.get("session_id", default_conversation)),
+            profile_id=_request_profile(source, conversation),
+            conversation_id=conversation,
             source=source,
             timestamp=payload.get("timestamp", 0.0),
             display_name=payload.get("display_name", ""),
@@ -144,6 +145,17 @@ def _parse_chat_request(payload: dict) -> ChatRequestData:
         include_messages=coerce_bool(payload.get("include_messages", True), True),
         trace_ttft=coerce_bool(payload.get("trace_ttft", False)),
     )
+
+
+def _request_profile(source: str, conversation: object) -> str:
+    if source != "discord":
+        return OWNER_PROFILE_ID
+    # Only the private Discord adapter supplies these IDs. Never accept a
+    # payload-selected profile or fall back to the owner for a malformed author.
+    match = re.fullmatch(r"discord:(?:dm:|guild:[0-9]+:channel:[0-9]+:user:)([1-9][0-9]{0,19})", str(conversation))
+    if match is None:
+        raise ValueError("Discord conversation requires a valid author ID.")
+    return f"discord:user:{match[1]}"
 
 
 def _json_line(payload: dict) -> bytes:
@@ -450,80 +462,58 @@ def _app_state_payload(
     return payload
 
 
-def _start_model_loading() -> None:
-    global _MODEL_LOAD_THREAD
-    manager = InferenceRuntime.get_instance()
-    status = manager.status()
-    if status["loaded"]:
-        return
-    if status["error"]:
-        return
-    with _MODEL_LOAD_LOCK:
-        if _MODEL_LOAD_THREAD is not None and _MODEL_LOAD_THREAD.is_alive():
-            return
-
-        def load() -> None:
-            try:
-                manager.ensure_loaded()
-            except Exception as exc:
-                _log("model-error", str(exc))
-
-        _MODEL_LOAD_THREAD = threading.Thread(
-            target=load,
-            daemon=True,
-            name="AkaneModelLoader",
-        )
-        _MODEL_LOAD_THREAD.start()
-
-
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    character = load_character_profile()
+    startup_started = time.perf_counter()
+    runtime = InferenceRuntime.get_instance()
     store = get_store()
-    store.start_cognition()
-    if SETTINGS.prompt_debug:
-        from app.core.prompt import stable_prompt_hash
-
-        state = store.debug_snapshot(OWNER_PROFILE_ID, DEFAULT_CONVERSATION_ID)
-        runtime = InferenceRuntime.get_instance().runtime_report()
-        options = runtime["effective_init_options"]
-        _log(
-            "runtime",
-            f"cwd={str(Path.cwd())!r} executable={sys.executable!r} "
-            f"module={str(Path(__file__).resolve())!r} project_root={str(SETTINGS.project_root.resolve())!r}",
-        )
-        _log(
-            "state",
-            f"schema_version={state['schema_version']} revision={state['revision']} "
-            f"path={Path(store.path).expanduser().resolve()}",
-        )
-        _log(
-            "character",
-            f"identity_path={character.identity_path!s} identity_sha256={character.identity_sha256} "
-            f"soul_path={character.soul_path!s} soul_sha256={character.soul_sha256} "
-            f"stable_character_prompt_sha256={stable_prompt_hash(character)}",
-        )
-        _log(
-            "model",
-            f"path={runtime['model_path']} llama_cpp_python={runtime['llama_cpp_python']} "
-            f"context={runtime['context_window']} threads={options.get('n_threads')} "
-            f"threads_batch={options.get('n_threads_batch')} batch={options.get('n_batch')} "
-            f"ubatch={options.get('n_ubatch')} swa_full={options.get('swa_full')}",
-        )
-        _log(
-            "sampling",
-            f"temperature={runtime['temperature']} top_k={runtime['top_k']} "
-            f"top_p={runtime['top_p']} min_p={runtime['min_p']} "
-            f"repeat_penalty={runtime['repeat_penalty']}",
-        )
     public_sessions = None
-    if PUBLIC_API_SETTINGS.enabled:
-        public_sessions = PublicSessionManager(store, PUBLIC_API_SETTINGS)
-        public_sessions.start()
-    app.state.public_sessions = public_sessions
-    _RUNTIME_SHUTDOWN.clear()
-    _start_model_loading()
+    app.state.public_sessions = None
     try:
+        await asyncio.to_thread(runtime.ensure_loaded)
+        log_timing("startup", inference_ready=time.perf_counter() - startup_started)
+        character = load_character_profile()
+        store.start_cognition()
+        if SETTINGS.prompt_debug:
+            from app.core.prompt import stable_prompt_hash
+
+            state = store.debug_snapshot(OWNER_PROFILE_ID, DEFAULT_CONVERSATION_ID)
+            report = runtime.runtime_report()
+            options = report["effective_init_options"]
+            _log(
+                "runtime",
+                f"cwd={str(Path.cwd())!r} executable={sys.executable!r} "
+                f"module={str(Path(__file__).resolve())!r} project_root={str(SETTINGS.project_root.resolve())!r}",
+            )
+            _log(
+                "state",
+                f"schema_version={state['schema_version']} revision={state['revision']} "
+                f"path={Path(store.path).expanduser().resolve()}",
+            )
+            _log(
+                "character",
+                f"identity_path={character.identity_path!s} identity_sha256={character.identity_sha256} "
+                f"soul_path={character.soul_path!s} soul_sha256={character.soul_sha256} "
+                f"stable_character_prompt_sha256={stable_prompt_hash(character)}",
+            )
+            _log(
+                "model",
+                f"path={report['model_path']} llama_cpp_python={report['llama_cpp_python']} "
+                f"context={report['context_window']} threads={options.get('n_threads')} "
+                f"threads_batch={options.get('n_threads_batch')} batch={options.get('n_batch')} "
+                f"ubatch={options.get('n_ubatch')} swa_full={options.get('swa_full')}",
+            )
+            _log(
+                "sampling",
+                f"temperature={report['temperature']} top_k={report['top_k']} "
+                f"top_p={report['top_p']} min_p={report['min_p']} "
+                f"repeat_penalty={report['repeat_penalty']}",
+            )
+        if PUBLIC_API_SETTINGS.enabled:
+            public_sessions = PublicSessionManager(store, PUBLIC_API_SETTINGS)
+            public_sessions.start()
+        app.state.public_sessions = public_sessions
+        _RUNTIME_SHUTDOWN.clear()
         yield
     finally:
         _RUNTIME_SHUTDOWN.set()
@@ -532,7 +522,7 @@ async def _lifespan(app: FastAPI):
         app.state.public_sessions = None
         cancel_all_generations()
         store.close()
-        InferenceRuntime.get_instance().close()
+        runtime.close()
 
 
 def create_app() -> FastAPI:
@@ -637,7 +627,8 @@ def create_app() -> FastAPI:
     ):
         conversation = session_id or conversation_id
         return JSONResponse(
-            _app_state_payload(
+            await asyncio.to_thread(
+                _app_state_payload,
                 conversation,
                 OWNER_PROFILE_ID,
                 include_messages=coerce_bool(include_messages, True),
@@ -646,7 +637,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/memory")
     async def api_memory(profile_id: str = DEFAULT_PROFILE_ID):
-        return JSONResponse(get_store().public_memory(OWNER_PROFILE_ID))
+        return JSONResponse(await asyncio.to_thread(get_store().public_memory, OWNER_PROFILE_ID))
 
     @app.post("/api/chat/cancel")
     async def api_cancel(request: Request):
@@ -654,10 +645,14 @@ def create_app() -> FastAPI:
         conversation = str(
             payload.get("conversation_id") or payload.get("session_id") or DEFAULT_CONVERSATION_ID
         )
+        try:
+            profile = _request_profile(str(payload.get("source") or "web").strip().casefold(), conversation)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(
             {
                 "ok": True,
-                "cancelled": cancel_generation(conversation, OWNER_PROFILE_ID),
+                "cancelled": await asyncio.to_thread(cancel_generation, conversation, profile),
             }
         )
 
@@ -667,20 +662,26 @@ def create_app() -> FastAPI:
             chat = _parse_chat_request(await _request_payload(request))
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        command = handle_builtin_command(chat.chat_input)
+        command = None
+        if chat.chat_input.text.startswith("/"):
+            command = await asyncio.to_thread(handle_builtin_command, chat.chat_input)
         if command is not None:
             return JSONResponse(command)
         _log_chat("question", chat.chat_input, chat.chat_input.text)
-        prior_reply = get_store().reply_for_request(
-            chat.chat_input.conversation_id,
-            chat.chat_input.profile_id,
-            chat.chat_input.request_id,
-        )
+        prior_reply = None
+        if chat.chat_input.request_id:
+            prior_reply = await asyncio.to_thread(
+                get_store().reply_for_request,
+                chat.chat_input.conversation_id,
+                chat.chat_input.profile_id,
+                chat.chat_input.request_id,
+            )
         if prior_reply is not None:
             _log_chat("reply", chat.chat_input, prior_reply)
             payload = {"reply": prior_reply, "duplicate_retry": True}
             if chat.include_messages:
-                payload["messages"] = _messages(
+                payload["messages"] = await asyncio.to_thread(
+                    _messages,
                     chat.chat_input.conversation_id,
                     chat.chat_input.profile_id,
                 )
@@ -695,7 +696,8 @@ def create_app() -> FastAPI:
         payload = {"reply": reply}
         messages_started_at = time.perf_counter()
         if chat.include_messages:
-            payload["messages"] = _messages(
+            payload["messages"] = await asyncio.to_thread(
+                _messages,
                 chat.chat_input.conversation_id,
                 chat.chat_input.profile_id,
             )
@@ -716,7 +718,9 @@ def create_app() -> FastAPI:
             chat = _parse_chat_request(await _request_payload(request))
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        command = handle_builtin_command(chat.chat_input)
+        command = None
+        if chat.chat_input.text.startswith("/"):
+            command = await asyncio.to_thread(handle_builtin_command, chat.chat_input)
         if command is not None:
             return JSONResponse(command)
         trace = request.state.ttft_trace if chat.trace_ttft else None
@@ -780,10 +784,7 @@ def serve_in_thread(
     thread = threading.Thread(target=server.run, daemon=True, name="AkaneAPIServer")
     server._thread = thread
     thread.start()
-    deadline = time.monotonic() + 5.0
     while thread.is_alive() and not server._server.started:
-        if time.monotonic() >= deadline:
-            break
         time.sleep(0.01)
     if not server._server.started:
         server._server.should_exit = True

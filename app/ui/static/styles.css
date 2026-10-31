@@ -12,7 +12,7 @@
   --color-panel-border: rgba(100, 150, 210, 0.2);
 
   --font-ui: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-  --font-bubble: "Crimson Pro", "Palatino Linotype", Georgia, serif;
+  --font-dialogue: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --shadow-panel: 0 8px 32px rgba(0, 0, 0, 0.4);
   --transition-fast: 0.15s ease;
   --transition-medium: 0.18s ease;
@@ -27,12 +27,7 @@
   --avatar-offset-y: 450px;
   --avatar-scale: 1;
 
-  --bubble-left: 20px;
-  --bubble-right: 0px;
-  --bubble-bottom: 330px;
-  --bubble-width: 289px;
-  --bubble-max-width: 500px;
-  --bubble-text-width: 340px;
+  --dialogue-gap: 16px;
 
   --composer-left: 40px;
   --composer-right: 0px;
@@ -116,7 +111,7 @@ body[data-popup-role="companion"] .shell {
 }
 
 body[data-popup-role="companion"] .character-wrap {
-  z-index: 2;
+  z-index: auto;
 }
 
 .avatar-hitbox {
@@ -128,83 +123,184 @@ body[data-popup-role="companion"] .character-wrap {
   pointer-events: auto;
 }
 
-/* Text bubble */
-.bubble-stage {
-  position: absolute;
-  top: 34px;
-  left: 20px;
-  right: 80px;
-  bottom: 120px;
-  z-index: 10;
-  display: flex;
-  align-items: flex-start;
-  padding-top: 0;
-  pointer-events: none;
-}
-
-body[data-popup-role="companion"] .bubble-stage {
-  left: var(--bubble-left);
-  right: auto;
-  bottom: var(--bubble-bottom);
-  top: auto;
-  width: var(--bubble-width);
-  align-items: flex-end;
-}
-
-.speech-bubble {
-  position: relative;
-  width: 100%;
-  max-width: var(--bubble-max-width);
-  height: auto;
-  aspect-ratio: 967 / 318;
-  flex: 0 0 auto;
-  padding: 22px 20px 42px 22px;
-  background: url("../../../images/Text%20Bubble.png") center / contain no-repeat;
-  border: none;
-  border-radius: 0;
+/* Floating dialogue. Geometry comes from the fixed composer, in CSS pixels. */
+.dialogue-panel,
+.response-panel {
+  position: fixed;
+  left: var(--dialogue-left, 40px);
+  bottom: var(--dialogue-bottom, 111px);
+  width: var(--dialogue-width, calc(100vw - var(--composer-left) - var(--composer-right)));
+  max-width: 100vw;
+  z-index: 18;
+  border: 1px solid rgba(155, 199, 247, 0.25);
+  border-radius: 12px;
+  background: linear-gradient(145deg, rgba(23, 40, 65, 0.92), rgba(13, 24, 43, 0.86));
+  box-shadow: 0 5px 18px rgba(4, 12, 25, 0.2);
+  color: #edf4ff;
   pointer-events: auto;
 }
 
-.speech-bubble[hidden] {
-  display: block !important;
-  visibility: hidden;
+.dialogue-panel {
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+.dialogue-panel[data-visible="true"] {
+  opacity: 1;
+}
+
+.dialogue-panel[data-visible="false"] {
   pointer-events: none;
 }
 
-.speech-bubble-decoration {
-  position: absolute;
-  top: 10px;
-  right: -10px;
-  width: 40px;
-  height: auto;
+[hidden] {
+  display: none !important;
+}
+
+.dialogue-open {
   display: block;
-  pointer-events: none;
-  user-select: none;
+  margin: 12px 14px;
+  max-height: min(calc(3 * 13px * 1.55), var(--dialogue-max-height, 100vh));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-anchor: none;
+  scrollbar-width: none;
+  border-radius: inherit;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
-.speech-bubble-body {
-  position: relative;
-  left: -6px;
-  top: 2px;
-  width: 100%;
-  max-width: var(--bubble-text-width);
-  height: 3lh;
-  max-height: 3lh;
-  padding-bottom: 0;
-  overflow: hidden;
-  color: var(--color-text);
-  font-family: var(--font-bubble);
-  font-size: 0.85rem;
-  line-height: 1.4;
+.dialogue-open::-webkit-scrollbar {
+  display: none;
+}
+
+.dialogue-text {
+  display: block;
+  font-family: var(--font-dialogue);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 2;
+}
+
+.dialogue-toolbar {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 3px);
+  display: flex;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 8px;
+  background: rgba(17, 31, 51, 0.94);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity var(--transition-fast);
+}
+
+.dialogue-panel:hover .dialogue-toolbar,
+.dialogue-panel:focus-within .dialogue-toolbar {
+  opacity: 1;
+  visibility: visible;
+}
+
+.dialogue-toolbar::after {
+  content: "";
+  position: absolute;
+  inset: 100% 0 -5px;
+}
+
+.dialogue-toolbar button,
+.response-header button {
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #c7dbf2;
+  font: 12px var(--font-ui);
+  cursor: pointer;
+}
+
+.dialogue-toolbar button,
+.response-header button {
+  min-width: 25px;
+  height: 25px;
+  padding: 2px 6px;
+}
+
+.dialogue-toolbar button:hover,
+.response-header button:hover {
+  background: rgba(138, 184, 238, 0.16);
+  color: white;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid #a0cfff;
+  outline-offset: 2px;
+}
+
+.response-panel {
+  display: flex;
+  flex-direction: column;
+  max-height: var(--response-max-height, 320px);
+  z-index: 30;
+}
+
+.response-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  padding: 7px 9px;
+  border-bottom: 1px solid rgba(155, 199, 247, 0.13);
+  font-size: 11px;
+  color: #bbcee6;
+}
+
+.response-header #responsePosition {
+  flex: 1;
+  text-align: center;
+}
+
+.response-content {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 13px 14px;
+  font: 13px/1.65 var(--font-dialogue);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overscroll-behavior: contain;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.response-hint {
+  margin: 0;
+  padding: 6px 14px 10px;
+  font-size: 10px;
+  color: #a1b7d1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition: none !important;
+    animation: none !important;
+  }
 }
 
 /* Composer/input */
 .composer {
   position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 10px;
-  z-index: 4;
+  left: var(--composer-left);
+  right: var(--composer-right);
+  bottom: var(--composer-bottom);
+  z-index: 20;
+  pointer-events: auto;
 
   display: flex;
   align-items: center;
@@ -252,8 +348,11 @@ body[data-popup-role="companion"] .composer {
   pointer-events: auto;
 }
 
-body[data-composer-open="false"] .composer {
-  display: none;
+body[data-composer-open="false"] .composer,
+.composer[hidden] {
+  display: flex !important;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .composer textarea {
@@ -321,14 +420,16 @@ body[data-popup-role="companion"] .composer button {
 }
 
 body[data-popup-role="companion"] .avatar-action-dock {
+  z-index: 22;
   right: var(--side-buttons-right);
   bottom: var(--side-buttons-bottom);
   top: auto;
   transform: none;
+  pointer-events: none;
 }
 
-body[data-popup-role="companion"] .avatar-hitbox:hover ~ .avatar-action-dock,
-body[data-popup-role="companion"] .avatar-action-dock:hover {
+body[data-popup-role="companion"] .avatar-action-dock[data-visible="true"],
+body[data-popup-role="companion"] .avatar-action-dock:has(:focus-visible) {
   opacity: 1;
   pointer-events: auto;
 }
@@ -348,6 +449,11 @@ body[data-popup-role="companion"] .avatar-action-dock:hover {
 }
 
 body[data-popup-role="companion"] .avatar-action-btn {
+  pointer-events: none;
+}
+
+body[data-popup-role="companion"] .avatar-action-dock[data-visible="true"] .avatar-action-btn,
+body[data-popup-role="companion"] .avatar-action-dock:has(:focus-visible) .avatar-action-btn {
   pointer-events: auto;
 }
 
@@ -408,12 +514,11 @@ body[data-popup-role="companion"] .memory-panel * {
 
 body[data-popup-role="companion"] .memory-panel {
   top: auto;
-  left: var(--bubble-left);
+  left: var(--dialogue-left, 40px);
   right: auto;
-  bottom: var(--bubble-bottom);
-  width: calc(100vw - var(--bubble-left) - 16px);
-  max-width: var(--bubble-max-width);
-  max-height: calc(100vh - var(--bubble-bottom) - 12px);
+  bottom: var(--dialogue-bottom, 111px);
+  width: var(--dialogue-width, 259px);
+  max-height: var(--response-max-height, 380px);
   transform: none;
   overflow: hidden;
 }

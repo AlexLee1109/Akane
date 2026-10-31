@@ -1,8 +1,12 @@
-"""Canonical value objects for Akane's durable schema-15 state."""
+"""Canonical value objects for Akane's durable schema-16 state."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.core.environment import EnvironmentChange
 
 
 SELF_GROUP_BY_KIND = {
@@ -307,6 +311,19 @@ class WorldChange:
 
 
 @dataclass(frozen=True, slots=True)
+class ExperienceGroup:
+    """Read-only consolidation of retained evidence, never a learning source."""
+
+    anchor_id: str
+    experience_ids: tuple[str, ...]
+    source_ids: tuple[str, ...]
+    independent_count: int
+    supporting_ids: tuple[str, ...] = ()
+    contradicting_ids: tuple[str, ...] = ()
+    superseded_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class StateSnapshot:
     profile_id: str
     conversation_id: str
@@ -321,6 +338,7 @@ class StateSnapshot:
     self_revisions: tuple[SelfRevision, ...]
     schema_version: int
     revision: int
+    experience_groups: tuple[ExperienceGroup, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,6 +406,7 @@ class StateChangeProposal:
     origin: str = "conversation"
     rejected: tuple[str, ...] = field(default_factory=tuple)
     world: tuple[WorldChange, ...] = ()
+    environment: EnvironmentChange | None = None
 
 
 @dataclass(frozen=True, slots=True)

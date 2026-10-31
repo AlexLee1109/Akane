@@ -42,6 +42,7 @@ from app.core.state import (
     clamp,
 )
 from app.core.utils import compact_text, lexical_terms, relevance, text_key
+from app.core.retrieval import same_memory_fact
 
 
 _GENERIC_TOPIC_TERMS = frozenset({
@@ -219,12 +220,12 @@ def self_topic_similarity(left: object, right: object) -> float:
 
 
 def _best_match(items, score, threshold: float = 0.67):
-    ranked = sorted(
+    best = max(
         ((score(item), item) for item in items),
         key=lambda pair: pair[0],
-        reverse=True,
+        default=None,
     )
-    return ranked[0][1] if ranked and ranked[0][0] >= threshold else None
+    return best[1] if best is not None and best[0] >= threshold else None
 
 
 def _stable_id(prefix: str, *parts: str) -> str:
@@ -277,29 +278,6 @@ def find_self_item(
     return _best_match(
         eligible,
         lambda item: self_topic_similarity(topic, item.topic),
-    )
-
-
-def _related_judgment(
-    items: tuple[SelfItem, ...], kind: str, topic: str,
-) -> SelfItem | None:
-    if kind not in {"opinion", "preference"}:
-        return None
-    return _best_match(
-        (
-            item for item in items
-            if item.kind in {"opinion", "preference"}
-            and item.status in {"active", "uncertain"}
-        ),
-        lambda item: (
-            1.0
-            if "preference" in {kind, item.kind}
-            and _same_self_topic("preference", topic, item.topic)
-            else self_topic_similarity(topic, item.topic)
-            if "preference" not in {kind, item.kind}
-            else 0.0
-        ),
-        0.82,
     )
 
 
@@ -588,6 +566,136 @@ def _valid_semantic_phrase(value: str) -> bool:
     return bool(self_topic_terms(value)) and "\n" not in value and "\r" not in value
 
 
+_POSITIVE_RESULT = re.compile(
+    r"\b(?:worked|works|succeeded|succeeds|passed|helped|fixed|resolved|recovered|"
+    r"(?:reveal(?:ed)?|identif(?:ied|y)|found|find) (?:the )?(?:root )?cause|"
+    r"(?:was|is|were|are|proved) (?:a )?(?:success|successful|effective|useful|"
+    r"helpful|correct|accurate|clear)|(?:completed|finished) successfully)\b",
+)
+_NEGATIVE_RESULT = re.compile(
+    r"\b(?:failed|fails|failure|unsuccessful|broke|broken|"
+    r"(?:was|is|were|are|proved) (?:incorrect|wrong|inaccurate|unclear|ineffective|unhelpful)|"
+    r"(?:was|is|were|are|proved) not (?:successful|effective|useful|helpful|correct|accurate|clear)|"
+    r"(?:not|never|didn't|doesn't|hasn't|haven't|couldn't|wouldn't) "
+    r"(?:work|succeed|pass|help|fix|resolve|recover))\b",
+)
+_RESULT_NEGATION = re.compile(
+    r"(?:\b(?:not|never|no)\b|n't)(?:\W+\w+){0,3}\W*$",
+)
+
+
+def _feedback_result_signals(text: str, action: str = "") -> set[str]:
+    text = _normalized_evidence(text)
+    if action:
+        text = re.sub(r"(?<!\w)" + re.escape(_normalized_evidence(action)) + r"(?!\w)", "", text)
+    results = ({'ambiguous'} if re.search(r"\b(?:hardly|barely|partly|partially|almost)\b", text)
+               else set())
+    for match in _POSITIVE_RESULT.finditer(text):
+        prefix = re.split(r"[.!?;,\n]|\b(?:but|however|yet)\b", text[:match.start()])[-1]
+        results.add("failure" if _RESULT_NEGATION.search(prefix) else "success")
+    for match in _NEGATIVE_RESULT.finditer(text):
+        prefix = re.split(r"[.!?;,\n]|\b(?:but|however|yet)\b", text[:match.start()])[-1]
+        if not _RESULT_NEGATION.search(prefix):
+            results.add("failure")
+    return results
+
+
+def verified_feedback_result(text: str, action: str = "") -> str:
+    """Read explicit result witnesses, without treating a model label as proof.
+
+    Unknown wording, negated success and mixed outcomes cannot grant positive
+    credit. The whole user report is checked as well as the selected quote, so
+    a sidecar cannot crop away an adverse result.
+    """
+    results = _feedback_result_signals(text, action)
+    return next(iter(results)) if len(results) == 1 and 'ambiguous' not in results else ""
+
+
+def feedback_result_is_contradicted(text: str, action: str, expected: str) -> bool:
+    opposite = 'failure' if expected == 'success' else 'success'
+    return opposite in _feedback_result_signals(text, action)
+
+
+def _feedback_kind_is_grounded(kind: str, evidence: str, user_text: str, action: str = "") -> bool:
+    if not _world_source_is_asserted(user_text) or _normalized_evidence(user_text).startswith(('"', '>')):
+        return False
+    if kind == "correction" and not action:
+        return True
+    expected = "success" if kind in {"task_success", "positive_feedback"} else "failure"
+    return (
+        verified_feedback_result(evidence, action) == expected
+        and verified_feedback_result(user_text, action) == expected
+    )
+
+
+def _feedback_action_turn(
+    action: str, evidence: str, user_turn: Turn, recent_turns: tuple[Turn, ...],
+) -> Turn | None:
+    action_key = _normalized_evidence(action)
+    action_terms = self_topic_terms(action)
+    if not action_terms:
+        return None
+    matches = tuple(
+        turn for turn in recent_turns
+        if turn.role == "assistant"
+        and turn.profile_id == user_turn.profile_id
+        and turn.conversation_id == user_turn.conversation_id
+        and turn.created_at <= user_turn.created_at
+        and action_key in _normalized_evidence(turn.content)
+    )
+    if len(matches) != 1:
+        return None
+    immediate_feedback = bool(re.fullmatch(
+        r"(?:it|that) (?:worked|failed|helped)[.!]?", _normalized_evidence(user_turn.content),
+    ))
+    # A result and a quoted action in separate reports do not establish credit.
+    if not immediate_feedback and not (
+        _world_span(action, evidence) or action_terms <= self_topic_terms(evidence)
+    ):
+        return None
+    if immediate_feedback:
+        latest = next((turn for turn in reversed(recent_turns)
+                       if turn.role == "assistant"
+                       and turn.profile_id == user_turn.profile_id
+                       and turn.conversation_id == user_turn.conversation_id
+                       and turn.created_at <= user_turn.created_at), None)
+        if latest is None or latest.id != matches[0].id:
+            return None
+    return matches[0]
+
+
+def dialogue_outcome_is_grounded(outcome: Outcome, turns: tuple[Turn, ...]) -> bool:
+    """Recheck conversational Outcome provenance at the canonical Store boundary."""
+    if (
+        outcome.result not in _EVENT_EVIDENCE_KINDS
+        or outcome.reason not in {
+            f"grounded:user-{outcome.result.replace('_', '-')}",
+            f"grounded:user-{outcome.result.replace('_', '-')}:partial-report",
+        }
+        or len(outcome.source_turn_ids) != 2
+        or outcome.source_turn_ids[0] != outcome.action_turn_id
+    ):
+        return False
+    feedback = next((turn for turn in turns
+                     if turn.id == outcome.source_turn_ids[1]
+                     and turn.role == "user" and turn.profile_id == outcome.profile_id), None)
+    if feedback is None or not _world_span(outcome.description, feedback.content):
+        return False
+    if outcome.reason.endswith(':partial-report') and (
+        outcome.result not in {'task_success', 'positive_feedback'}
+        or len(' '.join(feedback.content.split())) <= 280
+    ):
+        return False
+    prior_turns = turns[:turns.index(feedback)]
+    action = _feedback_action_turn(outcome.action, outcome.description, feedback, prior_turns)
+    return bool(
+        action is not None and action.id == outcome.action_turn_id
+        and _feedback_kind_is_grounded(
+            outcome.result, outcome.description, feedback.content, outcome.action,
+        )
+    )
+
+
 _WORLD_EVIDENCE_KINDS = frozenset({"we", "ws", "wf", "wr", "wr-", "wv"})
 
 
@@ -621,11 +729,127 @@ def _semantic_records(raw: str) -> tuple[dict, ...]:
     return tuple(records)
 
 
+_SELF_HISTORY = re.compile(
+    r"\b(?:i|we)(?:\s+(?:earlier|once|always|never|also|then|often|just|[a-z]+ly))*\s+"
+    r"(?:was|were|had|did|used to|[a-z]{3,}ed|drank|ate|went|grew|saw|sang|"
+    r"took|made|met|felt|found|thought|knew|bought|brought|chose|came|drove|"
+    r"flew|gave|got|heard|kept|left|lost|ran|rode|sat|slept|spent|stood|"
+    r"swam|taught|told|wore|won|wrote|said)\b|"
+    r"\b(?:i|we)(?: have|'ve|'d)\s+(?:(?:already|always|never|once|previously)\s+)*"
+    r"(?:been|[a-z]{3,}ed|drunk|eaten|gone|seen|taken|made|met|felt|found|"
+    r"known|bought|chosen|come|given|heard|kept|left|lost|run|ridden|slept|"
+    r"spent|stood|swum|taught|told|worn|won|written|said)\b|"
+    r"\bi(?: am|'m)\s+(?:originally\s+)?(?:from|born|raised)\b|"
+    r"\b(?:my|our)\s+(?:childhood|upbringing|birthplace|hometown|schooldays)\b",
+    re.IGNORECASE,
+)
+_SELF_BIOGRAPHY = re.compile(
+    r"\b(?:my|our)\s+(?:(?:first|last|past|early|own|family)\s+)*"
+    r"(?:trip|trips|visit|visits|journey|travels|upbringing|memories)\b|"
+    r"\b(?:my|our)\s+(?:\w+\s+)?(?:years|days)\s+(?:in|at)\b|"
+    r"\b(?:i|we)(?: have|'ve)\s+(?:\w+\s+)?memories\b|"
+    r"\b(?:i|we)(?:\s+(?:still|vividly|clearly|fondly))*\s+(?:remember|recall)\s+"
+    r"(?!you\b|your\b|(?:this|our|the) (?:conversation|chat)\b)\S|"
+    r"\bi(?: am|'m)\s+(?:a|an)\s+(?:\w+\s+)?native\b|"
+    r"\b(?:my|our)\s+(?:\w+\s+){1,3}"
+    r"(?:was|were|had|became|taught|brought|gave|took|[a-z]{3,}ed)\b",
+    re.IGNORECASE,
+)
+_SELF_PAST_FRAMING = re.compile(
+    r"(?:^|,\s*|\b(?:from|after|since)\s+)growing up\b|"
+    r"(?:^|,\s*)having\s+(?:been|[a-z]{3,}ed)\b|"
+    r"\b[a-z]+ing\b[^.!?;]*\b(?:last (?:year|month|week|night)|"
+    r"(?:years?|months?|weeks?|days?) ago|in (?:19|20)\d{2})\b",
+    re.IGNORECASE,
+)
+_SELF_SPEECH_HISTORY = re.compile(
+    r"\bi\s+(?:(?:previously|earlier|once)\s+)?(?:said|wrote)\s+"
+    r"[\"'](?P<expression>.+)[\"'][.!]?\s*$", re.IGNORECASE,
+)
+_SELF_JUDGMENT_HISTORY = re.compile(
+    r"i\s+(?:(?:used to)\s+(?P<present>like|prefer|believe|think|want|intend)|"
+    r"(?P<past>liked|preferred|believed|thought|wanted|intended))\s+(?P<view>.+)",
+    re.IGNORECASE,
+)
+_PRESENT_SELF_JUDGMENT = dict(zip(
+    ('liked', 'preferred', 'believed', 'thought', 'wanted', 'intended'),
+    ('like', 'prefer', 'believe', 'think', 'want', 'intend'),
+))
+
+
+def self_history_is_grounded(
+    text: str, *, prior_expressions: tuple[str, ...] = (),
+    observed_events: tuple[str, ...] = (),
+) -> bool:
+    """Past speech proves speech; only an observed event can prove an action.
+
+    This is a conservative lexical admission guard, not a semantic classifier.
+    Current opinions need no historical witness. Reject mixed candidates rather
+    than manufacture a cleaned preference or infer an event from topic overlap.
+    """
+    normalized = _normalized_evidence(text)
+    events = {_normalized_evidence(event).strip(' .!') for event in observed_events}
+    expressions = tuple(_normalized_evidence(value) for value in prior_expressions
+                        if _normalized_evidence(value) != normalized)
+    # Clause boundaries let a present judgment cite a separately witnessed past
+    # event. Do not crop an event down to a favorable substring of its witness.
+    for clause in re.split(r'[;\n]|(?<=[.!?])\s+|\bbecause\b|\bbut\b', normalized):
+        speech = _SELF_SPEECH_HISTORY.fullmatch(clause.strip())
+        unquoted = re.sub(r'(?<!\w)([\"\']).*?\1(?!\w)', '', clause)
+        # Quotes alone do not turn a claimed personal event into fiction. Keep
+        # an unattributed quoted assertion subject to the same history checks.
+        framed_quote = re.search(r'\b(?:fiction|fictional|story|novel|line|phrase|'
+                                 r'quote|quotation|character|poem|passage|lyrics?)\b', unquoted)
+        personal = re.sub(r'\bakane\b', 'i', unquoted if framed_quote else clause)
+        if not (
+            _SELF_HISTORY.search(personal)
+            or _SELF_BIOGRAPHY.search(personal)
+            or (_SELF_PAST_FRAMING.search(personal)
+                and re.search(r'\b(?:i|we|me|my|us|our)\b', personal))
+        ):
+            continue
+        if speech:
+            expression = speech['expression'].strip(' .!')
+            if expression and any(_world_span(expression, source) for source in expressions):
+                continue
+        judgment = _SELF_JUDGMENT_HISTORY.fullmatch(clause.strip(' ,.!'))
+        if judgment:
+            view = judgment['view']
+            verb = judgment['present'] or _PRESENT_SELF_JUDGMENT[judgment['past']]
+            # An exact prior expressed view establishes that view's history,
+            # never an additional action or autobiographical clause inside it.
+            if self_history_is_grounded(view) and any(
+                _world_span(f'i {verb} {view}', source) for source in expressions
+            ):
+                continue
+        if clause.strip(' ,.!') in events:
+            continue
+        return False
+    return True
+
+
+def observed_self_history(
+    experiences: tuple[Experience, ...], outcomes: tuple[Outcome, ...], *,
+    profile_id: str, before: float,
+) -> tuple[str, ...]:
+    """Exact trusted witnesses, retaining the virtual environment's scope."""
+    events = [item.what_happened.replace('Akane', 'I') for item in experiences
+              if item.profile_id == profile_id and item.created_at <= before
+              and item.reason == 'grounded:virtual_environment']
+    # Action-episode descriptions are trusted result receipts, not model prose.
+    events.extend(item.description for item in outcomes
+                  if item.profile_id == profile_id and item.created_at <= before
+                  and item.reason == 'grounded:action_episode')
+    return tuple(events)
+
+
 def validate_semantic_evidence(
     raw: str,
     user_turn: Turn,
     assistant_turn: Turn,
     recent_turns: tuple[Turn, ...] = (),
+    *, observed_history: tuple[str, ...] = (),
+    historical_expressions: tuple[str, ...] = (),
 ) -> SemanticEvidence | None:
     """Validate one model sidecar against canonical source turns, failing closed."""
 
@@ -733,6 +957,16 @@ def validate_semantic_evidence(
         or _CURRENT_WANT.search(evidence_key)
     ):
         return None
+    if current_self and not self_history_is_grounded(
+        evidence,
+        prior_expressions=historical_expressions + tuple(turn.content for turn in recent_turns
+            if turn.role == 'assistant' and turn.id != assistant_turn.id
+            and turn.profile_id == user_turn.profile_id
+            and turn.conversation_id == user_turn.conversation_id
+            and turn.created_at < assistant_turn.created_at),
+        observed_events=observed_history,
+    ):
+        return None
     if kind in _CURIOSITY_EVIDENCE_KINDS:
         if (
             not curiosity_focus
@@ -793,38 +1027,25 @@ def validate_semantic_evidence(
             confidence_band=confidence_band,
         )
     if kind in _EVENT_EVIDENCE_KINDS:
-        if evidence_key not in user_key or value:
+        if (
+            evidence_key not in user_key or value
+            or not _feedback_kind_is_grounded(kind, evidence, user_turn.content, action)
+            or (kind in {"task_success", "positive_feedback"} and stance != "positive")
+            or (kind in {"task_failure", "negative_feedback"} and stance != "negative")
+        ):
             return None
         if not action:
             if behavior or effect or strategy or developmental_goal:
                 return None
             return SemanticEvidence(kind, topic, stance, durability, evidence)
-        action_key = _normalized_evidence(action)
-        if not self_topic_terms(action):
+        action_turn = _feedback_action_turn(action, evidence, user_turn, tuple(
+            turn for turn in recent_turns if turn.id not in {user_turn.id, assistant_turn.id}
+        ))
+        if action_turn is None:
             return None
-        matches = tuple(
-            turn for turn in recent_turns
-            if turn.role == "assistant"
-            and turn.id not in {user_turn.id, assistant_turn.id}
-            and turn.profile_id == user_turn.profile_id
-            and turn.conversation_id == user_turn.conversation_id
-            and turn.created_at <= user_turn.created_at
-            and action_key
-            and action_key in _normalized_evidence(turn.content)
-        )
-        if len(matches) != 1:
-            return None
-        if re.fullmatch(r"(?:it|that) (?:worked|failed|helped)[.!]?", evidence_key):
-            latest = next((turn for turn in reversed(recent_turns)
-                           if turn.role == "assistant"
-                           and turn.profile_id == user_turn.profile_id
-                           and turn.conversation_id == user_turn.conversation_id
-                           and turn.id != assistant_turn.id), None)
-            if latest is None or latest.id != matches[0].id:
-                return None
         return SemanticEvidence(
             kind, topic, stance, durability, evidence,
-            action=action, action_turn_id=matches[0].id,
+            action=action, action_turn_id=action_turn.id,
             behavior=behavior, effect=effect,
             strategy=strategy,
             developmental_goal=developmental_goal,
@@ -1066,12 +1287,8 @@ def _find_memory(
         for memory in reversed(owned):
             if memory_topic(memory.text) == slot:
                 return memory
-    ranked = sorted(
-        ((relevance(text, memory.text), memory) for memory in owned),
-        key=lambda pair: pair[0],
-        reverse=True,
-    )
-    return ranked[0][1] if ranked and ranked[0][0] >= 0.62 else None
+    return next((memory for memory in reversed(owned)
+                 if same_memory_fact(text, memory.text)), None)
 
 
 def _has_non_durable_framing(normalized: str) -> bool:
@@ -1098,17 +1315,28 @@ def _memory_change(
     *,
     now: float,
 ) -> MemoryChange | None:
-    text = compact_text(user_turn.content, 360)
-    normalized = text_key(text)
+    if (user_turn.profile_id != profile_id or assistant_turn.profile_id != profile_id
+            or user_turn.role != "user" or assistant_turn.role != "assistant"
+            or user_turn.conversation_id != assistant_turn.conversation_id
+            or not user_turn.id or not assistant_turn.id or user_turn.id == assistant_turn.id
+            or user_turn.created_at > now):
+        return None
+    # Eligibility uses the complete canonical source, before storage compaction.
+    source = user_turn.content
+    normalized = _normalized_evidence(source)
     if (
-        not text
-        or text.rstrip().endswith("?")
+        not source.strip()
+        or source.rstrip().endswith("?")
         or _has_non_durable_framing(normalized)
-        or _is_other_person_claim(text)
-        or _QUOTED_FIRST_PERSON.search(text)
-        or not _MEMORY_CUES.search(text)
+        or _CURRENT_WANT.search(normalized)
+        or _is_other_person_claim(source)
+        or _QUOTED_FIRST_PERSON.search(source)
+        or not _MEMORY_CUES.search(source)
     ):
         return None
+    text = compact_text(source, 360)
+    normalized = text_key(text)
+    now = user_turn.created_at
     subject = "user"
     kind = "fact"
     if any(cue in normalized for cue in ("i promise", "i will", "i need to")):
@@ -1122,6 +1350,10 @@ def _memory_change(
         kind = "commitment"
     current = _find_memory(memories, text, subject)
     source_ids = (user_turn.id,) if subject == "user" else (user_turn.id, assistant_turn.id)
+    if current is not None and (
+        now <= current.updated_at or user_turn.id in current.source_turn_ids
+    ):
+        return None
     if current is None:
         memory = Memory(
             id=f"memory_{uuid.uuid4().hex}",
@@ -1144,7 +1376,7 @@ def _memory_change(
         importance=clamp(max(current.importance, 0.55), 0.0, 1.0),
         confidence=clamp(max(current.confidence, 0.75), 0.0, 1.0),
         updated_at=now,
-        source_turn_ids=(*current.source_turn_ids, *source_ids)[-6:],
+        source_turn_ids=_bounded_ids(current.source_turn_ids, source_ids),
     )
     return MemoryChange("upsert", memory, current.id)
 
@@ -1182,11 +1414,28 @@ def _experience(
     )
 
 
-def same_experience(previous: Experience, candidate: Experience) -> bool:
-    same_topic = (
+def same_experience_source(previous: Experience, candidate: Experience) -> bool:
+    """A summary of one source cannot become independent reinforcement."""
+    if (
+        previous.profile_id != candidate.profile_id
+        or not (
+            previous.kind == candidate.kind
+            or {previous.kind, candidate.kind} <= (_SELF_EVIDENCE_KINDS | {"mind_change"})
+        )
+        or previous.subject != candidate.subject
+        or not candidate.source_turn_ids
+        or set(previous.source_turn_ids) != set(candidate.source_turn_ids)
+    ):
+        return False
+    return (
         text_key(previous.topic) == text_key(candidate.topic)
         or relevance(previous.topic, candidate.topic) >= 0.85
     )
+
+
+def same_experience(previous: Experience, candidate: Experience) -> bool:
+    if not same_experience_source(previous, candidate):
+        return False
     previous_response = text_key(previous.akane_response)
     candidate_response = text_key(candidate.akane_response)
     previous_terms = lexical_terms(previous.akane_response)
@@ -1194,23 +1443,10 @@ def same_experience(previous: Experience, candidate: Experience) -> bool:
     response_jaccard = len(previous_terms & candidate_terms) / max(
         1, len(previous_terms | candidate_terms),
     )
-    same_response = (
+    return (
         previous_response == candidate_response
         or response_jaccard >= 0.72
-        or SequenceMatcher(
-            None, previous_response, candidate_response,
-        ).ratio() >= 0.82
-    )
-    return (
-        previous.profile_id == candidate.profile_id
-        and (
-            previous.kind == candidate.kind
-            or {previous.kind, candidate.kind} <= (_SELF_EVIDENCE_KINDS | {"mind_change"})
-        )
-        and previous.subject == candidate.subject
-        and previous.source_turn_ids == candidate.source_turn_ids
-        and same_topic
-        and same_response
+        or SequenceMatcher(None, previous_response, candidate_response).ratio() >= 0.82
     )
 
 
@@ -1265,13 +1501,19 @@ def _grounded_outcome(
         item.id for item in experiences
         if semantic.action_turn_id in item.source_turn_ids
     )[-6:]
+    report = ' '.join(user_turn.content.split())
+    goal_result = bool(semantic.developmental_goal) and semantic.kind in {
+        'task_success', 'positive_feedback',
+    }
+    partial_report = goal_result and len(report) > 280
     return Outcome(
         id=_stable_id(
             "outcome", profile_id, semantic.kind, semantic.action_turn_id,
         ),
         profile_id=profile_id,
         result=semantic.kind,
-        description=compact_text(semantic.evidence, 280),
+        description=(report if goal_result and not partial_report
+                     else compact_text(semantic.evidence, 280)),
         action=compact_text(semantic.action, 280),
         action_turn_id=semantic.action_turn_id,
         confidence=(
@@ -1279,7 +1521,8 @@ def _grounded_outcome(
             if semantic.kind in {"correction", "task_success", "task_failure"}
             else 0.8
         ),
-        reason=f"grounded:user-{semantic.kind.replace('_', '-')}",
+        reason=(f"grounded:user-{semantic.kind.replace('_', '-')}"
+                + (':partial-report' if partial_report else '')),
         created_at=now,
         source_turn_ids=(semantic.action_turn_id, user_turn.id),
         experience_ids=linked_experiences,
@@ -1302,6 +1545,18 @@ def _development_similarity(left: str, right: str) -> float:
     return len(left_terms & right_terms) / max(1, len(left_terms | right_terms))
 
 
+def _procedure_similarity(context: str, left: str, right: str) -> float:
+    """Structured virtual procedures include authoritative parameters.
+
+    Word overlap must not merge on/off, object IDs or numeric answers. Legacy
+    natural-language strategies retain their existing semantic matching.
+    """
+    prefix = tuple(verb + ' ' + context + ' ' for verb in ('inspect', 'verify', 'continue'))
+    if context.startswith('virtual ') and (left.startswith(prefix) or right.startswith(prefix)):
+        return float(text_key(left) == text_key(right))
+    return _development_similarity(left, right)
+
+
 def find_behavioral_tendency(
     tendencies: tuple[BehavioralTendency, ...],
     context: str,
@@ -1311,7 +1566,7 @@ def find_behavioral_tendency(
         tendencies,
         lambda item: min(
             _development_similarity(context, item.context),
-            _development_similarity(behavior, item.behavior),
+            _procedure_similarity(context, behavior, item.behavior),
         ),
     )
 
@@ -1441,7 +1696,7 @@ def find_strategy(
         strategies,
         lambda item: min(
             _development_similarity(context, item.context),
-            _development_similarity(procedure, item.procedure),
+            _procedure_similarity(context, procedure, item.procedure),
         ),
     )
 
@@ -1529,6 +1784,7 @@ def _strategy_change_from_outcome(
         item for item in strategies
         if item.status in {"uncertain", "retired"}
         and _development_similarity(semantic.topic, item.context) >= 0.67
+        and (outcome.reason != 'grounded:virtual_environment' or item.procedure == semantic.strategy)
     )
     if len(replacement_candidates) == 1:
         replaced = replacement_candidates[0]
@@ -1749,7 +2005,41 @@ def _grounded_outcome_relevant_to_goal(
     grounded_terms = self_topic_terms(
         f"{outcome.action} {outcome.description}",
     )
-    return bool(goal_topic_terms & grounded_terms)
+    return bool(goal_topic_terms) and goal_topic_terms <= grounded_terms
+
+
+def developmental_goal_completed_by_outcome(
+    goal: DevelopmentalGoal, outcome: Outcome,
+    *, feedback_text: str | None = None,
+) -> bool:
+    """A successful sub-action is progress, not completion of a whole goal.
+
+    Completion requires a trusted result explicitly naming the entire owned
+    goal. The goal's content is unrestricted; neither categories nor a number
+    of successful trials can substitute for that completion witness.
+    """
+    if (
+        goal.profile_id != outcome.profile_id
+        or _outcome_result(outcome.result) != "success"
+        or outcome.reason not in {
+            "grounded:user-task-success", "grounded:user-positive-feedback",
+            "grounded:action_episode", "grounded:virtual_environment",
+        }
+        or not _grounded_outcome_relevant_to_goal(goal, outcome)
+        or "?" in outcome.description
+        or outcome.description.lstrip().startswith(('"', "'", "“", ">"))
+        or (feedback_text is not None
+            and _normalized_evidence(feedback_text) != _normalized_evidence(outcome.description))
+    ):
+        return False
+    goal_text = re.escape(text_key(goal.goal))
+    completion = (rf"(?:your|akane s) goal {goal_text} (?:is|has been) "
+                  r"(?:complete|completed|fulfilled|achieved|met)")
+    action_result = re.escape(text_key(outcome.action)) + r" (?:worked|succeeded)"
+    return bool(goal_text and re.fullmatch(
+        rf"(?:{completion}(?: it (?:worked|succeeded))?|"
+        rf"{action_result} {completion}|{completion} {action_result})",
+        text_key(outcome.description)))
 
 
 def _form_developmental_goal(
@@ -1827,6 +2117,7 @@ def _progress_developmental_goal(
     outcome_id: str,
     *,
     now: float,
+    completed: bool = False,
 ) -> DevelopmentalGoalChange | None:
     if (
         current.status in {"satisfied", "retired"}
@@ -1836,7 +2127,6 @@ def _progress_developmental_goal(
     ):
         return None
     progress = (*current.progress_outcome_ids, outcome_id)[-6:]
-    satisfied = len(progress) >= 2
     strength, confidence = _adjust_strength_confidence(
         current.strength,
         current.confidence,
@@ -1848,14 +2138,14 @@ def _progress_developmental_goal(
         strength=strength,
         confidence=confidence,
         status=(
-            "satisfied" if satisfied else
+            "satisfied" if completed else
             "active" if current.source_ids else current.status
         ),
         updated_at=now,
         progress_outcome_ids=progress,
     )
     return DevelopmentalGoalChange(
-        "satisfy" if satisfied else "progress", item, current.id,
+        "satisfy" if completed else "progress", item, current.id,
     )
 
 
@@ -2139,6 +2429,10 @@ def derive_curiosity_changes(
     semantic = (
         validate_semantic_evidence(
             semantic_evidence, user_turn, assistant_turn, recent_turns,
+            observed_history=observed_self_history(experiences, outcomes,
+                profile_id=profile_id, before=user_turn.created_at),
+            historical_expressions=tuple(item.akane_response for item in experiences
+                if item.profile_id == profile_id and item.created_at <= user_turn.created_at),
         )
         if user_turn.profile_id == profile_id == assistant_turn.profile_id
         else None
@@ -2185,7 +2479,8 @@ def derive_curiosity_changes(
                         (prior[-1].id, experience.id),
                         now=current,
                     )
-        elif existing_curiosity is not None:
+        elif (existing_curiosity is not None
+              and _development_similarity(existing_curiosity.focus, semantic.curiosity_focus) >= 0.67):
             curiosity_change = _resolve_curiosity(
                 existing_curiosity, (experience.id,), strong=False, now=current,
             )
@@ -2211,6 +2506,7 @@ def derive_curiosity_changes(
                     if item.status == "unresolved"
                     and item.expires_at > current
                     and item.action_turn_id == outcome.action_turn_id
+                    and _normalized_evidence(item.action) == _normalized_evidence(outcome.action)
                 )
                 if len(matches) == 1:
                     resolved = _resolve_prediction(matches[0], outcome, now=current)
@@ -2325,10 +2621,6 @@ def derive_curiosity_changes(
             tuple(prediction_changes), (), (), (),
         )
     existing = find_self_item(self_items, semantic.kind, semantic.topic)
-    if existing is None:
-        existing = _related_judgment(
-            self_items, semantic.kind, semantic.topic,
-        )
     if existing is None and semantic.kind == "goal" and semantic.stance == "negative":
         return (
             (memory,) if memory else (), (), (), (),
@@ -2341,6 +2633,25 @@ def derive_curiosity_changes(
         self_item_id=self_item_id,
         existing=existing, now=current,
     )
+    # Identical restatements need new relevant executions to count as support.
+    # Attach that execution's real source pair without inferring a preference
+    # from task success; an independently emitted own judgment is still required.
+    topic_terms = self_topic_terms(semantic.topic)
+    prior_judgments = tuple(item for item in experiences
+        if item.subject == 'akane' and (item.kind == semantic.kind or (
+            item.kind == 'mind_change' and existing is not None and existing.id in item.self_item_ids))
+        and _same_self_topic(semantic.kind, item.topic, semantic.topic))
+    observed = next((item for item in reversed(outcomes)
+        if item.reason == 'grounded:virtual_environment' and item.created_at <= user_turn.created_at
+        and topic_terms and topic_terms <= self_topic_terms(item.action)), None)
+    new_observation = observed is not None and not any(
+        set(observed.source_turn_ids) <= set(item.source_turn_ids) for item in prior_judgments)
+    if (not new_observation and any(_normalized_evidence(item.akane_response)
+            == _normalized_evidence(semantic.evidence) for item in prior_judgments)):
+        return ((memory,) if memory else (), (), (), (), tuple(prediction_changes), (), (), ())
+    if new_observation:
+        experience = replace(experience, source_turn_ids=_bounded_ids(
+            experience.source_turn_ids, observed.source_turn_ids))
     if any(same_experience(previous, experience) for previous in experiences):
         return (
             (memory,) if memory else (), (), (), (),
@@ -2473,10 +2784,18 @@ def derive_developmental_goal_changes(
         if (
             current_goal is not None
             and _grounded_outcome_relevant_to_goal(current_goal, outcome)
+            and not any(
+                item.action_turn_id == outcome.action_turn_id
+                and item.id in (*current_goal.progress_outcome_ids, *current_goal.contradiction_ids)
+                for item in outcomes
+            )
         ):
             if _outcome_result(outcome.result) == "success":
                 goal_change = _progress_developmental_goal(
                     current_goal, outcome.id, now=current,
+                    completed=developmental_goal_completed_by_outcome(
+                        current_goal, outcome, feedback_text=user_turn.content,
+                    ),
                 )
             else:
                 goal_change = _contradict_developmental_goal(

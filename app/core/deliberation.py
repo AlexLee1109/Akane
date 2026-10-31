@@ -5,9 +5,34 @@ import json
 from dataclasses import asdict, dataclass
 
 from app.core.attention import _terms
+from app.core.environment import information_gain, goal_targets, task_progress
+from app.core.mind import SELF_ESTABLISHED_EVIDENCE
+from app.core.utils import lexical_terms
 
 
 ASSESSMENT_MAX_BYTES = 4096
+
+
+@dataclass(frozen=True, slots=True)
+class ActionEvaluation:
+    choice_id: str
+    eligible: bool
+    goal_progress: float
+    self_alignment: float
+    competence: float
+    information_gain: float
+    uncertainty_reduction: float
+    novelty: float
+    strategy_id: str = ''
+    evidence: tuple[str, ...] = ()
+    reason_codes: tuple[str, ...] = ()
+
+    @property
+    def rank(self):
+        # Explicit objectives, then owned judgments, then demonstrated skill,
+        # then useful information. No tuned reward weights or personality prior.
+        return (self.goal_progress, self.self_alignment, self.competence,
+                self.information_gain, self.uncertainty_reduction, self.novelty)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,10 +49,109 @@ class DeliberationAssessment:
     verification_needed: bool
     reason_codes: tuple[str, ...]
     created_at: float
+    action_evaluations: tuple[ActionEvaluation, ...] = ()
 
     def to_json(self):
         return json.dumps(asdict(self), ensure_ascii=False, allow_nan=False,
                           separators=(',', ':'))
+
+
+def _satisfied_goal(frame):
+    """Only explicit target/value goals with a matching current observation.
+
+    No inference of completion for mastery, open-ended growth or missing slots.
+    A later state change may make the same ongoing goal actionable again.
+    """
+    if not frame.relevant_goals:
+        return False
+    facts = dict(frame.environment.facts)
+    for goal in frame.relevant_goals:
+        terms = lexical_terms(' '.join(value for _, value in goal.values))
+        satisfied = False
+        for choice in frame.environment.choices:
+            if not choice.value or choice.target not in terms:
+                continue
+            values = {choice.value, facts.get(choice.target, '')} - {''}
+            desired = values & terms
+            if len(desired) == 1 and facts.get(choice.target) in desired:
+                satisfied = True
+        if not satisfied:
+            return False
+    return True
+
+
+def _evaluate_actions(frame, verification=False):
+    if frame.environment is None:
+        return ()
+    observation = frame.environment
+    context = _terms('virtual ' + observation.activity)
+    histories = {h.choice_id: h for h in frame.action_history}
+    goal_anchors = [_terms(' '.join(value for _, value in r.values)) - context
+                    for r in frame.relevant_goals]
+    complete = _satisfied_goal(frame)
+    evaluations = []
+    for choice in observation.choices:
+        history = histories.get(choice.id)
+        successes, failures = (history.successes, history.failures) if history else (0, 0)
+        n = successes + failures
+        reasons, evidence = [], [s.id for s in history.sources] if history else []
+        failed = bool(history and (history.latest_result == 'task_failure' or history.tendency_result == 'failure'))
+        eligible = (not failed and choice.operation != 'next' and not complete
+                    and (not verification or choice.action in {'inspect', 'verify'}))
+        if failed:
+            reasons.append('observed_failure')
+        if complete:
+            reasons.append('goal_already_observed')
+        targets = _terms(goal_targets(choice)) | lexical_terms(choice.value)
+        progress = max((len(anchor & targets) / len(anchor) for anchor in goal_anchors if anchor), default=None)
+        if progress is None:
+            progress = task_progress(observation, choice)
+        if progress > 0:
+            evidence.extend(r.id for r in frame.relevant_goals)
+            reasons.append('goal_progress')
+        affinities = []
+        for item in frame.relevant_self:
+            if item.kind not in {'preference', 'opinion', 'interest'}:
+                continue
+            values = dict(item.values)
+            if values.get('status', 'active') != 'active':
+                continue  # Contradicted Self is uncertainty, not a durable veto.
+            stance = values.get('stance', '')
+            if stance not in {'positive', 'negative', 'comparative'}:
+                continue
+            anchor = _terms(values.get('topic', '')) - context
+            if stance == 'comparative':
+                anchor = lexical_terms(values.get('preferred', '')) - lexical_terms('virtual ' + observation.activity)
+            features = _terms(choice.target + ' ' + choice.operation) | lexical_terms(choice.value)
+            overlap = len(anchor & features) / len(anchor) if anchor else 0.0
+            if not overlap:
+                continue
+            # Reuse existing strength/confidence and three-source establishment;
+            # an initial own judgment is weak and is never silently established.
+            support = min(1.0, len({s.id for s in item.sources}) / SELF_ESTABLISHED_EVIDENCE)
+            weight = float(values.get('strength', 0)) * float(values.get('confidence', 0)) * support
+            affinities.append((-1 if stance == 'negative' else 1) * weight * overlap)
+            evidence.append(item.id)
+            reasons.append(item.kind)
+        affinity = sum(affinities) / len(affinities) if affinities else 0.0
+        strategy_id = history.strategy_id if history else ''
+        # One neutral pseudo-observation at each pole. Positive competence needs
+        # an existing reinforced strategy backed by >=2 comparable executions.
+        competence = (successes - failures) / (n + 2) if strategy_id or failures else 0.0
+        if strategy_id:
+            evidence.append(strategy_id)
+            reasons.append('learned_strategy')
+        information = information_gain(observation, choice)
+        # Both signals are gated by a real information-bearing affordance.
+        # Revision changes, repeated switching and noise get no novelty bonus.
+        uncertainty = information / (1 + n)
+        novelty = information / (1 + successes)
+        if information:
+            reasons.append('information')
+        evaluations.append(ActionEvaluation(choice.id, eligible, progress, affinity, competence,
+            information, uncertainty, novelty, strategy_id,
+            tuple(dict.fromkeys(evidence))[:3], tuple(dict.fromkeys(reasons))))
+    return tuple(evaluations)
 
 
 def _unique_object(pairs):
@@ -122,7 +246,12 @@ def _assess_frame(frame):
                   and len({s.id for s in r.sources if s.kind == 'outcome'}) >= 2
                   for r in frame.relevant_strategies)
     developed = any(r.kind in {'preference', 'opinion', 'interest'}
+                    and dict(r.values).get('status', 'active') == 'active'
                     and len({s.id for s in r.sources}) >= 2 for r in frame.relevant_self)
+    if any(r.kind in {'preference', 'opinion', 'interest'} and (
+            len({s.id for s in r.sources}) < 2 or dict(r.values).get('status') == 'uncertain')
+           for r in frame.relevant_self):
+        uncertainty.append('provisional_self')
     surprise = 'surprise' in frame.attention.reason_codes
     if grounded_current:
         reasons.append('grounded_current')
@@ -175,6 +304,6 @@ def _assess_frame(frame):
         frame.profile_id, frame.percept.id,
         'frame_' + hashlib.sha256(frame.to_json().encode('utf-8')).hexdigest(),
         mode, complexity, confidence, tuple(uncertainty), tuple(conflicts),
-        tuple(missing), verification, tuple(reasons), frame.created_at,
+        tuple(missing), verification, tuple(reasons), frame.created_at, _evaluate_actions(frame, verification),
     )
     return result if len(result.to_json().encode('utf-8')) <= ASSESSMENT_MAX_BYTES else None

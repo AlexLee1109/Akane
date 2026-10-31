@@ -4,11 +4,12 @@ import json
 from dataclasses import asdict, dataclass, replace
 
 from app.core.attention import AttentionCandidate, _relevant, _terms
-from app.core.mind import self_development_state
+from app.core.mind import _reason_semantics
 from app.core.perception import Percept
 from app.core.retrieval import world_records
 from app.core.situation import current_situation
 from app.core.state import WorldEvent, WorldSource
+from app.core.environment import EnvironmentObservation, learning_context
 
 
 FRAME_MAX_BYTES = 6144
@@ -30,6 +31,48 @@ class FrameRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ActionHistory:
+    """Read-only summary of distinct verified executions in comparable conditions."""
+    choice_id: str
+    successes: int = 0
+    failures: int = 0
+    latest_result: str = ''
+    strategy_id: str = ''
+    tendency_result: str = ''
+    sources: tuple[WorldSource, ...] = ()
+
+
+def action_histories(observation, row, outcomes, strategies, tendencies):
+    receipts = {r['episode_id']: r for r in row['receipts']}
+    histories = []
+    for choice in observation.choices:
+        related, actions = [], set()
+        context = learning_context(choice, row['state'])
+        for outcome in reversed(outcomes):
+            proof = receipts.get(outcome.action_turn_id)
+            if (proof is None or outcome.action_turn_id in actions
+                    or outcome.reason != 'grounded:virtual_environment' or outcome.action != choice.procedure
+                    or outcome.result != 'task_' + proof['result']
+                    or outcome.source_turn_ids[-1] != proof['percept_id']
+                    or learning_context(choice, proof['before']) != context):
+                continue
+            related.append(outcome)
+            actions.add(outcome.action_turn_id)
+        confirmed = {o.id for o in related}
+        strategy = next((s for s in strategies if s.status == 'active' and s.procedure == choice.procedure
+                         and len(confirmed.intersection(s.supporting_outcome_ids)) >= 2), None)
+        tendency = next((t for t in tendencies if t.status == 'active' and t.behavior == choice.procedure
+                         and len(confirmed.intersection(t.supporting_outcome_ids)) >= 2), None)
+        histories.append(ActionHistory(choice.id,
+            sum(o.result == 'task_success' for o in related),
+            sum(o.result == 'task_failure' for o in related),
+            related[0].result if related else '', strategy.id if strategy else '',
+            tendency.expected_result if tendency else '',
+            tuple(WorldSource('outcome', o.id) for o in related[:2])))
+    return tuple(histories)
+
+
+@dataclass(frozen=True, slots=True)
 class CognitiveFrame:
     profile_id: str
     percept: Percept
@@ -45,6 +88,8 @@ class CognitiveFrame:
     relevant_goals: tuple[FrameRecord, ...] = ()
     linked_evidence: tuple[FrameRecord, ...] = ()
     temporal: tuple[tuple[str, str], ...] = ()
+    environment: EnvironmentObservation | None = None
+    action_history: tuple[ActionHistory, ...] = ()
 
     def to_json(self):
         """Canonical wire representation used for the hard UTF-8 byte bound."""
@@ -74,9 +119,11 @@ def _record(item, kind, fields, *, sources=None, extra=()):
     )
 
 
-def _build_frame(percept, attention, *, query, state, world, predictions, outcomes, now):
+def _build_frame(percept, attention, *, query, state, world, predictions, outcomes, now,
+                 environment=None, linked_evidence=(), action_history=()):
     """Only Store calls this, after validating current attention and ownership."""
-    frame = CognitiveFrame(percept.profile_id, percept, attention, now)
+    frame = CognitiveFrame(percept.profile_id, percept, attention, now,
+                           environment=environment, linked_evidence=linked_evidence, action_history=action_history)
     if len(frame.to_json().encode('utf-8')) > FRAME_MAX_BYTES:
         return None  # Required provenance is never truncated to make it fit.
     terms = _terms(query)
@@ -132,14 +179,16 @@ def _build_frame(percept, attention, *, query, state, world, predictions, outcom
         add('relevant_world', _record(item, kind, fields, extra=(('entity', labels),)))
 
     for item in state.self_items:
-        if (item.kind != 'goal' and item.status == 'active'
-                and self_development_state(item) in {'reinforced', 'established'}
+        if (item.kind != 'goal' and item.status in {'active', 'uncertain'}
                 and related(item.topic, item.value)):
+            stance, preferred = _reason_semantics(item.reason)
             add('relevant_self', _record(item, item.kind, ('topic', 'value'),
-                sources=tuple(WorldSource('evidence', id) for id in item.source_ids)))
+                sources=tuple(WorldSource('evidence', id) for id in item.source_ids),
+                extra=(('stance', stance), ('preferred', preferred), ('status', item.status),
+                       ('strength', str(item.strength)), ('confidence', str(item.confidence)))))
     for collection, kind, fields, refs in (
         (state.curiosities, 'curiosity', ('topic', 'focus'), 'source_ids'),
-        (state.behavioral_tendencies, 'tendency', ('context', 'behavior', 'expected_effect'), 'supporting_outcome_ids'),
+        (state.behavioral_tendencies, 'tendency', ('context', 'behavior', 'expected_effect', 'expected_result'), 'supporting_outcome_ids'),
     ):
         for item in collection:
             if item.status == 'active' and related(*(getattr(item, f) for f in fields[:2])):
@@ -150,9 +199,10 @@ def _build_frame(percept, attention, *, query, state, world, predictions, outcom
             add('relevant_strategies', _record(item, 'strategy', ('context', 'procedure', 'expected_result'),
                 sources=tuple(WorldSource('outcome', id) for id in item.supporting_outcome_ids)))
     for item in state.memories:
-        if related(item.text):
-            add('relevant_memory', _record(item, 'memory', ('subject', 'kind', 'text'),
-                sources=tuple(WorldSource('turn', id) for id in item.source_turn_ids)))
+        # Store already gates hybrid recall, confidence, time and provenance.
+        # A second lexical gate would discard indirectly relevant evidence.
+        add('relevant_memory', _record(item, 'memory', ('subject', 'kind', 'text'),
+            sources=tuple(WorldSource('turn', id) for id in item.source_turn_ids)))
     for item in state.experiences:
         if related(item.topic, item.what_happened):
             add('relevant_experience', _record(item, 'experience', ('topic', 'what_happened', 'outcome'),

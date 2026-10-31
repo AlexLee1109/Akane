@@ -9,7 +9,7 @@ import time
 from collections import deque
 
 from app.core.config import SETTINGS
-from app.core.utils import OWNER_PROFILE_ID, compact_text
+from app.core.utils import compact_text
 
 _CHAT_TIMEOUT_SECONDS = 300
 _DISCORD_MESSAGE_LIMIT = 1900
@@ -41,7 +41,7 @@ def _is_dm(message) -> bool:
 
 
 def _profile_id(message) -> str:
-    return OWNER_PROFILE_ID
+    return f"discord:user:{int(message.author.id)}"
 
 
 def _conversation_id(message) -> str:
@@ -195,7 +195,7 @@ async def _cancel_remote(http, conversation_id: str, profile_id: str) -> None:
     try:
         async with http.post(
             f"{SETTINGS.discord_server_url}/api/chat/cancel",
-            json={"conversation_id": conversation_id, "profile_id": profile_id},
+            json={"conversation_id": conversation_id, "profile_id": profile_id, "source": "discord"},
             headers=_headers(),
         ) as response:
             await response.read()

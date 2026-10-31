@@ -11,7 +11,8 @@ from app.core.mind import (
     _tendency_change_from_outcome, find_behavioral_tendency,
 )
 from app.core.perception import _text
-from app.core.state import Outcome, Prediction, PredictionChange, StateChangeProposal
+from app.core.state import Experience, Outcome, Prediction, PredictionChange, StateChangeProposal
+from app.core.environment import EnvironmentChoice, action_occurrence
 from app.core.utils import compact_text
 
 
@@ -41,6 +42,7 @@ class ActionEpisode:
     prediction: Prediction | None = None
     result_percept_id: str = ''
     outcome_id: str = ''
+    environment: EnvironmentChoice | None = None
 
 
 class EpisodeBook:
@@ -60,16 +62,24 @@ class EpisodeBook:
     def clear(self, profile_id):
         self._items = [(at, e) for at, e in self._items if e.profile_id != profile_id]
 
+    def cancel(self, profile_id, episode_ids):
+        """Cancel only bound background attempts, without fabricating a result."""
+        self._items = [(at, replace(e, status='cancelled')
+                        if e.profile_id == profile_id and e.id in episode_ids and e.status == 'pending' else e)
+                       for at, e in self._items]
+
     def start(self, decision, *, goal, strategy, source, producer, occurrence_id):
         self._expire()
         if (decision.selected_action not in {'inspect', 'verify', 'continue'}
                 or not (goal or strategy)):
             return None
+        if decision.environment is not None:
+            occurrence_id = action_occurrence(decision.environment)
         key = (decision.profile_id, decision.percept_id, decision.selected_action,
-               decision.active_goal_id, decision.strategy_id)
+               decision.active_goal_id, decision.strategy_id, decision.environment)
         for _, episode in self._items:
             same_decision = (episode.profile_id, episode.source_percept_id, episode.selected_action,
-                             episode.active_goal_id, episode.strategy_id) == key
+                             episode.active_goal_id, episode.strategy_id, episode.environment) == key
             same_occurrence = (episode.profile_id, episode.source, episode.producer, episode.occurrence_id) == (
                 decision.profile_id, source, producer, occurrence_id)
             if same_decision or same_occurrence:
@@ -80,12 +90,15 @@ class EpisodeBook:
         id = 'episode_' + uuid.uuid4().hex
         context = strategy.context if strategy else compact_text(goal.subject, 120)
         procedure = strategy.procedure if strategy else decision.selected_action
+        if decision.environment is not None:
+            context = 'virtual ' + decision.environment.activity
+            procedure = decision.environment.procedure
         prediction = None
         if strategy:
             # Reuse the learned expectation/confidence; no invented probability
             # for actions without an existing learned expectation.
             prediction = Prediction(
-                'prediction_' + id, decision.profile_id, decision.selected_action, id,
+                'prediction_' + id, decision.profile_id, procedure if decision.environment else decision.selected_action, id,
                 strategy.expected_result, strategy.expected_result, strategy.confidence,
                 'unresolved', decision.created_at, decision.created_at + EPISODE_TTL,
             )
@@ -95,6 +108,7 @@ class EpisodeBook:
             decision.selected_action, decision.strategy_id, decision.percept_id,
             source, producer, occurrence_id, context, procedure, 'pending',
             decision.created_at, decision.created_at + EPISODE_TTL, prediction,
+            environment=decision.environment,
         )
         # Reserve space for bounded terminal IDs and prediction resolution fields.
         if len(json.dumps(asdict(episode), ensure_ascii=False).encode()) > EPISODE_MAX_BYTES - 512:
@@ -138,15 +152,26 @@ def result_proposal(episode, receipt, result, *, strategies, tendencies, outcome
     Schema-15's legacy *_turn_id fields hold namespaced action/feedback source
     references here. No synthetic conversation turns or assistant claims exist.
     """
+    virtual = episode.environment is not None
+    action = episode.procedure if virtual else episode.selected_action
+    experience = Experience(
+        'experience_' + receipt.id, episode.profile_id, 'task_' + result, 'akane',
+        episode.context, f'In the virtual {episode.environment.activity}, Akane executed {action}.'[:200],
+        action, receipt.content[:160], .7, 'grounded:virtual_environment', now,
+        source_turn_ids=(episode.id, receipt.id),
+    ) if virtual else None
     outcome = Outcome(
         outcome_id(receipt), episode.profile_id, 'task_' + result, result,
-        episode.selected_action, episode.id, 1.0, 'grounded:action_episode', now,
+        action, episode.id, 1.0, 'grounded:virtual_environment' if virtual else 'grounded:action_episode', now,
         source_turn_ids=(episode.id, receipt.id),
     )
+    if virtual:
+        outcome = replace(outcome, description=receipt.content[:280])
     semantic = SemanticEvidence(
         outcome.result, episode.context, 'positive' if result == 'success' else 'negative',
-        'task-local', result, action=episode.selected_action, action_turn_id=episode.id,
+        'task-local', result, action=action, action_turn_id=episode.id,
         strategy=episode.procedure,
+        behavior=action if virtual else '', effect='verified virtual transition' if virtual else '',
     )
     # A revised/removed selected strategy must not transfer credit to another
     # procedure. New procedures can form only through the normal success rule.
@@ -157,12 +182,12 @@ def result_proposal(episode, receipt, result, *, strategies, tendencies, outcome
         change = _strategy_change_from_outcome(
             episode.profile_id, strategies, outcomes, outcome, semantic, now=now,
         )
-    tendency = find_behavioral_tendency(tendencies, episode.context, episode.selected_action)
+    tendency = find_behavioral_tendency(tendencies, episode.context, action)
     tendency_change = None
-    if tendency:
+    if tendency or virtual:
         tendency_change = _tendency_change_from_outcome(
             episode.profile_id, tendencies, outcomes, outcome,
-            replace(semantic, behavior=tendency.behavior, effect=tendency.expected_effect), now=now,
+            replace(semantic, behavior=tendency.behavior, effect=tendency.expected_effect) if tendency else semantic, now=now,
         )
     predictions = ()
     resolved = None
@@ -171,6 +196,7 @@ def result_proposal(episode, receipt, result, *, strategies, tendencies, outcome
         predictions = (PredictionChange('form', episode.prediction), PredictionChange('resolve', resolved))
     return StateChangeProposal(
         episode.profile_id, outcomes=(outcome,), predictions=predictions,
+        experiences=(experience,) if experience else (),
         strategies=(change,) if change else (),
         behavioral_tendencies=(tendency_change,) if tendency_change else (),
         origin='action_episode',

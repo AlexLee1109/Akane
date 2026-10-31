@@ -7,6 +7,7 @@ from app.core.mind import (
     self_topic_terms,
 )
 from app.core.situation import current_situation
+from app.core.environment import PRODUCER as ENVIRONMENT_PRODUCER
 
 
 ATTENTION_LIMIT = 16
@@ -17,7 +18,7 @@ _STOP = self_topic_terms(
     'like love prefer want think interest goal task result event status '
     'do does did doing make improve complete completed talking engaged'
 )
-_REASONS = ('goal', 'focus', 'self', 'novelty', 'surprise', 'curiosity', 'task')
+_REASONS = ('goal', 'focus', 'self', 'novelty', 'surprise', 'curiosity', 'task', 'deadline')
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +45,7 @@ def _relevant(anchor, terms, entity_terms):
 
 
 def _evaluate_attention(profile_id, percepts, *, world, self_items, tendencies,
-                        curiosities, goals, predictions, outcomes, now):
+                        curiosities, goals, predictions, outcomes, now, deadline_ids=()):
     """Internal projection. Inputs come exclusively from the locked Store.
 
     The public boundary accepts a profile, never supplied Percepts or state.
@@ -104,6 +105,8 @@ def _evaluate_attention(profile_id, percepts, *, world, self_items, tendencies,
         novelty = bool(event and event.created_at <= now
                        and event.kind in {'state_transition', 'relation_transition'}
                        and event.before != event.after)
+        if percept.source == 'runtime' and percept.producer == ENVIRONMENT_PRODUCER:
+            novelty = True  # A trusted version-bound offer can still produce WAIT.
         surprise = percept.source == 'user' and percept.source_id in surprise_turns
         key = (percept.source, percept.producer,
                percept.world_id or percept.subject)
@@ -118,6 +121,8 @@ def _evaluate_attention(profile_id, percepts, *, world, self_items, tendencies,
         terms = _terms(' '.join((percept.content, percept.subject, *labels)))
         reasons = {code for code, values in anchors.items()
                    if any(_relevant(anchor, terms, entity_terms) for anchor in values)}
+        if percept.source == 'runtime' and percept.producer == 'temporal' and percept.source_id in deadline_ids:
+            reasons.add('deadline')
         if novelty:
             reasons.add('novelty')
         if surprise:
@@ -130,4 +135,8 @@ def _evaluate_attention(profile_id, percepts, *, world, self_items, tendencies,
             salience, tuple(code for code in _REASONS if code in reasons),
             percept.timestamp,
         ))
-    return tuple(sorted(candidates, key=lambda c: -c.salience)[:ATTENTION_LIMIT])
+    # Store filters these to current revisions. At most three explicit sandbox
+    # offers reserve admission before old projections; this makes a purpose-free
+    # WAIT decision available even when historical events fill the window.
+    offers = {p.id for p in percepts if p.source == 'runtime' and p.producer == ENVIRONMENT_PRODUCER}
+    return tuple(sorted(candidates, key=lambda c: (c.percept_id not in offers, -c.salience))[:ATTENTION_LIMIT])

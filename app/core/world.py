@@ -20,7 +20,7 @@ _RECORD_TYPES = {
     "entities": WorldEntity, "states": WorldState, "facts": WorldFact,
     "relations": WorldRelation, "events": WorldEvent,
 }
-_SOURCE_KINDS = frozenset({"user_turn", "assistant_turn", "memory", "experience", "world"})
+_SOURCE_KINDS = frozenset({"user_turn", "assistant_turn", "memory", "experience", "world", "environment"})
 _KEY_FIELDS = frozenset({"attribute", "predicate", "relation"})
 
 
@@ -152,6 +152,9 @@ def known_world_sources(profile: dict) -> set[WorldSource]:
         sources.update(WorldSource(kind, row["id"]) for row in profile[collection])
     sources.update(WorldSource("world", row["id"])
                    for rows in profile["world"].values() for row in rows)
+    for row in profile.get('environment', {}).values():
+        sources.add(WorldSource('environment', row['instance_id']))
+        sources.update(WorldSource('environment', receipt['id']) for receipt in row['receipts'])
     return sources
 
 

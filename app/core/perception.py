@@ -21,6 +21,12 @@ PERCEPT_KEY_BYTES = 200
 _RECEIPT_KINDS = {"runtime": "event", "tool": "result", "task": "completion"}
 
 
+def percept_id(profile_id, source, kind, producer, source_id):
+    """Bind durable results before publication to the eventual passive receipt."""
+    identity = json.dumps([profile_id, source, kind, producer, source_id])
+    return 'percept_' + hashlib.sha256(identity.encode()).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class Percept:
     id: str
@@ -76,9 +82,8 @@ class PerceptBuffer:
             raise ValueError("Invalid or oversized percept receipt.")
         # A producer receipt identifies an occurrence, not its text. Repeated
         # words from distinct user turns or tool invocations remain distinct.
-        identity = json.dumps([profile_id, source, kind, producer, source_id])
         percept = Percept(
-            "percept_" + hashlib.sha256(identity.encode()).hexdigest(),
+            percept_id(profile_id, source, kind, producer, source_id),
             profile_id, source, kind, content, float(timestamp), producer,
             source_id, subject, world_id, event_id,
         )

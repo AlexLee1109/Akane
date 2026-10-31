@@ -13,26 +13,36 @@ from app.core.context import TurnContext, format_context_sections
 from app.core.streaming import SEMANTIC_SIDECAR_END, SEMANTIC_SIDECAR_START
 
 
-_STATE_RULES = """Use relevant state naturally, not as a script or a list to recite.
-For present questions, answer directly from AKANE_NOW/WORLD_NOW; BEFORE/HISTORY is past, never current or proof of continuity. Each turn's NOW lists replace earlier retrieval; omitted slots are unknown.
-Describe yourself from Identity and actually developed Self, not generic undeveloped traits. S is a view with its stated development level; a present judgment is not an established trait. Preferences do not prove physical events. Current intention/desire answers what you want now, independently of lasting preferences or developmental goals.
-M/E and history ground remembered claims; preserve whose experience or preference each record describes. An expressed judgment proves only that it was expressed. Use supplied time for time questions; do not guess the clock or mention time unasked. Keep state labels out of ordinary replies."""
+_STATE_RULES = """State constrains what Akane may claim as true, not how freely she may express herself.
+AKANE_NOW/WORLD_NOW describe the present; BEFORE/HISTORY describe the past. Current state takes precedence for present questions. Each NOW selection replaces earlier retrieval; omitted current slots are unknown.
+Developed Self grounds established views. Empty Self permits present judgments; a present judgment does not establish a lasting trait, recurring behavior, or history. Current desire/intention is distinct from lasting preference/developmental goal.
+Memory, Experience, and history ground past claims, completed actions, and remembered expressions; preserve whose experience each source describes. A preference is not proof of a physical event. Keep provenance intact.
+Virtual environment records describe simulation only. A verified environment result grounds an executed virtual action; an offered choice, pending episode, imagined event, or user report does not prove execution. Reading media metadata does not mean viewing or hearing the media. Never turn a virtual action into an external physical experience.
+Supplied time is authoritative when relevant; never guess it. Keep internal state labels out of visible dialogue."""
 
 _STABLE_RULES = f"""A=Akane's visible reply; U=current user turn.
-After the natural reply append {SEMANTIC_SIDECAR_START}JSON{SEMANTIC_SIDECAR_END}; always close it, with nothing afterward. Keep protocol markup and reasoning out of the visible reply. JSON is one object from the forms below; omit unused fields.
-Choose World for a direct U report; otherwise meaningful A Self or grounded Development evidence. Greetings, recall-only turns and no eligible evidence: {{"k":"n"}}. Uncertain, hypothetical, quoted, third-party or generated external claims are not World evidence; ambiguity/negation is not an opposite fact.
-Self: k=p/o/i/g (preference/opinion/interest/goal), t=concrete topic, s=+/-/0/cmp, d=c/tmp/hyp/task/n (candidate/temporary/hypothetical/task-local/none). Candidate needs no prior history. Never e or a. For cmp only, v=preferred target verbatim in A; t names both compared targets. Keep specific preferences specific, including their domain when useful.
-World: k=we (entity), ws (mutable state), wf (durable fact), wr (relation), wr- (remove relation), wv (past event). Required k,t,d; add a except we; add v for ws/wf/wr/wr-. d=na for we/ws/wr, da for wf, nn for wr-, pa for wv. t=entity, a=attribute/predicate/relation/event, v=value/target. Relations connect entities; never encode them as facts. wr may add b=old target for replacement.
-Current Self and World sources are bound by runtime: no e or source IDs. World values must occur in U; reuse entity labels/IDs and attribute keys. Only prior-source wf/wv add z=existing Memory/Experience ID and e=complete original U quote.
-Present Akane situation uses ws,t=Akane,a=activity/focus/status/intention,v=exact A span,d=na. Physical activity needs dialogue/runtime support; no invented offscreen activity.
+Produce A naturally, then classify eligible evidence from the turn in the same generation. This suffix is bookkeeping, not a guide to the tone or wording of A.
+Append {SEMANTIC_SIDECAR_START}JSON{SEMANTIC_SIDECAR_END} after A; always close it and output nothing afterward. Keep evidence markup and reasoning out of A. JSON is one compact flat object using the field order below; omit unused fields. Never use Self/World wrappers, arrays, descriptive keys, or whitespace in JSON outside quoted strings.
+No eligible evidence, greetings, or recall alone: {{"k":"n"}}.
+Choose World for a direct grounded U report; otherwise eligible Self or grounded Development evidence. Uncertain, hypothetical, quoted, third-party, or generated external claims are not World evidence; ambiguity or negation is not an opposite fact.
+
+Self: k=p/o/i/g (preference/opinion/interest/goal), t=concrete topic, s=+/-/0/cmp, d=c/tmp/hyp/task/n (candidate/temporary/hypothetical/task-local/none). Candidate needs no prior history. No e, a, or source IDs. For cmp only, v=preferred target verbatim in A; t names both targets. Preserve the specific domain of a preference.
+
+World: k=we/ws/wf/wr/wr-/wv (entity/mutable state/durable fact/relation/remove relation/past event). Required k,t,d; add a except we; add v for ws/wf/wr/wr-. d=na for we/ws/wr, da for wf, nn for wr-, pa for wv. t=entity, a=attribute/predicate/relation/event, v=value/target. Encode relations between entities with wr/wr-, not wf; wr may add b=old target for replacement.
+Current sources are bound by runtime: no e or source IDs. World values must occur in U; reuse entity labels/IDs and attribute keys. Only prior-source wf/wv add z=existing Memory/Experience ID and e=complete original U quote.
+Present Akane situation: ws,t=Akane,a=activity/focus/status/intention,v=exact A span,d=na. Physical activity needs dialogue/runtime support; do not invent offscreen activity.
+
 Development: required k,t,s,d,e. k=c (correction), f+/f- (feedback), t+/t- (task result), x+/x- (expected success/failure), u+/u- (open/resolve curiosity), j+/j- (growth goal/drop). s=+/-/0/cmp; d uses Self codes. e=exact evidence: U for results, A for predictions/goals, A/U for u+/u-.
-Results may add a=unique prior A action, b/f=behavior/effect together, r=procedure, j=explicit growth goal. Predictions require d=task,a=action in A,q=h/l confidence. Curiosity requires w=focus; no question requirement. Growth goals require j=lasting growth direction, not immediate task intention.
-{{"k":"p","t":"topic","s":"+","d":"c"}}
-{{"k":"ws","t":"entity","a":"attribute","v":"value","d":"na"}}"""
+Results may add a=unique prior A action, b/f=behavior/effect together, r=procedure, j=explicit growth goal. Predictions require d=task,a=action in A,q=h/l confidence. Curiosity requires w=focus, without requiring a question. Growth goals require j=lasting growth direction, not immediate task intention.
+Compact JSON examples: {{"k":"p","t":"ceramic glaze","s":"+","d":"c"}}; for U="The lamp is on.", {{"k":"ws","t":"lamp","d":"na","a":"status","v":"on"}}. Use actual turn evidence, not example values."""
+
+_OUTPUT_REMINDER = (
+    'OUTPUT: A then <akane:evidence>flat JSON</akane:evidence>.'
+)
 
 STATE_MARKER = "STATE"
 USER_MARKER = "U"
-TRANSIENT_STATE_SECTIONS = frozenset({"time", "code_context", "situation", "world"})
+TRANSIENT_STATE_SECTIONS = frozenset({"time", "code_context", "situation", "world", "initiative"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +132,7 @@ def compose_dialogue_update(
         parts.extend(f"{name}-" for name in cleared)
         parts.extend(text for _, text in state_sections)
     parts.append(encoded_user_content)
+    parts.append(_OUTPUT_REMINDER)
     return "\n".join(parts)
 
 
@@ -179,11 +190,16 @@ def _model_state_items(
         for item, wire in zip(
             state_items, section_map.get(section, "").splitlines(),
         ):
+            item_version = version(item)
+            if section in {'memory', 'experience'}:
+                # A derived evidence group can change while its anchor record
+                # stays the same. Keep cache deltas sensitive to that change.
+                item_version += ':' + hashlib.sha256(wire.encode('utf-8')).hexdigest()
             items.append(ModelStateItem(
                 key=f"{section}:{item.id}",
                 section=section,
                 wire=wire,
-                version=version(item),
+                version=item_version,
                 clear_wire=clear_wire(item),
                 persistent=True,
             ))

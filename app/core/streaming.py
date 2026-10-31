@@ -17,6 +17,27 @@ SEMANTIC_SIDECAR_END = "</akane:evidence>"
 _SEMANTIC_SIDECAR_BARE_START = SEMANTIC_SIDECAR_START.lstrip()
 
 
+def semantic_sidecar_grammar() -> str:
+    """Lazy native suffix framing; admission still checks grounded content."""
+
+    return r'''
+root ::= "<akane:evidence>" evidence "</akane:evidence>"
+evidence ::= none | self | world | development
+none ::= "{\"k\":\"n\"}"
+self ::= "{\"k\":" self-kind ",\"t\":" string ",\"s\":" stance ",\"d\":" durability (",\"v\":" string)? "}"
+self-kind ::= "\"p\"" | "\"o\"" | "\"i\"" | "\"g\""
+world ::= "{\"k\":" world-kind ",\"t\":" string ",\"d\":" world-durability (",\"a\":" string)? (",\"v\":" string)? (",\"b\":" string)? (",\"z\":" string)? (",\"e\":" string)? "}"
+world-kind ::= "\"we\"" | "\"ws\"" | "\"wf\"" | "\"wr\"" | "\"wr-\"" | "\"wv\""
+world-durability ::= "\"na\"" | "\"da\"" | "\"nn\"" | "\"pa\""
+development ::= "{\"k\":" development-kind ",\"t\":" string ",\"s\":" stance ",\"d\":" durability ",\"e\":" string (",\"a\":" string)? (",\"b\":" string)? (",\"f\":" string)? (",\"r\":" string)? (",\"j\":" string)? (",\"w\":" string)? (",\"q\":" string)? "}"
+development-kind ::= "\"c\"" | "\"f+\"" | "\"f-\"" | "\"t+\"" | "\"t-\"" | "\"x+\"" | "\"x-\"" | "\"u+\"" | "\"u-\"" | "\"j+\"" | "\"j-\""
+stance ::= "\"+\"" | "\"-\"" | "\"0\"" | "\"cmp\""
+durability ::= "\"c\"" | "\"tmp\"" | "\"hyp\"" | "\"task\"" | "\"n\""
+string ::= "\"" character* "\""
+character ::= [^"\\<\x00-\x1f] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])
+'''.strip()
+
+
 class SemanticSidecarFilter:
     """Forward spoken text while withholding an optional metadata suffix."""
 
@@ -31,6 +52,10 @@ class SemanticSidecarFilter:
     @property
     def semantic_evidence(self) -> str:
         return self._metadata if self._complete else ""
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def feed(self, text: str) -> str:
         chunk = str(text or "")

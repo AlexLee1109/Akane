@@ -357,7 +357,7 @@ def world_changes(profile_id, activity, row, now):
 
 
 def situation_changes(profile_id, activity, world, source, now):
-    from app.core.mind import _stable_id
+    from app.core.learning import _stable_id
     from app.core.situation import akane_entity
     sources = (WorldSource('environment', source),)
     entity = akane_entity(world, profile_id)

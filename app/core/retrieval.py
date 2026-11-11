@@ -1,7 +1,6 @@
-"""Bounded hybrid evidence selection and lexical World relations; no model."""
+"""Bounded grounded memory recall; no model, personality learning, or state writes."""
 
 from dataclasses import dataclass
-import json
 import re
 
 from app.core.utils import lexical_terms, text_key
@@ -16,8 +15,9 @@ with would you your about am please tell remind suggest consider explain
 remember recall report reported own owned some another additional more'''.split())
 _CONCEPT_WORDS = {
     'fatigue': 'exhausted exhaustion tired fatigue drained depleted burnout overworked',
+    'strain': 'stress stressful stressed overwhelm overwhelmed overload overloaded',
     'work': 'work job employment office workplace shift shifts manager employer career',
-    'responsibility': 'responsibility responsibilities duty duties workload assignment assignments',
+    'responsibility': 'responsibility responsibilities duty duties workload assignment assignments commitment commitments volunteer volunteering',
     'food': 'food eat eating hungry meal meals snack snacks sandwich sandwiches lunch dinner breakfast diet dietary',
     'allergy': 'allergy allergies allergic allergen allergens',
     'restriction': 'restriction restrictions intolerance intolerant avoid avoidance',
@@ -31,7 +31,8 @@ _CONCEPTS = {term: concept for concept, words in _CONCEPT_WORDS.items()
              for term in lexical_terms(words)}
 _FOOD_ALLERGENS = lexical_terms('peanut peanuts nut nuts dairy milk egg eggs wheat soy shellfish sesame fish gluten')
 _DAYS = lexical_terms('Monday Tuesday Wednesday Thursday Friday Saturday Sunday')
-_MUTABLE = lexical_terms(_CONCEPT_WORDS['fatigue'] + ' meeting appointment schedule this month')
+_MUTABLE = lexical_terms(_CONCEPT_WORDS['fatigue'] + ' ' + _CONCEPT_WORDS['strain']
+                        + ' meeting appointment schedule this month')
 _FATIGUE_PHRASES = re.compile(r'\b(?:worn out|(?:running|run) on empty|out of (?:energy|steam)|'
                               r'(?:no|little) energy|burn(?:ed|t) out)\b', re.I)
 _DEPICTIONS = lexical_terms('book novel fiction story painting picture film movie article')
@@ -40,7 +41,12 @@ _SPENDING_DECISIONS = lexical_terms('afford budget expensive buy buying')
 
 
 def recall_terms(text):
-    return lexical_terms(text) - RECALL_STOP_WORDS
+    terms = lexical_terms(text)
+    if '-' in text:
+        # Preserve exact identifiers while also matching ordinary compound
+        # words written with spaces. Numbers and stored evidence stay literal.
+        terms |= lexical_terms(re.sub(r'(?<=[a-zA-Z])-(?=[a-zA-Z])', ' ', text))
+    return terms - RECALL_STOP_WORDS
 
 
 def semantic_terms(text):
@@ -108,15 +114,17 @@ class RecallQuery:
             if shared < 2 or re.match(r'\s*(explain|how|why)\b', self.text, re.I):
                 return 0.0
         relation = 0.0
-        capacity_query = 'work' in self.concepts and bool(self.concepts & {'fatigue', 'responsibility'})
+        capacity_query = ('responsibility' in self.concepts
+                          or 'work' in self.concepts and bool(self.concepts & {'fatigue', 'strain'}))
         food_decision = 'food' in self.concepts and not self.terms & _DEPICTIONS
         # A report about a story/painting is not a report of the user's capacity.
         # Media questions can still retrieve that exact remembered object.
         if capacity_query and terms & _DEPICTIONS and not self.terms & _DEPICTIONS:
             return 0.0
         if self.personal:
-            if ({'fatigue', 'work'} <= concepts and 'work' in self.concepts
-                    and 'responsibility' in self.concepts):
+            if ('responsibility' in self.concepts and not self.terms & _DEPICTIONS
+                    and concepts & {'fatigue', 'strain'}
+                    and ('work' not in self.concepts or 'work' in concepts or 'strain' in concepts)):
                 relation = .75
             if ({'allergy', 'restriction'} & concepts and terms & _FOOD_ALLERGENS
                     and food_decision):
@@ -130,7 +138,8 @@ class RecallQuery:
         if (capacity_query
                 and 'work' in concepts and not concepts & {'fatigue', 'responsibility'}):
             return 0.0
-        if 'work' in self.concepts and 'fatigue' in concepts and 'work' not in concepts:
+        if ('work' in self.concepts and 'fatigue' in concepts
+                and 'work' not in concepts and 'responsibility' not in self.concepts):
             return 0.0
         if food_decision and not ('food' in concepts or
                 concepts & {'allergy', 'restriction'} and terms & _FOOD_ALLERGENS):
@@ -143,6 +152,7 @@ class RecallQuery:
         if self.terms & _DAYS and terms & _DAYS and not self.terms & terms & _DAYS:
             return 0.0
         return min(1.0, max(lexical, semantic, relation))
+
 
 
 def evidence_rank(score, row, now, *, historical=False, affinity=0.0):
@@ -166,183 +176,6 @@ def evidence_rank(score, row, now, *, historical=False, affinity=0.0):
     return score * weight, affinity, float(row.get('importance', row.get('salience', 0)))
 
 
-def consolidate_experiences(selected, experiences, outcomes=(), self_items=(), revisions=()):
-    """Connect retained originals without writing summaries or reinforcing Self.
-
-    Exact action AND context separate task procedures; Self's own provenance
-    determines support/contradiction and prior interpretations. We never infer
-    a positive outcome from response wording. Overlapping or recursively cited
-    source sets form one evidence component, including reworded summaries.
-    Work is bounded by the existing 64-episode retention cap, selected <=1.
-    """
-    from app.core.state import ExperienceGroup
-    profiles = {e.profile_id for e in selected}
-    experiences = tuple(e for e in experiences if e.profile_id in profiles)
-    by_id = {(e.profile_id, e.id): e for e in experiences}
-
-    def observations(e):
-        # Keep original observations separate: a summary citing A and B must
-        # neither count as C nor collapse independent A/B into one observation.
-        pending, visited, originals = [e], set(), []
-        while pending:
-            item = pending.pop()
-            key = (item.profile_id, item.id)
-            if key in visited:
-                continue
-            visited.add(key)
-            references = [source for source in item.source_turn_ids
-                          if source.startswith('experience_') or (item.profile_id, source) in by_id]
-            if references:
-                pending.extend(by_id[(item.profile_id, source)] for source in references
-                               if (item.profile_id, source) in by_id)
-            elif item.source_turn_ids:
-                originals.append(item)
-        return originals
-
-    def key(e):
-        if e.self_item_ids:
-            return 'self', e.subject, tuple(sorted(e.self_item_ids))
-        family = ('task' if e.kind in {'task_success', 'task_failure'} else
-                  'feedback' if e.kind in {'positive_feedback', 'negative_feedback'} else e.kind)
-        # An outcome supplies the procedure, not a guess from the narration.
-        linked = [o for o in outcomes if o.profile_id == e.profile_id and
-                  (e.id in o.experience_ids or set(o.source_turn_ids) & set(e.source_turn_ids))]
-        actions = {o.action for o in linked}
-        action = next(iter(actions)) if len(actions) == 1 else e.akane_response
-        context = text_key(e.topic) if family == 'task' else tuple(sorted(semantic_terms(e.topic)))
-        return family, e.subject, context, action if family == 'task' else ''
-
-    groups = []
-    for anchor in selected:
-        anchor_key = key(anchor)
-        members = [e for e in experiences if e.profile_id == anchor.profile_id and key(e) == anchor_key]
-        members.sort(key=lambda e: (e.created_at, e.id))
-        components, original_ids = [], set()
-        for e in members:
-            for original in observations(e):
-                if original.id in original_ids or key(original) != anchor_key:
-                    continue
-                original_ids.add(original.id)
-                sources = set(original.source_turn_ids)
-                overlapping = [c for c in components if c & sources]
-                for component in overlapping:
-                    sources.update(component)
-                    components.remove(component)
-                components.append(sources)
-        ids = {e.id for e in members}
-        supporting, contradicting, superseded = set(), set(), set()
-        for item in self_items:
-            if item.profile_id == anchor.profile_id and item.id in anchor.self_item_ids:
-                supporting.update(ids & set(item.source_ids))
-                contradicting.update(ids & set(item.contradiction_ids))
-                superseded.update(ids & {source for revision in revisions
-                    if revision.profile_id == anchor.profile_id and revision.self_item_id == item.id
-                    for source in revision.source_ids}
-                    - set(item.source_ids) - set(item.contradiction_ids))
-        if anchor.kind in {'task_success', 'task_failure', 'positive_feedback', 'negative_feedback'}:
-            supporting.update(e.id for e in members if e.id in original_ids
-                              and e.kind in {'task_success', 'positive_feedback'})
-            contradicting.update(e.id for e in members if e.id in original_ids
-                                 and e.kind in {'task_failure', 'negative_feedback'})
-        groups.append(ExperienceGroup(anchor.id, tuple(e.id for e in members),
-            tuple(sorted(set().union(*components))), len(components),
-            tuple(sorted(supporting)), tuple(sorted(contradicting)), tuple(sorted(superseded))))
-    return tuple(groups)
-
-WORLD_CONTEXT_BYTES = 768
-WORLD_RECORD_LIMIT = 6
-_ENTITY_STOP_WORDS = frozenset({
-    'the', 'my', 'your', 'our', 'their', 'this', 'that', 'is', 'are', 'was',
-    'were', 'it', 'what', 'which', 'of', 'on', 'in', 'to', 'and', 'for',
-})
-RETRIEVAL_RULES = (
-    "WORLD_NOW is current; WORLD_HISTORY and E/M are past, never overrides of NOW. "
-    "Each turn's WORLD lists replace previous retrieval; empty means none selected. "
-    "Use relevant context silently, not as a requirement to mention it. "
-    "Never expose system labels or invent missing history."
-)
-
-
 def wants_history(query):
-    return bool(re.search(r"\b(before|previous|previously|earlier|changed|happened|last time)\b|"
+    return bool(re.search(r"\b(before|previous|previously|earlier|change|changed|changes|changing|happened|last time)\b|"
                           r"\b(?:was|were)\b.*\b(?:doing|wrong)\b", query, re.I))
-
-
-def wants_situation(query):
-    return bool(re.search(r"\b(?:you|your|we)\b.*\b(?:doing|focused|focus|busy|want|intention|still|trying)\b|"
-                          r"\b(?:doing|focus|intention)\b.*\b(?:you|your)\b|"
-                          r"\bhow are things\b", query, re.I))
-
-
-def world_context(world, profile_id, query, recent_turns=(), now=float('inf'), *,
-                  conversation_id=None, _records=None):
-    entities = {e.id: e for e in world.entities if e.profile_id == profile_id}
-    entity_terms = {
-        key: terms for key, entity in entities.items()
-        if entity.label.casefold() != 'akane'
-        and (terms := lexical_terms(entity.label.replace('_', ' ')) - _ENTITY_STOP_WORDS)
-    }
-    def matches(text):
-        terms = lexical_terms(text) - _ENTITY_STOP_WORDS
-        return {key for key, anchor in entity_terms.items() if anchor <= terms}
-    selected = matches(query)
-    # Resolve a follow-up only against the nearest explicit user reference.
-    if not selected and re.search(r"\b(it|that)\b", query, re.I):
-        recent_conversation = conversation_id or (
-            recent_turns[-1].conversation_id if recent_turns else None)
-        for turn in reversed(recent_turns[-6:]):
-            if (turn.role == 'user' and turn.profile_id == profile_id
-                    and turn.conversation_id == recent_conversation and turn.created_at <= now):
-                candidates = matches(turn.content)
-                if candidates:
-                    selected = candidates if len(candidates) == 1 else set()
-                    break
-    current, history = [], []
-    def wire():
-        return 'WORLD_NOW ' + json.dumps(current, ensure_ascii=False, separators=(',', ':')) + \
-               '\nWORLD_HISTORY ' + json.dumps(history, ensure_ascii=False, separators=(',', ':'))
-    if not selected:
-        return wire()
-    def add(target, row, record):
-        if len(current) + len(history) >= WORLD_RECORD_LIMIT:
-            return
-        target.append(row)
-        if len(wire().encode('utf-8')) > WORLD_CONTEXT_BYTES:
-            target.pop()
-        elif _records is not None:
-            _records.append(record)
-    states = sorted((s for s in world.states if s.profile_id == profile_id
-                     and s.entity_id in selected and s.updated_at <= now),
-                    key=lambda s: (s.updated_at, s.id), reverse=True)
-    for state in states[:2]:
-        add(current, [entities[state.entity_id].label, state.attribute, state.value], state)
-    if wants_history(query):
-        events = sorted((e for e in world.events if e.profile_id == profile_id
-                         and selected.intersection(e.entity_ids) and e.created_at <= now),
-                        key=lambda e: (e.created_at, e.id), reverse=True)
-        for event in events[:2]:
-            add(history, [[entities[key].label for key in event.entity_ids if key in entities],
-                          event.attribute or event.kind, event.before, event.after], event)
-    relations = sorted((r for r in world.relations if r.profile_id == profile_id
-                        and r.subject_id in entities and r.object_id in entities and r.updated_at <= now),
-                       key=lambda r: (r.updated_at, r.id), reverse=True)
-    direct = [r for r in relations if {r.subject_id, r.object_id} & selected]
-    neighbors = selected | {key for r in direct for key in (r.subject_id, r.object_id)}
-    adjacent = [r for r in relations if r.subject_id not in selected and r.object_id not in selected
-                and {r.subject_id, r.object_id} & neighbors]
-    for relation in (direct + adjacent)[:2]:
-        add(current, [entities[relation.subject_id].label, relation.relation,
-                      entities[relation.object_id].label], relation)
-    for fact in sorted(world.facts, key=lambda f: (f.created_at, f.id), reverse=True):
-        if fact.profile_id == profile_id and fact.subject_id in selected and fact.created_at <= now:
-            add(current, [entities[fact.subject_id].label, fact.predicate, fact.value], fact)
-    return wire()
-
-
-def world_records(world, profile_id, query, *, now):
-    """The same Phase 3D selection with original IDs/provenance, current first."""
-    from app.core.state import WorldEvent
-
-    records = []
-    world_context(world, profile_id, query, now=now, _records=records)
-    return tuple(sorted(records, key=lambda r: isinstance(r, WorldEvent)))

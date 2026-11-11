@@ -1,4 +1,4 @@
-"""Canonical value objects for Akane's durable schema-16 state."""
+"""Canonical value objects for Akane's durable state; Store owns its schema version."""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ SELF_KINDS = frozenset(SELF_GROUP_BY_KIND)
 SELF_STATUSES = frozenset({"active", "uncertain", "completed", "abandoned", "retired"})
 MEMORY_SUBJECTS = frozenset({"user", "akane", "shared"})
 MEMORY_KINDS = frozenset({"fact", "event", "commitment", "shared_experience"})
+MEMORY_RECALL_ROLES = frozenset({"fact", "constraint", "consequence", "preference",
+                                "commitment", "event", "relationship"})
 EXPERIENCE_SUBJECTS = frozenset({"akane", "shared"})
 EXPERIENCE_KINDS = frozenset({
     "preference", "opinion", "interest", "goal", "mind_change", "correction",
@@ -68,6 +70,8 @@ class Memory:
     created_at: float
     updated_at: float
     source_turn_ids: tuple[str, ...] = ()
+    recall_role: str = ""
+    recall_cues: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +325,22 @@ class ExperienceGroup:
     supporting_ids: tuple[str, ...] = ()
     contradicting_ids: tuple[str, ...] = ()
     superseded_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class LearningState:
+    """One profile's evidence for post-turn learning, without retrieval filtering."""
+
+    memories: tuple[Memory, ...] = ()
+    experiences: tuple[Experience, ...] = ()
+    outcomes: tuple[Outcome, ...] = ()
+    predictions: tuple[Prediction, ...] = ()
+    behavioral_tendencies: tuple[BehavioralTendency, ...] = ()
+    strategies: tuple[Strategy, ...] = ()
+    curiosities: tuple[Curiosity, ...] = ()
+    developmental_goals: tuple[DevelopmentalGoal, ...] = ()
+    self_items: tuple[SelfItem, ...] = ()
+    world: WorldSnapshot = field(default_factory=WorldSnapshot)
 
 
 @dataclass(frozen=True, slots=True)

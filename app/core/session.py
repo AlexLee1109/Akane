@@ -1,4 +1,4 @@
-"""Foreground conversation orchestration over the v2 ownership boundaries."""
+"""V2 conversation lifecycle: recent dialogue and Memory → Qwen → atomic history commit."""
 
 from __future__ import annotations
 
@@ -7,30 +7,21 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from app.core.config import SETTINGS
 from app.core.context import ContextBuilder
-from app.core.situation import RuntimeSituation, derive_situation_changes, external_evidence
 from app.core.inference import (
     InferenceCancelled,
     InferenceQueueTimeout,
     InferenceRuntime,
     InferenceTiming,
 )
-from app.core.mind import (
-    behavioral_tendency_state,
-    curiosity_state,
-    derive_developmental_goal_changes,
-    derive_world_changes,
-    developmental_goal_state,
-    self_development_state,
-    strategy_state,
-)
+from app.core.mind import derive_memory_change
 from app.core.state import StateChangeProposal, Turn
 from app.core.prompt import PromptPlan, build_dialogue_prompt
 from app.core.store import get_store
-from app.core.streaming import SemanticSidecarFilter, SpeakableChunker, SpeakableDispatcher
+from app.core.streaming import SpeakableChunker, SpeakableDispatcher
 from app.core.utils import (
     OWNER_PROFILE_ID,
     canonical_profile_id,
@@ -220,8 +211,9 @@ def _fit_prompt(
                 context,
                 user_message=chat.text,
                 reply_context=chat.reply_context,
-                recent_limit=recent_limit or None,
+                recent_limit=recent_limit,
                 recent_token_counter=recent_token_counter,
+                output_budget=max_tokens,
             )
             prompt_build_seconds += time.perf_counter() - build_started_at
         tokenization_started_at = time.perf_counter()
@@ -242,9 +234,9 @@ def _fit_prompt(
                     "turns_removed": max(0, total_recent_turns - recent_limit),
                 },
             )
-        if recent_limit <= 2:
+        if recent_limit == 0:
             raise RuntimeError("The selected prompt does not fit the configured context window.")
-        recent_limit = max(2, recent_limit - 2)
+        recent_limit = max(0, recent_limit - 2)
         plan = None
 
 
@@ -290,7 +282,7 @@ def run_companion_turn(
     cancellation: threading.Event | None = None,
     queue_deadline: float | None = None,
     allow_tool_context: bool = True,
-    runtime_situation: RuntimeSituation | None = None,
+    runtime_situation=None,
 ) -> CompanionTurnResult:
     chat = chat_input
     session_started_at = time.perf_counter()
@@ -314,8 +306,6 @@ def run_companion_turn(
         if streaming and on_speakable is not None else None
     )
     try:
-        if store.cognition is not None:
-            store.cognition.foreground_started()
         log_performance("foreground_event", stage="request_start", at=time.time())
         runtime.foreground_started()
         prior_reply = store.reply_for_request(chat.conversation_id, chat.profile_id, chat.request_id)
@@ -330,7 +320,6 @@ def run_companion_turn(
             reply_context=chat.reply_context,
             allow_tool_context=allow_tool_context,
             now=chat.timestamp,
-            runtime_situation=runtime_situation,
         )
         context_finished_at = time.perf_counter()
         handle.check()
@@ -341,6 +330,7 @@ def run_companion_turn(
             reply_context=chat.reply_context,
             recent_limit=len(context.state.recent_turns) or None,
             append_only=True,
+            output_budget=token_limit,
         )
         prompt_build_seconds = time.perf_counter() - prompt_started_at
         wait_started_at = time.perf_counter()
@@ -397,6 +387,7 @@ def run_companion_turn(
                         reply_context=chat.reply_context,
                         recent_limit=len(context.state.recent_turns) or None,
                         recent_token_counter=recent_token_counter,
+                        output_budget=token_limit,
                     )
                     prompt_build_seconds += time.perf_counter() - build_started_at
                 return canonical_plan
@@ -445,7 +436,6 @@ def run_companion_turn(
                     cache_key=cache_key,
                 )
             chunks: list[str] = []
-            sidecar = SemanticSidecarFilter()
 
             def deliver_spoken(chunk: str) -> None:
                 nonlocal delta_callback, first_eight_visible_tokens_at
@@ -499,8 +489,7 @@ def run_companion_turn(
                 canonical_rebuild=(canonical_rebuild if fast_path else None),
             ):
                 handle.check()
-                deliver_spoken(sidecar.feed(chunk))
-            deliver_spoken(sidecar.finish())
+                deliver_spoken(chunk)
             runtime.finalize_dialogue_reply(cache_key, "".join(chunks))
             log_performance("foreground_event", stage="dialogue_end", at=time.time())
         reservation_released_at = time.perf_counter()
@@ -540,554 +529,53 @@ def run_companion_turn(
             f"turn_{uuid.uuid4().hex}", chat.profile_id, chat.conversation_id,
             "assistant", reply, max(committed_at, chat.timestamp), chat.request_id,
         )
-        development_started_at = time.perf_counter()
-        memory_changes = ()
-        self_changes = ()
-        experience_changes = ()
-        outcome_changes = ()
-        prediction_changes = ()
-        tendency_changes = ()
-        strategy_changes = ()
-        curiosity_changes = ()
-        developmental_goal_changes = ()
-        world_changes = ()
-        if not skip_memory:
-            memories = store.memories(chat.profile_id)
-            experiences = store.experiences(chat.profile_id)
-            (
-                memory_changes,
-                self_changes,
-                experience_changes,
-                outcome_changes,
-                prediction_changes,
-                tendency_changes,
-                strategy_changes,
-                curiosity_changes,
-                developmental_goal_changes,
-            ) = derive_developmental_goal_changes(
-                chat.profile_id,
-                store.self_items(chat.profile_id),
-                memories,
-                user_turn,
-                assistant_turn,
-                experiences=experiences,
-                outcomes=store.outcomes(chat.profile_id),
-                predictions=store.predictions(chat.profile_id),
-                behavioral_tendencies=store.behavioral_tendencies(chat.profile_id),
-                strategies=store.strategies(chat.profile_id),
-                curiosities=store.curiosities(chat.profile_id),
-                developmental_goals=store.developmental_goals(chat.profile_id),
-                recent_turns=context.state.recent_turns,
-                semantic_evidence=sidecar.semantic_evidence,
-                now=committed_at,
-            )
-            world = store.world(chat.profile_id)
-            world_changes = derive_world_changes(
-                external_evidence(sidecar.semantic_evidence, world), user_turn, assistant_turn,
-                world=world,
-                recent_turns=context.state.recent_turns,
-                memories=memories,
-                experiences=experiences,
-                now=committed_at,
-            )
-            world_changes += derive_situation_changes(
-                sidecar.semantic_evidence, user_turn, assistant_turn,
-                world=world, now=committed_at,
-                runtime=runtime_situation,
-            )
-        development_finished_at = time.perf_counter()
+        memory = None if skip_memory else derive_memory_change(
+            chat.profile_id, store.memories(chat.profile_id), user_turn, assistant_turn,
+            now=committed_at,
+        )
         proposal = StateChangeProposal(
-            chat.profile_id,
-            turns=(user_turn, assistant_turn),
-            memories=memory_changes,
-            experiences=experience_changes,
-            outcomes=outcome_changes,
-            predictions=prediction_changes,
-            behavioral_tendencies=tendency_changes,
-            strategies=strategy_changes,
-            curiosities=curiosity_changes,
-            developmental_goals=developmental_goal_changes,
-            self_items=self_changes,
-            world=world_changes,
-            origin="conversation",
+            chat.profile_id, turns=(user_turn, assistant_turn),
+            memories=(memory,) if memory else (), origin="conversation",
         )
         persist_started_at = time.perf_counter()
-        # Order publication with reset/forget and cancellation. A cleared turn
-        # must not recreate its conversation or profile after derivation ends.
+        # Reset/forget and cancellation cannot race publication of a completed turn.
         with _SCHEDULER._lock:
             handle.check()
-            commit = (store.commit(proposal, offered_initiative_id=context.initiative_id)
-                      if context.initiative_id else store.commit(proposal))
+            commit = store.commit(proposal)
         persist_finished_at = time.perf_counter()
-        new_experience = (
-            experience_changes[0]
-            if experience_changes and "experience:form" in commit.applied else None
-        )
-        new_self = (
-            self_changes[0]
-            if self_changes and f"self:{self_changes[0].action}" in commit.applied else None
-        )
-        new_outcome = (
-            outcome_changes[0]
-            if outcome_changes and "outcome:form" in commit.applied else None
-        )
-        formed_prediction = next((
-            change.prediction for change in prediction_changes
-            if change.action == "form"
-        ), None) if "prediction:form" in commit.applied else None
-        resolved_prediction = next((
-            change.prediction for change in prediction_changes
-            if change.action == "resolve"
-        ), None) if "prediction:resolve" in commit.applied else None
-        expired_predictions = [
-            change.prediction.id for change in prediction_changes
-            if change.action == "expire"
-        ][:commit.applied.count("prediction:expire")]
-        changed_tendency = next((
-            change for change in tendency_changes
-            if f"tendency:{change.action}" in commit.applied
-        ), None)
-        changed_strategy = next((
-            change for change in strategy_changes
-            if f"strategy:{change.action}" in commit.applied
-        ), None)
-        changed_curiosity = next((
-            change for change in curiosity_changes
-            if f"curiosity:{change.action}" in commit.applied
-        ), None)
-        changed_developmental_goal = next((
-            change for change in developmental_goal_changes
-            if f"developmental_goal:{change.action}" in commit.applied
-        ), None)
-        model_finished_at = timing.model_finished_at or reservation_released_at
-        log_timing(
-            "session",
-            store_snapshot=context_builder.last_timing.get("store_snapshot_seconds", 0.0),
-            relevance_selection=context_builder.last_timing.get(
-                "relevance_selection_seconds", 0.0,
-            ),
-            context_build=context_finished_at - context_started_at,
-            prompt_build=prompt_build_seconds,
-            tokenization=tokenization_seconds,
-            model_wait=reservation_acquired_at - wait_started_at,
-            prefill=timing.prefill_seconds,
-            decode=timing.decode_seconds,
-            final_eos_or_stop=(
-                max(0.0, timing.stop_observed_at - final_token_at)
-                if timing.stop_observed_at and final_token_at else 0.0
-            ),
-            stop_to_model_end=(
-                max(0.0, model_finished_at - timing.stop_observed_at)
-                if timing.stop_observed_at else 0.0
-            ),
-            finalize_stream=max(0.0, reservation_released_at - model_finished_at),
-            speakable_dispatch=speakable_dispatch_seconds,
-            reply_build=reply_ready_at - reply_build_started_at,
-            durable_state_derivation=development_finished_at - development_started_at,
-            persist_turn=persist_finished_at - persist_started_at,
-            final_token_to_return=max(0.0, persist_finished_at - final_token_at),
-            total=persist_finished_at - session_started_at,
-        )
         metrics = {
+            **asdict(timing),
             "generation_id": handle.generation_id,
-            "prompt_tokens": timing.prompt_tokens,
-            "prompt_token_method": timing.prompt_token_method,
-            "prompt_token_breakdown": token_breakdown,
-            "static_prompt_hash": plan.static_prefix_hash,
-            "selected_counts": plan.selected_counts,
-            "durable_updates": [
-                item for item in commit.applied
-                if item.startswith((
-                    "self:", "memory:", "experience:", "outcome:", "prediction:",
-                    "tendency:",
-                    "strategy:",
-                    "curiosity:",
-                    "developmental_goal:",
-                ))
-            ],
-            "new_experience": (
-                {
-                    "id": new_experience.id,
-                    "kind": new_experience.kind,
-                    "topic": new_experience.topic,
-                    "why": new_experience.reason,
-                    "linked_self_item_ids": list(new_experience.self_item_ids),
-                }
-                if new_experience is not None else None
-            ),
-            "new_outcome": (
-                {
-                    "id": new_outcome.id,
-                    "result": new_outcome.result,
-                    "action": new_outcome.action,
-                    "action_turn_id": new_outcome.action_turn_id,
-                    "linked_experience_ids": list(new_outcome.experience_ids),
-                    "reason": new_outcome.reason,
-                }
-                if new_outcome is not None else None
-            ),
-            "prediction_formed": (
-                {
-                    "id": formed_prediction.id,
-                    "action": formed_prediction.action,
-                    "action_turn_id": formed_prediction.action_turn_id,
-                    "expected_result": formed_prediction.expected_result,
-                    "confidence": formed_prediction.confidence,
-                    "expires_at": formed_prediction.expires_at,
-                }
-                if formed_prediction is not None else None
-            ),
-            "prediction_resolved": (
-                {
-                    "id": resolved_prediction.id,
-                    "expected_result": resolved_prediction.expected_result,
-                    "actual_outcome_id": resolved_prediction.outcome_id,
-                    "actual_result": resolved_prediction.actual_result,
-                    "error_category": resolved_prediction.error_category,
-                    "error_value": resolved_prediction.error_value,
-                }
-                if resolved_prediction is not None else None
-            ),
-            "predictions_expired": expired_predictions,
-            "behavioral_tendency": (
-                {
-                    "id": changed_tendency.tendency.id,
-                    "action": changed_tendency.action,
-                    "context": changed_tendency.tendency.context,
-                    "behavior": changed_tendency.tendency.behavior,
-                    "expected_effect": changed_tendency.tendency.expected_effect,
-                    "expected_result": changed_tendency.tendency.expected_result,
-                    "state": behavioral_tendency_state(
-                        changed_tendency.tendency,
-                    ),
-                    "strength": changed_tendency.tendency.strength,
-                    "confidence": changed_tendency.tendency.confidence,
-                    "supporting_outcome_ids": list(
-                        changed_tendency.tendency.supporting_outcome_ids,
-                    ),
-                    "contradiction_outcome_ids": list(
-                        changed_tendency.tendency.contradiction_outcome_ids,
-                    ),
-                    "reason": f"grounded-outcome:{changed_tendency.action}",
-                }
-                if changed_tendency is not None else None
-            ),
-            "behavioral_tendency_count": len(
-                store.behavioral_tendencies(chat.profile_id),
-            ),
-            "strategy": (
-                {
-                    "id": changed_strategy.strategy.id,
-                    "action": changed_strategy.action,
-                    "context": changed_strategy.strategy.context,
-                    "procedure": changed_strategy.strategy.procedure,
-                    "expected_result": changed_strategy.strategy.expected_result,
-                    "state": strategy_state(changed_strategy.strategy),
-                    "strength": changed_strategy.strategy.strength,
-                    "confidence": changed_strategy.strategy.confidence,
-                    "supporting_outcome_ids": list(
-                        changed_strategy.strategy.supporting_outcome_ids,
-                    ),
-                    "contradiction_outcome_ids": list(
-                        changed_strategy.strategy.contradiction_outcome_ids,
-                    ),
-                    "reason": f"grounded-outcome:{changed_strategy.action}",
-                }
-                if changed_strategy is not None else None
-            ),
-            "strategy_count": len(store.strategies(chat.profile_id)),
-            "curiosity": (
-                {
-                    "id": changed_curiosity.curiosity.id,
-                    "action": changed_curiosity.action,
-                    "topic": changed_curiosity.curiosity.topic,
-                    "focus": changed_curiosity.curiosity.focus,
-                    "state": curiosity_state(changed_curiosity.curiosity),
-                    "strength": changed_curiosity.curiosity.strength,
-                    "confidence": changed_curiosity.curiosity.confidence,
-                    "source_ids": list(changed_curiosity.curiosity.source_ids),
-                    "resolution_ids": list(
-                        changed_curiosity.curiosity.resolution_ids,
-                    ),
-                    "reason": f"grounded-development:{changed_curiosity.action}",
-                }
-                if changed_curiosity is not None else None
-            ),
-            "curiosity_count": len(store.curiosities(chat.profile_id)),
-            "developmental_goal": (
-                {
-                    "id": changed_developmental_goal.goal.id,
-                    "action": changed_developmental_goal.action,
-                    "topic": changed_developmental_goal.goal.topic,
-                    "goal": changed_developmental_goal.goal.goal,
-                    "state": developmental_goal_state(
-                        changed_developmental_goal.goal,
-                    ),
-                    "strength": changed_developmental_goal.goal.strength,
-                    "confidence": changed_developmental_goal.goal.confidence,
-                    "source_ids": list(
-                        changed_developmental_goal.goal.source_ids,
-                    ),
-                    "progress_outcome_ids": list(
-                        changed_developmental_goal.goal.progress_outcome_ids,
-                    ),
-                    "contradiction_ids": list(
-                        changed_developmental_goal.goal.contradiction_ids,
-                    ),
-                    "reason": (
-                        f"grounded-development:{changed_developmental_goal.action}"
-                    ),
-                }
-                if changed_developmental_goal is not None else None
-            ),
-            "developmental_goal_count": len(
-                store.developmental_goals(chat.profile_id),
-            ),
-            "self_development": (
-                {
-                    "id": new_self.item.id,
-                    "action": new_self.action,
-                    "state": self_development_state(new_self.item),
-                    "strength": new_self.item.strength,
-                    "confidence": new_self.item.confidence,
-                    "why": new_self.item.reason,
-                    "support_experience_ids": [
-                        source for source in new_self.item.source_ids
-                        if source.startswith("experience_")
-                    ],
-                    "contradiction_experience_ids": [
-                        source for source in new_self.item.contradiction_ids
-                        if source.startswith("experience_")
-                    ],
-                }
-                if new_self is not None and new_self.item is not None else None
-            ),
             "revision": commit.revision,
-            "store_snapshot_ms": context_builder.last_timing.get("store_snapshot_seconds", 0.0) * 1000,
-            "relevance_selection_ms": context_builder.last_timing.get(
-                "relevance_selection_seconds", 0.0,
-            ) * 1000,
-            "memory_candidates": int(context_builder.last_timing.get("memory_candidates", 0)),
-            "self_candidates": int(context_builder.last_timing.get("self_candidates", 0)),
-            "experience_candidates": int(
-                context_builder.last_timing.get("experience_candidates", 0)
-            ),
-            "behavioral_tendency_candidates": int(
-                context_builder.last_timing.get(
-                    "behavioral_tendency_candidates", 0,
-                )
-            ),
-            "strategy_candidates": int(
-                context_builder.last_timing.get("strategy_candidates", 0)
-            ),
-            "curiosity_candidates": int(
-                context_builder.last_timing.get("curiosity_candidates", 0)
-            ),
-            "developmental_goal_candidates": int(
-                context_builder.last_timing.get(
-                    "developmental_goal_candidates", 0,
-                )
-            ),
-            "context_build_ms": (context_finished_at - context_started_at) * 1000,
-            "prompt_build_ms": prompt_build_seconds * 1000,
-            "tokenization_ms": tokenization_seconds * 1000,
-            "model_wait_ms": (reservation_acquired_at - wait_started_at) * 1000,
-            "foreground_queue_wait_ms": timing.foreground_queue_wait_seconds * 1000,
-            "model_lock_wait_ms": timing.model_lock_wait_seconds * 1000,
-            "prefill_ms": timing.prefill_seconds * 1000,
-            "prefill_tokens": timing.prefill_tokens,
-            "previous_prompt_tokens": timing.previous_prompt_tokens,
-            "current_prompt_tokens": timing.current_prompt_tokens,
-            "actual_token_lcp": timing.actual_token_lcp,
-            "actual_lcp_percent": timing.actual_lcp_percent,
-            "tokens_after_lcp": timing.tokens_after_lcp,
-            "backend_prompt_eval_tokens": timing.backend_prompt_eval_tokens,
-            "backend_reused_tokens": timing.backend_reused_tokens,
-            "backend_compute_graph_reuses": timing.backend_compute_graph_reuses,
-            "llama_n_tokens_before": timing.llama_n_tokens_before,
-            "llama_n_tokens_after": timing.llama_n_tokens_after,
-            "cache_owner": timing.cache_owner,
-            "cache_epoch": timing.cache_epoch,
-            "cache_invalidated": timing.cache_invalidated,
-            "cache_invalidated_reason": timing.cache_invalidated_reason,
-            "cache_invalidated_from_token": timing.cache_invalidated_from_token,
-            "prompt_architecture": timing.prompt_architecture,
-            "static_prefix_tokens": timing.static_prefix_tokens,
-            "historical_prefix_tokens": timing.historical_prefix_tokens,
-            "dynamic_state_tokens": timing.dynamic_state_tokens,
-            "new_user_tokens": timing.new_user_tokens,
-            "self_tokens": timing.self_tokens,
-            "memory_tokens": timing.memory_tokens,
-            "experience_tokens": timing.experience_tokens,
-            "time_tokens": timing.time_tokens,
-            "code_context_tokens": timing.code_context_tokens,
-            "wrapper_tokens": timing.wrapper_tokens,
-            "chat_template_overhead_tokens": timing.chat_template_overhead_tokens,
-            "state_revision_before": timing.state_revision_before,
-            "state_revision_after": timing.state_revision_after,
-            "state_payload_tokens": timing.state_payload_tokens,
-            "state_payload_mode": timing.state_payload_mode,
-            "context_trimmed": timing.context_trimmed,
-            "tokens_removed": timing.tokens_removed,
-            "turns_removed": timing.turns_removed,
-            "cache_rebuild_reason": timing.cache_rebuild_reason,
-            "logical_prompt_tokens": timing.logical_prompt_tokens,
-            "resident_sequence_tokens": timing.resident_sequence_tokens,
-            "appended_tokens": timing.appended_tokens,
-            "state_delta_tokens": timing.state_delta_tokens,
-            "template_overhead_tokens": timing.template_overhead_tokens,
-            "health_before": timing.health_before,
-            "health_after_prefill": timing.health_after_prefill,
-            "health_after_decode": timing.health_after_decode,
-            "sequence_state_bytes": timing.sequence_state_bytes,
-            "prompt_eval_ms": timing.prefill_seconds * 1000,
-            "prefill_tokens_per_second": _tokens_per_second(
-                timing.prefill_tokens, timing.prefill_seconds,
-            ),
-            "time_to_first_token_ms": (
-                max(0.0, timing.first_token_at - session_started_at) * 1000
-                if timing.first_token_at else None
-            ),
-            "decode_ms": timing.decode_seconds * 1000,
-            "generation_ms": max(
-                0.0, timing.model_finished_at - timing.model_started_at,
-            ) * 1000,
-            "generated_tokens": timing.generated_tokens,
-            "generated_token_method": timing.generated_token_method,
-            "backend_decode_eval_tokens": timing.backend_decode_eval_tokens,
-            "finish_reason": timing.finish_reason or "unavailable",
-            "decode_tokens_per_second": _tokens_per_second(
-                timing.backend_decode_eval_tokens
-                if timing.backend_decode_eval_tokens is not None else timing.generated_tokens,
-                timing.decode_seconds,
-            ),
-            "decode_evaluations_per_second": (
-                _tokens_per_second(timing.backend_decode_eval_tokens, timing.decode_seconds)
-                if timing.backend_decode_eval_tokens is not None else None
-            ),
-            "time_to_first_8_visible_tokens_ms": (
-                max(0.0, first_eight_visible_tokens_at - session_started_at) * 1000
-                if first_eight_visible_tokens_at else None
-            ),
-            "visible_token_timing_method": "whitespace_estimate",
-            "time_to_first_speakable_chunk_ms": (
-                max(0.0, first_speakable_chunk_at - session_started_at) * 1000
-                if first_speakable_chunk_at else None
-            ),
-            "final_token_to_reply_ready_ms": (
-                max(0.0, reply_ready_at - final_token_at) * 1000
-                if final_token_at else None
-            ),
-            "final_eos_or_stop_ms": (
-                max(0.0, timing.stop_observed_at - final_token_at) * 1000
-                if timing.stop_observed_at and final_token_at else None
-            ),
-            "stop_to_model_end_ms": (
-                max(0.0, model_finished_at - timing.stop_observed_at) * 1000
-                if timing.stop_observed_at else None
-            ),
-            "reply_persistence_ms": (persist_finished_at - persist_started_at) * 1000,
-            "durable_state_derivation_ms": (
-                development_finished_at - development_started_at
-            ) * 1000,
-            "speakable_dispatch_ms": speakable_dispatch_seconds * 1000,
-            "kv_finalize_ms": max(0.0, reservation_released_at - model_finished_at) * 1000,
-            "store_lock_wait_ms": float(commit.timings.get("lock_wait", 0.0)) * 1000,
-            "store_lock_held_ms": float(commit.timings.get("lock_held", 0.0)) * 1000,
-            "state_copy_ms": float(commit.timings.get("copy", 0.0)) * 1000,
-            "conversation_mutation_ms": float(
-                commit.timings.get("conversation_mutation", 0.0)
-            ) * 1000,
-            "state_validation_ms": float(commit.timings.get("validate", 0.0)) * 1000,
-            "state_serialization_ms": float(commit.timings.get("serialize", 0.0)) * 1000,
-            "state_json_bytes": int(commit.timings.get("json_bytes", 0)),
-            "atomic_write_ms": float(commit.timings.get("write", 0.0)) * 1000,
-            "fsync_ms": float(commit.timings.get("fsync", 0.0)) * 1000,
-            "atomic_replace_ms": float(commit.timings.get("replace", 0.0)) * 1000,
+            "selected_counts": plan.selected_counts,
+            "prompt_token_breakdown": token_breakdown,
+            "finish_reason": timing.finish_reason,
             "foreground_total_ms": (persist_finished_at - session_started_at) * 1000,
-            "visible_response_ms": (
-                max(0.0, stream_flushed_at - session_started_at) * 1000
-                if streaming else (persist_finished_at - session_started_at) * 1000
-            ),
-            "last_token_to_visible_complete_ms": (
-                max(0.0, stream_flushed_at - final_token_at) * 1000
-                if streaming and final_token_at else None
-            ),
-            "post_generation_ms": (
-                max(0.0, persist_finished_at - final_token_at) * 1000
-                if final_token_at else None
-            ),
-            "model_calls": {"dialogue": 1},
-            "model_seconds": max(0.0, timing.model_finished_at - timing.model_started_at),
-            "first_token_seconds": (
-                max(0.0, timing.first_token_at - timing.model_started_at)
-                if timing.first_token_at else None
-            ),
-            "post_generation_seconds": (
-                max(0.0, persist_finished_at - final_token_at)
-                if final_token_at else None
-            ),
-            "persist_seconds": persist_finished_at - persist_started_at,
-            "model_wait_seconds": reservation_acquired_at - wait_started_at,
+            "time_to_first_token_ms": ((timing.first_token_at - session_started_at) * 1000
+                                       if timing.first_token_at else None),
+            "decode_tokens_per_second": _tokens_per_second(timing.generated_tokens, timing.decode_seconds),
+            "persist_turn_ms": (persist_finished_at - persist_started_at) * 1000,
+            "applied": commit.applied,
+            "rejected": commit.rejected,
         }
-        runtime_status = getattr(runtime, "status", lambda: {})()
-        for name in (
-            "foreground_direct_append_count",
-            "foreground_canonical_rebuild_count",
-        ):
-            metrics[name] = runtime_status.get(name)
-        log_performance(
-            "foreground",
-            type="chat",
-            input=metrics["prompt_tokens"],
-            prefill_eval=metrics["backend_prompt_eval_tokens"],
-            prefill_tok_s=metrics["prefill_tokens_per_second"],
-            actual_token_lcp=metrics["actual_token_lcp"],
-            backend_reused_prompt_tokens=metrics["backend_reused_tokens"],
-            generated=metrics["generated_tokens"],
-            decode_tok_s=metrics["decode_tokens_per_second"],
-            foreground_queue_wait_ms=metrics["foreground_queue_wait_ms"],
-            model_lock_wait_ms=metrics["model_lock_wait_ms"],
-            ttft_ms=metrics["time_to_first_token_ms"],
-            cache_invalidated=metrics["cache_invalidated"],
-            cache_invalidated_reason=metrics["cache_invalidated_reason"],
-            cache_invalidated_from_token=metrics["cache_invalidated_from_token"],
-            prompt_architecture=metrics["prompt_architecture"],
-            foreground_direct_append_count=metrics["foreground_direct_append_count"],
-            foreground_canonical_rebuild_count=metrics["foreground_canonical_rebuild_count"],
-            total_ms=metrics["foreground_total_ms"],
-            finish=metrics["finish_reason"],
-        )
         with _DEBUG_LOCK:
             _TURN_DEBUG[(chat.profile_id, chat.conversation_id)] = metrics
-        log_performance("foreground_event", stage="foreground_complete", at=time.time())
         handed_off_at = time.perf_counter()
-        metrics["session_handoff_ms"] = max(0.0, handed_off_at - persist_finished_at) * 1000
-        metrics["final_token_to_session_handoff_ms"] = (
-            max(0.0, handed_off_at - final_token_at) * 1000
-            if final_token_at else None
-        )
-        metrics["post_generation_ms"] = metrics["final_token_to_session_handoff_ms"]
-        metrics["post_generation_seconds"] = (
-            max(0.0, handed_off_at - final_token_at)
-            if final_token_at else None
-        )
         return CompanionTurnResult(
-            reply,
-            handle.generation_id,
-            final_token_at,
-            reply_ready_at,
-            persist_finished_at,
-            handed_off_at,
+            reply, handle.generation_id, final_token_at, reply_ready_at,
+            persist_finished_at, handed_off_at,
         )
     except (InferenceCancelled, InferenceQueueTimeout) as exc:
+        runtime.discard_dialogue_cache(chat.profile_id, chat.conversation_id, reason="turn-failed")
         raise GenerationCancelled(str(exc)) from exc
+    except BaseException:
+        # A generated reply that failed persistence must never become resident history.
+        runtime.discard_dialogue_cache(chat.profile_id, chat.conversation_id, reason="turn-failed")
+        raise
     finally:
         if speech_dispatcher is not None:
             speech_dispatcher.close()
         runtime.foreground_finished()
-        if store.cognition is not None:
-            store.cognition.foreground_finished()
         _SCHEDULER.finish(handle)
 
 
@@ -1141,169 +629,9 @@ def session_state_snapshot(conversation_id: str, profile_id: str) -> dict[str, o
 def debug_state_report(conversation_id: str, profile_id: str, *, verbose: bool = False) -> str:
     snapshot = session_state_snapshot(conversation_id, profile_id)
     last = snapshot.get("last_turn", {})
-    new_experience = last.get("new_experience")
-    new_outcome = last.get("new_outcome")
-    prediction_formed = last.get("prediction_formed")
-    prediction_resolved = last.get("prediction_resolved")
-    predictions_expired = last.get("predictions_expired", ())
-    tendency_change = last.get("behavioral_tendency")
-    strategy_change = last.get("strategy")
-    curiosity_change = last.get("curiosity")
-    developmental_goal_change = last.get("developmental_goal")
-    self_development = last.get("self_development")
-    self_counts = snapshot["self_counts"]
-    development_counts = snapshot["self_development_counts"]
-    lines = [
-        f"Akane v2 state: schema {snapshot['schema_version']}, revision {snapshot['revision']}",
+    return "\n".join((
+        f"Akane v2: schema {snapshot['schema_version']}, revision {snapshot['revision']}",
         f"Recent turns: {snapshot['recent_turn_count']}",
-        f"Total SelfItems: {snapshot['self_count']}",
-        "Self: " + ", ".join(f"{kind}={count}" for kind, count in self_counts.items()),
-        "Development: " + ", ".join(
-            f"{state}={count}" for state, count in development_counts.items()
-        ),
-        f"Selected Self: {', '.join(snapshot['selected_self']) or 'none'}",
-        f"Selected memories: {len(snapshot['selected_memories'])}",
-        f"Experiences: {snapshot['experience_count']}",
-        f"Selected experiences: {len(snapshot['selected_experiences'])}",
-        f"Outcomes: {snapshot['outcome_count']}",
-        f"Predictions: {snapshot['prediction_count']} "
-        f"(unresolved={snapshot['prediction_status_counts']['unresolved']}, "
-        f"resolved={snapshot['prediction_status_counts']['resolved']}, "
-        f"expired={snapshot['prediction_status_counts']['expired']})",
-        f"Behavioral tendencies: {snapshot['behavioral_tendency_count']} "
-        "(" + ", ".join(
-            f"{state}={count}"
-            for state, count in snapshot[
-                "behavioral_tendency_state_counts"
-            ].items()
-        ) + ")",
-        "Selected behavioral tendencies: "
-        f"{len(snapshot['selected_behavioral_tendencies'])}",
-        f"Strategies: {snapshot['strategy_count']} "
-        "(" + ", ".join(
-            f"{state}={count}"
-            for state, count in snapshot["strategy_state_counts"].items()
-        ) + ")",
-        f"Selected strategies: {len(snapshot['selected_strategies'])}",
-        f"Curiosities: {snapshot['curiosity_count']} "
-        "(" + ", ".join(
-            f"{state}={count}"
-            for state, count in snapshot["curiosity_state_counts"].items()
-        ) + ")",
-        f"Selected curiosities: {len(snapshot['selected_curiosities'])}",
-        f"Developmental Goals: {snapshot['developmental_goal_count']} "
-        "(" + ", ".join(
-            f"{state}={count}"
-            for state, count in snapshot[
-                "developmental_goal_state_counts"
-            ].items()
-        ) + ")",
-        "Selected developmental Goals: "
-        f"{len(snapshot['selected_developmental_goals'])}",
-        (
-            f"New experience: {new_experience['id']} because {new_experience['why']}; "
-            f"Self links: {', '.join(new_experience['linked_self_item_ids']) or 'none'}"
-            if isinstance(new_experience, dict) else "New experience: none"
-        ),
-        (
-            f"New outcome: {new_outcome['id']} {new_outcome['result']}; "
-            f"action: {new_outcome['action']} ({new_outcome['action_turn_id']}); "
-            f"Experience links: "
-            f"{', '.join(new_outcome['linked_experience_ids']) or 'none'}; "
-            f"because {new_outcome['reason']}"
-            if isinstance(new_outcome, dict) else "New outcome: none"
-        ),
-        (
-            f"Prediction formed: {prediction_formed['id']}; "
-            f"expected={prediction_formed['expected_result']} "
-            f"confidence={prediction_formed['confidence']:.2f}; "
-            f"action: {prediction_formed['action']} "
-            f"({prediction_formed['action_turn_id']})"
-            if isinstance(prediction_formed, dict) else "Prediction formed: none"
-        ),
-        (
-            f"Prediction resolved: {prediction_resolved['id']}; "
-            f"expected={prediction_resolved['expected_result']}; "
-            f"actual={prediction_resolved['actual_result']} "
-            f"({prediction_resolved['actual_outcome_id']}); "
-            f"error={prediction_resolved['error_category']} "
-            f"{prediction_resolved['error_value']:.2f}"
-            if isinstance(prediction_resolved, dict) else "Prediction resolved: none"
-        ),
-        f"Predictions expired: {', '.join(predictions_expired) or 'none'}",
-        (
-            f"Behavioral tendency: {tendency_change['action']} "
-            f"{tendency_change['id']} -> {tendency_change['state']} "
-            f"({tendency_change['strength']:.2f}/"
-            f"{tendency_change['confidence']:.2f}); "
-            f"{tendency_change['context']}: {tendency_change['behavior']}; "
-            f"expected {tendency_change['expected_result']} "
-            f"({tendency_change['expected_effect']}); "
-            f"evidence: "
-            f"{', '.join(tendency_change['supporting_outcome_ids']) or 'none'}; "
-            f"contradictions: "
-            f"{', '.join(tendency_change['contradiction_outcome_ids']) or 'none'}; "
-            f"because {tendency_change['reason']}"
-            if isinstance(tendency_change, dict)
-            else "Behavioral tendency: none"
-        ),
-        (
-            f"Strategy: {strategy_change['action']} {strategy_change['id']} "
-            f"-> {strategy_change['state']} "
-            f"({strategy_change['strength']:.2f}/"
-            f"{strategy_change['confidence']:.2f}); "
-            f"{strategy_change['context']}: {strategy_change['procedure']}; "
-            f"evidence: "
-            f"{', '.join(strategy_change['supporting_outcome_ids']) or 'none'}; "
-            f"contradictions: "
-            f"{', '.join(strategy_change['contradiction_outcome_ids']) or 'none'}; "
-            f"because {strategy_change['reason']}"
-            if isinstance(strategy_change, dict) else "Strategy: none"
-        ),
-        (
-            f"Curiosity: {curiosity_change['action']} {curiosity_change['id']} "
-            f"-> {curiosity_change['state']} "
-            f"({curiosity_change['strength']:.2f}/"
-            f"{curiosity_change['confidence']:.2f}); "
-            f"{curiosity_change['topic']}: {curiosity_change['focus']}; "
-            f"evidence: {', '.join(curiosity_change['source_ids']) or 'none'}; "
-            f"resolutions: "
-            f"{', '.join(curiosity_change['resolution_ids']) or 'none'}; "
-            f"because {curiosity_change['reason']}"
-            if isinstance(curiosity_change, dict) else "Curiosity: none"
-        ),
-        (
-            f"Developmental Goal: {developmental_goal_change['action']} "
-            f"{developmental_goal_change['id']} -> "
-            f"{developmental_goal_change['state']} "
-            f"({developmental_goal_change['strength']:.2f}/"
-            f"{developmental_goal_change['confidence']:.2f}); "
-            f"{developmental_goal_change['topic']}: "
-            f"{developmental_goal_change['goal']}; "
-            f"sources: "
-            f"{', '.join(developmental_goal_change['source_ids']) or 'none'}; "
-            f"progress: "
-            f"{', '.join(developmental_goal_change['progress_outcome_ids']) or 'none'}; "
-            f"contradictions: "
-            f"{', '.join(developmental_goal_change['contradiction_ids']) or 'none'}; "
-            f"because {developmental_goal_change['reason']}"
-            if isinstance(developmental_goal_change, dict)
-            else "Developmental Goal: none"
-        ),
-        (
-            f"Self development: {self_development['action']} {self_development['id']} "
-            f"→ {self_development['state']} "
-            f"({self_development['strength']:.2f}/{self_development['confidence']:.2f}); "
-            f"because {self_development['why']}; "
-            f"evidence: {', '.join(self_development['support_experience_ids']) or 'none'}; "
-            f"contradictions: "
-            f"{', '.join(self_development['contradiction_experience_ids']) or 'none'}"
-            if isinstance(self_development, dict) else "Self development: none"
-        ),
-        f"Last prompt tokens: {last.get('prompt_tokens', 'not generated')}",
-        f"Last durable updates: {', '.join(last.get('durable_updates', ())) or 'none'}",
-    ]
-    if verbose:
-        lines.append(f"Last change: {snapshot.get('last_change')}")
-        lines.append(f"Last model timing: {last.get('model_seconds', 'n/a')} seconds")
-    return "\n".join(lines)
+        f"Memories: {snapshot['memory_count']} (selected {len(snapshot['selected_memories'])})",
+        f"Generation: {last.get('finish_reason', 'none')}",
+    ))

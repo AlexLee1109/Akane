@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from app.core.mind import _semantic_records, _stable_id, _world_source_is_asserted, _world_span
+from app.core.learning import SemanticSidecar, _semantic_records, _stable_id, _world_source_is_asserted, _world_span
 from app.core.state import WorldChange, WorldEntity, WorldSource, WorldState
 
 
@@ -106,7 +106,9 @@ def external_evidence(raw, world):
     """Reserved situation slots cannot fall through to external-World admission."""
     records = _semantic_records(raw)
     if any(_own(r, world) for r in records):
-        return json.dumps([r for r in records if not _own(r, world)])
+        selected = tuple(r for r in records if not _own(r, world))
+        wire = json.dumps(selected)
+        return SemanticSidecar(wire, selected)
     return raw
 
 

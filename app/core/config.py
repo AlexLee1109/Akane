@@ -143,7 +143,6 @@ class Settings:
     self_result_limit: int
     prompt_debug: bool
     timing_enabled: bool
-    autonomous_generation_enabled: bool = False
 
     def validate(self) -> None:
         if not 1 <= self.server_port <= 65535:
@@ -214,7 +213,7 @@ def load_settings() -> Settings:
         llama_cache_type_k=_llama_cache_type("LLAMA_CACHE_TYPE_K", "q8_0" if raspberry_pi else ""),
         llama_cache_type_v=_llama_cache_type("LLAMA_CACHE_TYPE_V", "q8_0" if raspberry_pi else ""),
         llama_enable_thinking=coerce_bool(_raw("LLAMA_ENABLE_THINKING"), False),
-        max_tokens=max(24, min(_integer("MAX_TOKENS", 96), context_window - 256)),
+        max_tokens=max(24, min(_integer("MAX_TOKENS", 384), context_window - 256)),
         temperature=max(0.0, min(2.0, _number("TEMPERATURE", 0.98))),
         top_k=max(0, _integer("TOP_K", 64)),
         top_p=max(0.05, min(1.0, _number("TOP_P", 0.93))),
@@ -227,12 +226,11 @@ def load_settings() -> Settings:
         max_pending_generations=max(0, _integer("MAX_PENDING_GENERATIONS", 4)),
         generation_queue_timeout_seconds=max(1.0, _number("GENERATION_QUEUE_TIMEOUT_SECONDS", 120.0)),
         recent_turn_limit=max(4, _integer("RECENT_TURN_LIMIT", 16)),
-        recent_conversation_budget=max(64, _integer("RECENT_CONVERSATION_BUDGET", 360)),
+        recent_conversation_budget=max(64, _integer("RECENT_CONVERSATION_BUDGET", 1536)),
         memory_result_limit=min(2, max(1, _integer("MEMORY_MAX_RESULTS", 2))),
         self_result_limit=min(2, max(1, _integer("SELF_MAX_RESULTS", 2))),
         prompt_debug=coerce_bool(_raw("PROMPT_DEBUG"), False),
         timing_enabled=coerce_bool(_raw("TIMING"), False),
-        autonomous_generation_enabled=coerce_bool(_raw("AUTONOMOUS_GENERATION_ENABLED"), False),
     )
     settings.validate()
     return settings

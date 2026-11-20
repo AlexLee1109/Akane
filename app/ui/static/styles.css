@@ -36,7 +36,7 @@
 
   --send-size: 30px;
   --side-buttons-right: -10px;
-  --side-buttons-bottom: 120px;
+  --side-buttons-bottom: 200px;
   --side-button-size: 44px;
   --side-button-gap: 8px;
 }
@@ -68,6 +68,21 @@ body[data-popup-role="companion"] {
   pointer-events: none;
 }
 
+/* The native companion uses a 460px UI anchor within its wider canvas.
+   These values match COMPANION_WIDTH in popup.py. */
+body[data-popup-role="companion"] {
+  --companion-ui-width: 460px;
+  --companion-content-shift-x: 35px;
+  --shell-width: 299px; /* 65vw in the original 460px native window */
+  --avatar-offset-y: 410px;
+  --composer-left: 5px;
+  --composer-right: 35px;
+  --side-buttons-right: 40px;
+  /* The output bubble stays independently sized and viewport-clamped. */
+  --dialogue-target-width: 500px;
+  --dialogue-screen-margin: 16px;
+}
+
 /* Popup window */
 .shell {
   position: relative;
@@ -79,6 +94,7 @@ body[data-popup-role="companion"] {
 
 body[data-popup-role="companion"] .shell {
   position: relative;
+  left: calc(100vw - var(--companion-ui-width) + var(--companion-content-shift-x));
   width: var(--shell-width);
   height: 100vh;
   overflow: visible;
@@ -134,7 +150,12 @@ body[data-popup-role="companion"] .character-wrap {
   z-index: 18;
   border: 1px solid rgba(155, 199, 247, 0.25);
   border-radius: 12px;
-  background: linear-gradient(145deg, rgba(23, 40, 65, 0.92), rgba(13, 24, 43, 0.86));
+  background: linear-gradient(
+    115deg,
+    rgba(34, 68, 149, 0.94) 0%,
+    rgba(75, 96, 195, 0.93) 52%,
+    rgba(114, 90, 181, 0.92) 100%
+  );
   box-shadow: 0 5px 18px rgba(4, 12, 25, 0.2);
   color: #edf4ff;
   pointer-events: auto;
@@ -168,6 +189,13 @@ body[data-popup-role="companion"] .character-wrap {
   border-radius: inherit;
   user-select: text;
   -webkit-user-select: text;
+}
+
+/* Adapt to the actual wrapped reply: 1, 2, or 3 lines naturally.
+   The .dialogue-open max-height above limits visible content to three lines;
+   overflow beyond that remains scrollable during live streaming. */
+body[data-popup-role="companion"] .dialogue-open {
+  height: auto;
 }
 
 .dialogue-open::-webkit-scrollbar {
@@ -404,7 +432,9 @@ body[data-popup-role="companion"] .composer button {
   transform: scale(0.96);
 }
 
-/* Side buttons */
+/* Side buttons â€” coordinated with the sapphire-to-violet dialogue gradient.
+   All controls keep their original DOM hooks, positions, sizes and click behavior.
+   Icons are external SVG assets in the project images/ folder; PNGs are no longer used for the right-side controls. */
 .avatar-action-dock {
   position: absolute;
   right: 24px;
@@ -437,15 +467,33 @@ body[data-popup-role="companion"] .avatar-action-dock:has(:focus-visible) {
 .avatar-action-btn {
   width: var(--side-button-size);
   height: var(--side-button-size);
-  display: block;
-  border: none;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  position: relative;
+  padding: 0;
+  border: 1px solid rgba(193, 202, 255, 0.73);
   border-radius: 50%;
-  background: transparent;
+  background: linear-gradient(115deg, #224495 0%, #4b60c3 52%, #725ab5 100%);
   color: transparent;
+  font-size: 0;
   cursor: pointer;
-  box-shadow: none;
-  backdrop-filter: none;
-  transition: transform 0.16s ease;
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.28),
+    0 3px 10px rgba(25, 28, 86, 0.24);
+  transition: transform 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease;
+}
+
+/* Each icon is a scalable SVG; CSS owns the button gradient and interactions. */
+.avatar-action-btn::before {
+  content: "";
+  display: block;
+  position: absolute;
+  inset: 0;
+  background-position: center;
+  background-size: 59% 59%;
+  background-repeat: no-repeat;
+  pointer-events: none;
 }
 
 body[data-popup-role="companion"] .avatar-action-btn {
@@ -459,10 +507,14 @@ body[data-popup-role="companion"] .avatar-action-dock:has(:focus-visible) .avata
 
 .avatar-action-btn:hover {
   transform: scale(1.04);
+  filter: brightness(1.12);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.36),
+    0 4px 14px rgba(99, 91, 196, 0.40);
 }
 
 .avatar-action-btn:active {
-  transform: scale(0.98);
+  transform: scale(0.96);
 }
 
 .avatar-action-btn-small {
@@ -470,20 +522,22 @@ body[data-popup-role="companion"] .avatar-action-dock:has(:focus-visible) .avata
   height: var(--side-button-size);
 }
 
-.avatar-action-btn-message {
-  background: url("../../../images/Chat%20Icon.png") center / 100% 100% no-repeat;
+.avatar-action-btn-message::before {
+  background-image: url("../../../images/akane-chat.svg");
 }
 
-.avatar-action-btn-minimize {
-  background: url("../../../images/Minimize%20icon.png") center / 100% 100% no-repeat;
+.avatar-action-btn-minimize::before {
+  background-image: url("../../../images/akane-minimize.svg");
 }
 
-.avatar-action-btn-close {
-  background: url("../../../images/Close%20Icon.png") center / 100% 100% no-repeat;
+.avatar-action-btn-close::before {
+  background-image: url("../../../images/akane-close.svg");
 }
 
-.avatar-action-btn-memory {
-  background: url("../../../images/Memory%20Icon.png") center / 100% 100% no-repeat;
+/* Memory button postponed; keep its HTML/JavaScript for future use. */
+.avatar-action-btn-memory,
+#memoryActionButton {
+  display: none !important;
 }
 
 /* Memory panel */
@@ -514,10 +568,12 @@ body[data-popup-role="companion"] .memory-panel * {
 
 body[data-popup-role="companion"] .memory-panel {
   top: auto;
-  left: var(--dialogue-left, 40px);
+  /* Memory panel stays at its original composer-sized location; only the
+     dialogue and full-response panels receive the independent wider width. */
+  left: var(--composer-panel-left, 40px);
   right: auto;
   bottom: var(--dialogue-bottom, 111px);
-  width: var(--dialogue-width, 259px);
+  width: var(--composer-panel-width, 259px);
   max-height: var(--response-max-height, 380px);
   transform: none;
   overflow: hidden;

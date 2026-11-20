@@ -1,0 +1,18 @@
+@skills:akane
+
+Test the full autonomous engineering workflow in an authorized test repository.
+
+1. Create a fresh integration branch from main.
+2. Launch 2 real Managed Devin implementation children.
+3. Give each child a separate harmless documentation change.
+4. Each child must create its own work branch.
+5. Each child must commit and open a PR targeting your integration branch.
+6. Coordinate and automatically merge both child PRs when authorized and all repository requirements pass.
+7. Confirm the integration branch contains both changes.
+8. Run independent QA and code review on the integrated commit.
+9. Open a final draft PR from your branch to main.
+10. Report all child session URLs, PR URLs, merge results, tests, and final commit SHA.
+
+Do not merge the final PR into main.
+Do not bypass Citi approvals or GitHub protections.
+Do not simulate sessions, merges, or results.

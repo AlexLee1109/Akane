@@ -23,10 +23,9 @@ except ImportError:  # pragma: no cover - macOS-only popup behavior
 AVATAR_RIGHT_MARGIN = -145
 AVATAR_BOTTOM_MARGIN = -50
 DEFAULT_SESSION_ID = "popup"
-# Single transparent companion window. Its existing off-screen margins keep
-# the avatar and bottom-anchored conversation controls in their current place.
 COMPANION_WIDTH = 460
 COMPANION_HEIGHT = 560
+COMPANION_CANVAS_WIDTH = 860
 WINDOW_TITLE = "Akane"
 MOUSE_UPDATE_INTERVAL = 1 / 60
 # Let pywebview resolve the JS bridge call before destroying its WKWebView.
@@ -67,7 +66,7 @@ class PopupLayout:
             self.screen_width = COMPANION_WIDTH
             self.screen_height = COMPANION_HEIGHT
             self.frames = {
-                "companion": Frame(0, 0, COMPANION_WIDTH, COMPANION_HEIGHT),
+                "companion": Frame(0, 0, COMPANION_CANVAS_WIDTH, COMPANION_HEIGHT),
             }
             return
         f = screen.frame()
@@ -77,12 +76,17 @@ class PopupLayout:
         self.screen_width = int(f.size.width)
         self.screen_height = int(f.size.height)
 
-        # Keep the window compact — just the bottom-right corner.
-        window_x = self.screen_x + self.screen_width - COMPANION_WIDTH - AVATAR_RIGHT_MARGIN
+        # Preserve the original 460px companion region at EXACTLY the same
+        # screen position.  Only transparent canvas is added to its left.
+        original_x = (
+            self.screen_x + self.screen_width - COMPANION_WIDTH - AVATAR_RIGHT_MARGIN
+        )
+        left_extension = COMPANION_CANVAS_WIDTH - COMPANION_WIDTH
+        window_x = original_x - left_extension
         window_y = self.screen_y + self.screen_height - COMPANION_HEIGHT - AVATAR_BOTTOM_MARGIN
 
         self.frames = {
-            "companion": Frame(window_x, window_y, COMPANION_WIDTH, COMPANION_HEIGHT),
+            "companion": Frame(window_x, window_y, COMPANION_CANVAS_WIDTH, COMPANION_HEIGHT),
         }
 
 
@@ -98,6 +102,9 @@ class WindowApi:
 
     def send_message_stream(self, message: str, request_id: str = "", trace_ttft: bool = False) -> None:
         self.app.send_message_stream(message, request_id, trace_ttft)
+
+    def send_command(self, message: str) -> dict:
+        return self.app.send_command(message)
 
     def request_headers(self) -> dict[str, str]:
         return (
@@ -291,9 +298,8 @@ class PopupApp:
                 pass
             if exc.code == 401:
                 raise RuntimeError(
-                    "The Pi rejected the popup credentials (HTTP 401). Set "
-                    "AKANE_SERVER_API_TOKEN on this computer to the same private "
-                    "token used by the Pi's akane.service."
+                    "The backend rejected the popup credentials (HTTP 401). Set "
+                    "AKANE_SERVER_API_TOKEN to match the server."
                 ) from exc
             raise RuntimeError(f"Remote backend returned HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
@@ -319,6 +325,43 @@ class PopupApp:
                 )
                 self._stream_thread = thread
                 thread.start()
+
+    def send_command(self, message: str) -> dict:
+        payload = json.dumps({
+            "message": str(message or "").strip(),
+            "session_id": DEFAULT_SESSION_ID,
+            "source": "popup",
+        }, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if SETTINGS.server_api_token:
+            headers["Authorization"] = f"Bearer {SETTINGS.server_api_token}"
+        request = urllib.request.Request(
+            urljoin(f"{self.backend_url}/", "api/chat"),
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = exc.reason
+            try:
+                body = json.loads(exc.read().decode("utf-8", errors="replace"))
+                detail = body.get("error") or body.get("detail") or detail
+            except (AttributeError, json.JSONDecodeError):
+                pass
+            if exc.code == 401:
+                raise RuntimeError(
+                    "The backend rejected the popup credentials (HTTP 401). Set "
+                    "AKANE_SERVER_API_TOKEN to match the server."
+                ) from exc
+            raise RuntimeError(f"Remote backend returned HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Could not reach remote backend at {self.backend_url}: {exc.reason}") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("Remote backend returned an invalid command response.")
+        return result
 
     def viewport_bounds(self) -> dict[str, float] | None:
         """Visible display intersection in WKWebView's logical CSS coordinates."""
@@ -521,8 +564,6 @@ class PopupApp:
             pass
 
     def _ensure_server(self):
-        if not popup_backend_is_local():
-            return
         headers = {}
         if SETTINGS.server_api_token:
             headers["Authorization"] = f"Bearer {SETTINGS.server_api_token}"
@@ -530,22 +571,33 @@ class PopupApp:
             if delay:
                 time.sleep(delay)
             request = urllib.request.Request(
-                urljoin(f"{self.backend_url}/", "api/state"),
+                urljoin(f"{self.backend_url}/", "health"),
                 headers=headers,
             )
             try:
-                with urllib.request.urlopen(request, timeout=1):
+                with urllib.request.urlopen(request, timeout=1) as response:
+                    health = json.loads(response.read())
+                if health.get("runtime") != "akane_next":
+                    raise RuntimeError(
+                        "The configured backend is not running Akane Next. "
+                        "Stop it, then start the popup again."
+                    )
+                if health.get("status") == "ok" and health.get("model_loaded") is True:
                     return
-            except HTTPError:
-                # Any HTTP response proves that a server owns this address.
-                return
+            except HTTPError as error:
+                raise RuntimeError(
+                    f"The configured local backend returned HTTP {error.code}; "
+                    "the Akane Next popup cannot use it."
+                ) from error
             except (OSError, URLError):
                 continue
-        from app.server import serve_in_thread
-
         backend = urlsplit(self.backend_url)
+        if not popup_backend_is_local() or backend.scheme != "http":
+            raise RuntimeError("Could not reach a ready Akane Next backend at the configured URL.")
+        from app.companion.server import serve_in_thread
+
         host = backend.hostname or "127.0.0.1"
-        port = backend.port or (443 if backend.scheme == "https" else 80)
+        port = backend.port or 80
         self.server, _ = serve_in_thread(host=host, port=port)
 
     def _build_start_url(self) -> str:
@@ -734,11 +786,10 @@ class PopupApp:
             if self._cleanup_started:
                 return
             self._cleanup_started = True
-        threading.Thread(
-            target=self._cleanup_background_resources,
-            daemon=True,
-            name="AkanePopupCleanup",
-        ).start()
+            self._cleanup_thread = threading.Thread(
+                target=self._cleanup_background_resources, name="AkanePopupCleanup",
+            )
+            self._cleanup_thread.start()
 
     def _cleanup_background_resources(self) -> None:
         with self._stream_lock:
@@ -782,11 +833,16 @@ class PopupApp:
                 pass
 
     def run(self):
-        layout = self._layout()
-        frame = layout.frames["companion"]
-        self._create_window(width=frame.width, height=frame.height)
-        webview.start(self._on_start)
-        self._finalize_window_closed()
+        try:
+            layout = self._layout()
+            frame = layout.frames["companion"]
+            self._create_window(width=frame.width, height=frame.height)
+            icon_path = Path(__file__).parent / "static" / "akane.icns"
+            webview.start(self._on_start, icon=str(icon_path) if icon_path.is_file() else None)
+        finally:
+            self._finalize_window_closed()
+            self._cleanup_thread.join()
+
 
 
 def launch_popup():

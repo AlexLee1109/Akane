@@ -10,12 +10,6 @@ const elements = {
   dialoguePanel: document.getElementById("dialoguePanel"),
   dialogueText: document.getElementById("dialogueText"),
   dialogueOpen: document.getElementById("dialogueOpen"),
-  dialoguePrevious: document.getElementById("dialoguePrevious"),
-  dialogueNext: document.getElementById("dialogueNext"),
-  dialogueLatest: document.getElementById("dialogueLatest"),
-  dialogueExpand: document.getElementById("dialogueExpand"),
-  dialogueToolbar: document.querySelector(".dialogue-toolbar"),
-  dialogueDismiss: document.getElementById("dialogueDismiss"),
   responsePanel: document.getElementById("responsePanel"),
   responseContent: document.getElementById("responseContent"),
   responsePrevious: document.getElementById("responsePrevious"),
@@ -49,7 +43,6 @@ const activeFetchControllers = new Set();
 let preservePreview = false;
 let lastRenderedMessagesKey = "";
 let lastKnownStateVersion = -1;
-let lastInitiativeDeliveryId = "";
 
 let streamingAssistantText = "";
 let subtitles = null;
@@ -389,9 +382,42 @@ function layoutDialogue() {
   const rect = elements.composer.getBoundingClientRect();
   const root = document.documentElement;
   const gap = parseFloat(getComputedStyle(root).getPropertyValue("--dialogue-gap"));
-  const left = Math.max(0, visibleViewport?.left || 0, rect.left);
-  const right = Math.min(window.innerWidth, visibleViewport?.right ?? window.innerWidth, rect.right);
-  const width = Math.max(1, right - left);
+  const visibleLeft = Math.max(0, visibleViewport?.left ?? 0);
+  const visibleRight = Math.min(window.innerWidth, visibleViewport?.right ?? window.innerWidth);
+
+  // The existing composer/memory-panel geometry must NOT change.
+  const composerLeft = Math.max(0, visibleLeft, rect.left);
+  const composerRight = Math.min(window.innerWidth, visibleRight, rect.right);
+  // The memory panel is absolutely positioned within .shell, not the viewport.
+  const shellLeft = elements.composer.closest(".shell")?.getBoundingClientRect().left ?? 0;
+  root.style.setProperty("--composer-panel-left", `${composerLeft - shellLeft}px`);
+  root.style.setProperty("--composer-panel-width", `${Math.max(1, composerRight - composerLeft)}px`);
+
+  let left = composerLeft;
+  let width = Math.max(1, composerRight - composerLeft);
+  if (POPUP_ROLE === "companion") {
+    // The output bubble is independent of the avatar and input dimensions.
+    // Align its right edge with the unchanged composer, so the narrower bubble
+    // sits above the lower torso rather than far left of the character.
+    const theme = getComputedStyle(document.body);
+    const desiredWidth = parseFloat(theme.getPropertyValue("--dialogue-target-width")) || 500;
+    const screenMargin = parseFloat(theme.getPropertyValue("--dialogue-screen-margin")) || 16;
+    const screenLeft = Math.max(0, visibleLeft + screenMargin);
+    const screenRight = Math.max(screenLeft, Math.min(window.innerWidth, visibleRight - screenMargin));
+    const preferredRight = Math.max(screenLeft, Math.min(screenRight, rect.right));
+    const availableToLeft = Math.max(0, preferredRight - screenLeft);
+
+    if (availableToLeft >= Math.min(220, desiredWidth)) {
+      width = Math.min(desiredWidth, availableToLeft);
+      left = preferredRight - width;
+    } else {
+      // Keep the bubble visible on smaller/clipped displays, without moving
+      // the character, input bar, or memory panel.
+      width = Math.max(1, Math.min(desiredWidth, screenRight - screenLeft));
+      left = Math.max(screenLeft, screenRight - width);
+    }
+  }
+
   const bottom = Math.min(rect.top - gap, visibleViewport?.bottom ?? window.innerHeight, window.innerHeight);
   root.style.setProperty("--dialogue-left", `${left}px`);
   root.style.setProperty("--dialogue-width", `${width}px`);
@@ -527,9 +553,6 @@ function renderSubtitle(snapshot) {
       }, 180);
     }
   }
-  elements.dialoguePrevious.disabled = !snapshot.hasPrevious;
-  elements.dialogueNext.disabled = !snapshot.hasNext;
-  elements.dialogueLatest.hidden = !snapshot.manual;
   scheduleSubtitleScroll();
   renderCompleteResponse();
   syncInteractiveRegions();
@@ -539,7 +562,6 @@ function openCompleteResponse() {
   if (!availableReplies().length) return;
   expandedReplyId = subtitles?.snapshot().responseId || availableReplies().at(-1).id;
   elements.responsePanel.hidden = false;
-  elements.dialogueExpand.setAttribute("aria-expanded", "true");
   subtitles?.pause("expanded", true);
   // Hiding a hovered/focused caption does not reliably dispatch leave events.
   subtitles?.pause("hover", false);
@@ -551,7 +573,6 @@ function openCompleteResponse() {
 
 function closeCompleteResponse() {
   elements.responsePanel.hidden = true;
-  elements.dialogueExpand.setAttribute("aria-expanded", "false");
   subtitles?.pause("hover", false);
   subtitles?.pause("focus", false);
   subtitles?.pause("expanded", false);
@@ -592,10 +613,6 @@ function initializeSubtitles() {
   layoutDialogue();
   subtitles = new window.AkaneSubtitles({ onChange: renderSubtitle });
   window.__akaneSubtitles = subtitles;
-  elements.dialoguePrevious.addEventListener("click", () => subtitles.previous());
-  elements.dialogueNext.addEventListener("click", () => subtitles.next());
-  elements.dialogueDismiss.addEventListener("click", () => subtitles.dismiss());
-  elements.dialogueExpand.addEventListener("click", openCompleteResponse);
   elements.avatarHitbox?.addEventListener("dblclick", openCompleteResponse);
   elements.messageActionButton?.addEventListener("contextmenu", event => {
     event.preventDefault();
@@ -606,14 +623,6 @@ function initializeSubtitles() {
       event.preventDefault();
       openCompleteResponse();
     }
-  });
-  elements.dialogueLatest.addEventListener("click", () => {
-    subtitles.pause("manual", false);
-    stopSubtitleScroll();
-    const viewport = elements.dialogueOpen;
-    subtitleScrollExpected = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
-    viewport.scrollTop = subtitleScrollExpected;
-    subtitleScrollExpected = viewport.scrollTop;
   });
   elements.dialogueOpen.addEventListener("keydown", event => {
     if (event.key === "Enter") {
@@ -1225,29 +1234,34 @@ async function sendCommand(message) {
   setSendingState(true);
 
   try {
-    const response = await apiFetch(
-      "/api/chat",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
+    let payload;
+    if (window.pywebview?.api?.send_command) {
+      payload = await window.pywebview.api.send_command(message, SESSION_ID);
+    } else {
+      const response = await apiFetch(
+        "/api/chat",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            message,
+            session_id: SESSION_ID,
+            source: "popup",
+          }),
         },
-        body: JSON.stringify({
-          message,
-          session_id: SESSION_ID,
-          source: "popup",
-        }),
-      },
-    );
-
-    const payload = await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        payload.error ||
-          payload.detail ||
-          "Something went wrong.",
       );
+
+      payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          payload.error ||
+            payload.detail ||
+            "Something went wrong.",
+        );
+      }
     }
 
     if (Array.isArray(payload.messages)) {
@@ -1436,125 +1450,6 @@ async function refreshStatus() {
   }
 }
 
-async function reportPopupAvailability(available) {
-  if (isQuitting) {
-    return null;
-  }
-  return apiFetch("/api/initiative/delivery/claim", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    keepalive: !available,
-    body: JSON.stringify({
-      adapter: "popup",
-      conversation_id: SESSION_ID,
-      available,
-      wait_seconds: available ? 25 : 0,
-    }),
-  });
-}
-
-async function acknowledgeInitiative(
-  delivery,
-  success,
-) {
-  const response = await apiFetch(
-    "/api/initiative/delivery/ack",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        adapter: "popup",
-        conversation_id: SESSION_ID,
-        opportunity_id:
-          delivery.opportunity_id,
-        claim_token: delivery.claim_token,
-        success,
-        message_id:
-          delivery.opportunity_id,
-      }),
-    },
-  );
-  return response.ok;
-}
-
-async function initiativeDeliveryLoop() {
-  if (POPUP_ROLE !== "companion") {
-    return;
-  }
-  while (!isQuitting) {
-    if (document.visibilityState !== "visible") {
-      try {
-        await reportPopupAvailability(false);
-      } catch {}
-      await new Promise((resolve) => {
-        document.addEventListener(
-          "visibilitychange",
-          resolve,
-          { once: true },
-        );
-      });
-      continue;
-    }
-    try {
-      const response =
-        await reportPopupAvailability(true);
-      if (isQuitting || !response) {
-        return;
-      }
-      if (response.status === 404 || response.status === 405) {
-        return;
-      }
-      if (!response.ok) {
-        throw new Error("Initiative delivery is unavailable.");
-      }
-      const payload = await response.json();
-      if (isQuitting) {
-        return;
-      }
-      const delivery = payload.delivery;
-      if (!delivery?.message) {
-        continue;
-      }
-      if (document.visibilityState !== "visible") {
-        await acknowledgeInitiative(
-          delivery,
-          false,
-        );
-        continue;
-      }
-      if (
-        lastInitiativeDeliveryId !==
-        delivery.opportunity_id
-      ) {
-        lastInitiativeDeliveryId =
-          delivery.opportunity_id;
-        rememberMessages([
-          ...currentMessages,
-          {
-            role: "assistant",
-            content: delivery.message,
-          },
-        ]);
-        setBubbleText(delivery.message);
-      }
-      await acknowledgeInitiative(
-        delivery,
-        true,
-      );
-      lastKnownStateVersion = -1;
-    } catch {
-      if (isQuitting) {
-        return;
-      }
-      await new Promise((resolve) => {
-        window.setTimeout(resolve, 1000);
-      });
-    }
-  }
-}
-
 async function handleComposerSubmit(event) {
   event.preventDefault();
   if (isQuitting) {
@@ -1596,6 +1491,25 @@ elements.composer?.addEventListener(
   "submit",
   handleComposerSubmit,
 );
+
+async function cancelReply() {
+  try {
+    const response = await apiFetch("/api/chat/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: SESSION_ID }),
+    });
+    if (!response.ok) throw new Error("Could not cancel the reply.");
+  } catch (error) {
+    showNotice(error.message, "error");
+  }
+}
+
+window.addEventListener("keydown", event => {
+  if (event.key !== "Escape" || !isSending || event.defaultPrevented) return;
+  event.preventDefault();
+  void cancelReply();
+});
 
 elements.input?.addEventListener(
   "input",
@@ -1829,12 +1743,74 @@ async function openMemoryPanel() {
     const memory =
       await response.json();
 
-    elements.memoryContent.innerHTML =
-      formatMemoryForDisplay(memory);
+    if (Array.isArray(memory.source_turns)) {
+      renderManagedMemory(memory);
+    } else {
+      elements.memoryContent.innerHTML = formatMemoryForDisplay(memory);
+    }
   } catch {
     elements.memoryContent.innerHTML =
       '<div class="memory-empty">Could not load memory.</div>';
   }
+}
+
+function renderManagedMemory(memory) {
+  const panel = elements.memoryContent;
+  panel.replaceChildren();
+  const note = document.createElement("p");
+  note.textContent = "Select a statement to save it or use it to correct a memory.";
+  panel.append(note);
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", "Statement to remember");
+  for (const source of memory.source_turns) {
+    const option = document.createElement("option");
+    option.value = source.id;
+    option.textContent = source.content;
+    select.append(option);
+  }
+  panel.append(select);
+  const proposal = () => {
+    const source = memory.source_turns.find(turn => turn.id === select.value);
+    if (!source) throw new Error("Send a statement before saving a memory.");
+    return { text: source.content, evidence: source.content, source_turn_id: source.id, confirmed: true };
+  };
+  const action = (parent, label, method, path, body) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        const response = await apiFetch(path, {
+          method,
+          headers: { "Content-Type": "application/json" },
+          ...(body ? { body: JSON.stringify(body()) } : {}),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Could not update memory.");
+        const refreshed = await apiFetch("/api/memory");
+        if (!refreshed.ok) throw new Error("Could not reload memory.");
+        renderManagedMemory(await refreshed.json());
+      } catch (error) {
+        showNotice(error.message, "error");
+        button.disabled = false;
+      }
+    });
+    parent.append(button);
+  };
+  action(panel, "Save selected statement", "POST", "/api/memory", proposal);
+  for (const fact of memory.facts) {
+    const item = document.createElement("div");
+    item.className = "memory-item";
+    const text = document.createElement("p");
+    text.textContent = fact.content;
+    item.append(text);
+    action(item, "Use selected correction", "PATCH", `/api/memory/${encodeURIComponent(fact.id)}`, proposal);
+    action(item, "Remove", "DELETE", `/api/memory/${encodeURIComponent(fact.id)}`);
+    panel.append(item);
+  }
+  if (memory.facts.length) action(panel, "Clear stored memories", "DELETE", "/api/memory");
+  syncInteractiveRegions();
 }
 
 function closeMemoryPanel() {
@@ -1976,14 +1952,6 @@ async function boot() {
     refreshStatus,
     2500,
   );
-
-  void initiativeDeliveryLoop();
-
-  window.addEventListener("pagehide", () => {
-    if (!isQuitting) {
-      void reportPopupAvailability(false);
-    }
-  });
 
 
 }

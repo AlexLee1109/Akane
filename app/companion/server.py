@@ -20,8 +20,9 @@ import uvicorn
 
 from app.core.config import SETTINGS, coerce_bool
 from app.ui.assets import resolve_ui_asset
-from .next_adapter import ApplicationBusy, JobConflict, JobNotFound, NextCompanion
+from .next_adapter import ActiveTurn, ApplicationBusy, JobConflict, JobNotFound, NextCompanion
 from app.ai.continuity.store import ContinuityConflict, SessionNotFound
+from app.ai.contracts import TaskReference
 from app.ai.conversation.model import ContextBudgetExceeded
 from app.ai.host import CommitPending
 
@@ -43,6 +44,8 @@ def session_key(payload):
 
 
 def safe_error(error):
+    if isinstance(error, (JobNotFound, SessionNotFound)):
+        return 'Record not found.'
     if isinstance(error, (ValueError, ApplicationBusy, CommitPending, JobConflict, ContextBudgetExceeded)):
         return str(error)
     print(f'[Akane:error] {type(error).__name__}: {error}', flush=True)
@@ -58,18 +61,23 @@ async def stream_events(companion, payload):
     include = coerce_bool(payload.get('include_messages', True), True)
     active = None
 
+    def enqueue(event):
+        if events is not None:
+            events.put_nowait(event)
+
     def emit(kind, **data):
-        event = dict(type=kind, generation_id=str(active.token.turn_id) if active else '',
-                     request_id=request_id, **data)
         if not disconnected.is_set():
-            loop.call_soon_threadsafe(events.put_nowait, event)
+            event = dict(type=kind, generation_id=str(active.turn_id) if active else '',
+                         request_id=request_id, **data)
+            loop.call_soon_threadsafe(enqueue, event)
 
     def work():
         nonlocal active
         try:
-            active = companion.reserve(session, request_id, include_messages=include)
-            if disconnected.is_set():
-                companion.cancel(session, generation_id=str(active.token.turn_id))
+            active = companion.reserve(session, request_id, include_messages=include, text=payload['message'],
+                                       use_task=payload.get('use_task'))
+            if disconnected.is_set() and isinstance(active, ActiveTurn):
+                companion.cancel(session, generation_id=str(active.turn_id))
             start = {'messages': [*active.previous, {'role': 'user', 'content': payload['message']}]} if include else {}
             emit('start', **start)
             result = companion.run_turn(active, payload['message'],
@@ -84,7 +92,9 @@ async def stream_events(companion, payload):
                 result.setdefault('error', 'The reply did not complete.')
                 emit('error', **result)
         except Exception as error:
-            emit('error', error=safe_error(error), outcome='failed')
+            recovery = {'retry_commit': True} if (isinstance(error, CommitPending)
+                and isinstance(active, ActiveTurn) and active.use_task is not None) else {}
+            emit('error', error=safe_error(error), outcome='failed', **recovery)
 
     worker = asyncio.create_task(asyncio.to_thread(work))
     try:
@@ -96,8 +106,9 @@ async def stream_events(companion, payload):
                 break
     finally:
         disconnected.set()
-        if active is not None:
-            companion.cancel(session, generation_id=str(active.token.turn_id))
+        events = None  # Drop queued payloads before the generation thread finishes unwinding.
+        if isinstance(active, ActiveTurn):
+            companion.cancel(session, generation_id=str(active.turn_id))
 
 
 def create_app(companion=None):
@@ -134,6 +145,8 @@ def create_app(companion=None):
                 if not secrets.compare_digest(supplied, SETTINGS.server_api_token):
                     return JSONResponse(dict(error='Unauthorized.'), status_code=401)
             if request.query_params.get('profile_id', '') not in ('', 'local:owner', 'local', 'popup'):
+                if request.url.path == '/api/tasks' or request.url.path.startswith('/api/tasks/'):
+                    return JSONResponse(dict(error='Record not found.'), status_code=404)
                 return JSONResponse(dict(error='Only the local owner profile is supported.'), status_code=400)
         return await next_handler(request)
 
@@ -154,6 +167,8 @@ def create_app(companion=None):
             if field in result and (not isinstance(result[field], str) or len(result[field]) > 200):
                 raise ValueError('Invalid session or request identifier.')
         if result.get('profile_id', '') not in ('', 'local:owner', 'local', 'popup'):
+            if request.url.path.startswith('/api/tasks/'):
+                raise JobNotFound('No accepted task in this session.')
             raise ValueError('Only the local owner profile is supported.')
         return result
 
@@ -161,6 +176,16 @@ def create_app(companion=None):
         data = await payload(request)
         if 'message' not in data:
             raise ValueError('A nonempty message is required.')
+        if 'use_task' in data:
+            binding = data['use_task']
+            if (not isinstance(binding, dict) or set(binding) != {'task_id', 'runtime_epoch'}
+                    or not all(isinstance(value, str) and len(value) == 36 for value in binding.values())
+                    or not data.get('request_id')):
+                raise ValueError('Task selection requires its ID, runtime epoch and a request ID.')
+            try:
+                data['use_task'] = TaskReference(UUID(binding['task_id']), UUID(binding['runtime_epoch']))
+            except ValueError as error:
+                raise ValueError('Invalid task selection.') from error
         return data
 
     @app.exception_handler(ValueError)
@@ -192,7 +217,7 @@ def create_app(companion=None):
     @app.get('/health')
     async def health():
         owners = companion.runtime_status()
-        ready = owners['l1']['ready'] and owners['l2']['ready']
+        ready = owners['l1']['ready'] and (owners['l2']['ready'] or owners['l2'].get('lazy', False))
         payload = dict(status='ok' if ready else 'stopping', runtime=companion.runtime_name,
                        model_loaded=ready, model_loading=False)
         if owners['mode'] == 'independent':
@@ -207,6 +232,9 @@ def create_app(companion=None):
                       model=dict(loaded=companion.ready), internal_state={})
         if coerce_bool(include_messages, True):
             result['messages'] = snapshot['turns']
+        capability = companion.task_capability()
+        if capability is not None:
+            result['background_tasks'] = capability
         return result
 
     @app.post('/api/session')
@@ -268,6 +296,20 @@ def create_app(companion=None):
                                       UUID(source) if source is not None else None)
         return JSONResponse(jsonable_encoder(job), status_code=202)
 
+    @app.get('/api/tasks')
+    async def list_tasks(session_id: str = 'popup'):
+        result = await asyncio.to_thread(companion.list_tasks, session_id)
+        return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+    @app.get('/api/tasks/{task_id}')
+    async def task_status(task_id: UUID, session_id: str = 'popup'):
+        result = await asyncio.to_thread(companion.task, session_id, task_id)
+        return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+    @app.post('/api/tasks/{task_id}/cancel')
+    async def cancel_task(task_id: UUID, request: Request):
+        return await asyncio.to_thread(companion.task, session_key(await payload(request)), task_id, cancel=True)
+
     @app.get('/api/background/{job_id}')
     async def job_status(job_id: UUID, session_id: str = 'popup'):
         return jsonable_encoder(await asyncio.to_thread(companion.job, session_id, job_id))
@@ -289,6 +331,8 @@ def create_app(companion=None):
         session = session_key(data)
         # Exact slash commands are explicit transport controls, not NLP routing.
         if text in {'/clear', '/reset_chat', '/forget_me'}:
+            if data.get('use_task') is not None:
+                raise ValueError('Task results can only be discussed in a chat message.')
             await asyncio.to_thread(companion.reset, session, forget=text == '/forget_me')
             return dict(reply='', messages=[], notice='Chat reset.')
         return None
@@ -308,7 +352,8 @@ def create_app(companion=None):
         if command is not None: return command
         def run():
             active = companion.reserve(session_key(data), data.get('request_id', ''),
-                                       include_messages=coerce_bool(data.get('include_messages', True), True))
+                                       include_messages=coerce_bool(data.get('include_messages', True), True),
+                                       text=data['message'], use_task=data.get('use_task'))
             return companion.run_turn(active, data['message'],
                                       skip_memory=coerce_bool(data.get('skip_memory', False)),
                                       on_delta=lambda _text: None)
@@ -321,7 +366,7 @@ def create_app(companion=None):
 
     @app.get('/{asset_path:path}')
     async def assets(asset_path, request: Request):
-        allowed = {'app.js', 'styles.css', 'subtitles.js', 'index.html'}
+        allowed = {'app.js', 'styles.css', 'subtitles.js', 'background-tasks.js', 'index.html'}
         if not asset_path:
             path = STATIC / 'index.html' if request.query_params.get('popup_role') or not (WEBSITE / 'index.html').exists() else WEBSITE / 'index.html'
         elif asset_path in allowed:

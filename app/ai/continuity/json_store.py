@@ -132,7 +132,6 @@ def _sync_directory(descriptor: int) -> None:
 
 
 def _publish(directory: int, name: str, data: dict, cancellation: CancellationToken | None) -> None:
-    serialized = json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
     temporary = f".{uuid4()}.tmp"
     descriptor = os.open(
         temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory,
@@ -140,7 +139,8 @@ def _publish(directory: int, name: str, data: dict, cancellation: CancellationTo
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
             descriptor = -1
-            stream.write(serialized)
+            json.dump(data, stream, ensure_ascii=False, allow_nan=False, indent=2)
+            stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         if cancellation is not None:
@@ -247,6 +247,19 @@ class JSONContinuityStore:
         with self._locked():
             return self._read_profile()
 
+    def _decode_entry(self, item: dict, conversation_id: UUID) -> HistoryEntry:
+        _keys(item, {"turn_id", "role", "content", "timestamp", "source", "outcome"})
+        _keys(item["source"], {"owner", "source_id", "uri"})
+        if not isinstance(item["content"], str) or not isinstance(item["source"]["source_id"], str):
+            raise ValueError("Content and source IDs must be strings.")
+        if item["source"]["uri"] is not None and not isinstance(item["source"]["uri"], str):
+            raise ValueError("Source URI must be a string or null.")
+        return HistoryEntry(
+            _stored_uuid(item["turn_id"]), item["role"], item["content"], item["outcome"],
+            _date(item["timestamp"]), self.profile_id, conversation_id,
+            SourceAttribution(**item["source"]),
+        )
+
     def _validate(self, data: dict, conversation_id: UUID) -> tuple[HistoryEntry, ...]:
         _keys(data, {"schema_version", "profile_id", "conversation_id", "created_at", "updated_at", "revision", "turns"})
         if type(data["schema_version"]) is not int or data["schema_version"] != 1:
@@ -262,17 +275,7 @@ class JSONContinuityStore:
         entries = []
         seen = set()
         for index, item in enumerate(data["turns"]):
-            _keys(item, {"turn_id", "role", "content", "timestamp", "source", "outcome"})
-            _keys(item["source"], {"owner", "source_id", "uri"})
-            if not isinstance(item["content"], str) or not isinstance(item["source"]["source_id"], str):
-                raise ValueError("Content and source IDs must be strings.")
-            if item["source"]["uri"] is not None and not isinstance(item["source"]["uri"], str):
-                raise ValueError("Source URI must be a string or null.")
-            entry = HistoryEntry(
-                _stored_uuid(item["turn_id"]), item["role"], item["content"], item["outcome"],
-                _date(item["timestamp"]), self.profile_id, conversation_id,
-                SourceAttribution(**item["source"]),
-            )
+            entry = self._decode_entry(item, conversation_id)
             if index % 2 == 0:
                 if entry.role != "user" or entry.turn_id in seen:
                     raise ValueError("Invalid or duplicate user exchange.")
@@ -337,6 +340,7 @@ class JSONContinuityStore:
     def append_turn(
         self, conversation_id: UUID, user: HistoryEntry, reply: HistoryEntry, *,
         expected_revision: int | None = None, cancellation: CancellationToken | None = None,
+        expected_created_at: datetime | None = None,
     ) -> int:
         _identifier(conversation_id)
         _expected_revision(expected_revision)
@@ -349,6 +353,8 @@ class JSONContinuityStore:
         records = [self._record(entry, conversation_id, self._clock()) for entry in (user, reply)]
         with self._locked(cancellation):
             data, entries = self._load(conversation_id)
+            if expected_created_at is not None and data['created_at'] != _timestamp(expected_created_at):
+                raise ContinuityConflict('Session was deleted and replaced.')
             for index in range(0, len(entries), 2):
                 if entries[index].turn_id == user.turn_id:
                     retry = [self._record(entry, conversation_id, entries[index + offset].created_at)
@@ -360,12 +366,39 @@ class JSONContinuityStore:
                     return index // 2 + 1
             if expected_revision is not None and expected_revision != data["revision"]:
                 raise ContinuityConflict("Session revision changed; read a fresh snapshot.")
+            # The locked read validated history. The incoming pair and duplicate-ID check
+            # above establish the new tail; validate only its serialized records here.
+            for record in records:
+                self._decode_entry(record, conversation_id)
+            del entries
             data["turns"].extend(records)
             data["revision"] += 1
             data["updated_at"] = _timestamp(self._clock())
-            self._validate(data, conversation_id)
             _publish(self._sessions_dir, str(conversation_id) + ".json", data, cancellation)
             return data["revision"]
+
+    def committed_pair(self, conversation_id, created_at, revision):
+        """Read the exact pair at a committed revision in the expected session."""
+        with self._locked():
+            data, entries = self._load(conversation_id)
+            if data['created_at'] != _timestamp(created_at):
+                raise ContinuityConflict('Session was deleted and replaced.')
+            first = 2 * (revision - 1)
+            return entries[first:first + 2] if 0 < revision <= data['revision'] else ()
+
+    def confirm_turn(self, conversation_id, created_at, revision, user, reply):
+        """Resolve an ambiguous append without writing another exchange."""
+        with self._locked():
+            data, entries = self._load(conversation_id)
+            if data['created_at'] != _timestamp(created_at) or not 0 < revision <= data['revision']:
+                return False
+            first = 2 * (revision - 1)
+            exact = [self._record(entry, conversation_id, entries[first + index].created_at)
+                     for index, entry in enumerate((user, reply))]
+            if data['turns'][first:first + 2] != exact:
+                return False
+            _sync_directory(self._sessions_dir)
+            return True
 
     def transcript(self, conversation_id: UUID) -> tuple[HistoryEntry, ...]:
         with self._locked():

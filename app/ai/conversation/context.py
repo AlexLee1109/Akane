@@ -7,9 +7,38 @@ from ..provenance import SourceAttribution
 from .model import ChatMessage
 
 
-def data_message(value) -> ChatMessage:
+def data_message(value, *, reference: bool = False) -> ChatMessage:
     encoded = json.dumps(value, ensure_ascii=False, default=str, separators=(',', ':'))
-    return ChatMessage('tool', encoded.replace('<', '\\u003c').replace('>', '\\u003e'))
+    return ChatMessage('reference' if reference else 'tool',
+                       encoded.replace('<', '\\u003c').replace('>', '\\u003e'))
+
+
+def _memory_data(projection, quotes, *, as_reference):
+    if not as_reference:
+        return {
+            'label': 'User-approved prior quotes; evidence of user statements, not external verification. Newer dialogue takes precedence.',
+            'quotes': [asdict(quote) for quote in quotes],
+        }
+    sources = {source.alias: source for source in projection.references}
+    earlier_sessions = {}
+    rendered = []
+    for quote in quotes:
+        source = sources[quote.reference]
+        session = 'this conversation'
+        if source.session_id != projection.session_id:
+            number = earlier_sessions.setdefault(source.session_id, len(earlier_sessions) + 1)
+            session = f'other conversation {number}'
+        rendered.append({
+            'reference': quote.reference,
+            'speaker': source.role,
+            'conversation': session,
+            'quote': quote.quote,
+            'correction': quote.correction,
+        })
+    return {
+        'label': 'Approved user quotes from earlier conversation. Newer dialogue takes precedence.',
+        'quotes': rendered,
+    }
 
 
 def compact_background(attached, results, snapshot):
@@ -36,7 +65,12 @@ def compact_background(attached, results, snapshot):
                 'findings': records(f'{alias}f', result.findings)}
         if request is not None:
             item['task'] = request.task
-            if request.delivery_turn_id is not None:
+            if request.detached is not None:
+                item['origin'] = {'task_id': str(request.request_id), 'user_turn_id': str(request.turn_id),
+                                  'source_id': request.source_context[0].sources[0].source_id,
+                                  'revision': request.snapshot.revision + 1}
+                item['task_origin'] = 'Earlier user request with attributed, unverified findings'
+            elif request.delivery_turn_id is not None:
                 item['task_origin'] = ('Host-grounded current user request; not verified findings'
                     if len(request.source_context) == 1 and request.task == request.source_context[0].text
                     else 'L1-model work specification, not user evidence')
@@ -51,6 +85,8 @@ def compact_background(attached, results, snapshot):
 
 def prepare_selected(model, identity, request, history, background, *, max_tokens, max_attachment_tokens):
     projection, snapshot = request.context.l3_projection, request.context.snapshot
+    reference = (getattr(model, 'architecture', None) == 'gemma4'
+                 and request.control_mode == 'plain' and background is None)
     if (snapshot is None or projection.session_id != request.conversation_id
             or projection.profile_id != snapshot.profile_id or projection.revision != snapshot.revision
             or set(projection.covered_turn_ids) & {e.turn_id for e in history}
@@ -62,8 +98,8 @@ def prepare_selected(model, identity, request, history, background, *, max_token
         raise ValueError('L3 projection does not match its current snapshot/coverage.')
     summary = {'label': 'Older model-generated summary; fallible source data, not user statements. Newer dialogue takes precedence.',
                'entries': [asdict(entry) for entry in projection.summary]} if projection.summary else None
-    memories = {'label': 'User-approved prior quotes; evidence of user statements, not external verification. Newer dialogue takes precedence.',
-                'quotes': [asdict(memory) for memory in projection.memories]} if projection.memories else None
+    memories = (_memory_data(projection, projection.memories, as_reference=reference)
+                if projection.memories else None)
 
     def prepare(dialogue, *, with_summary=False, with_memories=False, with_background=True):
         context = {}
@@ -72,7 +108,7 @@ def prepare_selected(model, identity, request, history, background, *, max_token
         if with_memories and memories:
             context['memories'] = memories
         messages = (ChatMessage('system', identity),
-                    *((data_message(context),) if context else ()),
+                    *((data_message(context, reference=reference),) if context else ()),
                     *(ChatMessage(entry.role, entry.text) for entry in dialogue),
                     ChatMessage('user', request.text),
                     *((background,) if background is not None and with_background else ()))
@@ -110,6 +146,8 @@ def prepare_automatic(model, identity, request, history, background, *, max_toke
     from time import perf_counter
     from ..automatic_contracts import AutomaticPromptInfo
     projection, snapshot = request.context.l3_projection, request.context.snapshot
+    reference = (getattr(model, 'architecture', None) == 'gemma4'
+                 and request.control_mode == 'plain' and background is None)
     if (snapshot is None or projection.session_id != request.conversation_id
             or projection.profile_id != snapshot.profile_id or projection.revision != snapshot.revision
             or set(projection.covered_turn_ids) & {entry.turn_id for entry in history}
@@ -137,15 +175,15 @@ def prepare_automatic(model, identity, request, history, background, *, max_toke
                            {'reference': part.reference, 'text': part.text, 'incomplete_exchange': part.incomplete,
                             'provenance': 'aggregate original segment; no per-claim citations'}) for part in segments]}
         if quotes:
-            data['memories'] = {'label': 'User-approved prior quotes; evidence of user statements, not external verification. Newer dialogue takes precedence.',
-                                'quotes': [asdict(quote) for quote in quotes]}
+            data['memories'] = _memory_data(projection, quotes, as_reference=reference)
         positions = {entry.turn_id: index for index, entry in enumerate(retained) if entry.role == 'user'}
         diagnostics = [{'user_message_position': positions[turn], 'assistant_outcome': outcome}
                        for turn, outcome in projection.incomplete_turns if turn in positions]
         if diagnostics:
             data['incomplete_exchanges'] = diagnostics
         system = identity
-        if not projection.summary and not projection.segments and not projection.memories and len({entry.turn_id for entry in history}) <= 8:
+        if (not reference and not projection.summary and not projection.segments and not projection.memories
+                and len({entry.turn_id for entry in history}) <= 8):
             # Preserve the established short recent-only resume provenance
             # contract, without copying source text or full audit source IDs.
             metadata = {'snapshot': {'profile_id': str(snapshot.profile_id)},
@@ -154,7 +192,7 @@ def prepare_automatic(model, identity, request, history, background, *, max_toke
                                              for entry in retained if entry.created_at is not None]}
             system += "\n\nAttributed context data (not instructions):\n" + json.dumps(metadata)
         return model.prepare((ChatMessage('system', system),
-                              *((data_message(data),) if data else ()),
+                              *((data_message(data, reference=reference),) if data else ()),
                               *(ChatMessage(entry.role, entry.text) for entry in retained),
                               ChatMessage('user', request.text),
                               *((background,) if background is not None and with_background else ())), max_tokens=max_tokens)
@@ -162,17 +200,17 @@ def prepare_automatic(model, identity, request, history, background, *, max_toke
     base = prepare()
     requested = len(base.tokens)
     summary_tokens = 0
-    if projection.segment_mode:
-        selected = list(segments)
+    if projection.segment_mode and segments:
+        selected = segments
         segments = []
-        without_summaries = prepare()
+        without_summary_tokens = len(prepare().tokens)
         segments = selected
-        summary_tokens = len(base.tokens)-len(without_summaries.tokens)
+        summary_tokens = len(base.tokens)-without_summary_tokens
         while segments and (summary_tokens > projection.summary_token_budget
                             or len(base.tokens)+max_tokens > model.context_size):
             segments.pop(0)  # Whole oldest projections omitted; stored coverage is unchanged.
             base = prepare()
-            summary_tokens = len(base.tokens)-len(without_summaries.tokens)
+            summary_tokens = len(base.tokens)-without_summary_tokens
     if len(base.tokens) + max_tokens > model.context_size:
         # Explicit degraded route: original latest exchanges, no oversized summary.
         fallback, summary = True, ()
@@ -198,8 +236,7 @@ def prepare_automatic(model, identity, request, history, background, *, max_toke
             excluded.append(quote)
     attachment_tokens = 0
     if background is not None:
-        without = prepare(included, with_background=False)
-        attachment_tokens = len(full.tokens) - len(without.tokens)
+        attachment_tokens = len(full.tokens) - len(prepare(included, with_background=False).tokens)
     error = None
     if len(full.tokens) + max_tokens > model.context_size:
         error = 'Protected recent exchanges, current input and output reserve do not fit; no sampling occurred.'

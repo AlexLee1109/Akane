@@ -24,6 +24,7 @@ class ContextAssembly:
     memories: tuple[MemoryRecord, ...]
     memory_lineages: tuple[tuple[MemoryRecord, ...], ...]
     segments: tuple[SummarySegment, ...] = ()
+    excluded_memory_ids: tuple[UUID, ...] = ()
 
 
 def _dialogue(entries: tuple[HistoryEntry, ...]) -> tuple[HistoryEntry, ...]:
@@ -60,19 +61,23 @@ class ContextAssembler:
             self._memories = JSONMemoryStore(self.store)
         with self.store._locked():
             _data, records = self._memories._state()
-            active = {r.memory_id: r for r in records if r.status == 'active'}
-            if any(identifier not in active for identifier in pinned):
-                raise MemoryNotFound('Pinned memory is no longer active for this profile.')
-            ordered = (*pinned, *(r.memory_id for r in sorted(active.values(),
-                        key=lambda r: (r.approval.approved_at, str(r.memory_id)), reverse=True)
-                        if r.memory_id not in pinned and r.memory_id not in excluded))
-            return tuple(ordered[:self.max_memories]), tuple(ordered[self.max_memories:])
+            return self._automatic_ids(records, pinned, excluded)
+
+    def _automatic_ids(self, records, pinned, excluded):
+        active = {r.memory_id: r for r in records if r.status == 'active'}
+        if any(identifier not in active for identifier in pinned):
+            raise MemoryNotFound('Pinned memory is no longer active for this profile.')
+        ordered = (*pinned, *(r.memory_id for r in sorted(active.values(),
+                    key=lambda r: (r.approval.approved_at, str(r.memory_id)), reverse=True)
+                    if r.memory_id not in pinned and r.memory_id not in excluded))
+        return ordered[:self.max_memories], ordered[self.max_memories:]
 
     def assemble(self, session: ConversationSession, *, use_summary: bool,
                  memory_ids: tuple[UUID, ...], max_recent_turns: int,
                  cancellation: CancellationToken, automatic: bool = False,
                  memory_token_budget: int = 256, protected_exchanges: int = 2,
-                 segment_mode: bool = False, max_summary_segments: int = 4, summary_token_budget: int = 768) -> ContextAssembly:
+                 segment_mode: bool = False, max_summary_segments: int = 4, summary_token_budget: int = 768,
+                 automatic_memory_exclusions: tuple[UUID, ...] | None = None) -> ContextAssembly:
         if session.profile_id != self.store.profile_id:
             raise ValueError('Context selection belongs to another profile.')
         if type(use_summary) is not bool or type(max_recent_turns) is not int or max_recent_turns < 1:
@@ -82,7 +87,7 @@ class ContextAssembler:
         # Initialize only explicitly requested readers, outside the capture lock.
         if use_summary and self._summaries is None:
             self._summaries = JSONSummaryStore(self.store)
-        if selected and self._memories is None:
+        if (selected or automatic_memory_exclusions is not None) and self._memories is None:
             self._memories = JSONMemoryStore(self.store)
         with self.store._locked(cancellation):
             data, entries = self.store._load(session.conversation_id)
@@ -102,8 +107,13 @@ class ContextAssembler:
             if segments:
                 state = 'selected'
             memories, lineages, references = [], [], []
+            excluded_ids = ()
+            if selected or automatic_memory_exclusions is not None:
+                # Selection and provenance checks share the locked archive used for context.
+                _memory_data, records = self._memories._state(source_archive=(data, entries))
+                if automatic_memory_exclusions is not None:
+                    selected, excluded_ids = self._automatic_ids(records, selected, automatic_memory_exclusions)
             if selected:
-                _memory_data, records = self._memories._state()  # Existing evidence revalidation/redaction policy.
                 by_id = {record.memory_id: record for record in records}
                 for index, identifier in enumerate(selected, 1):
                     record = by_id.get(identifier)
@@ -119,7 +129,7 @@ class ContextAssembler:
             if summary is not None or segments:
                 boundary = 2 * (manifest.frontier if manifest else len(summary.covered_turn_ids))
                 recent = _dialogue(entries[boundary:])  # Every original turn after coverage, without silent clipping.
-                baseline = _dialogue(entries)
+                baseline = () if automatic else _dialogue(entries)
                 references[:0] = [ContextReference(f's/{source.alias}', current.conversation_id,
                                                    source.turn_id, source.role, source.attribution, source.outcome)
                                   for source in (summary.sources if summary else ())]
@@ -153,4 +163,4 @@ class ContextAssembler:
                 )
             cancellation.raise_if_cancelled()
             return ContextAssembly(ConversationContext(snapshot, l3_projection=projection), state,
-                                   summary, tuple(memories), tuple(lineages), tuple(segments))
+                                   summary, tuple(memories), tuple(lineages), segments, excluded_ids)

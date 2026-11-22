@@ -8,27 +8,30 @@ from collections.abc import Iterator
 from contextlib import closing, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from hashlib import sha256
 from time import monotonic
 from uuid import UUID, uuid4
 
 from .automatic import AutomaticContextManager
 from .automatic_contracts import AutomaticContextPolicy
 from .background.contracts import BackgroundJob, BackgroundResult, TaskState
+from .background.residency import LazyL2
 from .background.scheduler import InferenceScheduler, JobConflict, JobNotFound, QueueFull, SchedulerClosed
 from .background.worker import BackgroundIntelligence
 from .contracts import (
     AttachedResult, ContextRecord, ContextSnapshot, ConversationContext, ConversationSession,
-    DelegationRequest, HistoryEntry, InteractionRequest,
+    DelegationRequest, DeliveryClaim, DetachedBinding, HistoryEntry, InteractionRequest, TaskReference,
 )
 from .continuity.store import ContinuityConflict, ContinuityStore, SessionNotFound
 from .continuity.context import ContextAssembler, ContextAssembly
 from .continuity.json_store import JSONContinuityStore
 from .context_contracts import ContextSelectionStatus
 from .conversation.cancellation import CancellationToken, TurnCancellationOwner
-from .conversation.events import InteractionEvent, ReplyCancelled, ReplyFailed
+from .conversation.events import InteractionEvent, ReplyCancelled, ReplyCompleted, ReplyFailed, ReplyTextDelta, TaskReceipt
 from .conversation.model import ChatMessage, DialogueModel
 from .conversation.cancellation import GenerationCancelled
 from .delegation import AutoDelegationLimits, AuthorizedTask
+from .detached import DetachedExecutor, committed_origin, validated_finding
 from .provenance import SourceAttribution
 from .conversation.interaction import InteractionModel
 
@@ -59,6 +62,20 @@ class _Exchange:
     revision: int | None
     attachment: _Selection | None
     automatic: bool = False
+    delivery: DeliveryClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Admission:
+    request: DelegationRequest
+    user: HistoryEntry
+    reply: HistoryEntry
+
+
+@dataclass(frozen=True, slots=True)
+class _Acknowledgment:
+    job: BackgroundJob
+    chunks: tuple[ReplyTextDelta, ...]
 
 
 class ConversationHost:
@@ -69,7 +86,8 @@ class ConversationHost:
         max_selected_memories: int = 4, automatic_context: AutomaticContextPolicy | None = None,
         automatic_delegation: bool = False, delegation_limits: AutoDelegationLimits = AutoDelegationLimits(),
         background_scheduler: InferenceScheduler | None = None,
-        maintenance_model: DialogueModel | None = None,
+        maintenance_model: DialogueModel | LazyL2 | None = None,
+        asynchronous_delegation: bool = False, overlap_safe: bool = False,
     ) -> None:
         if store is not None and store.profile_id != profile_id:
             raise ValueError("Store belongs to another profile.")
@@ -113,6 +131,17 @@ class ConversationHost:
             raise ValueError('Automatic delegation enablement must be Boolean.')
         self._delegate_enabled = automatic_delegation
         self._delegate_limits = delegation_limits
+        if asynchronous_delegation and (self.background_scheduler is scheduler or not isinstance(store, JSONContinuityStore)
+                                        or not interaction._intent_only):
+            raise ValueError('Asynchronous delegation requires independent schedulers, JSON storage and intent-only routing.')
+        self._async = asynchronous_delegation
+        self._overlap_safe = asynchronous_delegation and overlap_safe
+        self._experimental_native_overlap = False
+        self.runtime_epoch = uuid4()
+        self._uncertain_admission: _Admission | None = None
+        self.accepted_turn: UUID | None = None
+        self._detached_executor = (DetachedExecutor(store, executor, delegation_limits.result_characters)
+                                   if asynchronous_delegation else None)
         self._auto_pin = None
         self._auto_job_id = None
         self._draining_job_id = None
@@ -125,7 +154,7 @@ class ConversationHost:
     def _idle(self) -> None:
         if self._busy:
             raise RuntimeError("A conversation turn is active.")
-        if self._pending is not None:
+        if self._pending is not None or self._uncertain_admission is not None:
             raise CommitPending("Exchange commit is pending; use :retry commit before continuing.")
 
     def _current(self) -> ConversationSession:
@@ -227,6 +256,8 @@ class ConversationHost:
     def _validate(self, job: BackgroundJob, result: BackgroundResult) -> None:
         current = self._current()
         request, payload = job.request, result.payload
+        if request.detached is not None:
+            raise JobConflict('Detached work has no attachment target in this phase.')
         if request.delivery_turn_id is not None and (
                 not self._busy or self.last_request is None
                 or request.delivery_turn_id != self.last_request.turn_id
@@ -348,6 +379,8 @@ class ConversationHost:
         }
 
     def require_inference_ready(self) -> None:
+        if self._uncertain_admission is not None:
+            raise CommitPending('Acknowledgment commit is uncertain; retry commit before continuing.')
         if self._draining_job_id is None:
             return
         try:
@@ -373,20 +406,20 @@ class ConversationHost:
     def _refresh_request(self, request, token, *, skip_memory=False):
         attached = request.context.attached_results
         if self.automatic is not None:
-            ids, self._excluded_memory_ids = ((), ()) if skip_memory else self._assembler().automatic_ids(
-                self._memory_ids, excluded=tuple(self._removed_memory_ids))
             self.last_context_assembly = self._assembler().assemble(
-                self.session, use_summary=self._summary_override is not False, memory_ids=ids,
+                self.session, use_summary=self._summary_override is not False,
+                memory_ids=() if skip_memory else self._memory_ids,
                 max_recent_turns=self.interaction.recent.max_turns, cancellation=token, automatic=True,
                 memory_token_budget=self._automatic_policy.memory_tokens,
                 protected_exchanges=self._automatic_policy.protected_exchanges,
                 segment_mode=self._automatic_policy.segment_exchanges is not None,
                 max_summary_segments=self._automatic_policy.max_summary_segments,
                 summary_token_budget=self._automatic_policy.summary_tokens,
+                automatic_memory_exclusions=None if skip_memory else tuple(self._removed_memory_ids),
             )
+            self._excluded_memory_ids = self.last_context_assembly.excluded_memory_ids
             context = replace(self.last_context_assembly.context, attached_results=attached,
                                       delegation_failure=request.context.delegation_failure)
-            snapshot = context.snapshot
             request = replace(request, context=context)
         elif self._use_summary or self._memory_ids:
             self.last_context_assembly = self._selected_context(
@@ -394,7 +427,6 @@ class ConversationHost:
             )
             context = replace(self.last_context_assembly.context, attached_results=attached,
                                       delegation_failure=request.context.delegation_failure)
-            snapshot = context.snapshot
             request = replace(request, context=context)
         else:
             # A foreground lease may have waited behind native cleanup. Ordinary
@@ -453,14 +485,19 @@ class ConversationHost:
 
     def _foreground_events(self, request, cancellation, *, automatic=False, skip_memory=False):
         waiting = monotonic()
-        # L1 still owns only its own lease. Defer L2 dispatch while L1 is using
-        # Metal until concurrent native execution has a separate acceptance run.
+        # Native overlap is scoped by the guarded experiment to a single turn.
+        # The L2 scheduler still blocks new dispatch, construction and eviction.
+        pause_options = ({'drain_active': False, 'drain_loading': True} if self._experimental_native_overlap
+                         else {'drain_active': False} if self._overlap_safe else {})
         with (self.scheduler.foreground(self.profile_id, request.turn_id, cancellation=cancellation) as token,
-              self.background_scheduler.pause_background(cancellation=token)
+              self.background_scheduler.pause_background(cancellation=token, **pause_options)
               if self.background_scheduler is not self.scheduler else nullcontext()):
             self.last_foreground_wait_seconds = monotonic()-waiting
-            request = (self._refresh_request(request, token, skip_memory=True) if skip_memory
-                       else self._refresh_request(request, token))
+            # The status-only pass uses the already authorized request as its
+            # source anchor and needs no new transcript or memory projection.
+            if not (request.acknowledge_work and self.interaction.uses_isolated_acknowledgment):
+                request = (self._refresh_request(request, token, skip_memory=True) if skip_memory
+                           else self._refresh_request(request, token))
             if (request.control_mode == 'decision' and self.interaction._intent_only
                     and self._delegate_limits.min_task_tokens):
                 source = self.interaction._model.prepare((ChatMessage('user', request.text),), max_tokens=1)
@@ -476,7 +513,11 @@ class ConversationHost:
                     raise JobConflict('Automatic decision was superseded before the reply.')
             self.last_request = request
             for item in request.context.attached_results:
-                self._validate(self.background_scheduler.get_job(self.profile_id, item.job_id), self.show(item.job_id))
+                job, result = self.status(item.job_id), self.show(item.job_id)
+                if item.claim is None:
+                    self._validate(job, result)
+                else:
+                    self._validate_delivery(item.claim, job, result, token.turn_id)
             output = self.interaction.stream(request,cancellation=token)
             try:
                 for event in output:
@@ -484,7 +525,11 @@ class ConversationHost:
                         self._authorized_task = self._authorize_task(event.decision,request,token)
                     elif automatic and self._delegate_limits.wait_seconds is not None and event.kind == 'reply_failed':
                         self._delegation_audit['error'] = event.message
-                        event = ReplyFailed(request.turn_id, 'The reply could not be completed.')
+                        budget = self.interaction.last_automatic_info
+                        exhausted = budget is not None and budget.error and any(
+                            item.claim is not None for item in request.context.attached_results)
+                        event = ReplyFailed(request.turn_id, 'The selected result exceeds this turn’s context budget.'
+                                            if exhausted else 'The reply could not be completed.')
                     yield event
             finally:
                 output.close()
@@ -573,6 +618,9 @@ class ConversationHost:
         self._delegation_audit.update(state='queued', authorized=authorized,
             task_origin=('host-grounded u0' if getattr(self.interaction, '_intent_only', False)
                          else 'l1-model specification'))
+        if self._async:
+            yield from self._acknowledge(authorized, cancellation, skip_memory=skip_memory)
+            return
         failure = None
         attached = ()
         try:
@@ -626,10 +674,205 @@ class ConversationHost:
         self._check_authorized(authorized,cancellation)
         yield from self._final_events(cancellation, attached=attached, failure=failure, skip_memory=skip_memory)
 
-    def stream(self, text: str, *, cancellation: CancellationToken, skip_memory: bool = False) -> Iterator[InteractionEvent]:
+    def _acknowledge(self, authorized, cancellation, *, skip_memory):
+        request = authorized.request
+        request = replace(request, delivery_turn_id=None, source_turn_id=request.turn_id,
+                          detached=DetachedBinding(self.runtime_epoch, sha256(request.task.encode()).hexdigest()))
+        self._delegation_audit['authorized'] = replace(authorized, request=request)
+        job = self.background_scheduler.submit_background(self.profile_id, request, self._detached_executor,
+                                                           budget_seconds=self._delegate_limits.seconds, reserve=True)
+        self._delegation_audit['state'] = 'reserved'
+        chunks = []
+        completed = False
+        try:
+            acknowledgment = replace(self.last_request, control_mode='final', acknowledge_work=True)
+            with closing(self._foreground_events(acknowledgment, cancellation, automatic=True,
+                                                 skip_memory=skip_memory)) as output:
+                for event in output:
+                    if event.kind == 'reply_text_delta':
+                        chunks.append(event)
+                    elif event.kind in ('reply_failed', 'reply_cancelled'):
+                        yield event
+                        return
+                    elif event.kind == 'reply_completed':
+                        completed = True
+            cancellation.raise_if_cancelled()
+            if not completed or not ''.join(chunk.text for chunk in chunks).strip():
+                yield ReplyFailed(request.turn_id, 'The acknowledgment did not complete.')
+                return
+            yield _Acknowledgment(job, tuple(chunks))
+        finally:
+            pending = self._uncertain_admission
+            if pending is None or pending.request.request_id != job.job_id:
+                self.background_scheduler.discard_reserved(self.profile_id, job.job_id)
+
+    def _publish_admission(self, admission):
+        request = admission.request
+        job = self.background_scheduler.publish_reserved(self.profile_id, request.request_id,
+            queue_seconds=self._delegate_limits.wait_seconds or self._delegate_limits.seconds)
+        self.accepted_turn = request.turn_id
+        self._delegation_audit['state'] = 'accepted'
+        return self._receipt(job)
+
+    @staticmethod
+    def _receipt(job):
+        status = job.status.value.lower()
+        if job.invalidated:
+            status = 'invalidated'
+        elif job.delivered_turn_id is not None:
+            status = 'consumed'
+        elif job.status in (TaskState.LOADING, TaskState.RUNNING) and (
+            job.cancellation_requested_monotonic is not None or job.load_aborting
+        ):
+            status = 'cancelling'
+        elif job.status == TaskState.PENDING:
+            status = 'queued'
+        return TaskReceipt(job.job_id, job.request.turn_id, job.request.detached.runtime_epoch, status, job.status_version)
+
+    def scoped_task(self, session, task_id):
+        if not self._async:
+            raise JobNotFound('No accepted task in this session.')
+        job = self.status(task_id)
+        request = job.request
+        if (request.detached is None or request.detached.runtime_epoch != self.runtime_epoch
+                or job.status == TaskState.RESERVED or job.conversation_id != session.conversation_id
+                or request.session_created_at != session.created_at):
+            raise JobNotFound('No accepted task in this session.')
+        return job
+
+    def _pin_delivery(self, reference, turn_id):
+        current = self._current()
+        job = self.scoped_task(current, reference.task_id)
+        if reference.runtime_epoch != self.runtime_epoch:
+            raise JobNotFound('No accepted task in this session.')
+        pin_id = uuid4()
+        job, result = self.background_scheduler.pin_result(self.profile_id, job.job_id, pin_id)
+        try:
+            finding = validated_finding(job.request, result.payload, self._delegate_limits.result_characters)
+            claim = DeliveryClaim(reference, pin_id, self.profile_id, current.conversation_id, current.created_at,
+                turn_id, current.revision, job.request.detached.source_sha256, sha256(finding.text.encode()).hexdigest())
+            self._validate_delivery(claim, job, result, turn_id)
+            attachment = AttachedResult(job.job_id, self.profile_id, job.request, result.payload,
+                                        job.created_at, result.completed_at, turn_id, claim)
+            return claim, attachment
+        except BaseException:
+            self.background_scheduler.unpin_result(self.profile_id, job.job_id, pin_id)
+            raise
+
+    def _validate_delivery(self, claim, job, result, turn_id):
+        current = self._current()
+        request = job.request
+        if (self.scoped_task(current, claim.task.task_id) != job or claim.profile_id != self.profile_id
+                or claim.task.runtime_epoch != self.runtime_epoch or claim.conversation_id != current.conversation_id
+                or claim.session_created_at != current.created_at or claim.expected_revision != current.revision
+                or claim.target_turn_id != turn_id or request.detached.source_sha256 != claim.source_sha256
+                or job.invalidated or job.delivered_turn_id is not None or result.status != TaskState.COMPLETED
+                or result.job_id != job.job_id or result.profile_id != self.profile_id):
+            raise JobConflict('The selected task or target exchange changed.')
+        committed_origin(self.store, request)
+        finding = validated_finding(request, result.payload, self._delegate_limits.result_characters)
+        if sha256(finding.text.encode()).hexdigest() != claim.finding_sha256:
+            raise JobConflict('The selected finding changed.')
+
+    def _commit_delivery(self, exchange, cancellation=None):
+        claim = exchange.delivery
+        def confirm():
+            try:
+                return self.store.confirm_turn(claim.conversation_id, claim.session_created_at,
+                    claim.expected_revision + 1, exchange.user, exchange.reply)
+            except SessionNotFound:
+                return False
+
+        try:
+            job = self.status(claim.task.task_id)
+            self._validate_delivery(claim, job, self.show(job.job_id), claim.target_turn_id)
+            committed = self.store.append_turn(claim.conversation_id, exchange.user, exchange.reply,
+                expected_revision=claim.expected_revision, expected_created_at=claim.session_created_at,
+                cancellation=cancellation)
+            if committed != claim.expected_revision + 1:
+                raise ContinuityConflict('The result was written at the wrong target revision.')
+        except Exception as error:
+            try:
+                confirmed = confirm()
+            except Exception as read_error:
+                raise CommitPending('Result exchange commit is uncertain. Retry commit to verify it.') from read_error
+            if not confirmed:
+                if isinstance(error, (ContinuityConflict, SessionNotFound, GenerationCancelled, JobConflict, JobNotFound)):
+                    self._pending = None
+                    if cancellation is None:
+                        self.background_scheduler.unpin_result(self.profile_id, claim.task.task_id, claim.pin_id)
+                    raise
+                raise CommitPending('Could not save the result exchange. Retry commit without generating again.') from error
+        job = self.background_scheduler.consume_result(self.profile_id, claim.task.task_id, pin_id=claim.pin_id,
+                                                       turn_id=claim.target_turn_id, release_pin=True)
+        self._pending = None
+        self.accepted_turn = claim.target_turn_id
+        if self.automatic is not None:
+            self.automatic.observe(claim.conversation_id, self.interaction.last_automatic_info,
+                                   context_size=self.interaction._model.context_size)
+        return self._receipt(job)
+
+    def detached_exchange(self, conversation_id, task_id, *, runtime_epoch=None):
+        """Internal, session-scoped receipt lookup and exact acknowledgment replay."""
+        if runtime_epoch is not None and runtime_epoch != self.runtime_epoch:
+            return TaskReceipt(task_id, task_id, runtime_epoch, 'expired'), ()
+        try:
+            job = self.status(task_id)
+        except JobNotFound:
+            if runtime_epoch is not None:
+                return TaskReceipt(task_id, task_id, runtime_epoch, 'expired'), ()
+            raise
+        if (job.request.detached is None or job.status == TaskState.RESERVED
+                or job.request.conversation_id != conversation_id):
+            raise JobNotFound('No accepted task in this session.')
+        try:
+            pair = committed_origin(self.store, job.request)
+        except (ContinuityConflict, SessionNotFound) as error:
+            raise JobNotFound('No accepted task in this session.') from error
+        return self._receipt(job), pair
+
+    def _confirm_admission(self, admission):
+        request = admission.request
+        try:
+            return self.store.confirm_turn(request.conversation_id, request.session_created_at,
+                request.snapshot.revision + 1, admission.user, admission.reply)
+        except SessionNotFound:
+            return False
+
+    def _commit_acknowledgment(self, acknowledgment, user_time, cancellation):
+        request = acknowledgment.job.request
+        admission = _Admission(request, HistoryEntry(request.turn_id, 'user', request.task, created_at=user_time,
+                                                      attribution=request.source_context[0].sources[0]),
+                               HistoryEntry(request.turn_id, 'assistant',
+                                            ''.join(chunk.text for chunk in acknowledgment.chunks),
+                                            created_at=datetime.now(timezone.utc)))
+        cancellation.raise_if_cancelled()
+        try:
+            committed = self.store.append_turn(request.conversation_id, admission.user, admission.reply,
+                expected_revision=request.snapshot.revision, expected_created_at=request.session_created_at,
+                cancellation=cancellation)
+            if committed != request.snapshot.revision + 1:
+                raise ContinuityConflict('Acknowledgment is recorded at the wrong origin revision.')
+        except Exception:
+            try:
+                confirmed = self._confirm_admission(admission)
+            except Exception as error:
+                self._uncertain_admission = admission
+                raise CommitPending('Acknowledgment commit is uncertain; retry commit to check the saved exchange.') from error
+            if not confirmed:
+                raise
+        receipt = self._publish_admission(admission)
+        if self.automatic is not None:
+            self.automatic.observe(request.conversation_id, self.interaction.last_automatic_info,
+                                   context_size=self.interaction._model.context_size)
+        return receipt
+
+    def stream(self, text: str, *, cancellation: CancellationToken, skip_memory: bool = False,
+               use_task: TaskReference | None = None) -> Iterator[InteractionEvent]:
         self._idle()
         self.require_inference_ready()
         self._busy = True
+        self.accepted_turn = None
         self.last_request = None
         self.last_context_assembly = None
         self.last_foreground_wait_seconds = None
@@ -637,16 +880,24 @@ class ConversationHost:
         self._auto_job_id = None
         self._delegation_audit = {'enabled':self._delegate_enabled,'state':'starting','turn_id':cancellation.turn_id,'passes':[]}
         started = False
+        acknowledgment_commit = False
         pieces = []
         outcome = 'failed'
         selection = None
+        delivery = None
+        delivery_chunks = []
         snapshot = None
         user_time = datetime.now(timezone.utc)
         interaction_started = monotonic()
         try:
             snapshot = self._snapshot(cancellation)
             attached = ()
-            if self._selection is not None and self._selection.armed:
+            if use_task is not None:
+                if self._selection is not None:
+                    raise JobConflict('Detach the manual result before using a background task.')
+                delivery, attachment = self._pin_delivery(use_task, cancellation.turn_id)
+                attached = (attachment,)
+            elif self._selection is not None and self._selection.armed:
                 selection = self._selection
                 job,result = self.background_scheduler.pin_result(self.profile_id,selection.job_id,selection.pin_id)
                 self._validate(job,result)
@@ -658,6 +909,25 @@ class ConversationHost:
             output = self._turn_events(request,cancellation,skip_memory=skip_memory)
             try:
                 for event in output:
+                    if delivery is not None and event.kind == 'reply_text_delta':
+                        delivery_chunks.append(event)
+                        continue
+                    if delivery is not None and event.kind == 'reply_completed':
+                        self._pending = _Exchange(HistoryEntry(cancellation.turn_id, 'user', text, created_at=user_time),
+                            HistoryEntry(cancellation.turn_id, 'assistant', ''.join(chunk.text for chunk in delivery_chunks),
+                                         created_at=datetime.now(timezone.utc)), delivery.expected_revision, None,
+                            delivery=delivery)
+                        receipt = self._commit_delivery(self._pending, cancellation)
+                        yield from delivery_chunks
+                        yield ReplyCompleted(cancellation.turn_id, task=receipt)
+                        continue
+                    if isinstance(event, _Acknowledgment):
+                        acknowledgment_commit = True
+                        receipt = self._commit_acknowledgment(event, user_time, cancellation)
+                        self._delegation_audit['first_visible_total_seconds'] = monotonic() - interaction_started
+                        yield from event.chunks
+                        yield ReplyCompleted(cancellation.turn_id, task=receipt)
+                        continue
                     if self.last_request is not None:
                         snapshot = self.last_request.context.snapshot
                     if event.kind == 'reply_started':started = True
@@ -675,10 +945,15 @@ class ConversationHost:
             self._delegation_audit['state'] = 'cancelled'
             yield ReplyCancelled(cancellation.turn_id)
         except GeneratorExit:
-            outcome = 'cancelled'
-            self._delegation_audit['state'] = 'cancelled'
+            if self.accepted_turn != cancellation.turn_id:
+                outcome = 'cancelled'
+                self._delegation_audit['state'] = 'cancelled'
+            raise
+        except CommitPending:
             raise
         except Exception as error:
+            if use_task is not None and isinstance(error, (JobNotFound, JobConflict)):
+                raise
             self._delegation_audit.update(state='failed',error=f'{type(error).__name__}: {error}')
             if not self._delegate_enabled:
                 raise  # Preserve previous explicit-host exception contract.
@@ -689,7 +964,12 @@ class ConversationHost:
             yield ReplyFailed(cancellation.turn_id,message)
         finally:
             self._busy = False
-            if started:
+            if delivery is not None:
+                if self._pending is None and self.accepted_turn != cancellation.turn_id:
+                    self.background_scheduler.unpin_result(self.profile_id, delivery.task.task_id, delivery.pin_id)
+            elif acknowledgment_commit:
+                self._delegation_audit['total_seconds'] = monotonic() - interaction_started
+            elif started:
                 self._pending = _Exchange(
                     HistoryEntry(cancellation.turn_id,'user',text,created_at=user_time),
                     HistoryEntry(cancellation.turn_id,'assistant',''.join(pieces),outcome,created_at=datetime.now(timezone.utc)),
@@ -702,9 +982,22 @@ class ConversationHost:
     def retry_commit(self) -> None:
         if self._busy:
             raise RuntimeError("A conversation turn is active.")
+        if self._uncertain_admission is not None:
+            admission = self._uncertain_admission
+            if self.session.conversation_id != admission.request.conversation_id:
+                raise CommitPending('Retry the originating session before continuing.')
+            if self._confirm_admission(admission):
+                self._publish_admission(admission)
+            else:
+                self.background_scheduler.discard_reserved(self.profile_id, admission.request.request_id)
+            self._uncertain_admission = None
+            return
         exchange = self._pending
         if exchange is None:
             raise CommitPending("No exchange commit is pending.")
+        if exchange.delivery is not None:
+            self._commit_delivery(exchange)
+            return
         try:
             self._current()
             if self.store:
@@ -772,6 +1065,13 @@ class ConversationHost:
             raise RuntimeError("Cannot close an active conversation.")
         if self.automatic is not None:
             self.automatic.close()
+        if self._uncertain_admission is not None:
+            self.background_scheduler.discard_reserved(self.profile_id, self._uncertain_admission.request.request_id)
+            self._uncertain_admission = None
+        if self._pending is not None and self._pending.delivery is not None:
+            claim = self._pending.delivery
+            self.background_scheduler.unpin_result(self.profile_id, claim.task.task_id, claim.pin_id)
+            self._pending = None
         if self._selection is not None:
             self.background_scheduler.unpin_result(self.profile_id, self._selection.job_id, self._selection.pin_id)
             self._selection = None

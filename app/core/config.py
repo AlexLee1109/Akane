@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -71,6 +72,9 @@ class Settings:
     next_l2_model_path: Path | None = None
     next_l1_context_size: int = 4096
     next_l2_context_size: int = 4096
+    next_async_delegation: bool = False
+    next_l2_lazy_load: bool = False
+    next_l2_idle_unload_seconds: float = 60.0
 
     def validate(self) -> None:
         if not 1 <= self.server_port <= 65535:
@@ -88,6 +92,12 @@ class Settings:
                     raise ValueError(f'AKANE_NEXT_{role}_MODEL_PATH is required in independent mode.')
                 if type(context) is not int or context < 2048:
                     raise ValueError(f'AKANE_NEXT_{role}_CONTEXT_SIZE must be an integer of at least 2048.')
+            if self.next_l2_lazy_load:
+                if self.next_auto_delegation and not self.next_async_delegation:
+                    raise ValueError('Lazy L2 automatic delegation requires AKANE_NEXT_ASYNC_DELEGATION=true.')
+                timeout = self.next_l2_idle_unload_seconds
+                if type(timeout) not in (int, float) or not isfinite(timeout) or timeout <= 0:
+                    raise ValueError('AKANE_NEXT_L2_IDLE_UNLOAD_SECONDS must be finite and positive.')
 
 
 def load_settings() -> Settings:
@@ -107,6 +117,12 @@ def load_settings() -> Settings:
                            next_l2_model_path=_path(root, l2_path) if l2_path else None,
                            next_l1_context_size=_context_size('NEXT_L1_CONTEXT_SIZE'),
                            next_l2_context_size=_context_size('NEXT_L2_CONTEXT_SIZE'))
+        if coerce_bool(_raw('NEXT_L2_LAZY_LOAD', 'false')):
+            try:
+                idle_seconds = float(_raw('NEXT_L2_IDLE_UNLOAD_SECONDS', '60'))
+            except ValueError as error:
+                raise ValueError('AKANE_NEXT_L2_IDLE_UNLOAD_SECONDS must be finite and positive.') from error
+            independent.update(next_l2_lazy_load=True, next_l2_idle_unload_seconds=idle_seconds)
     server_port = _integer("SERVER_PORT", 8000)
     settings = Settings(
         project_root=root,
@@ -122,6 +138,7 @@ def load_settings() -> Settings:
         timing_enabled=coerce_bool(_raw("TIMING"), False),
         next_auto_delegation=coerce_bool(_raw("NEXT_AUTO_DELEGATION", "true")),
         next_runtime=runtime,
+        next_async_delegation=coerce_bool(_raw('NEXT_ASYNC_DELEGATION', 'false')),
         **independent,
     )
     settings.validate()

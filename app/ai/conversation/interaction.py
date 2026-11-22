@@ -24,8 +24,21 @@ from .decisions import (DecisionDecoder, DelegateDecision, DECISION_SCHEMA, FINA
                         MODE_FIRST_SCHEMA, MODE_FIRST_FINAL_SCHEMA,
                         MODE_FIRST_TECHNICAL, MODE_FIRST_FINAL_TECHNICAL,
                         INTENT_ONLY_SCHEMA, INTENT_ONLY_FINAL_SCHEMA,
-                        INTENT_ONLY_TECHNICAL, INTENT_ONLY_FINAL_TECHNICAL)
+                        INTENT_ONLY_TECHNICAL, INTENT_ONLY_FINAL_TECHNICAL, GEMMA_INTENT_ONLY_TECHNICAL)
 from .context import compact_background, data_message, prepare_selected, prepare_automatic
+
+
+_GEMMA_RUNTIME_FACT = (
+    'Runtime facts about you: Your conversational mind only runs to generate a reply. '
+    'Between replies you do no thinking, processing, self-maintenance, or other activity. '
+    'Saved dialogue is a record you can read when responding. Background tasks are separate '
+    'work, and their status comes from the application.'
+)
+_GEMMA_ACKNOWLEDGMENT = (
+    'The requested analysis is pending and starts after this reply is saved. '
+    'Acknowledge its pending status in one brief sentence in Akane’s voice. '
+    'Return the acknowledgment in the text field of the final reply JSON.'
+)
 
 
 class InteractionModel:
@@ -42,6 +55,8 @@ class InteractionModel:
             raise ValueError('Unsupported decision protocol.')
         self._intent_only = decision_protocol == 'intent-only'
         self._mode_first = decision_protocol in ('mode-first','intent-only')
+        self._gemma = getattr(model, 'architecture', None) == 'gemma4'
+        self.uses_isolated_acknowledgment = self._gemma and self._intent_only
         if max_attachment_tokens < 1:
             raise ValueError("Attachment token allowance must be positive.")
         self._attachment_tokens = max_attachment_tokens
@@ -76,8 +91,11 @@ class InteractionModel:
                 raise ValueError("Context must exclude the pending turn.")
             self.last_prompt = None
             self.last_generation_metrics = None
-            self.last_automatic_info = None
-            self.last_context_budget = None
+            # A status-only pass gives no information about dialogue pressure.
+            # Keep the full conversational prompt's budget for maintenance.
+            if not (request.acknowledge_work and self.uses_isolated_acknowledgment):
+                self.last_automatic_info = None
+                self.last_context_budget = None
             self.last_background_references = ()
             self.last_decision = None
             self.last_control_raw = ''
@@ -158,12 +176,37 @@ class InteractionModel:
         self, request: InteractionRequest, history: tuple[HistoryEntry, ...],
     ) -> tuple[PreparedPrompt, tuple[SourceAttribution, ...]]:
         max_tokens = DECISION_OUTPUT_TOKENS if request.control_mode == 'decision' else self._max_tokens
+        if request.acknowledge_work:
+            max_tokens = min(max_tokens, 64)
+            if self.uses_isolated_acknowledgment:
+                self.last_attachment_tokens = 0
+                prompt = self._model.prepare((
+                    ChatMessage('system', self._identity),
+                    ChatMessage('user', _GEMMA_ACKNOWLEDGMENT),
+                ), max_tokens=max_tokens)
+                if len(prompt.tokens) + max_tokens > self._model.context_size:
+                    raise ContextBudgetExceeded('Acknowledgment prompt and output reservation do not fit.')
+                return prompt, (request.source,)
         identity = self._identity
+        if request.control_mode == 'plain' and self._gemma:
+            identity += '\n\n' + _GEMMA_RUNTIME_FACT
         if request.control_mode != 'plain':
             initial_text,final_text = ((INTENT_ONLY_TECHNICAL,INTENT_ONLY_FINAL_TECHNICAL) if self._intent_only
                 else (MODE_FIRST_TECHNICAL,MODE_FIRST_FINAL_TECHNICAL) if self._mode_first
                 else (TECHNICAL_DECISION,TECHNICAL_FINAL))
-            if request.control_mode == 'final' and self._intent_only and any(
+            if self._intent_only and request.control_mode == 'decision' and self._gemma:
+                initial_text = GEMMA_INTENT_ONLY_TECHNICAL
+            if request.acknowledge_work:
+                final_text = (
+                    'Use the final reply JSON. This work is scheduled to start after the current exchange is saved. '
+                    'Give only a brief acknowledgment in your own voice and say the analysis is pending. '
+                    'Omit the analysis, findings, completion claims and internal controls.'
+                )
+            elif request.control_mode == 'final' and any(item.claim is not None for item in request.context.attached_results):
+                final_text += (' Discuss the selected background finding in response to the current user message. '
+                               'Treat it as fallible evidence from an earlier exchange. Respect newer corrections '
+                               'and qualify any uncertainty.')
+            elif request.control_mode == 'final' and self._intent_only and any(
                 item.request.delivery_turn_id is not None for item in request.context.attached_results
             ):
                 final_text += (
@@ -191,23 +234,26 @@ class InteractionModel:
                     or item.request.conversation_id != request.conversation_id
                     or (snapshot is not None and snapshot.profile_id not in (None, item.profile_id))):
                 raise ValueError("Attachment belongs to another profile, session, or turn.")
-        background = [{
-            "job_id": str(item.job_id), "profile_id": str(item.profile_id),
-            "request_id": str(item.request.request_id),
-            "conversation_id": str(item.request.conversation_id),
-            "source_turn_id": str(item.request.source_turn_id) if item.request.source_turn_id else None,
-            "request_turn_id": str(item.request.turn_id), "target_turn_id": str(item.target_turn_id),
-            "task": item.request.task, "created_at": item.created_at.isoformat(),
-            "completed_at": item.completed_at.isoformat(),
-            "source_revision": item.request.snapshot.revision if item.request.snapshot else None,
-            "current_revision": snapshot.revision if snapshot else None,
-            "session_created_at": item.request.session_created_at,
-            "supplied_sources": [asdict(record) for record in item.request.source_context],
-            "result": asdict(item.result),
-        } for item in attached]
-        background.extend({"result": asdict(result)} for result in results)
+        projection = request.context.l3_projection
         tool = None
-        if background:
+        if projection is not None or any(item.request.automatic for item in attached):
+            tool, self.last_background_references = compact_background(attached, results, snapshot)
+        elif attached or results:
+            background = [{
+                "job_id": str(item.job_id), "profile_id": str(item.profile_id),
+                "request_id": str(item.request.request_id),
+                "conversation_id": str(item.request.conversation_id),
+                "source_turn_id": str(item.request.source_turn_id) if item.request.source_turn_id else None,
+                "request_turn_id": str(item.request.turn_id), "target_turn_id": str(item.target_turn_id),
+                "task": item.request.task, "created_at": item.created_at.isoformat(),
+                "completed_at": item.completed_at.isoformat(),
+                "source_revision": item.request.snapshot.revision if item.request.snapshot else None,
+                "current_revision": snapshot.revision if snapshot else None,
+                "session_created_at": item.request.session_created_at,
+                "supplied_sources": [asdict(record) for record in item.request.source_context],
+                "result": asdict(item.result),
+            } for item in attached]
+            background.extend({"result": asdict(result)} for result in results)
             # Qwen's embedded template supports a tool response as a data carrier.
             # Escape template delimiters in *all* supplied strings before rendering.
             encoded = json.dumps({
@@ -216,13 +262,9 @@ class InteractionModel:
                 "items": background,
             }, ensure_ascii=False, default=str).replace("<", "\\u003c").replace(">", "\\u003e")
             tool = ChatMessage("tool", encoded)
-        if any(item.request.delivery_turn_id is not None for item in attached):
-            tool, self.last_background_references = compact_background(attached, results, snapshot)
         tool = failure_tool if failure_tool is not None else tool
-        if request.context.l3_projection is not None:
-            tool, self.last_background_references = compact_background(attached, results, snapshot)
-            tool = failure_tool if failure_tool is not None else tool
-            if request.context.l3_projection.automatic or request.context.l3_projection.segment_mode:
+        if projection is not None:
+            if projection.automatic or projection.segment_mode:
                 prompt, sources, info, attachment_tokens = prepare_automatic(
                     self._model, identity, request, history, tool,
                     max_tokens=max_tokens, max_attachment_tokens=self._attachment_tokens,

@@ -22,6 +22,7 @@ const elements = {
   input: document.getElementById("messageInput"),
   send: document.getElementById("sendButton"),
   notice: document.getElementById("notice"),
+  backgroundTasks: document.getElementById("backgroundTasks"),
   minimizeButton: document.getElementById("minimizeButton"),
   closeButton: document.getElementById("closeButton"),
   messageActionButton: document.getElementById("messageActionButton"),
@@ -43,6 +44,19 @@ const activeFetchControllers = new Set();
 let preservePreview = false;
 let lastRenderedMessagesKey = "";
 let lastKnownStateVersion = -1;
+let stateRequestSequence = 0;
+let retryTaskCommit = false;
+const taskSessionQuery = `session_id=${encodeURIComponent(SESSION_ID)}`;
+const backgroundTasks = new BackgroundTasks({
+  async list() {
+    const response = await apiFetch(`/api/tasks?${taskSessionQuery}`, { cache: "no-store" });
+    if (response.status === 404) return { tasks: [], runtime_epoch: backgroundTasks.scope?.epoch };
+    if (!response.ok) throw new Error("Could not check background work.");
+    return response.json();
+  },
+  changed: renderBackgroundTasks,
+  active: () => !document.hidden && !isQuitting,
+});
 
 let streamingAssistantText = "";
 let subtitles = null;
@@ -1055,6 +1069,87 @@ function setSendingState(sending) {
   if (elements.send) {
     elements.send.disabled = sending;
   }
+  renderBackgroundTasks();
+}
+
+async function saveTaskReply() {
+  const response = await apiFetch("/api/chat/retry-commit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: SESSION_ID }),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Could not save the reply.");
+  retryTaskCommit = false;
+  if (Array.isArray(payload.turns)) renderMessages(payload.turns);
+  await backgroundTasks.refresh();
+  renderBackgroundTasks();
+}
+
+function renderBackgroundTasks() {
+  const panel = elements.backgroundTasks;
+  if (!panel) return;
+  panel.hidden = !backgroundTasks.scope || (!backgroundTasks.tasks.size && !retryTaskCommit);
+  if (panel.hidden) {
+    panel.replaceChildren();
+    syncInteractiveRegions();
+    return;
+  }
+  const labels = {
+    queued: "Queued", loading: "Loading model", running: "Working", cancelling: "Stopping", ready: "Ready",
+    failed: "Analysis failed", cancelled: "Cancelled", expired: "Expired", invalidated: "Unavailable",
+    consumed: "Discussed",
+  };
+  const action = (label, run, disabled = false) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.disabled = disabled;
+    button.addEventListener("click", async () => {
+      try { await run(); } catch (error) { showNotice(error.message, "error"); }
+    });
+    return button;
+  };
+  const header = document.createElement("header");
+  const heading = document.createElement("strong");
+  heading.textContent = "Background work";
+  header.append(heading, action("Refresh", () => backgroundTasks.refresh()));
+  const rows = document.createElement("ul");
+  for (const task of [...backgroundTasks.tasks.values()].reverse()) {
+    const row = document.createElement("li");
+    const title = document.createElement("span");
+    title.className = "task-label";
+    title.textContent = task.label || "Background analysis";
+    title.title = title.textContent;
+    const status = document.createElement("span");
+    status.className = "task-status";
+    status.textContent = labels[task.status] || "Accepted";
+    row.append(title, status);
+    if (["queued", "loading", "running"].includes(task.status)) {
+      row.append(action("Cancel", async () => {
+        const response = await apiFetch(`/api/tasks/${encodeURIComponent(task.task_id)}/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: SESSION_ID }),
+        });
+        if (!response.ok) {
+          await backgroundTasks.refresh();
+          throw new Error("This background task is unavailable.");
+        }
+        backgroundTasks.receipt(await response.json());
+      }));
+    } else if (task.status === "ready") {
+      const selected = backgroundTasks.selection === task.task_id;
+      row.append(action(selected ? "Clear selection" : "Use result", () => {
+        backgroundTasks.select(selected ? null : task.task_id);
+        focusComposerInput();
+      }, isSending));
+    }
+    rows.append(row);
+  }
+  panel.replaceChildren(header, rows);
+  if (retryTaskCommit) panel.append(action("Retry saving reply", saveTaskReply, isSending));
+  syncInteractiveRegions();
 }
 
 async function fetchState() {
@@ -1071,6 +1166,7 @@ async function fetchState() {
 async function loadStatePayload(
   includeMessages = true,
 ) {
+  const sequence = ++stateRequestSequence;
   const response = await apiFetch(
     `/api/state?session_id=${encodeURIComponent(
         SESSION_ID,
@@ -1088,11 +1184,23 @@ async function loadStatePayload(
     );
   }
 
-  return response.json();
+  const payload = await response.json();
+  if (sequence === stateRequestSequence) {
+    const previousScope = backgroundTasks.scope;
+    const epoch = payload.background_tasks?.runtime_epoch;
+    if (previousScope?.session !== payload.session_id || previousScope?.epoch !== epoch) retryTaskCommit = false;
+    backgroundTasks.configure(payload.session_id, epoch);
+    if (backgroundTasks.scope && backgroundTasks.scope === previousScope
+        && Number(payload.version || 0) !== lastKnownStateVersion) void backgroundTasks.refresh();
+  }
+  return payload;
 }
 
 async function sendMessage(message) {
-  const requestId = message.startsWith("/") ? "" : beginTTFT();
+  const traceId = message.startsWith("/") ? "" : beginTTFT();
+  const useTask = backgroundTasks.selected();
+  const requestId = traceId || (backgroundTasks.scope && !message.startsWith("/")
+    ? (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`) : "");
   preservePreview = false;
 
   if (message.startsWith("/")) {
@@ -1113,8 +1221,12 @@ async function sendMessage(message) {
     window.__akanePendingMessage = message;
 
     try {
-      await window.pywebview.api
-        .send_message_stream(message, requestId, Boolean(requestId));
+      const bridge = window.pywebview.api;
+      if (useTask || SESSION_ID !== "popup") {
+        await bridge.send_message_stream(message, requestId, Boolean(traceId), useTask || null, SESSION_ID);
+      } else {
+        await bridge.send_message_stream(message, requestId, Boolean(traceId));
+      }
     } catch (error) {
       showNotice(
         error?.message ||
@@ -1142,7 +1254,8 @@ async function sendMessage(message) {
           session_id: SESSION_ID,
           source: "popup",
           request_id: requestId,
-          trace_ttft: Boolean(requestId),
+          trace_ttft: Boolean(traceId),
+          ...(useTask ? { use_task: useTask } : {}),
         }),
       },
     );
@@ -1333,6 +1446,10 @@ function handleStreamEvent(
   }
 
   if (event.type === "done") {
+    if (event.task) {
+      backgroundTasks.receipt(event.task);
+      void backgroundTasks.refresh();
+    }
 
     // Store final history without replacing the subtitle being read.
     if (Array.isArray(event.messages)) {
@@ -1381,6 +1498,11 @@ function handleStreamEvent(
   }
 
   if (event.type === "error") {
+    if (event.retry_commit) {
+      retryTaskCommit = true;
+      renderBackgroundTasks();
+    }
+    if (backgroundTasks.scope) void backgroundTasks.refresh();
     finishSubtitle();
     streamingAssistantText = "";
 
@@ -1579,6 +1701,7 @@ elements.closeButton?.addEventListener(
       return;
     }
     isQuitting = true;
+    backgroundTasks.stop();
     elements.closeButton.disabled = true;
     elements.closeButton.setAttribute(
       "aria-disabled",
@@ -1667,6 +1790,7 @@ function syncInteractiveRegions() {
     elements.avatarHitbox,
     dockVisible ? elements.actionDock : null,
     elements.composer,
+    elements.backgroundTasks,
     elements.memoryPanel,
   ];
   const clippedRect = (element) => {
@@ -1964,5 +2088,9 @@ window.addEventListener(
   "resize",
   () => { scheduleDialogueLayout(); void refreshVisibleViewport(); },
 );
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) backgroundTasks.stop();
+  else if (backgroundTasks.scope) void backgroundTasks.refresh();
+});
 
 void boot();

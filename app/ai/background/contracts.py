@@ -10,7 +10,9 @@ from ..conversation.cancellation import CancellationToken
 
 
 class TaskState(str, Enum):
+    RESERVED = "RESERVED"
     PENDING = "PENDING"
+    LOADING = "LOADING"
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -30,6 +32,8 @@ class BackgroundJob:
     cancellation_requested_monotonic: float | None = None
     invalidated: bool = False
     delivered_turn_id: UUID | None = None
+    status_version: int = 1
+    load_aborting: bool = False
 
     @property
     def conversation_id(self) -> UUID:

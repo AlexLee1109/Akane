@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 from .background.compaction import CompactionExecutor
 from .background.contracts import TaskState
 from .background.scheduler import InferenceScheduler
+from .background.residency import LazyL2
 from .contracts import ConversationSession, DelegationRequest
 from .continuity.compaction import JSONSummaryStore
 from .continuity.compaction_contracts import CompactionLimits, CompactionPrefix, SummaryCheckpoint
@@ -24,7 +25,7 @@ class CompactionOperation:
 
 class Compactor:
     """Use the configured maintenance model and scheduler to compute summaries."""
-    def __init__(self, summaries: JSONSummaryStore, model: DialogueModel, scheduler: InferenceScheduler, *,
+    def __init__(self, summaries: JSONSummaryStore, model: DialogueModel | LazyL2, scheduler: InferenceScheduler, *,
                  limits: CompactionLimits = CompactionLimits()):
         self.summaries, self.model, self.scheduler, self.limits = summaries, model, scheduler, limits
 

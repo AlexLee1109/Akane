@@ -1,6 +1,6 @@
 """The local Metal adapter. Native dependencies are imported only on construction."""
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import closing
 from dataclasses import asdict, dataclass
 import ctypes
@@ -52,6 +52,40 @@ def _metal_device(llama_cpp) -> str:
     raise RuntimeError("No accessible Metal GPU. Run from a terminal with GPU access.")
 
 
+def _load_with_checkpoints(llama, api, cancelled, **kwargs):
+    """Install per-instance callbacks in the pinned llama-cpp-python constructor."""
+    active_check = [cancelled]
+
+    def stopping():
+        check = active_check[0]
+        return check is not None and check()
+
+    progress = api.llama_progress_callback(lambda _progress, _data: not stopping())
+    abort = api.ggml_abort_callback(lambda _data: stopping())
+
+    class GuardedLlama(llama):
+        def __setattr__(self, name, value):
+            if name == 'model_params':
+                value.progress_callback = progress
+            elif name == 'context_params':
+                value.abort_callback = abort
+            super().__setattr__(name, value)
+            if name in ('model_params', '_model', '_ctx') and stopping():
+                raise RuntimeError('Native L2 initialization stopped at an allocation checkpoint.')
+
+    instance = GuardedLlama.__new__(GuardedLlama)
+    try:
+        instance.__init__(**kwargs)
+        api.llama_set_abort_callback(instance._ctx.ctx, api.ggml_abort_callback(), None)
+    except BaseException:
+        if hasattr(instance, '_stack'):
+            instance.close()
+        raise
+    finally:
+        active_check[0] = None
+    return instance
+
+
 @dataclass(slots=True)
 class GenerationMetrics:
     prompt_tokens: int
@@ -76,7 +110,8 @@ class GenerationMetrics:
 class NativeModel:
     supports_decisions = True  # Same audited optional JSON-schema completion path.
 
-    def __init__(self, model_path: Path, *, context_size: int = 4096) -> None:
+    def __init__(self, model_path: Path, *, context_size: int = 4096,
+                 load_cancelled: Callable[[], bool] | None = None) -> None:
         if not model_path.is_file():
             raise FileNotFoundError(model_path)
         from llama_cpp import Llama, LlamaGrammar, StoppingCriteriaList, llama_cpp
@@ -91,13 +126,11 @@ class NativeModel:
         self.model_path = model_path.resolve()
         self._slot = Lock()
         self._stopping_criteria = StoppingCriteriaList
-        self._grammar_factory = lambda schema: _checked_grammar(
-            LlamaGrammar.from_json_schema(schema, verbose=False), self._llm._model.vocab, llama_cpp,
-        )
         self.seed: int | None = None
         self.last_metrics: GenerationMetrics | None = None
         started = perf_counter()
-        self._llm = Llama(
+        load = Llama if load_cancelled is None else partial(_load_with_checkpoints, Llama, llama_cpp, load_cancelled)
+        self._llm = load(
             model_path=str(self.model_path), n_ctx=context_size,
             n_gpu_layers=-1, flash_attn=True, offload_kqv=True, op_offload=True,
             type_k=llama_cpp.GGML_TYPE_Q8_0, type_v=llama_cpp.GGML_TYPE_Q8_0,
@@ -105,6 +138,12 @@ class NativeModel:
             use_mmap=True, verbose=False,
         )
         try:
+            # The vocabulary is borrowed for this owner's lifetime. Capturing the
+            # owner here would retain the closed binding and its Python buffers.
+            vocab = self._llm._model.vocab
+            self._grammar_factory = lambda schema: _checked_grammar(
+                LlamaGrammar.from_json_schema(schema, verbose=False), vocab, llama_cpp,
+            )
             template = self._llm.metadata.get("tokenizer.chat_template")
             if not template:
                 raise RuntimeError("The GGUF has no embedded chat template.")
@@ -206,16 +245,29 @@ class NativeModel:
             metrics.finish_reason = "failed"
             raise
         finally:
-            if cancellation.cancelled:
-                metrics.finish_reason = "cancelled"
-            metrics.total_seconds = perf_counter() - started
-            metrics.generator_exit_monotonic = perf_counter()
-            self._slot.release()
+            try:
+                self._release_sampler()
+            finally:
+                if cancellation.cancelled:
+                    metrics.finish_reason = "cancelled"
+                metrics.total_seconds = perf_counter() - started
+                metrics.generator_exit_monotonic = perf_counter()
+                self._slot.release()
+
+    def _release_sampler(self) -> None:
+        # llama-cpp-python 0.3.36 leaves the sampler on Llama after iteration.
+        # Its cleanup callback references the sampler itself, so dropping the
+        # reference alone can defer freeing the chain (and its grammar) to GC.
+        sampler = getattr(self._llm, '_sampler', None)
+        if sampler is not None:
+            sampler.close()
+            self._llm._sampler = None
 
     def close(self) -> None:
         if not self._slot.acquire(blocking=False):
             raise RuntimeError("Stop generation before closing the model.")
         try:
+            self._release_sampler()
             self._llm.close()
         finally:
             self._slot.release()

@@ -32,8 +32,18 @@ class ReplyTextDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskReceipt:
+    task_id: UUID
+    originating_turn_id: UUID
+    runtime_epoch: UUID
+    status: str
+    status_version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
 class ReplyCompleted:
     turn_id: UUID
+    task: TaskReceipt | None = None
     kind: Literal["reply_completed"] = field(default="reply_completed", init=False)
     owner: Literal["l1"] = field(default="l1", init=False)
 

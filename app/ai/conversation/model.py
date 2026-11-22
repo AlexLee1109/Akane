@@ -12,7 +12,8 @@ INITIAL_MODEL_FILENAME = "Qwen3.5-9B-Q4_K_M.gguf"
 
 @dataclass(frozen=True, slots=True)
 class ChatMessage:
-    role: Literal["system", "user", "assistant", "tool"]
+    # "reference" is host-supplied past context for the Gemma chat formatter.
+    role: Literal["system", "user", "assistant", "tool", "reference"]
     content: str
 
 

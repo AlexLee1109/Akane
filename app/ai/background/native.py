@@ -14,6 +14,7 @@ from ..conversation.cancellation import CancellationToken, GenerationCancelled
 from ..conversation.model import ChatMessage, ContextBudgetExceeded, DialogueModel, PreparedPrompt
 from ..provenance import SourceAttribution
 from .contracts import TaskState
+from .residency import LazyL2
 from .scheduler import InferenceScheduler
 
 
@@ -43,6 +44,12 @@ def _finding_text(raw: str, limit: int) -> str:
     return text
 
 
+def _require_current_user_source(request):
+    if (len(request.source_context) != 1 or not request.source_context[0].sources
+            or any(source.owner != 'user' for source in request.source_context[0].sources)):
+        raise ValueError('Automatic execution requires the authorized current user source.')
+
+
 @dataclass(frozen=True, slots=True)
 class BackgroundLimits:
     max_prompt_tokens: int = 2048
@@ -65,7 +72,7 @@ class NativeBackgroundExecutor:
     """
 
     def __init__(
-        self, profile_id: UUID, model: DialogueModel, scheduler: InferenceScheduler, *,
+        self, profile_id: UUID, model: DialogueModel | LazyL2, scheduler: InferenceScheduler, *,
         limits: BackgroundLimits = BackgroundLimits(),
         automatic_limits: BackgroundLimits | None = None,
         clock: Callable[[], float] = monotonic,
@@ -81,6 +88,7 @@ class NativeBackgroundExecutor:
         self.last_prompt: PreparedPrompt | None = None
         self.last_output = ""
         self.last_status = TaskState.PENDING
+        self.last_cancellation = None
 
     def execute(
         self, request: DelegationRequest, *, cancellation: CancellationToken,
@@ -88,15 +96,20 @@ class NativeBackgroundExecutor:
         self.last_prompt = None
         self.last_output = ""
         self.last_status = TaskState.RUNNING
+        self.last_cancellation = None
         started = self._clock()
-        automatic = self.automatic_limits if request.delivery_turn_id is not None else None
+        automatic = self.automatic_limits if request.automatic else None
         limits = automatic or self.limits
+        model = self._model
+        lazy = isinstance(model, LazyL2)
         token = CancellationToken(
             request.turn_id, Event(), _parent=cancellation,
-            _deadline=started + limits.max_seconds, _clock=self._clock,
+            _deadline=started + limits.max_seconds, _clock=self._clock, _deadline_origin='background_executor',
         )
         try:
             self._scheduler.require_background_owner(self.profile_id, request.request_id, cancellation=cancellation)
+            if request.detached is not None and automatic is None:
+                raise ValueError('Detached work requires structured automatic execution limits.')
             if cancellation.turn_id != request.turn_id:
                 raise ValueError("Cancellation token belongs to another turn.")
             if not all(isinstance(value, UUID) for value in (request.request_id, request.conversation_id, request.turn_id)):
@@ -109,6 +122,14 @@ class NativeBackgroundExecutor:
             ):
                 raise ValueError("Task context belongs to another profile or conversation.")
             token.raise_if_cancelled()
+            if lazy:
+                if automatic:
+                    _require_current_user_source(request)
+                model, lease = self._scheduler.borrow_background_model(model, cancellation)
+                started = self._clock()
+                token = CancellationToken(request.turn_id, Event(), _parent=lease,
+                                          _deadline=started + limits.max_seconds, _clock=self._clock,
+                                          _deadline_origin='background_executor')
             supplied = json.dumps({
                 "task": request.task,
                 "sources": [asdict(source) for source in request.source_context],
@@ -126,16 +147,16 @@ class NativeBackgroundExecutor:
                 )) + f"Use at most {limits.max_output_tokens} output tokens and {limits.max_result_chars} characters."),
                 ChatMessage("user", supplied),
             )
-            prompt = self._model.prepare(messages, max_tokens=limits.max_output_tokens)
+            prompt = model.prepare(messages, max_tokens=limits.max_output_tokens)
             if automatic:
                 prompt = replace(prompt, json_schema=AUTOMATIC_FINDING_SCHEMA)
             self.last_prompt = prompt
             token.raise_if_cancelled()
             if (len(prompt.tokens) > limits.max_prompt_tokens
-                    or len(prompt.tokens) + prompt.max_tokens > self._model.context_size):
+                    or len(prompt.tokens) + prompt.max_tokens > model.context_size):
                 raise ContextBudgetExceeded("Task prompt exceeds its exact token allowance.")
             wire_limit = limits.max_result_chars * 12 + 64 if automatic else limits.max_result_chars
-            with closing(self._model.stream(prompt, cancellation=token)) as output:
+            with closing(model.stream(prompt, cancellation=token)) as output:
                 for text in output:
                     token.raise_if_cancelled()
                     remaining = wire_limit - len(self.last_output)
@@ -145,7 +166,7 @@ class NativeBackgroundExecutor:
                     if "<think>" in self.last_output or "</think>" in self.last_output:
                         raise ValueError("Unexpected reasoning-channel marker; result was not published.")
             token.raise_if_cancelled()
-            metrics = getattr(self._model, "last_metrics", None)
+            metrics = getattr(model, "last_metrics", None)
             if metrics is not None and metrics.finish_reason == "length":
                 raise ValueError("Output token limit reached; diagnostic result is incomplete.")
             if automatic and metrics is not None and metrics.finish_reason != 'stop':
@@ -154,10 +175,8 @@ class NativeBackgroundExecutor:
                 raise ValueError("The model returned an empty task result.")
             finding = _finding_text(self.last_output, limits.max_result_chars) if automatic else self.last_output
             if automatic:
-                if len(request.source_context) != 1 or not request.source_context[0].sources or any(
-                    source.owner != 'user' for source in request.source_context[0].sources
-                ):
-                    raise ValueError('Automatic execution requires the authorized current user source.')
+                if not lazy:
+                    _require_current_user_source(request)
                 token.raise_if_cancelled()
             sources = (SourceAttribution("l2", f"model-generated:{request.request_id}"), *(
                 source for record in request.source_context for source in record.sources
@@ -165,23 +184,24 @@ class NativeBackgroundExecutor:
             self.last_status = TaskState.COMPLETED
             return DelegationResult(
                 request.request_id, request.conversation_id, request.turn_id, "completed",
-                (ContextRecord(finding, sources),), generation=self._generation(started),
+                (ContextRecord(finding, sources),), generation=self._generation(started, model),
             )
-        except GenerationCancelled:
+        except GenerationCancelled as error:
             self.last_status = TaskState.CANCELLED
+            self.last_cancellation = error.cause
             return DelegationResult(
                 request.request_id, request.conversation_id, request.turn_id, "cancelled",
-                generation=self._generation(started),
+                generation=self._generation(started, model),
             )
         except Exception as error:
             self.last_status = TaskState.FAILED
             return DelegationResult(
                 request.request_id, request.conversation_id, request.turn_id, "failed",
-                error=f"{type(error).__name__}: {error}", generation=self._generation(started),
+                error=f"{type(error).__name__}: {error}", generation=self._generation(started, model),
             )
 
-    def _generation(self, started: float) -> GenerationInfo:
-        metrics = getattr(self._model, "last_metrics", None) if self.last_prompt is not None else None
+    def _generation(self, started: float, model) -> GenerationInfo:
+        metrics = getattr(model, "last_metrics", None) if self.last_prompt is not None else None
         # A preparation failure must never reuse the preceding generation's metrics.
         if metrics is not None and (metrics.started_monotonic is None or metrics.started_monotonic < started):
             metrics = None

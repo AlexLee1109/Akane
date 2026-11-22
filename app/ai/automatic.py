@@ -98,8 +98,8 @@ class AutomaticContextManager:
                 return MaintenanceStatus(session_id, attempts=self._attempts)
             if self._operation is not None:
                 job = self.scheduler.get_job(self.store.profile_id, self._operation.job_id)
-                if job.status.name in ('PENDING', 'RUNNING'):
-                    status = replace(status, state='queued' if job.status.name == 'PENDING' else 'running')
+                if job.status.name in ('PENDING', 'LOADING', 'RUNNING'):
+                    status = replace(status, state='queued' if job.status.name == 'PENDING' else job.status.value.lower())
             return status
 
     def observe(self, session_id, info, *, context_size):

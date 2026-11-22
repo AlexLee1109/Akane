@@ -322,6 +322,52 @@ button:disabled {
 }
 
 /* Composer/input */
+.background-tasks {
+  position: absolute;
+  left: var(--composer-left);
+  right: var(--composer-right);
+  bottom: calc(var(--composer-bottom) + var(--composer-height) + 8px);
+  z-index: 21;
+  max-height: 11rem;
+  overflow: auto;
+  padding: 7px 10px;
+  color: var(--color-text);
+  background: var(--color-panel);
+  border: 1px solid var(--color-panel-border);
+  border-radius: 12px;
+  font-size: 0.76rem;
+  pointer-events: auto;
+}
+
+.background-tasks[hidden],
+body[data-composer-open="false"] .background-tasks {
+  display: none;
+}
+
+.background-tasks header,
+.background-tasks li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.background-tasks header { justify-content: space-between; }
+.background-tasks ul { list-style: none; margin: 5px 0 0; padding: 0; }
+.background-tasks li { min-height: 26px; border-top: 1px solid var(--color-panel-border); }
+.task-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-status { color: var(--color-blue); white-space: nowrap; }
+
+.background-tasks button {
+  border: 1px solid var(--color-panel-border);
+  border-radius: 7px;
+  padding: 2px 6px;
+  background: transparent;
+  color: var(--color-text);
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
 .composer {
   position: absolute;
   left: var(--composer-left);

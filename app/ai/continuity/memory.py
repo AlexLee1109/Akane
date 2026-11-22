@@ -217,27 +217,31 @@ class JSONMemoryStore:
     def profile_id(self) -> UUID:
         return self._store.profile_id
 
-    def _source(self, proposal: MemoryProposal) -> None:
+    def _source(self, proposal: MemoryProposal, source_archive=None) -> None:
         _identifier(proposal.memory_id)
         if proposal.profile_id != self.profile_id:
             raise InvalidMemorySource("Memory proposal belongs to another profile.")
         _content(proposal.content)
         source = proposal.source
         _source_shape(source, proposal.content)
-        data, entries = self._store._load(source.session_id)
+        if source_archive is not None and source_archive[0]['conversation_id'] == str(source.session_id):
+            data, entries = source_archive
+        else:
+            data, entries = self._store._load(source.session_id)
         user = next((entry for entry in entries if entry.turn_id == source.turn_id and entry.role == "user"), None)
         if (user is None or self._store._session(data).created_at != source.session_created_at
                 or user.created_at != source.turn_created_at or user.source != source.attribution
                 or user.outcome != "completed" or user.text[source.start:source.end] != proposal.content):
             raise InvalidMemorySource("Memory span does not match its original durable user statement.")
 
-    def _state(self) -> tuple[dict, tuple[MemoryRecord, ...]]:
+    def _state(self, *, source_archive=None) -> tuple[dict, tuple[MemoryRecord, ...]]:
         data, records = _load(self._store)
         updated = []
         for record in records:
             if record.source is not None:
                 try:
-                    self._source(MemoryProposal(record.memory_id, self.profile_id, record.content, record.source))
+                    self._source(MemoryProposal(record.memory_id, self.profile_id, record.content, record.source),
+                                 source_archive)
                 except (SessionNotFound, InvalidMemorySource):
                     record = _redact(record, MemoryDeletion("source_unavailable", self._store._clock()))
             updated.append(record)

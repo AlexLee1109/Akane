@@ -1,6 +1,7 @@
 """Immutable messages crossing layer boundaries; no runtime or backend imports."""
 
 from dataclasses import dataclass, field
+from hashlib import sha256
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
@@ -115,6 +116,31 @@ class ContextSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class DetachedBinding:
+    runtime_epoch: UUID
+    source_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskReference:
+    task_id: UUID
+    runtime_epoch: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryClaim:
+    task: TaskReference
+    pin_id: UUID
+    profile_id: UUID
+    conversation_id: UUID
+    session_created_at: datetime
+    target_turn_id: UUID
+    expected_revision: int
+    source_sha256: str
+    finding_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class DelegationRequest:
     """An explicit L1 task; L2 cannot create independent goals."""
 
@@ -128,11 +154,26 @@ class DelegationRequest:
     session_created_at: datetime | None = None
     source_turn_id: UUID | None = None
     delivery_turn_id: UUID | None = None
+    detached: DetachedBinding | None = None
 
     def __post_init__(self) -> None:
         if self.snapshot is not None:
             if self.snapshot.conversation_id != self.conversation_id:
                 raise ValueError("Delegation snapshot belongs to another conversation.")
+        if self.detached is not None:
+            expected = ContextRecord(self.task, (SourceAttribution('user', f'{self.turn_id}:user'),))
+            if (self.delivery_turn_id is not None or self.source_turn_id != self.turn_id
+                    or self.request_id != self.turn_id or self.session_created_at is None
+                    or self.snapshot is None or self.snapshot.profile_id is None
+                    or self.snapshot != ContextSnapshot(self.conversation_id, self.snapshot.revision,
+                                                        profile_id=self.snapshot.profile_id)
+                    or self.source_context != (expected,)
+                    or self.detached.source_sha256 != sha256(self.task.encode()).hexdigest()):
+                raise ValueError('Detached work requires the exact authorized user source and a metadata-only anchor.')
+
+    @property
+    def automatic(self) -> bool:
+        return self.delivery_turn_id is not None or self.detached is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,8 +237,18 @@ class AttachedResult:
     created_at: datetime
     completed_at: datetime
     target_turn_id: UUID
+    claim: DeliveryClaim | None = None
 
     def __post_init__(self) -> None:
+        if (self.request.detached is None) != (self.claim is None):
+            raise ValueError('A detached attachment requires its delivery claim.')
+        if self.claim is not None and (
+                self.claim.task != TaskReference(self.job_id, self.request.detached.runtime_epoch)
+                or self.claim.profile_id != self.profile_id or self.claim.conversation_id != self.request.conversation_id
+                or self.claim.session_created_at != self.request.session_created_at
+                or self.claim.target_turn_id != self.target_turn_id
+                or self.claim.source_sha256 != self.request.detached.source_sha256):
+            raise ValueError('Attachment does not match its delivery claim.')
         if self.request.delivery_turn_id not in (None, self.target_turn_id):
             raise ValueError("Automatic findings are bound to one originating interaction.")
         if self.result.status != "completed" or not self.result.findings:
@@ -217,10 +268,14 @@ class InteractionRequest:
     text: str
     context: ConversationContext = field(default_factory=ConversationContext)
     control_mode: Literal["plain", "decision", "final"] = "plain"
+    acknowledge_work: bool = False
 
     def __post_init__(self):
         if self.control_mode not in ("plain", "decision", "final"):
             raise ValueError("Unknown interaction control mode.")
+        if self.acknowledge_work and (self.control_mode != 'final' or self.context.attached_results
+                                     or self.context.delegation_results or self.context.delegation_failure):
+            raise ValueError('Acknowledgment requires a final-only pass without findings.')
 
     @property
     def source(self) -> SourceAttribution:

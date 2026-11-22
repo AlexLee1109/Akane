@@ -100,8 +100,9 @@ class WindowApi:
     def minimize_window(self) -> None:
         self.app.minimize_all_windows()
 
-    def send_message_stream(self, message: str, request_id: str = "", trace_ttft: bool = False) -> None:
-        self.app.send_message_stream(message, request_id, trace_ttft)
+    def send_message_stream(self, message: str, request_id: str = "", trace_ttft: bool = False,
+                            use_task: dict | None = None, session_id: str = DEFAULT_SESSION_ID) -> None:
+        self.app.send_message_stream(message, request_id, trace_ttft, use_task, session_id)
 
     def send_command(self, message: str) -> dict:
         return self.app.send_command(message)
@@ -172,7 +173,8 @@ class PopupApp:
             return
 
     def _run_message_stream(self, message: str, request_id: str = "",
-                            trace_ttft: bool = False, started_at: float = 0.0) -> None:
+                            trace_ttft: bool = False, started_at: float = 0.0,
+                            use_task: dict | None = None, session_id: str = DEFAULT_SESSION_ID) -> None:
         started_at = started_at or time.perf_counter()
         first_line_at = None
         first_delta_at = None
@@ -184,9 +186,9 @@ class PopupApp:
         if not message:
             self._emit_stream_event({"type": "error", "error": "Message is empty."})
             return
-        session_id = DEFAULT_SESSION_ID
         try:
-            for line in self._remote_stream_lines(message, session_id, request_id, trace_ttft):
+            selection = {'use_task': use_task} if use_task is not None else {}
+            for line in self._remote_stream_lines(message, session_id, request_id, trace_ttft, **selection):
                 if self._shutdown_started():
                     break
                 line_count += 1
@@ -244,7 +246,7 @@ class PopupApp:
         return event
 
     def _remote_stream_lines(self, message: str, session_id: str,
-                             request_id: str = "", trace_ttft: bool = False):
+                             request_id: str = "", trace_ttft: bool = False, *, use_task: dict | None = None):
         stream_cancelled = getattr(self, "_stream_cancelled", threading.Event())
         stream_lock = getattr(self, "_stream_lock", threading.Lock())
         payload = json.dumps(
@@ -255,6 +257,7 @@ class PopupApp:
                 "skip_memory": False,
                 "request_id": request_id,
                 "trace_ttft": trace_ttft,
+                **({'use_task': use_task} if use_task is not None else {}),
             },
             ensure_ascii=False,
         ).encode("utf-8")
@@ -309,7 +312,8 @@ class PopupApp:
                 if getattr(self, "_stream_response", None) is response:
                     self._stream_response = None
 
-    def send_message_stream(self, message: str, request_id: str = "", trace_ttft: bool = False) -> None:
+    def send_message_stream(self, message: str, request_id: str = "", trace_ttft: bool = False,
+                            use_task: dict | None = None, session_id: str = DEFAULT_SESSION_ID) -> None:
         started_at = time.perf_counter()
         with self._shutdown_lock:
             if self._shutdown_state != SHUTDOWN_RUNNING:
@@ -319,7 +323,7 @@ class PopupApp:
                     raise RuntimeError("A reply is already in progress.")
                 thread = threading.Thread(
                     target=self._run_message_stream,
-                    args=(message, request_id, trace_ttft, started_at),
+                    args=(message, request_id, trace_ttft, started_at, use_task, session_id),
                     daemon=True,
                     name="AkanePopupStream",
                 )

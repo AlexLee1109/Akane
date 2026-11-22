@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import ExitStack, closing, suppress
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import fcntl
 import os
@@ -15,13 +15,16 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from app.core.config import SETTINGS
 
 from app.ai.automatic_contracts import AutomaticContextPolicy
+from app.ai.background.contracts import TaskState
+from app.ai.background.l2_memory import guarded_l2_load
 from app.ai.background.native import BackgroundLimits, NativeBackgroundExecutor
+from app.ai.background.residency import LazyL2
 from app.ai.background.scheduler import InferenceScheduler, JobConflict, JobNotFound
 from app.ai.continuity.json_store import JSONContinuityStore
 from app.ai.continuity.memory import JSONMemoryStore
 from app.ai.continuity.memory_contracts import MemoryApproval
 from app.ai.continuity.store import ContinuityConflict, SessionNotFound
-from app.ai.contracts import ContextRecord
+from app.ai.contracts import ContextRecord, TaskReference
 from app.ai.conversation.cancellation import CancellationToken, GenerationCancelled, TurnCancellationOwner
 from app.ai.conversation.interaction import InteractionModel
 from app.ai.conversation.model import DialogueModel
@@ -43,11 +46,29 @@ class ActiveTurn:
     request_id: str
     token: CancellationToken
     previous: list[dict] | None
+    use_task: TaskReference | None = None
+
+    @property
+    def turn_id(self):
+        return self.token.turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayedTurn:
+    turn_id: UUID
+    previous: list[dict] | None
+    result: dict
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestRecord:
+    turn_id: UUID
+    use_task: TaskReference | None
 
 
 @dataclass(frozen=True, slots=True)
 class _ModelRuntime:
-    model: DialogueModel
+    model: DialogueModel | LazyL2
     scheduler: InferenceScheduler
 
 
@@ -67,6 +88,32 @@ def _open_runtime(startup, path: Path, *, role: str = 'shared', context_size: in
     scheduler = InferenceScheduler(prioritize_tasks=True) if role == 'l2' else InferenceScheduler()
     startup.callback(scheduler.shutdown)
     return _ModelRuntime(model, scheduler)
+
+
+def _validate_lazy_file(path):
+    with path.open('rb') as stream:
+        header = stream.read(8)
+    if len(header) != 8 or header[:4] != b'GGUF' or int.from_bytes(header[4:], 'little') not in (2, 3):
+        raise ValueError('Configured L2 file must have a supported GGUF header.')
+
+
+def _open_lazy_runtime(startup, path, *, context_size, idle_seconds):
+    model_factory, guard = NativeModel, guarded_l2_load
+
+    def factory(cancelled):
+        model = model_factory(path, context_size=context_size, load_cancelled=cancelled)
+        if model.architecture != 'qwen35' or model.context_size != context_size:
+            model.close()
+            raise ValueError('L2 metadata or context does not match the configured Qwen owner.')
+        return model
+
+    def load(cancellation, on_abort):
+        return guard(factory, cancellation, on_abort, model_path=path)
+
+    owner = LazyL2(path, context_size, idle_seconds, load)
+    scheduler = InferenceScheduler(prioritize_tasks=True, lazy_l2=owner)
+    startup.callback(scheduler.shutdown)
+    return _ModelRuntime(owner, scheduler)
 
 
 class NextCompanion:
@@ -89,7 +136,9 @@ class NextCompanion:
         self._server_lock = None
         self._settings = SETTINGS
         self._auto_delegation = self._settings.next_auto_delegation
-        self._request_ids: OrderedDict[tuple[UUID, datetime], OrderedDict[str, None]] = OrderedDict()
+        self._async = (self._settings.next_runtime == 'independent' and self._auto_delegation
+                       and self._settings.next_async_delegation)
+        self._request_ids: OrderedDict[tuple[UUID, datetime], OrderedDict[str, _RequestRecord]] = OrderedDict()
 
     @staticmethod
     def _session_uuid(session: str) -> UUID:
@@ -154,8 +203,14 @@ class NextCompanion:
                         raise FileNotFoundError(f'{role} model file does not exist: {path}')
                 if l1_path.samefile(l2_path):
                     raise ValueError('Independent L1 and L2 require distinct GGUF files.')
+                if settings.next_l2_lazy_load:
+                    _validate_lazy_file(l2_path)
                 l1 = _open_runtime(startup, l1_path, role='l1', context_size=settings.next_l1_context_size)
-                l2 = _open_runtime(startup, l2_path, role='l2', context_size=settings.next_l2_context_size)
+                if settings.next_l2_lazy_load:
+                    l2 = _open_lazy_runtime(startup, l2_path, context_size=settings.next_l2_context_size,
+                                            idle_seconds=settings.next_l2_idle_unload_seconds)
+                else:
+                    l2 = _open_runtime(startup, l2_path, role='l2', context_size=settings.next_l2_context_size)
             else:
                 l1 = l2 = _open_runtime(startup, Path(settings.model_path))
             limits = PRODUCTION_AUTODELEGATION_LIMITS
@@ -169,6 +224,9 @@ class NextCompanion:
                 automatic_context=self.policy,
                 automatic_delegation=self._auto_delegation, delegation_limits=limits,
                 background_scheduler=l2.scheduler, maintenance_model=l2.model,
+                asynchronous_delegation=self._async,
+                overlap_safe=all(getattr(runtime.model, 'supports_independent_overlap', False)
+                                 for runtime in (l1, l2)),
             )
             self._l1, self._l2, self._host, self._server_lock = l1, l2, host, lease
             startup.pop_all()
@@ -201,7 +259,11 @@ class NextCompanion:
                         'architecture': getattr(runtime.model, 'architecture', None) if runtime else None,
                         'context_size': runtime.model.context_size if runtime else None}
 
-            return {'mode': mode, 'l1': describe('l1', self._l1), 'l2': describe('l2', self._l2),
+            l2 = describe('l2', self._l2)
+            if self._l2 is not None and isinstance(self._l2.model, LazyL2):
+                l2.update(self._l2.model.snapshot(), lazy=True, **self._l2.scheduler.background_activity())
+                l2['ready'] = ready and l2['lifecycle_state'] == 'ready'
+            return {'mode': mode, 'l1': describe('l1', self._l1), 'l2': l2,
                     'maintenance_owner': 'l2' if mode == 'independent' else 'shared'}
 
     def _select(self, session):
@@ -244,7 +306,71 @@ class NextCompanion:
     def messages(self, session="popup"):
         return self.snapshot(session)["turns"]
 
-    def reserve(self, session, request_id, *, include_messages):
+    @staticmethod
+    def _task_data(receipt):
+        return {name: str(value) if isinstance(value, UUID) else value for name, value in asdict(receipt).items()}
+
+    def task_capability(self):
+        with self._lock:
+            return {'runtime_epoch': str(self._host.runtime_epoch)} if self._async and self.ready else None
+
+    def _task_session(self, session):
+        self._available()
+        if not self._async or self._host is None or len(session) > 200:
+            raise JobNotFound('No accepted task in this session.')
+        return self._store.get_session(self._session_uuid(session))
+
+    def _task_status(self, job):
+        data = self._task_data(self._host._receipt(job))
+        if data['status'] == 'completed':
+            data['status'] = 'ready'
+        data['label'] = ' '.join(job.request.task.split())[:96]
+        return data
+
+    def list_tasks(self, session):
+        with self._lock:
+            current = self._task_session(session)
+            jobs = self._l2.scheduler.detached_jobs(_PROFILE_ID, current.conversation_id, current.created_at)
+            return {'runtime_epoch': str(self._host.runtime_epoch), 'tasks': [self._task_status(job) for job in jobs]}
+
+    def task(self, session, identifier, *, cancel=False):
+        with self._lock:
+            current = self._task_session(session)
+            job = self._host.scoped_task(current, identifier)
+            if cancel and job.status in (TaskState.PENDING, TaskState.LOADING, TaskState.RUNNING):
+                self._l2.scheduler.cancel_background(_PROFILE_ID, identifier)
+                job = self._host.scoped_task(current, identifier)
+            return self._task_status(job)
+
+    def _replay(self, session, current, record, text, include_messages):
+        turn_id = record.turn_id
+        try:
+            if record.use_task is None:
+                receipt, (user, reply) = self._host.detached_exchange(current.conversation_id, turn_id)
+            else:
+                task = record.use_task
+                job = self._host.scoped_task(current, task.task_id)
+                if job.delivered_turn_id != turn_id or job.request.detached.runtime_epoch != task.runtime_epoch:
+                    raise JobNotFound('The result exchange is unavailable.')
+                pair = tuple(entry for entry in self._store.transcript(current.conversation_id) if entry.turn_id == turn_id)
+                if len(pair) != 2 or pair[1].outcome != 'completed':
+                    raise JobNotFound('The result exchange is unavailable.')
+                user, reply = pair
+                receipt = self._host._receipt(job)
+        except JobNotFound as error:
+            raise JobConflict('This request ID has already been admitted for this session.') from error
+        if text != user.text:
+            raise JobConflict('This request ID was admitted with different text.')
+        result = {'reply': reply.text, 'outcome': 'completed', 'task': self._task_data(receipt)}
+        previous = None
+        if include_messages:
+            snapshot = self.snapshot(session)
+            result.update(messages=snapshot['turns'], revision=snapshot['revision'])
+            first = next(index for index, item in enumerate(snapshot['turns']) if item['id'] == str(turn_id))
+            previous = snapshot['turns'][:first]
+        return ReplayedTurn(turn_id, previous, result)
+
+    def reserve(self, session, request_id, *, include_messages, text=None, use_task=None):
         with self._lock:
             self._idle()
             current = self._select(session)
@@ -257,12 +383,22 @@ class NextCompanion:
             if self._auto_delegation and request_id:
                 requests = self._request_ids.get(key, OrderedDict())
                 if request_id in requests:
+                    if self._async and text is not None:
+                        if requests[request_id].use_task != use_task:
+                            raise JobConflict('This request ID used a different task selection.')
+                        return self._replay(session, current, requests[request_id], text, include_messages)
                     raise JobConflict('This request ID has already been admitted for this session.')
+            if use_task is not None:
+                if not self._async or use_task.runtime_epoch != self._host.runtime_epoch:
+                    raise JobNotFound('No accepted task in this session.')
+                job = self._host.scoped_task(current, use_task.task_id)
+                if job.status != TaskState.COMPLETED or job.invalidated or job.delivered_turn_id is not None:
+                    raise JobConflict('The selected task is unavailable for delivery.')
             previous = self.messages(session) if include_messages else None
-            active = ActiveTurn(session, request_id, self._owner.begin(uuid4()), previous)
+            active = ActiveTurn(session, request_id, self._owner.begin(uuid4()), previous, use_task)
             self._active = active
             if requests is not None:
-                requests[request_id] = None
+                requests[request_id] = _RequestRecord(active.turn_id, use_task)
                 if len(requests) > 128:
                     requests.popitem(last=False)
                 self._request_ids[key] = requests
@@ -272,21 +408,29 @@ class NextCompanion:
             return active
 
     def run_turn(self, active, text, *, skip_memory, on_delta):
+        if isinstance(active, ReplayedTurn):
+            on_delta(active.result['reply'])
+            return active.result
         pieces = []
         outcome, error = "failed", None
+        receipt = None
         try:
-            with closing(self._host.stream(text, cancellation=active.token, skip_memory=skip_memory)) as events:
+            with closing(self._host.stream(text, cancellation=active.token, skip_memory=skip_memory,
+                                           use_task=active.use_task)) as events:
                 for event in events:
                     if event.kind == "reply_text_delta":
                         pieces.append(event.text)
                         on_delta(event.text)
                     elif event.kind == "reply_completed":
                         outcome = "completed"
+                        receipt = event.task
                     elif event.kind == "reply_cancelled":
                         outcome = "cancelled"
                     elif event.kind == "reply_failed":
                         error = event.message
             result = {"reply": "".join(pieces), "outcome": outcome}
+            if receipt is not None:
+                result['task'] = self._task_data(receipt)
             if error:
                 result["error"] = error
             with self._lock:
@@ -308,14 +452,15 @@ class NextCompanion:
                 with suppress(OSError):
                     print('Akane delegation', metrics, flush=True)
 
-    def cancel(self, session, *, request_id="", generation_id=""):
+    def cancel(self, session, *, request_id="", generation_id="", origin="user_cancel"):
         with self._lock:
             active = self._active
             if (active is None or active.session != session
                     or request_id and request_id != active.request_id
-                    or generation_id and generation_id != str(active.token.turn_id)):
+                    or generation_id and generation_id != str(active.token.turn_id)
+                    or self._host.accepted_turn == active.turn_id):
                 return False
-            self._owner.cancel(active.token.turn_id)
+            self._owner.cancel(active.token.turn_id, origin=origin)
             self._host.cancel_turn(active.token.turn_id)
             return True
 
@@ -325,7 +470,7 @@ class NextCompanion:
                 return
             self._closing = True
             if self._active is not None:
-                self.cancel(self._active.session)
+                self.cancel(self._active.session, origin="shutdown")
             for runtime in self._runtimes():
                 runtime.scheduler.request_shutdown()
 
@@ -387,7 +532,7 @@ class NextCompanion:
                 raise ApplicationBusy("Akane is not ready.")
             job = self._host.status(job_id)
             current = self._ensure_store().get_session(self._session_uuid(session))
-            if (job.request.snapshot is None or job.request.delivery_turn_id is not None
+            if (job.request.snapshot is None or job.request.automatic
                     or job.conversation_id != current.conversation_id
                     or job.request.session_created_at != current.created_at):
                 raise JobNotFound("No matching manual job in this session.")
@@ -459,7 +604,8 @@ class NextCompanion:
             cleanup.callback(self._close_store)
             runtimes = self._runtimes()
             for runtime in runtimes:
-                cleanup.callback(runtime.model.close)
+                if not isinstance(runtime.model, LazyL2):
+                    cleanup.callback(runtime.model.close)
             for runtime in runtimes:
                 cleanup.callback(runtime.scheduler.shutdown)
             if self._host is not None:

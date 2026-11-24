@@ -6,6 +6,7 @@ from hashlib import sha256
 from .background.worker import BackgroundIntelligence
 from .continuity.json_store import JSONContinuityStore
 from .continuity.store import ContinuityConflict
+from .continuity.task_findings import archive_finding
 from .provenance import SourceAttribution
 
 
@@ -38,6 +39,10 @@ class DetachedExecutor:
     store: JSONContinuityStore
     executor: BackgroundIntelligence
     max_result_characters: int
+
+    def commit_finding(self, request, result, cancellation):
+        finding = validated_finding(request, result, self.max_result_characters)
+        archive_finding(self.store, request, finding, cancellation)
 
     def execute(self, request, *, cancellation):
         cancellation.raise_if_cancelled()

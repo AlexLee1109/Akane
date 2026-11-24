@@ -216,6 +216,13 @@ class DelegationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskStatus:
+    state: str
+    label: str
+    cancellation_stage: Literal['while queued', 'after worker dispatch began'] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ConversationContext:
     """Optional L3 history and L2 data; an empty value is fully valid."""
 
@@ -224,6 +231,7 @@ class ConversationContext:
     attached_results: tuple["AttachedResult", ...] = ()
     l3_projection: "L3Projection | None" = None
     delegation_failure: ContextRecord | None = None
+    task_statuses: tuple[TaskStatus, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

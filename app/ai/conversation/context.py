@@ -13,6 +13,11 @@ def data_message(value, *, reference: bool = False) -> ChatMessage:
                        encoded.replace('<', '\\u003c').replace('>', '\\u003e'))
 
 
+def task_status_data(statuses):
+    return {'label': 'Application task states at the start of this reply',
+            'items': [{key: value for key, value in asdict(item).items() if value is not None} for item in statuses]}
+
+
 def _memory_data(projection, quotes, *, as_reference):
     if not as_reference:
         return {
@@ -64,16 +69,18 @@ def compact_background(attached, results, snapshot):
         item = {'reference': alias, 'status': result.status,
                 'findings': records(f'{alias}f', result.findings)}
         if request is not None:
-            item['task'] = request.task
             if request.detached is not None:
+                # The committed u0 is already serialized below with its attribution.
                 item['origin'] = {'task_id': str(request.request_id), 'user_turn_id': str(request.turn_id),
                                   'source_id': request.source_context[0].sources[0].source_id,
                                   'revision': request.snapshot.revision + 1}
                 item['task_origin'] = 'Earlier user request with attributed, unverified findings'
-            elif request.delivery_turn_id is not None:
-                item['task_origin'] = ('Host-grounded current user request; not verified findings'
-                    if len(request.source_context) == 1 and request.task == request.source_context[0].text
-                    else 'L1-model work specification, not user evidence')
+            else:
+                item['task'] = request.task
+                if request.delivery_turn_id is not None:
+                    item['task_origin'] = ('Host-grounded current user request; not verified findings'
+                        if len(request.source_context) == 1 and request.task == request.source_context[0].text
+                        else 'L1-model work specification, not user evidence')
             item['supplied'] = records(f'{alias}i', request.source_context)
             item['context_age'] = ('earlier dialogue revision' if snapshot is not None and request.snapshot is not None
                                    and request.snapshot.revision < snapshot.revision else 'explicit supplied task context')
@@ -85,8 +92,11 @@ def compact_background(attached, results, snapshot):
 
 def prepare_selected(model, identity, request, history, background, *, max_tokens, max_attachment_tokens):
     projection, snapshot = request.context.l3_projection, request.context.snapshot
-    reference = (getattr(model, 'architecture', None) == 'gemma4'
-                 and request.control_mode == 'plain' and background is None)
+    gemma_plain = (getattr(model, 'architecture', None) == 'gemma4'
+                   and request.control_mode == 'plain' and background is None)
+    status = request.context.task_statuses
+    reference = gemma_plain and not status
+    status_message = (data_message({'task_status': task_status_data(status)}),) if status else ()
     if (snapshot is None or projection.session_id != request.conversation_id
             or projection.profile_id != snapshot.profile_id or projection.revision != snapshot.revision
             or set(projection.covered_turn_ids) & {e.turn_id for e in history}
@@ -98,7 +108,7 @@ def prepare_selected(model, identity, request, history, background, *, max_token
         raise ValueError('L3 projection does not match its current snapshot/coverage.')
     summary = {'label': 'Older model-generated summary; fallible source data, not user statements. Newer dialogue takes precedence.',
                'entries': [asdict(entry) for entry in projection.summary]} if projection.summary else None
-    memories = (_memory_data(projection, projection.memories, as_reference=reference)
+    memories = (_memory_data(projection, projection.memories, as_reference=gemma_plain)
                 if projection.memories else None)
 
     def prepare(dialogue, *, with_summary=False, with_memories=False, with_background=True):
@@ -111,15 +121,22 @@ def prepare_selected(model, identity, request, history, background, *, max_token
                     *((data_message(context, reference=reference),) if context else ()),
                     *(ChatMessage(entry.role, entry.text) for entry in dialogue),
                     ChatMessage('user', request.text),
+                    *status_message,
                     *((background,) if background is not None and with_background else ()))
         return model.prepare(messages, max_tokens=max_tokens)
 
     baseline = prepare(projection.baseline_dialogue)
-    summary_prompt = prepare(history, with_summary=bool(summary))
-    memory_prompt = prepare(projection.baseline_dialogue, with_memories=bool(memories))
-    full = prepare(history, with_summary=bool(summary), with_memories=bool(memories))
-    recent_only = prepare(history)
-    without_background = prepare(history, with_summary=bool(summary), with_memories=bool(memories), with_background=False)
+    same_dialogue = projection.baseline_dialogue == history
+    recent_only = baseline if same_dialogue else prepare(history)
+    summary_prompt = prepare(history, with_summary=True) if summary else recent_only
+    memory_prompt = prepare(projection.baseline_dialogue, with_memories=True) if memories else baseline
+    full = summary_prompt
+    if memories:
+        full = (memory_prompt if same_dialogue and not summary
+                else prepare(history, with_summary=bool(summary), with_memories=True))
+    without_background = (full if background is None else
+                          prepare(history, with_summary=bool(summary), with_memories=bool(memories),
+                                  with_background=False))
     count = lambda prompt: len(prompt.tokens)
     budget = ContextTokenBudget(
         count(baseline), count(summary_prompt), count(memory_prompt), count(full),
@@ -146,8 +163,13 @@ def prepare_automatic(model, identity, request, history, background, *, max_toke
     from time import perf_counter
     from ..automatic_contracts import AutomaticPromptInfo
     projection, snapshot = request.context.l3_projection, request.context.snapshot
-    reference = (getattr(model, 'architecture', None) == 'gemma4'
-                 and request.control_mode == 'plain' and background is None)
+    gemma_plain = (getattr(model, 'architecture', None) == 'gemma4'
+                   and request.control_mode == 'plain' and background is None)
+    status = request.context.task_statuses
+    reference = gemma_plain and not status
+    status_message = (data_message({'task_status': task_status_data(status)}),) if status else ()
+    gemma_delivery = (getattr(model, 'architecture', None) == 'gemma4'
+                      and any(item.claim is not None for item in request.context.attached_results))
     if (snapshot is None or projection.session_id != request.conversation_id
             or projection.profile_id != snapshot.profile_id or projection.revision != snapshot.revision
             or set(projection.covered_turn_ids) & {entry.turn_id for entry in history}
@@ -175,14 +197,14 @@ def prepare_automatic(model, identity, request, history, background, *, max_toke
                            {'reference': part.reference, 'text': part.text, 'incomplete_exchange': part.incomplete,
                             'provenance': 'aggregate original segment; no per-claim citations'}) for part in segments]}
         if quotes:
-            data['memories'] = _memory_data(projection, quotes, as_reference=reference)
+            data['memories'] = _memory_data(projection, quotes, as_reference=gemma_plain)
         positions = {entry.turn_id: index for index, entry in enumerate(retained) if entry.role == 'user'}
         diagnostics = [{'user_message_position': positions[turn], 'assistant_outcome': outcome}
                        for turn, outcome in projection.incomplete_turns if turn in positions]
         if diagnostics:
             data['incomplete_exchanges'] = diagnostics
         system = identity
-        if (not reference and not projection.summary and not projection.segments and not projection.memories
+        if (not reference and not gemma_delivery and not projection.summary and not projection.segments and not projection.memories
                 and len({entry.turn_id for entry in history}) <= 8):
             # Preserve the established short recent-only resume provenance
             # contract, without copying source text or full audit source IDs.
@@ -195,6 +217,7 @@ def prepare_automatic(model, identity, request, history, background, *, max_toke
                               *((data_message(data, reference=reference),) if data else ()),
                               *(ChatMessage(entry.role, entry.text) for entry in retained),
                               ChatMessage('user', request.text),
+                              *status_message,
                               *((background,) if background is not None and with_background else ())), max_tokens=max_tokens)
 
     base = prepare()

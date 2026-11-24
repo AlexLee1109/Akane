@@ -20,11 +20,12 @@ from .background.scheduler import InferenceScheduler, JobConflict, JobNotFound, 
 from .background.worker import BackgroundIntelligence
 from .contracts import (
     AttachedResult, ContextRecord, ContextSnapshot, ConversationContext, ConversationSession,
-    DelegationRequest, DeliveryClaim, DetachedBinding, HistoryEntry, InteractionRequest, TaskReference,
+    DelegationRequest, DeliveryClaim, DetachedBinding, HistoryEntry, InteractionRequest, TaskReference, TaskStatus,
 )
 from .continuity.store import ContinuityConflict, ContinuityStore, SessionNotFound
 from .continuity.context import ContextAssembler, ContextAssembly
 from .continuity.json_store import JSONContinuityStore
+from .continuity.task_findings import delivery_uri, recover_findings
 from .context_contracts import ContextSelectionStatus
 from .conversation.cancellation import CancellationToken, TurnCancellationOwner
 from .conversation.events import InteractionEvent, ReplyCancelled, ReplyCompleted, ReplyFailed, ReplyTextDelta, TaskReceipt
@@ -87,6 +88,7 @@ class ConversationHost:
         automatic_delegation: bool = False, delegation_limits: AutoDelegationLimits = AutoDelegationLimits(),
         background_scheduler: InferenceScheduler | None = None,
         maintenance_model: DialogueModel | LazyL2 | None = None,
+        maintenance_scheduler: InferenceScheduler | None = None,
         asynchronous_delegation: bool = False, overlap_safe: bool = False,
     ) -> None:
         if store is not None and store.profile_id != profile_id:
@@ -112,11 +114,12 @@ class ConversationHost:
         self._automatic_policy = automatic_context
         if automatic_context is not None and not isinstance(store, JSONContinuityStore):
             raise ValueError("Automatic context requires JSON persistence.")
-        if automatic_context is not None and self.background_scheduler is not scheduler and maintenance_model is None:
+        maintenance_owner = self.background_scheduler if maintenance_scheduler is None else maintenance_scheduler
+        if automatic_context is not None and maintenance_owner is not scheduler and maintenance_model is None:
             raise ValueError("Independent maintenance requires a model for the background scheduler.")
         self.automatic = (AutomaticContextManager(
             store, interaction._model if maintenance_model is None else maintenance_model,
-            self.background_scheduler, automatic_context)
+            maintenance_owner, automatic_context)
                           if automatic_context is not None else None)
         self._summary_override = None
         self._excluded_memory_ids = ()
@@ -138,6 +141,7 @@ class ConversationHost:
         self._overlap_safe = asynchronous_delegation and overlap_safe
         self._experimental_native_overlap = False
         self.runtime_epoch = uuid4()
+        self._recovered_sessions = {}
         self._uncertain_admission: _Admission | None = None
         self.accepted_turn: UUID | None = None
         self._detached_executor = (DetachedExecutor(store, executor, delegation_limits.result_characters)
@@ -443,7 +447,7 @@ class ConversationHost:
                 or authorized.revision is not None and authorized.revision != current.revision):
             raise JobConflict('Automatic task source/session/revision is stale.')
 
-    def _authorize_task(self, decision, request, cancellation):
+    def _authorize_task(self, decision, request, cancellation, *, source_tokens=None):
         cancellation.raise_if_cancelled()
         current = self._current()
         snapshot = request.context.snapshot
@@ -462,7 +466,8 @@ class ConversationHost:
         task = request.text if intent_only else decision.task
         if not isinstance(task, str) or not task.strip() or not 0 < len(task) <= (limits.source_characters if intent_only else 1024) or len(request.text)>limits.source_characters:
             raise _DelegationBudgetExceeded('Automatic task/source character bound exceeded.')
-        task_tokens = len(self.interaction._model.prepare((ChatMessage('user',task),), max_tokens=1).tokens)
+        task_tokens = (source_tokens if intent_only and source_tokens is not None else
+                       len(self.interaction._model.prepare((ChatMessage('user', task),), max_tokens=1).tokens))
         source_tokens = (task_tokens if intent_only else
                          len(self.interaction._model.prepare((ChatMessage('user',request.text),), max_tokens=1).tokens))
         if task_tokens>limits.task_tokens or source_tokens>limits.source_tokens:
@@ -491,18 +496,31 @@ class ConversationHost:
                          else {'drain_active': False} if self._overlap_safe else {})
         with (self.scheduler.foreground(self.profile_id, request.turn_id, cancellation=cancellation) as token,
               self.background_scheduler.pause_background(cancellation=token, **pause_options)
-              if self.background_scheduler is not self.scheduler else nullcontext()):
+              if (self.background_scheduler is not self.scheduler
+                  and not getattr(self.executor, 'independent_resources', False)) else nullcontext()):
             self.last_foreground_wait_seconds = monotonic()-waiting
             # The status-only pass uses the already authorized request as its
             # source anchor and needs no new transcript or memory projection.
             if not (request.acknowledge_work and self.interaction.uses_isolated_acknowledgment):
                 request = (self._refresh_request(request, token, skip_memory=True) if skip_memory
                            else self._refresh_request(request, token))
+            source_tokens = None
             if (request.control_mode == 'decision' and self.interaction._intent_only
                     and self._delegate_limits.min_task_tokens):
                 source = self.interaction._model.prepare((ChatMessage('user', request.text),), max_tokens=1)
-                if len(source.tokens) < self._delegate_limits.min_task_tokens:
+                source_tokens = len(source.tokens)
+                if source_tokens < self._delegate_limits.min_task_tokens:
                     request = replace(request, control_mode='plain')
+            if self._async and request.control_mode in ('decision', 'plain') and not request.context.attached_results:
+                jobs = self.background_scheduler.detached_jobs(self.profile_id, self.session.conversation_id,
+                                                                self.session.created_at)
+                statuses = tuple(TaskStatus('ready' if receipt.status == 'completed' else receipt.status,
+                                            ' '.join(job.request.task.split())[:96],
+                                            ('while queued' if job.acquired_monotonic is None else
+                                             'after worker dispatch began') if receipt.status == 'cancelled' else None)
+                                 for job in jobs if (receipt := self._receipt(job)).status not in ('consumed', 'invalidated'))
+                if statuses:
+                    request = replace(request, context=replace(request.context, task_statuses=statuses[-4:]))
             if automatic and self._authorized_task is not None:
                 # Final ownership may have waited behind another caller. A fresh
                 # snapshot must not legitimize findings bound to an older revision.
@@ -522,7 +540,8 @@ class ConversationHost:
             try:
                 for event in output:
                     if event.kind == 'reply_delegated':
-                        self._authorized_task = self._authorize_task(event.decision,request,token)
+                        self._authorized_task = self._authorize_task(event.decision, request, token,
+                                                                     source_tokens=source_tokens)
                     elif automatic and self._delegate_limits.wait_seconds is not None and event.kind == 'reply_failed':
                         self._delegation_audit['error'] = event.message
                         budget = self.interaction.last_automatic_info
@@ -594,7 +613,12 @@ class ConversationHost:
             return
         self._delegation_audit['state'] = 'deciding'
         delegated = False
-        initial = replace(request,control_mode='final' if request.context.attached_results else 'decision')
+        attached = request.context.attached_results
+        # Explicit detached selection has already authorized the one finding.
+        # Gemma presents it as dialogue while the host buffers and commits it.
+        mode = ('plain' if attached and attached[0].claim is not None and self.interaction.uses_isolated_acknowledgment
+                else 'final' if attached else 'decision')
+        initial = replace(request, control_mode=mode)
         try:
             with closing(self._foreground_events(initial,cancellation,automatic=True,skip_memory=skip_memory)) as output:
                 for event in output:
@@ -680,7 +704,8 @@ class ConversationHost:
                           detached=DetachedBinding(self.runtime_epoch, sha256(request.task.encode()).hexdigest()))
         self._delegation_audit['authorized'] = replace(authorized, request=request)
         job = self.background_scheduler.submit_background(self.profile_id, request, self._detached_executor,
-                                                           budget_seconds=self._delegate_limits.seconds, reserve=True)
+            budget_seconds=self._delegate_limits.seconds, reserve=True,
+            commit_finding=self._detached_executor.commit_finding)
         self._delegation_audit['state'] = 'reserved'
         chunks = []
         completed = False
@@ -739,6 +764,26 @@ class ConversationHost:
                 or request.session_created_at != session.created_at):
             raise JobNotFound('No accepted task in this session.')
         return job
+
+    def restore_task_findings(self, session):
+        if not self._async:
+            return
+        key = session.conversation_id, session.created_at
+        restored = self._recovered_sessions.setdefault(key, set())
+        if restored is None:
+            return
+        findings = recover_findings(self.store, session, self.runtime_epoch)
+        for request, payload, _ in findings:
+            committed_origin(self.store, request)
+            validated_finding(request, payload, self._delegate_limits.result_characters)
+        for request, payload, completed_at in findings:
+            if request.request_id in restored:
+                continue
+            if not self.background_scheduler.restore_detached(request, payload, completed_at,
+                                                              budget_seconds=self._delegate_limits.seconds):
+                return
+            restored.add(request.request_id)
+        self._recovered_sessions[key] = None
 
     def _pin_delivery(self, reference, turn_id):
         current = self._current()
@@ -890,7 +935,6 @@ class ConversationHost:
         user_time = datetime.now(timezone.utc)
         interaction_started = monotonic()
         try:
-            snapshot = self._snapshot(cancellation)
             attached = ()
             if use_task is not None:
                 if self._selection is not None:
@@ -905,7 +949,7 @@ class ConversationHost:
                                           job.created_at,result.completed_at,cancellation.turn_id),)
                 selection.armed = False
             request = InteractionRequest(self.session.conversation_id,cancellation.turn_id,text,
-                                         ConversationContext(snapshot,attached_results=attached))
+                                         ConversationContext(attached_results=attached))
             output = self._turn_events(request,cancellation,skip_memory=skip_memory)
             try:
                 for event in output:
@@ -913,9 +957,15 @@ class ConversationHost:
                         delivery_chunks.append(event)
                         continue
                     if delivery is not None and event.kind == 'reply_completed':
+                        # The provenance URI and the reply share one atomic transcript append.
+                        # If the process dies before in-memory consumption, recovery sees the marker.
+                        attribution = SourceAttribution('l1',
+                            f'{self.profile_id}:{delivery.conversation_id}:{cancellation.turn_id}:assistant',
+                            delivery_uri(delivery.task.task_id))
                         self._pending = _Exchange(HistoryEntry(cancellation.turn_id, 'user', text, created_at=user_time),
                             HistoryEntry(cancellation.turn_id, 'assistant', ''.join(chunk.text for chunk in delivery_chunks),
-                                         created_at=datetime.now(timezone.utc)), delivery.expected_revision, None,
+                                         created_at=datetime.now(timezone.utc), attribution=attribution),
+                            delivery.expected_revision, None,
                             delivery=delivery)
                         receipt = self._commit_delivery(self._pending, cancellation)
                         yield from delivery_chunks

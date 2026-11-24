@@ -437,6 +437,8 @@ class JSONContinuityStore:
             _delete_source_memories(self, conversation_id, cancellation)
             from .compaction import _delete_session_summary
             _delete_session_summary(self, conversation_id)
+            from .task_findings import delete_session_findings
+            delete_session_findings(self, conversation_id)
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
             os.unlink(str(conversation_id) + ".json", dir_fd=self._sessions_dir)

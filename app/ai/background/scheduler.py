@@ -40,6 +40,7 @@ class _Background:
     worker: BackgroundIntelligence | None
     signal: Event
     maintenance: bool
+    commit_finding: Callable[[DelegationRequest, DelegationResult, CancellationToken], None] | None = None
     result: BackgroundResult | None = None
     pin_id: UUID | None = None
     queue_deadline: float | None = None
@@ -64,7 +65,8 @@ class InferenceScheduler:
     """Cooperating operations share one resource; this class never loads a model.
 
     Foreground work executes in its caller's thread. One lazily started thread
-    executes explicitly submitted background jobs. Neither path writes storage.
+    executes explicitly submitted background jobs. A detached completion may
+    call its dedicated store publisher before releasing the result.
     """
 
     def __init__(
@@ -152,6 +154,7 @@ class InferenceScheduler:
         job_id: UUID | None = None, budget_seconds: float = 30.0,
         cancellation: CancellationToken | None = None, maintenance: bool = False,
         reserve: bool = False,
+        commit_finding: Callable[[DelegationRequest, DelegationResult, CancellationToken], None] | None = None,
     ) -> BackgroundJob:
         job_id = request.request_id if job_id is None else job_id
         if not all(isinstance(value, UUID) for value in (
@@ -168,6 +171,8 @@ class InferenceScheduler:
             raise ValueError("Task snapshot belongs to another profile.")
         if reserve != (request.detached is not None) or reserve and (cancellation is not None or maintenance):
             raise ValueError('Only detached work can reserve a slot, with independent cancellation.')
+        if commit_finding is not None and (not reserve or not callable(commit_finding)):
+            raise ValueError('A finding publisher requires a detached reservation.')
         with self._condition:
             self._available()
             self._expire_detached()
@@ -196,7 +201,7 @@ class InferenceScheduler:
             job = BackgroundJob(job_id, profile_id, request, self._timestamp(), budget_seconds, token)
             if reserve:
                 job = replace(job, status=TaskState.RESERVED)
-            entry = _Background(job, worker, signal, maintenance)
+            entry = _Background(job, worker, signal, maintenance, commit_finding)
             if not token.cancelled:
                 self._start_worker()
             self._jobs[job_id] = entry
@@ -247,6 +252,31 @@ class InferenceScheduler:
                          if entry.job.profile_id == profile_id and entry.job.conversation_id == conversation_id
                          and entry.job.request.session_created_at == created_at and entry.job.request.detached is not None
                          and entry.job.status != TaskState.RESERVED)
+
+    def restore_detached(self, request, payload, completed_at, *, budget_seconds):
+        """Register an already validated archived finding without queuing work."""
+        if (request.detached is None or payload.status != 'completed' or completed_at.utcoffset() is None
+                or (payload.request_id, payload.conversation_id, payload.turn_id) !=
+                   (request.request_id, request.conversation_id, request.turn_id)):
+            raise ValueError('Only a completed archived result may restore a detached task.')
+        profile_id, task_id = request.snapshot.profile_id, request.request_id
+        with self._condition:
+            self._available()
+            self._expire_detached()
+            if task_id in self._jobs or (profile_id, task_id) in self._requests:
+                raise JobConflict('An archived task is already registered.')
+            if len(self._jobs) >= self._retained_limit:
+                return False
+            signal = CancellationSignal('background_scheduler')
+            token = CancellationToken(request.turn_id, signal)
+            job = BackgroundJob(task_id, profile_id, request, completed_at, budget_seconds, token,
+                                status=TaskState.COMPLETED)
+            result = BackgroundResult(task_id, profile_id, request.conversation_id, TaskState.COMPLETED,
+                                      payload, completed_at)
+            self._jobs[task_id] = _Background(job, None, signal, False, result=result,
+                                               expires=self._clock() + self._detached_retention)
+            self._requests[profile_id, task_id] = task_id
+            return True
 
     def pending_background_count(self) -> int:
         with self._condition:
@@ -470,7 +500,19 @@ class InferenceScheduler:
         elif payload.status == "failed":
             status, error, payload = TaskState.FAILED, payload.error, None
         else:
-            status = TaskState.COMPLETED
+            # The scheduler condition linearizes cancellation against durable
+            # finding publication. Ready is observable only after the write.
+            try:
+                if entry.commit_finding is not None:
+                    entry.commit_finding(entry.job.request, payload, entry.job.cancellation)
+            except GenerationCancelled:
+                status, payload = TaskState.CANCELLED, None
+                entry.signal.set()
+            except Exception as failure:
+                status, payload, error = TaskState.FAILED, None, f'Finding archive failed: {failure}'
+            else:
+                status = TaskState.COMPLETED
+        entry.commit_finding = None
         entry.job = replace(entry.job, status=status, status_version=entry.job.status_version + 1)
         entry.result = BackgroundResult(
             entry.job.job_id, entry.job.profile_id, entry.job.conversation_id,

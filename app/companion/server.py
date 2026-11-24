@@ -217,6 +217,14 @@ def create_app(companion=None):
     @app.get('/health')
     async def health():
         owners = companion.runtime_status()
+        if owners['l2'].get('backend') == 'remote':
+            await asyncio.to_thread(companion.check_remote_readiness)
+            owners = companion.runtime_status()
+            ready = owners['l1']['ready']
+            status = ('ok' if owners['l2']['ready'] else 'degraded') if ready else 'stopping'
+            payload = dict(status=status, runtime=companion.runtime_name, model_loaded=ready,
+                           model_loading=False, inference=owners)
+            return JSONResponse(payload, status_code=200 if ready else 503)
         ready = owners['l1']['ready'] and (owners['l2']['ready'] or owners['l2'].get('lazy', False))
         payload = dict(status='ok' if ready else 'stopping', runtime=companion.runtime_name,
                        model_loaded=ready, model_loading=False)

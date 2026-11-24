@@ -2,7 +2,6 @@
 from dataclasses import asdict, fields
 import hashlib
 import json
-from uuid import UUID
 
 from ..contracts import GenerationInfo
 from ..provenance import SourceAttribution

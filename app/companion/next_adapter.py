@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import ExitStack, closing, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import fcntl
 import os
@@ -18,6 +18,7 @@ from app.ai.automatic_contracts import AutomaticContextPolicy
 from app.ai.background.contracts import TaskState
 from app.ai.background.l2_memory import guarded_l2_load
 from app.ai.background.native import BackgroundLimits, NativeBackgroundExecutor
+from app.ai.background.remote import RemoteL2
 from app.ai.background.residency import LazyL2
 from app.ai.background.scheduler import InferenceScheduler, JobConflict, JobNotFound
 from app.ai.continuity.json_store import JSONContinuityStore
@@ -68,7 +69,7 @@ class _RequestRecord:
 
 @dataclass(frozen=True, slots=True)
 class _ModelRuntime:
-    model: DialogueModel | LazyL2
+    model: DialogueModel | LazyL2 | None
     scheduler: InferenceScheduler
 
 
@@ -133,6 +134,7 @@ class NextCompanion:
         self._active: ActiveTurn | None = None
         self._closing = False
         self._store = self._l1 = self._l2 = self._host = None
+        self._remote = None
         self._server_lock = None
         self._settings = SETTINGS
         self._auto_delegation = self._settings.next_auto_delegation
@@ -196,17 +198,28 @@ class NextCompanion:
                 raise RuntimeError("Another Akane Next server already owns this data directory.") from error
             session = self._session("popup")
             JSONMemoryStore(store).list_active()
+            remote = None
             if settings.next_runtime == 'independent':
                 l1_path, l2_path = settings.next_l1_model_path, settings.next_l2_model_path
-                for role, path in (('L1', l1_path), ('L2', l2_path)):
+                remote = (RemoteL2(settings.next_l2_remote_url, settings.next_l2_remote_token,
+                                   timeout=settings.next_l2_remote_timeout) if settings.next_l2_remote_url else None)
+                paths = (('L1', l1_path),) if remote else (('L1', l1_path), ('L2', l2_path))
+                for role, path in paths:
                     if not path.is_file():
                         raise FileNotFoundError(f'{role} model file does not exist: {path}')
-                if l1_path.samefile(l2_path):
+                if remote is None and l1_path.samefile(l2_path):
                     raise ValueError('Independent L1 and L2 require distinct GGUF files.')
                 if settings.next_l2_lazy_load:
                     _validate_lazy_file(l2_path)
+                if remote:
+                    remote.check_ready()
+                    if remote.colocated:
+                        raise ValueError('Remote L2 must have a separate native resource host.')
                 l1 = _open_runtime(startup, l1_path, role='l1', context_size=settings.next_l1_context_size)
-                if settings.next_l2_lazy_load:
+                if remote:
+                    l2 = _ModelRuntime(None, InferenceScheduler())
+                    startup.callback(l2.scheduler.shutdown)
+                elif settings.next_l2_lazy_load:
                     l2 = _open_lazy_runtime(startup, l2_path, context_size=settings.next_l2_context_size,
                                             idle_seconds=settings.next_l2_idle_unload_seconds)
                 else:
@@ -214,21 +227,28 @@ class NextCompanion:
             else:
                 l1 = l2 = _open_runtime(startup, Path(settings.model_path))
             limits = PRODUCTION_AUTODELEGATION_LIMITS
+            if remote:
+                # Leave a short cleanup window outside the transport deadline.
+                seconds = remote.timeout + 2
+                limits = replace(limits, seconds=seconds, wait_seconds=max(limits.wait_seconds, seconds))
             worker_limits = BackgroundLimits(limits.prompt_tokens, limits.output_tokens,
                                              limits.result_characters, limits.seconds)
+            executor = remote or NativeBackgroundExecutor(_PROFILE_ID, l2.model, l2.scheduler,
+                automatic_limits=worker_limits if self._auto_delegation else None)
             host = ConversationHost(
                 _PROFILE_ID, session.conversation_id,
                 InteractionModel(l1.model, decision_protocol='intent-only' if self._auto_delegation else 'union'),
-                l1.scheduler, NativeBackgroundExecutor(_PROFILE_ID, l2.model, l2.scheduler,
-                    automatic_limits=worker_limits if self._auto_delegation else None), store=store,
+                l1.scheduler, executor, store=store,
                 automatic_context=self.policy,
                 automatic_delegation=self._auto_delegation, delegation_limits=limits,
-                background_scheduler=l2.scheduler, maintenance_model=l2.model,
+                background_scheduler=l2.scheduler, maintenance_model=l1.model if remote else l2.model,
+                maintenance_scheduler=l1.scheduler if remote else None,
                 asynchronous_delegation=self._async,
                 overlap_safe=all(getattr(runtime.model, 'supports_independent_overlap', False)
                                  for runtime in (l1, l2)),
             )
             self._l1, self._l2, self._host, self._server_lock = l1, l2, host, lease
+            self._remote = remote
             startup.pop_all()
 
     @property
@@ -254,17 +274,27 @@ class NextCompanion:
             ready = self._host is not None and not self._closing
 
             def describe(role, runtime):
+                model = runtime.model if runtime else None
                 return {'owner': 'shared' if mode == 'shared' else role, 'ready': ready,
-                        'model': runtime.model.model_path.name if runtime else None,
-                        'architecture': getattr(runtime.model, 'architecture', None) if runtime else None,
-                        'context_size': runtime.model.context_size if runtime else None}
+                        'model': model.model_path.name if model else None,
+                        'architecture': getattr(model, 'architecture', None),
+                        'context_size': model.context_size if model else None}
 
             l2 = describe('l2', self._l2)
+            if self._remote is not None:
+                l2.update(backend='remote', ready=ready and self._remote.ready,
+                          architecture='qwen35' if self._remote.ready else None)
             if self._l2 is not None and isinstance(self._l2.model, LazyL2):
                 l2.update(self._l2.model.snapshot(), lazy=True, **self._l2.scheduler.background_activity())
                 l2['ready'] = ready and l2['lifecycle_state'] == 'ready'
-            return {'mode': mode, 'l1': describe('l1', self._l1), 'l2': l2,
-                    'maintenance_owner': 'l2' if mode == 'independent' else 'shared'}
+            maintenance = 'l1' if self._remote else ('l2' if mode == 'independent' else 'shared')
+            return {'mode': mode, 'l1': describe('l1', self._l1), 'l2': l2, 'maintenance_owner': maintenance}
+
+    def check_remote_readiness(self):
+        with self._lock:
+            worker = self._remote
+        if worker is not None:
+            worker.check_ready()
 
     def _select(self, session):
         if self._host is None:
@@ -318,7 +348,9 @@ class NextCompanion:
         self._available()
         if not self._async or self._host is None or len(session) > 200:
             raise JobNotFound('No accepted task in this session.')
-        return self._store.get_session(self._session_uuid(session))
+        current = self._store.get_session(self._session_uuid(session))
+        self._host.restore_task_findings(current)
+        return current
 
     def _task_status(self, job):
         data = self._task_data(self._host._receipt(job))
@@ -391,6 +423,7 @@ class NextCompanion:
             if use_task is not None:
                 if not self._async or use_task.runtime_epoch != self._host.runtime_epoch:
                     raise JobNotFound('No accepted task in this session.')
+                self._host.restore_task_findings(current)
                 job = self._host.scoped_task(current, use_task.task_id)
                 if job.status != TaskState.COMPLETED or job.invalidated or job.delivered_turn_id is not None:
                     raise JobConflict('The selected task is unavailable for delivery.')
@@ -506,6 +539,8 @@ class NextCompanion:
     def submit_job(self, session, task, source_turn_id=None):
         with self._lock:
             self._idle()
+            if self._remote is not None:
+                raise ValueError('Remote L2 accepts only automatic detached tasks.')
             current = self._select(session)
             context = ()
             if source_turn_id is not None:
@@ -604,10 +639,11 @@ class NextCompanion:
             cleanup.callback(self._close_store)
             runtimes = self._runtimes()
             for runtime in runtimes:
-                if not isinstance(runtime.model, LazyL2):
+                if runtime.model is not None and not isinstance(runtime.model, LazyL2):
                     cleanup.callback(runtime.model.close)
             for runtime in runtimes:
                 cleanup.callback(runtime.scheduler.shutdown)
             if self._host is not None:
                 cleanup.callback(self._host.close)
             self._host = self._l1 = self._l2 = None
+            self._remote = None

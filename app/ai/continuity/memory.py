@@ -283,7 +283,7 @@ class JSONMemoryStore:
                 session_id, self._store._session(data).created_at, turn_id, user.created_at,
                 start, start + len(quote), user.source,
             ))
-            self._source(proposal)
+            self._source(proposal, source_archive=(data, entries))
             return proposal
 
     def _admit(self, proposal: MemoryProposal, approval: MemoryApproval, expected_revision: int,

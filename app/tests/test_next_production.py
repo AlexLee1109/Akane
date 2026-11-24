@@ -210,6 +210,37 @@ def test_foreground_cancel_partial_failure_recovery_and_restart(runtime):
     assert len(models) == 2 and all(model.closed for model in models)
 
 
+def test_empty_gemma_reply_fails_over_http_and_stays_failed_after_restart(runtime, monkeypatch):
+    class EmptyFirstGemma(Model):
+        architecture = 'gemma4'
+
+        def stream(self, prompt, *, cancellation):
+            if not self.prompts:
+                self.prompts.append(prompt)
+                return
+            yield from super().stream(prompt, cancellation=cancellation)
+
+    models = []
+
+    def create(_path):
+        model = EmptyFirstGemma()
+        models.append(model)
+        return model
+
+    monkeypatch.setattr(next_adapter, 'NativeModel', create)
+    with listener(next_adapter.NextCompanion()) as url:
+        with http(url, '/api/chat/stream', {'message': 'Fair.'}) as stream:
+            events = list(map(json.loads, stream))
+        assert [event['type'] for event in events] == ['start', 'error']
+        assert events[-1]['outcome'] == 'failed'
+        assert events[-1]['reply'] == ''
+        assert len(models[0].prompts) == 1
+        assert read(url, '/api/chat', {'message': 'Continue.'})['reply'] == 'First second'
+
+    with listener(next_adapter.NextCompanion()) as url:
+        assert [row['outcome'] for row in read(url, '/api/state')['messages'][1::2]] == ['failed', 'completed']
+
+
 def test_disconnected_stream_cancels_the_actual_turn(runtime):
     _, models = runtime
     companion = next_adapter.NextCompanion()

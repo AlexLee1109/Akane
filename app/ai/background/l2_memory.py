@@ -1,12 +1,15 @@
 """Host pressure checks for an opt-in cold L2 load on macOS."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 import subprocess
 from threading import Event, Thread
 from time import monotonic
 
-from ..conversation.cancellation import CancellationToken
+
+_VM_RESERVE = 5 * 2**30
+# Native K/V, recurrent, compute and transient allocations are separate from the mapped GGUF.
+_COLD_LOAD_HEADROOM = 2**30
 
 
 class L2ResourceError(RuntimeError):
@@ -25,6 +28,7 @@ class MemoryReading:
     pressure: int
     swap_mib: float
     pageout_mib: float
+    available_vm_bytes: int | None = field(default=None, kw_only=True)
 
 
 def mac_memory() -> MemoryReading:
@@ -38,9 +42,12 @@ def mac_memory() -> MemoryReading:
         stats = query('/usr/bin/vm_stat')
         page_size = re.search(r'page size of (\d+) bytes', stats)
         pageouts = re.search(r'^Pageouts:\s+(\d+)\.', stats, re.M)
-        if not (available and swap and page_size and pageouts):
+        pool = re.findall(r'^Pages (free|active|inactive|speculative):\s*(\d+)\.$', stats, re.M)
+        if not (available and swap and page_size and pageouts and len(pool) == len(dict(pool)) == 4):
             raise ValueError('Incomplete memory readings.')
-        return MemoryReading(int(available[1]), pressure, float(swap[1]), int(page_size[1]) * int(pageouts[1]) / 2**20)
+        page_bytes = int(page_size[1])
+        return MemoryReading(int(available[1]), pressure, float(swap[1]), page_bytes * int(pageouts[1]) / 2**20,
+                             available_vm_bytes=page_bytes * sum(int(count) for _, count in pool))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise L2ResourceError('Required macOS memory counters are unavailable.') from error
 
@@ -69,6 +76,7 @@ def guarded_l2_load(factory, cancellation, on_abort, *, model_path=None, read=ma
     finished, resource_stop = Event(), Event()
     deadline = clock() + seconds
     error = None
+    entry_bytes = None
 
     def check_attempt():
         cancellation.raise_if_cancelled()
@@ -81,10 +89,27 @@ def guarded_l2_load(factory, cancellation, on_abort, *, model_path=None, read=ma
         check_memory(reading, first, floor=31 if admit is None else 6, swap_limit=64)
         if admit is not None:
             admit(first, reading)
+        if entry_bytes is not None:
+            check_pool(reading, entry_bytes)
+
+    def check_pool(reading, required):
+        available = reading.available_vm_bytes
+        if type(available) is not int or available < required:
+            raise L2ResourceError(f'Qwen L2 requires {required} bytes in the VM pool. Observed {available} bytes.')
+
+    def check_loading(reading):
+        check_memory(reading, baseline, floor=6, swap_limit=256)
+        if entry_bytes is not None:
+            check_pool(reading, _VM_RESERVE)
 
     check_attempt()
     if model_path is not None:
         check_model_holders(model_path)
+        if admit is None:
+            try:
+                entry_bytes = model_path.stat().st_size + _COLD_LOAD_HEADROOM + _VM_RESERVE
+            except OSError as error:
+                raise L2ResourceError('Could not size the Qwen GGUF for memory admission.') from error
     first = read()
     check_quiet(first, first)
     until = clock() + quiet_seconds
@@ -100,7 +125,7 @@ def guarded_l2_load(factory, cancellation, on_abort, *, model_path=None, read=ma
         while not finished.wait(interval):
             try:
                 check_attempt()
-                check_memory(read(), baseline, floor=6, swap_limit=256)
+                check_loading(read())
             except Exception as failure:
                 error = failure
                 resource_stop.set()
@@ -117,7 +142,7 @@ def guarded_l2_load(factory, cancellation, on_abort, *, model_path=None, read=ma
             check_attempt()  # A native abort can be reported as a constructor error.
             raise
         check_attempt()
-        check_memory(read(), baseline, floor=6, swap_limit=256)
+        check_loading(read())
     except BaseException:
         if model is not None:
             model.close()

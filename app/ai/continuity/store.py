@@ -1,9 +1,9 @@
-"""L3 transcript port and separately deferred memory/compaction contracts."""
+"""L3 transcript port."""
 
 from typing import Protocol
 from uuid import UUID
 
-from ..contracts import ContextRecord, ContextSnapshot, ConversationSession, HistoryEntry
+from ..contracts import ContextSnapshot, ConversationSession, HistoryEntry
 from ..conversation.cancellation import CancellationToken
 
 
@@ -64,35 +64,5 @@ class ContinuityStore(Protocol):
         An optional storage token cancels before publication; cancellation after
         publication raises too, but the accepted state may already be durable.
         Retry by turn ID to resolve that uncertainty. Never infer memory from output.
-        """
-        ...
-
-
-class MemoryAndCompactionStore(ContinuityStore, Protocol):
-    """Reserved for later steps; the transcript adapter does not implement this."""
-
-    def remember(
-        self, conversation_id: UUID, memory: ContextRecord, *,
-        expected_revision: int, cancellation: CancellationToken,
-    ) -> int:
-        """Commit an attributed memory explicitly, using revision compare-and-swap.
-
-        Raise ContinuityConflict on a stale revision; cancellation before commit
-        leaves state unchanged. Return the new revision only after durable commit.
-        """
-        ...
-
-    def compact(
-        self, conversation_id: UUID, summary: ContextRecord, *,
-        covered_turn_ids: tuple[UUID, ...], expected_revision: int,
-        cancellation: CancellationToken,
-    ) -> ContextSnapshot:
-        """Atomically replace the summary view, preserving the raw transcript.
-
-        Coverage must be a complete history prefix including prior summary
-        coverage. Keep the recent suffix verbatim, retain supporting provenance,
-        and increment the revision. Reject stale revisions with ContinuityConflict.
-        Cancellation before commit leaves the previous snapshot intact. Summary
-        text is supplied explicitly; this port never invokes a model itself.
         """
         ...
